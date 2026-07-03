@@ -1,7 +1,10 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { User, Settings, LogOut } from "lucide-react";
+
+import { authClient } from "@/lib/auth-client";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -26,9 +29,16 @@ function initials(name: string) {
 }
 
 export function UserMenu() {
+  const router = useRouter();
   const { orgId } = useActiveOrg();
   // The first member is the signed-in Org Admin in this prototype.
   const user = getMembers(orgId)[0];
+
+  const onLogout = async () => {
+    await authClient.signOut();
+    router.push("/login");
+    router.refresh();
+  };
 
   return (
     <DropdownMenu>
@@ -69,7 +79,7 @@ export function UserMenu() {
         <DropdownMenuSeparator />
         <DropdownMenuItem
           variant="destructive"
-          render={<Link href="/login" />}
+          onClick={onLogout}
           className="gap-2"
         >
           <LogOut className="size-4" />

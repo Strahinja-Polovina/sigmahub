@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, Loader2, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
+import { authClient } from "@/lib/auth-client";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
@@ -37,7 +38,7 @@ export default function LoginPage() {
   const [codeError, setCodeError] = React.useState<string | null>(null);
   const [verifying, setVerifying] = React.useState(false);
 
-  const submitCredentials = (e: React.FormEvent) => {
+  const submitCredentials = async (e: React.FormEvent) => {
     e.preventDefault();
     const emailError = validateEmail(email);
     const passwordError = validatePassword(password);
@@ -45,28 +46,43 @@ export default function LoginPage() {
     if (emailError || passwordError) return;
 
     setSubmitting(true);
-    // Mock credential check → advance to the 2FA step.
-    setTimeout(() => {
-      setSubmitting(false);
+    const { data, error } = await authClient.signIn.email({ email, password });
+    setSubmitting(false);
+
+    if (error) {
+      toast.error("Couldn’t sign in", {
+        description: error.message ?? "Invalid email or password.",
+      });
+      return;
+    }
+    // Users with 2FA enrolled get a redirect flag instead of a session.
+    if ((data as { twoFactorRedirect?: boolean } | null)?.twoFactorRedirect) {
       setStep("totp");
       toast.info("Verification required", {
         description: "Enter the 6-digit code from your authenticator app.",
       });
-    }, 550);
+      return;
+    }
+    toast.success("Welcome back");
+    router.push("/dashboard");
   };
 
-  const verifyCode = (value?: string) => {
+  const verifyCode = async (value?: string) => {
     const candidate = value ?? code;
     const err = validateOtp(candidate);
     setCodeError(err);
     if (err) return;
 
     setVerifying(true);
-    // Mock TOTP verification → into the app.
-    setTimeout(() => {
-      toast.success("Welcome back");
-      router.push("/dashboard");
-    }, 650);
+    const { error } = await authClient.twoFactor.verifyTotp({ code: candidate });
+    setVerifying(false);
+
+    if (error) {
+      setCodeError("Invalid or expired code. Try again.");
+      return;
+    }
+    toast.success("Welcome back");
+    router.push("/dashboard");
   };
 
   if (step === "totp") {

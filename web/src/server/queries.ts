@@ -2,6 +2,7 @@ import "server-only";
 import { eq } from "drizzle-orm";
 import { db } from "./db";
 import * as s from "./db/schema";
+import { user } from "./db/auth-schema";
 
 export const UNIT_PRICE = 5;
 export const FREE_TIER_SERVERS = 3;
@@ -54,13 +55,13 @@ export async function getResource(id: string) {
 export async function getMembers(orgId: string) {
   return db
     .select({
-      id: s.users.id,
-      name: s.users.name,
-      email: s.users.email,
+      id: user.id,
+      name: user.name,
+      email: user.email,
       role: s.memberships.role,
     })
     .from(s.memberships)
-    .innerJoin(s.users, eq(s.memberships.userId, s.users.id))
+    .innerJoin(user, eq(s.memberships.userId, user.id))
     .where(eq(s.memberships.orgId, orgId));
 }
 export async function getDeployments(resourceId: string) {

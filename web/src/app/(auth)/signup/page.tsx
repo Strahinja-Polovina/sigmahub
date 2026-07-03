@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { authClient } from "@/lib/auth-client";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
@@ -36,7 +37,7 @@ export default function SignupPage() {
   const clear = (key: keyof Errors) =>
     setErrors((prev) => (prev[key] ? { ...prev, [key]: null } : prev));
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const next: Errors = {
       name: validateName(name),
@@ -48,13 +49,25 @@ export default function SignupPage() {
     if (next.name || next.email || next.password || next.confirm) return;
 
     setSubmitting(true);
-    // Mock account creation → straight into the app.
-    setTimeout(() => {
-      toast.success("Account created", {
-        description: "Welcome to SigmaHub. Your first 3 servers are free.",
+    const { error } = await authClient.signUp.email({ name, email, password });
+    setSubmitting(false);
+
+    if (error) {
+      const isDup = error.status === 422 || /exist/i.test(error.message ?? "");
+      setErrors((p) => ({
+        ...p,
+        email: isDup ? "An account with this email already exists." : p.email,
+      }));
+      toast.error("Couldn’t create account", {
+        description: error.message ?? "Please try again.",
       });
-      router.push("/dashboard");
-    }, 700);
+      return;
+    }
+    // signUp signs the user in — the session cookie is already set.
+    toast.success("Account created", {
+      description: "Welcome to SigmaHub. Your first 3 servers are free.",
+    });
+    router.push("/dashboard");
   };
 
   return (

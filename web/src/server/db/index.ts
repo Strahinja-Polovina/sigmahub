@@ -5,6 +5,7 @@ import { mkdirSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "./schema";
+import * as authSchema from "./auth-schema";
 
 const DATA_DIR = process.env.PGLITE_DIR ?? ".data/pg";
 
@@ -14,5 +15,9 @@ mkdirSync(DATA_DIR, { recursive: true }); // PGlite's own mkdir isn't recursive
 const client = g.__sigmaPglite ?? new PGlite(DATA_DIR);
 if (process.env.NODE_ENV !== "production") g.__sigmaPglite = client;
 
-export const db = drizzle(client, { schema });
-export { schema, client };
+const fullSchema = { ...schema, ...authSchema };
+export const db = drizzle(client, {
+  schema: fullSchema,
+  logger: process.env.SQL_LOG === "1",
+});
+export { schema, authSchema, client };

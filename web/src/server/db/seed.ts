@@ -1,9 +1,15 @@
-// Applies migrations to the (PGlite) DB and seeds it with the canonical demo
-// dataset — mirrors the old mock so the app looks identical on first run.
+// Applies migrations to the (PGlite) DB and seeds the canonical demo dataset —
+// mirrors the old mock so the app looks identical on first run.
+// Identity: the demo user is created through better-auth (real hashed password);
+// the other members are display-only rows in better-auth's `user` table.
+// Demo login → strahinja@sigmajunction.com / sigmahub123
 // Run: pnpm db:seed
+import { fileURLToPath } from "node:url";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import { db, client } from "./index";
 import * as s from "./schema";
+import { user, session, account, verification, twoFactor } from "./auth-schema";
+import { auth } from "../../lib/auth";
 import {
   orgs as mockOrgs,
   projects as mockProjects,
@@ -12,6 +18,9 @@ import {
   resources as mockResources,
   members as mockMembers,
 } from "../../lib/mock/data";
+
+export const DEMO_EMAIL = "strahinja@sigmajunction.com";
+export const DEMO_PASSWORD = "sigmahub123";
 
 function sha7(x: string) {
   let h = 5381;
@@ -22,7 +31,7 @@ function sha7(x: string) {
 async function main() {
   await migrate(db, { migrationsFolder: "drizzle" });
 
-  // Idempotent: clear (child → parent order) then insert.
+  // Idempotent: clear (child → parent) then identity tables.
   await db.delete(s.deployments);
   await db.delete(s.resources);
   await db.delete(s.envServers);
@@ -30,25 +39,46 @@ async function main() {
   await db.delete(s.environments);
   await db.delete(s.projects);
   await db.delete(s.memberships);
-  await db.delete(s.users);
   await db.delete(s.orgs);
+  await db.delete(s.auditLog);
+  await db.delete(twoFactor);
+  await db.delete(session);
+  await db.delete(account);
+  await db.delete(verification);
+  await db.delete(user);
+
+  // Demo user via better-auth → creates `user` + `account` (hashed password).
+  const demo = mockMembers[0];
+  const signUp = await auth.api.signUpEmail({
+    body: { email: DEMO_EMAIL, password: DEMO_PASSWORD, name: demo.name },
+  });
+  const demoUserId = signUp.user.id;
+
+  // Other members are display-only (no credentials) → direct user rows.
+  const others = mockMembers.slice(1);
+  await db.insert(user).values(
+    others.map((m) => ({
+      id: m.id,
+      name: m.name,
+      email: m.email,
+      emailVerified: true,
+    }))
+  );
 
   await db.insert(s.orgs).values(
     mockOrgs.map((o) => ({ id: o.id, name: o.name, slug: o.slug, plan: o.plan }))
   );
 
-  await db.insert(s.users).values(
-    mockMembers.map((m) => ({ id: m.id, name: m.name, email: m.email }))
-  );
   await db.insert(s.memberships).values([
-    ...mockMembers.map((m) => ({
+    { id: "mem_acme_u1", orgId: "org_acme", userId: demoUserId, role: demo.role },
+    ...others.map((m) => ({
       id: `mem_acme_${m.id}`,
       orgId: "org_acme",
       userId: m.id,
       role: m.role,
     })),
     // demo user is also Org Admin of Northwind so both orgs have a member
-    { id: "mem_nw_u1", orgId: "org_northwind", userId: "u1", role: "Org Admin" },
+    { id: "mem_nw_u1", orgId: "org_northwind", userId: demoUserId, role: "Org Admin" },
   ]);
 
   await db.insert(s.projects).values(
@@ -112,7 +142,7 @@ async function main() {
         id: `dep_${r.id}_${i}`,
         resourceId: r.id,
         sha: sha7(r.id + i),
-        status: i === 0 ? "running" : i === 1 ? "success" : "success",
+        status: i === 0 ? "running" : "success",
         author: ["mila", "nikola", "ana"][i % 3],
         durationSec: 40 + i * 13,
         startedAt: new Date(Date.parse(r.lastDeployAt) - i * 86_400_000),
@@ -127,12 +157,17 @@ async function main() {
     db.$count(s.resources),
   ]);
   console.log(
-    `seed done — orgs:${orgN} projects:${projN} servers:${srvN} resources:${resN}`
+    `seed done — orgs:${orgN} projects:${projN} servers:${srvN} resources:${resN} · ` +
+      `login ${DEMO_EMAIL} / ${DEMO_PASSWORD}`
   );
   await client.close();
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Only run when executed directly (pnpm db:seed) — NOT when imported, so pulling
+// in DEMO_EMAIL/DEMO_PASSWORD elsewhere doesn't wipe + reseed the database.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

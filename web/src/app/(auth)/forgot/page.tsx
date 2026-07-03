@@ -4,6 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { ArrowLeft, Loader2, MailCheck } from "lucide-react";
 
+import { authClient } from "@/lib/auth-client";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { validateEmail } from "@/components/auth/validators";
@@ -14,18 +15,23 @@ export default function ForgotPasswordPage() {
   const [submitting, setSubmitting] = React.useState(false);
   const [sent, setSent] = React.useState(false);
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const emailError = validateEmail(email);
     setError(emailError);
     if (emailError) return;
 
     setSubmitting(true);
-    // Mock reset-email dispatch → success state.
-    setTimeout(() => {
-      setSubmitting(false);
-      setSent(true);
-    }, 650);
+    // Best-effort dispatch. We always show the same success state so the form
+    // never reveals whether an account exists. (Dev has no mail transport;
+    // prod sends via GCP.)
+    try {
+      await authClient.requestPasswordReset({ email, redirectTo: "/login" });
+    } catch {
+      // swallow — don't leak account existence
+    }
+    setSubmitting(false);
+    setSent(true);
   };
 
   if (sent) {

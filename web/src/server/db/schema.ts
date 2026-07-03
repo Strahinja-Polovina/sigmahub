@@ -1,8 +1,8 @@
 // SigmaHub v1 data model — Drizzle (PostgreSQL dialect; canonical A-4 §5).
 // Dev runs on embedded PGlite; prod = AlloyDB / Cloud SQL for PostgreSQL 18.
-// NOTE: user/org/membership here are the app's minimal identity tables so the
-// app runs end-to-end; V1-2 layers GCP Identity Platform / better-auth on top
-// (its session/account tables live alongside these; org+membership are shared).
+// NOTE: user auth (user/session/account/two_factor) is owned by better-auth in
+// ./auth-schema (V1-2; prod = GCP Identity Platform). Orgs + memberships are the
+// app's own tables and reference better-auth's `user`.
 
 import {
   pgTable,
@@ -12,19 +12,13 @@ import {
   timestamp,
   primaryKey,
 } from "drizzle-orm/pg-core";
+import { user } from "./auth-schema";
 
 export const orgs = pgTable("orgs", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   slug: text("slug").notNull().unique(),
   plan: text("plan").notNull().default("free"), // free | cloud
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-});
-
-export const users = pgTable("users", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  email: text("email").notNull().unique(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
@@ -35,7 +29,7 @@ export const memberships = pgTable("memberships", {
     .references(() => orgs.id, { onDelete: "cascade" }),
   userId: text("user_id")
     .notNull()
-    .references(() => users.id, { onDelete: "cascade" }),
+    .references(() => user.id, { onDelete: "cascade" }),
   role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
