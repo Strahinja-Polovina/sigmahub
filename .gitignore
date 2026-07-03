@@ -1,6 +1,7 @@
 # --- Secrets & local config — NEVER commit ---
 /.mcp.json
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 .env
 .env.local
 .env*.local
