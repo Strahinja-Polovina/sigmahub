@@ -1,0 +1,26 @@
+# --- Secrets & local config — NEVER commit ---
+/.mcp.json
+.claude/settings.local.json
+.env
+.env.local
+.env*.local
+
+# --- Dependencies & build output (web/ has its own too) ---
+node_modules/
+.next/
+dist/
+build/
+.turbo/
+out/
+
+# --- Local data (SQLite / PGlite, etc.) ---
+.data/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- OS / logs / editor ---
+.DS_Store
+Thumbs.db
+*.log
+.codex/
