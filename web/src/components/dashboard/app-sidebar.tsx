@@ -35,9 +35,12 @@ import {
 } from "@/components/ui/collapsible";
 import { Logo } from "@/components/logo";
 import { OrgSwitcher } from "@/components/dashboard/org-switcher";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import { getProjects, getEnvironments } from "@/lib/mock";
-import type { Project } from "@/lib/mock";
+
+export type SidebarProject = {
+  id: string;
+  name: string;
+  environments: { id: string; name: string }[];
+};
 
 const PRIMARY_NAV: { label: string; href: string; icon: React.ElementType }[] = [
   { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
@@ -59,13 +62,10 @@ function ProjectNavItem({
   project,
   pathname,
 }: {
-  project: Project;
+  project: SidebarProject;
   pathname: string;
 }) {
-  const environments = React.useMemo(
-    () => getEnvironments(project.id),
-    [project.id]
-  );
+  const environments = project.environments;
   const projectActive = pathname.startsWith(
     `/dashboard/projects/${project.id}`
   );
@@ -112,10 +112,8 @@ function ProjectNavItem({
   );
 }
 
-export function AppSidebar() {
+export function AppSidebar({ projects }: { projects: SidebarProject[] }) {
   const pathname = usePathname();
-  const { orgId } = useActiveOrg();
-  const projects = React.useMemo(() => getProjects(orgId), [orgId]);
 
   return (
     <Sidebar collapsible="icon">

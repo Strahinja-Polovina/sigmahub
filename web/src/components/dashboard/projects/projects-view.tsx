@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import Link from "next/link";
 import { Boxes, FolderGit2, Layers, Server as ServerIcon } from "lucide-react";
 
@@ -13,14 +12,19 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { StatusDot } from "@/components/dashboard/status-indicator";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import {
-  getEnvironments,
-  getProjects,
-  getResourcesByProject,
-} from "@/lib/mock";
-import type { Project, Status } from "@/lib/mock";
+import type { Status } from "@/lib/mock";
 import { NewProjectDialog } from "./new-project-dialog";
+import { ProjectCardMenu } from "./project-card-menu";
+
+export type ProjectCardData = {
+  id: string;
+  name: string;
+  description: string;
+  envCount: number;
+  serverCount: number;
+  resourceCount: number;
+  statusCounts: Record<string, number>;
+};
 
 // Priority order so the most-severe status floats to the front of the chip row.
 const STATUS_PRIORITY: Status[] = [
@@ -31,56 +35,14 @@ const STATUS_PRIORITY: Status[] = [
   "running",
 ];
 
-const STATUS_LABELS: Record<Status, string> = {
-  running: "running",
-  degraded: "degraded",
-  provisioning: "provisioning",
-  stopped: "stopped",
-  error: "error",
-};
-
-type ProjectSummary = {
-  project: Project;
-  envCount: number;
-  serverCount: number;
-  resourceCount: number;
-  statusCounts: Partial<Record<Status, number>>;
-};
-
-function summarize(project: Project): ProjectSummary {
-  const envs = getEnvironments(project.id);
-  const serverIds = new Set<string>();
-  for (const env of envs) for (const id of env.serverIds) serverIds.add(id);
-
-  const resources = getResourcesByProject(project.id);
-  const statusCounts: Partial<Record<Status, number>> = {};
-  for (const r of resources) {
-    statusCounts[r.status] = (statusCounts[r.status] ?? 0) + 1;
-  }
-
-  return {
-    project,
-    envCount: envs.length,
-    serverCount: serverIds.size,
-    resourceCount: resources.length,
-    statusCounts,
-  };
-}
-
-function StatusChips({
-  counts,
-}: {
-  counts: Partial<Record<Status, number>>;
-}) {
+function StatusChips({ counts }: { counts: Record<string, number> }) {
   const entries = STATUS_PRIORITY.filter((s) => counts[s]).map((s) => ({
     status: s,
-    count: counts[s] as number,
+    count: counts[s],
   }));
 
   if (entries.length === 0) {
-    return (
-      <span className="text-xs text-muted-foreground">No resources yet</span>
-    );
+    return <span className="text-xs text-muted-foreground">No resources yet</span>;
   }
 
   return (
@@ -92,7 +54,7 @@ function StatusChips({
         >
           <StatusDot status={status} />
           <span className="tabular-nums text-foreground">{count}</span>
-          {STATUS_LABELS[status]}
+          {status}
         </span>
       ))}
     </div>
@@ -117,37 +79,42 @@ function MetaStat({
   );
 }
 
-function ProjectCard({ summary }: { summary: ProjectSummary }) {
-  const { project, envCount, serverCount, resourceCount, statusCounts } =
-    summary;
+function ProjectCard({ data }: { data: ProjectCardData }) {
   return (
     <Card className="group/project relative transition-colors hover:ring-foreground/20">
+      <div className="absolute right-3 top-3">
+        <ProjectCardMenu
+          projectId={data.id}
+          name={data.name}
+          description={data.description}
+        />
+      </div>
       <CardHeader>
-        <CardTitle>
+        <CardTitle className="pr-8">
           <Link
-            href={`/dashboard/projects/${project.id}`}
+            href={`/dashboard/projects/${data.id}`}
             className="after:absolute after:inset-0 hover:underline"
           >
-            {project.name}
+            {data.name}
           </Link>
         </CardTitle>
         <CardDescription className="line-clamp-2">
-          {project.description}
+          {data.description || "No description"}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
-        <MetaStat icon={Layers} value={envCount} label="envs" />
-        <MetaStat icon={ServerIcon} value={serverCount} label="servers" />
-        <MetaStat icon={Boxes} value={resourceCount} label="resources" />
+        <MetaStat icon={Layers} value={data.envCount} label="envs" />
+        <MetaStat icon={ServerIcon} value={data.serverCount} label="servers" />
+        <MetaStat icon={Boxes} value={data.resourceCount} label="resources" />
       </CardContent>
       <CardFooter className="relative">
-        <StatusChips counts={statusCounts} />
+        <StatusChips counts={data.statusCounts} />
       </CardFooter>
     </Card>
   );
 }
 
-function EmptyState() {
+function EmptyState({ orgId }: { orgId: string }) {
   return (
     <Card>
       <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
@@ -160,20 +127,21 @@ function EmptyState() {
             Create your first project to organize environments and resources.
           </p>
         </div>
-        <NewProjectDialog />
+        <NewProjectDialog orgId={orgId} />
       </CardContent>
     </Card>
   );
 }
 
-export function ProjectsView() {
-  const { orgId, org } = useActiveOrg();
-
-  const summaries = React.useMemo(
-    () => getProjects(orgId).map(summarize),
-    [orgId]
-  );
-
+export function ProjectsView({
+  orgId,
+  orgName,
+  projects,
+}: {
+  orgId: string;
+  orgName: string;
+  projects: ProjectCardData[];
+}) {
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -182,18 +150,18 @@ export function ProjectsView() {
             Projects
           </h1>
           <p className="text-sm text-muted-foreground">
-            Projects group environments and resources across {org.name}.
+            Projects group environments and resources across {orgName}.
           </p>
         </div>
-        {summaries.length > 0 && <NewProjectDialog />}
+        {projects.length > 0 && <NewProjectDialog orgId={orgId} />}
       </div>
 
-      {summaries.length === 0 ? (
-        <EmptyState />
+      {projects.length === 0 ? (
+        <EmptyState orgId={orgId} />
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {summaries.map((summary) => (
-            <ProjectCard key={summary.project.id} summary={summary} />
+          {projects.map((p) => (
+            <ProjectCard key={p.id} data={p} />
           ))}
         </div>
       )}

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Plus } from "lucide-react";
+import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -18,12 +18,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { createProject } from "@/server/actions/projects";
 
-// Mock "New project" dialog. No backend — just validates and toasts.
-export function NewProjectDialog() {
+export function NewProjectDialog({ orgId }: { orgId: string }) {
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
+  const [pending, startTransition] = React.useTransition();
 
   function reset() {
     setName("");
@@ -34,17 +35,27 @@ export function NewProjectDialog() {
     e.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
-    toast.success(`Project “${trimmed}” created`, {
-      description: "Add an environment to start deploying.",
+    startTransition(async () => {
+      try {
+        await createProject({ orgId, name: trimmed, description });
+        toast.success(`Project “${trimmed}” created`, {
+          description: "Add an environment to start deploying.",
+        });
+        setOpen(false);
+        reset();
+      } catch (err) {
+        toast.error("Couldn’t create project", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
     });
-    setOpen(false);
-    reset();
   }
 
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        if (pending) return;
         setOpen(next);
         if (!next) reset();
       }}
@@ -89,10 +100,11 @@ export function NewProjectDialog() {
             </div>
           </div>
           <DialogFooter>
-            <DialogClose render={<Button variant="outline" type="button" />}>
+            <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
               Cancel
             </DialogClose>
-            <Button type="submit" disabled={!name.trim()}>
+            <Button type="submit" disabled={!name.trim() || pending}>
+              {pending && <Loader2 className="size-4 animate-spin" />}
               Create project
             </Button>
           </DialogFooter>

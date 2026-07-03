@@ -1,6 +1,6 @@
-import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { auth } from "@/lib/auth";
+import { getActiveOrgId } from "@/server/active-org";
+import { getProjectsWithEnvs } from "@/server/queries";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { OrgProvider } from "@/components/dashboard/org-context";
 import { AppSidebar } from "@/components/dashboard/app-sidebar";
@@ -11,14 +11,16 @@ export default async function AppLayout({
 }: {
   children: React.ReactNode;
 }) {
-  // Gate the whole dashboard on a valid session.
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) redirect("/login");
+  // Gate the whole dashboard on a valid session (getActiveOrgId → getSessionUser
+  // redirects to /login when unauthenticated) and resolve the active org.
+  const orgId = await getActiveOrgId();
+  if (!orgId) redirect("/login");
+  const projects = await getProjectsWithEnvs(orgId);
 
   return (
-    <OrgProvider>
+    <OrgProvider initialOrgId={orgId}>
       <SidebarProvider>
-        <AppSidebar />
+        <AppSidebar projects={projects} />
         <SidebarInset>
           <TopBar />
           <div className="flex flex-1 flex-col">{children}</div>

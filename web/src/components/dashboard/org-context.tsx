@@ -15,8 +15,14 @@ type OrgContextValue = {
 
 const OrgContext = React.createContext<OrgContextValue | null>(null);
 
-export function OrgProvider({ children }: { children: React.ReactNode }) {
-  const [orgId, setOrgId] = React.useState<string>(DEFAULT_ORG_ID);
+export function OrgProvider({
+  children,
+  initialOrgId,
+}: {
+  children: React.ReactNode;
+  initialOrgId?: string;
+}) {
+  const [orgId, setOrgId] = React.useState<string>(initialOrgId ?? DEFAULT_ORG_ID);
   const orgs = React.useMemo(() => getOrgs(), []);
   const org = React.useMemo(() => getOrg(orgId), [orgId]);
 

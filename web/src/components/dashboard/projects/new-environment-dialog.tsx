@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Plus } from "lucide-react";
+import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -17,27 +17,44 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { createEnvironment } from "@/server/actions/projects";
 
-// Mock "New environment" dialog — free-text env name, toast on create.
-export function NewEnvironmentDialog({ projectName }: { projectName: string }) {
+export function NewEnvironmentDialog({
+  projectId,
+  projectName,
+}: {
+  projectId: string;
+  projectName: string;
+}) {
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
+  const [pending, startTransition] = React.useTransition();
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
-    toast.success(`Environment “${trimmed}” added to ${projectName}`, {
-      description: "Attach servers to deploy resources here.",
+    startTransition(async () => {
+      try {
+        await createEnvironment({ projectId, name: trimmed });
+        toast.success(`Environment “${trimmed}” added to ${projectName}`, {
+          description: "Attach servers to deploy resources here.",
+        });
+        setOpen(false);
+        setName("");
+      } catch (err) {
+        toast.error("Couldn’t add environment", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
     });
-    setOpen(false);
-    setName("");
   }
 
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        if (pending) return;
         setOpen(next);
         if (!next) setName("");
       }}
@@ -70,10 +87,11 @@ export function NewEnvironmentDialog({ projectName }: { projectName: string }) {
             />
           </div>
           <DialogFooter>
-            <DialogClose render={<Button variant="outline" type="button" />}>
+            <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
               Cancel
             </DialogClose>
-            <Button type="submit" disabled={!name.trim()}>
+            <Button type="submit" disabled={!name.trim() || pending}>
+              {pending && <Loader2 className="size-4 animate-spin" />}
               Create environment
             </Button>
           </DialogFooter>

@@ -1,7 +1,5 @@
-"use client";
-
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { redirect } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
 import {
@@ -26,31 +24,28 @@ import {
   ServerTypeBadge,
   formatDate,
 } from "@/components/dashboard/projects/shared";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import {
-  getProject,
-  getEnvironment,
-  getResources,
-  getServer,
-  getDeployments,
-} from "@/lib/mock";
-import type { Server } from "@/lib/mock";
+import type { ResourceKind, ServerType, Status } from "@/lib/mock";
+import { getActiveOrgId } from "@/server/active-org";
+import { getEnvironmentPanel, getProject } from "@/server/queries";
 
-export default function EnvironmentDetailPage() {
-  const params = useParams<{ projectId: string; envId: string }>();
-  const projectId = params.projectId;
-  const envId = params.envId;
-  const { orgId } = useActiveOrg();
+export default async function EnvironmentDetailPage({
+  params,
+}: {
+  params: Promise<{ projectId: string; envId: string }>;
+}) {
+  const { projectId, envId } = await params;
+  const orgId = await getActiveOrgId();
+  if (!orgId) redirect("/login");
 
-  const project = getProject(projectId);
-  const env = getEnvironment(envId);
+  const project = await getProject(projectId);
+  const panel = await getEnvironmentPanel(envId);
 
   // Guard: unknown ids, or an env/project that belongs to another org.
   if (
     !project ||
-    !env ||
+    !panel ||
     project.orgId !== orgId ||
-    env.projectId !== projectId
+    panel.env.projectId !== projectId
   ) {
     return (
       <div className="p-4 md:p-6">
@@ -72,16 +67,10 @@ export default function EnvironmentDetailPage() {
     );
   }
 
-  const servers = env.serverIds
-    .map((id) => getServer(id))
-    .filter((s): s is Server => Boolean(s));
-  const resources = getResources(envId);
+  const { env, servers, resources } = panel;
   const deploys = resources
-    .flatMap((r) =>
-      getDeployments(r.id)
-        .slice(0, 2)
-        .map((d) => ({ ...d, resourceName: r.name }))
-    )
+    .map((r) => (r.latestDeploy ? { ...r.latestDeploy, resourceName: r.name } : null))
+    .filter((d): d is NonNullable<typeof d> => Boolean(d))
     .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
     .slice(0, 6);
 
@@ -99,13 +88,11 @@ export default function EnvironmentDetailPage() {
           <h1 className="text-xl font-semibold tracking-tight text-foreground">
             {env.name}
           </h1>
-          <span className="text-sm text-muted-foreground">
-            · {project.name}
-          </span>
+          <span className="text-sm text-muted-foreground">· {project.name}</span>
         </div>
         <p className="text-sm text-muted-foreground">
-          {resources.length} {resources.length === 1 ? "resource" : "resources"}{" "}
-          · {servers.length} {servers.length === 1 ? "server" : "servers"}
+          {resources.length} {resources.length === 1 ? "resource" : "resources"} ·{" "}
+          {servers.length} {servers.length === 1 ? "server" : "servers"}
         </p>
       </div>
 
@@ -118,19 +105,16 @@ export default function EnvironmentDetailPage() {
             {servers.length === 0 ? (
               <p className="text-sm text-muted-foreground">No servers attached.</p>
             ) : (
-              servers.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-center justify-between gap-2"
-                >
+              servers.map((sv) => (
+                <div key={sv.id} className="flex items-center justify-between gap-2">
                   <Link
-                    href={`/dashboard/servers/${s.id}`}
+                    href={`/dashboard/servers/${sv.id}`}
                     className="inline-flex items-center gap-2 text-sm font-medium text-foreground hover:underline"
                   >
-                    <StatusDot status={s.status} />
-                    {s.name}
+                    <StatusDot status={sv.status as Status} />
+                    {sv.name}
                   </Link>
-                  <ServerTypeBadge type={s.type} />
+                  <ServerTypeBadge type={sv.type as ServerType} />
                 </div>
               ))
             )}
@@ -169,15 +153,15 @@ export default function EnvironmentDetailPage() {
                           href={`/dashboard/resources/${r.id}`}
                           className="inline-flex items-center gap-2 hover:underline"
                         >
-                          <StatusDot status={r.status} />
+                          <StatusDot status={r.status as Status} />
                           {r.name}
                         </Link>
                       </TableCell>
                       <TableCell>
-                        <KindBadge kind={r.kind} />
+                        <KindBadge kind={r.kind as ResourceKind} />
                       </TableCell>
                       <TableCell>
-                        <StatusBadge status={r.status} />
+                        <StatusBadge status={r.status as Status} />
                       </TableCell>
                       <TableCell className="pr-6 text-muted-foreground">
                         {formatDate(r.lastDeployAt)}
@@ -200,20 +184,11 @@ export default function EnvironmentDetailPage() {
             <p className="text-sm text-muted-foreground">No recent deploys.</p>
           ) : (
             deploys.map((d) => (
-              <div
-                key={d.id}
-                className="flex items-center justify-between gap-3 text-sm"
-              >
+              <div key={d.id} className="flex items-center justify-between gap-3 text-sm">
                 <div className="flex min-w-0 items-center gap-2">
-                  <span className="font-medium text-foreground">
-                    {d.resourceName}
-                  </span>
-                  <span className="font-mono text-xs text-muted-foreground">
-                    {d.sha}
-                  </span>
-                  <span className="truncate text-xs text-muted-foreground">
-                    by {d.author}
-                  </span>
+                  <span className="font-medium text-foreground">{d.resourceName}</span>
+                  <span className="font-mono text-xs text-muted-foreground">{d.sha}</span>
+                  <span className="truncate text-xs text-muted-foreground">by {d.author}</span>
                 </div>
                 <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
                   {d.durationSec}s

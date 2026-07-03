@@ -35,7 +35,7 @@ export function ServerTypeBadge({ type }: { type: ServerType }) {
   );
 }
 
-export function formatDate(iso: string) {
+export function formatDate(iso: string | Date) {
   return new Date(iso).toLocaleDateString("en-GB", {
     day: "numeric",
     month: "short",
@@ -43,7 +43,7 @@ export function formatDate(iso: string) {
   });
 }
 
-export function formatDateTime(iso: string) {
+export function formatDateTime(iso: string | Date) {
   return new Date(iso).toLocaleString("en-GB", {
     day: "numeric",
     month: "short",

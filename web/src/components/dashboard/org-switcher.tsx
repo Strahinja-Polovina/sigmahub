@@ -1,6 +1,8 @@
 "use client";
 
+import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   ChevronsUpDown,
   Check,
@@ -25,13 +27,25 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
 import { useActiveOrg } from "@/components/dashboard/org-context";
+import { setActiveOrg } from "@/server/actions/org";
 
 function orgInitial(name: string) {
   return name.charAt(0).toUpperCase();
 }
 
 export function OrgSwitcher() {
+  const router = useRouter();
+  const [, startTransition] = React.useTransition();
   const { org, orgs, setOrgId } = useActiveOrg();
+
+  function switchOrg(id: string) {
+    if (id === org.id) return;
+    setOrgId(id); // immediate client feedback
+    startTransition(async () => {
+      await setActiveOrg(id); // persist cookie so server components follow
+      router.refresh();
+    });
+  }
 
   return (
     <SidebarMenu>
@@ -67,7 +81,7 @@ export function OrgSwitcher() {
               {orgs.map((o) => (
                 <DropdownMenuItem
                   key={o.id}
-                  onClick={() => setOrgId(o.id)}
+                  onClick={() => switchOrg(o.id)}
                   className="gap-2"
                 >
                   <span className="grid size-6 shrink-0 place-items-center rounded bg-muted font-mono text-xs font-semibold text-foreground">
