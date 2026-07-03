@@ -24,6 +24,10 @@ export default function RootLayout({
       className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
       <body className="min-h-full">
+        {/* Without JS, reveal-on-scroll wrappers would stay hidden — force them visible. */}
+        <noscript>
+          <style>{`[data-shown="false"]{opacity:1!important;transform:none!important}`}</style>
+        </noscript>
         <ThemeProvider
           attribute="class"
           defaultTheme="light"
