@@ -120,8 +120,15 @@ async function main() {
     )
   );
 
+  // Deploy dates are relative to "now" (recent past) so that live deploys
+  // created in-app sort as the newest — the mock's fixed 2027 dates would
+  // otherwise always outrank them.
+  const DAY = 86_400_000;
+  const resourceDeployAt = (idx: number) =>
+    new Date(Date.now() - ((idx % 12) + 1) * DAY - idx * 3_600_000);
+
   await db.insert(s.resources).values(
-    mockResources.map((r) => ({
+    mockResources.map((r, idx) => ({
       id: r.id,
       projectId: r.projectId,
       environmentId: r.environmentId,
@@ -132,22 +139,23 @@ async function main() {
       repo: r.repo ?? null,
       domain: r.domain ?? null,
       version: r.version ?? null,
-      lastDeployAt: new Date(r.lastDeployAt),
+      lastDeployAt: resourceDeployAt(idx),
     }))
   );
 
   await db.insert(s.deployments).values(
-    mockResources.flatMap((r) =>
-      [0, 1, 2].map((i) => ({
+    mockResources.flatMap((r, idx) => {
+      const base = resourceDeployAt(idx).getTime();
+      return [0, 1, 2].map((i) => ({
         id: `dep_${r.id}_${i}`,
         resourceId: r.id,
         sha: sha7(r.id + i),
         status: i === 0 ? "running" : "success",
         author: ["mila", "nikola", "ana"][i % 3],
         durationSec: 40 + i * 13,
-        startedAt: new Date(Date.parse(r.lastDeployAt) - i * 86_400_000),
-      }))
-    )
+        startedAt: new Date(base - i * DAY),
+      }));
+    })
   );
 
   const [orgN, projN, srvN, resN] = await Promise.all([

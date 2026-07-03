@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
   GitBranch,
@@ -39,14 +40,14 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
+import { canHost } from "@/lib/mock";
+import type { ResourceKind, ServerType } from "@/lib/mock";
+import { createResource } from "@/server/actions/resources";
 import {
-  getProjects,
-  getEnvironments,
-  getServer,
-  canHost,
-} from "@/lib/mock";
-import type { ResourceKind } from "@/lib/mock";
-import { KIND_LABELS, SERVER_TYPE_LABELS } from "./resource-meta";
+  KIND_LABELS,
+  SERVER_TYPE_LABELS,
+  type DeployTarget,
+} from "./resource-meta";
 
 // ---- Mock Git surface -------------------------------------------------------
 
@@ -132,12 +133,13 @@ function newId() {
 export function DeployWizard({
   open,
   onOpenChange,
-  orgId,
+  targets,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  orgId: string;
+  targets: DeployTarget[];
 }) {
+  const router = useRouter();
   const [step, setStep] = React.useState(1);
   const [repoQuery, setRepoQuery] = React.useState("");
   const [repo, setRepo] = React.useState<Repo | null>(null);
@@ -148,27 +150,27 @@ export function DeployWizard({
   const [deployPhase, setDeployPhase] = React.useState(0);
   const [deploying, setDeploying] = React.useState(false);
 
-  const projects = React.useMemo(() => getProjects(orgId), [orgId]);
+  const projects = targets;
   const kind = repo?.detectedKind;
 
   const environments = React.useMemo(
-    () => (projectId ? getEnvironments(projectId) : []),
-    [projectId]
+    () => projects.find((p) => p.id === projectId)?.environments ?? [],
+    [projects, projectId]
   );
 
   // Candidate servers for the chosen environment, annotated with matrix compatibility.
   const candidateServers = React.useMemo(() => {
     const env = environments.find((e) => e.id === environmentId);
     if (!env || !kind) return [];
-    return env.serverIds
-      .map((id) => getServer(id))
-      .filter((s): s is NonNullable<typeof s> => Boolean(s))
-      .map((s) => ({ server: s, compatible: canHost(s.type, kind) }));
+    return env.servers.map((server) => ({
+      server,
+      compatible: canHost(server.type as ServerType, kind),
+    }));
   }, [environments, environmentId, kind]);
 
   const selectedServer = React.useMemo(
-    () => (serverId ? getServer(serverId) : undefined),
-    [serverId]
+    () => environments.flatMap((e) => e.servers).find((s) => s.id === serverId),
+    [environments, serverId]
   );
 
   // A typed "422-style" incompatibility error, shown inline in step 3.
@@ -176,11 +178,11 @@ export function DeployWizard({
   // environment whose servers are all incompatible with the detected kind.
   const incompatibility = React.useMemo(() => {
     if (!kind) return null;
-    if (selectedServer && !canHost(selectedServer.type, kind)) {
+    if (selectedServer && !canHost(selectedServer.type as ServerType, kind)) {
       return {
         code: 422,
         type: "resource_kind_unsupported",
-        message: `A ${SERVER_TYPE_LABELS[selectedServer.type]} server cannot host a ${KIND_LABELS[kind]} resource.`,
+        message: `A ${SERVER_TYPE_LABELS[selectedServer.type as ServerType]} server cannot host a ${KIND_LABELS[kind]} resource.`,
       };
     }
     if (
@@ -236,11 +238,28 @@ export function DeployWizard({
       if (phase >= DEPLOY_PHASES.length) {
         clearInterval(timer);
         setDeployPhase(DEPLOY_PHASES.length);
-        setDeploying(false);
-        toast.success(
-          `${repo?.fullName ?? "Resource"} deployed`,
-          { description: "Health checks passed · now serving traffic." }
-        );
+        // The animation is the simulated pipeline; persist the result now.
+        createResource({
+          projectId,
+          environmentId,
+          serverId,
+          name: repo?.fullName.split("/").pop() ?? "resource",
+          kind: repo?.detectedKind ?? "app",
+          repo: repo?.fullName,
+        })
+          .then(() => {
+            setDeploying(false);
+            router.refresh();
+            toast.success(`${repo?.fullName ?? "Resource"} deployed`, {
+              description: "Health checks passed · now serving traffic.",
+            });
+          })
+          .catch((err) => {
+            setDeploying(false);
+            toast.error("Deploy failed", {
+              description: err instanceof Error ? err.message : "Please try again.",
+            });
+          });
       } else {
         setDeployPhase(phase);
       }
@@ -550,7 +569,7 @@ export function DeployWizard({
                                 {server.name}
                               </span>
                               <Badge variant="outline" className="text-[10px]">
-                                {SERVER_TYPE_LABELS[server.type]}
+                                {SERVER_TYPE_LABELS[server.type as ServerType]}
                               </Badge>
                             </div>
                             <p className="truncate text-xs text-muted-foreground">
