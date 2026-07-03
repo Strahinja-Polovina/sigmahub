@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -17,6 +17,7 @@ import {
   MinusCircle,
   Unplug,
   Activity,
+  Loader2,
 } from "lucide-react";
 
 import {
@@ -45,21 +46,40 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import {
-  getServer,
-  getProjects,
-  getResourcesByProject,
-  getProject,
-  getEnvironment,
-} from "@/lib/mock";
-import type { Resource } from "@/lib/mock";
+import type { ResourceKind, ServerType, Status } from "@/lib/mock";
+import { disconnectServer } from "@/server/actions/servers";
 import { ServerMetrics } from "./server-metrics";
+import { CheckInButton } from "./servers-view";
 import {
   SERVER_TYPE_LABELS,
   RESOURCE_KIND_LABELS,
   formatDate,
 } from "./server-meta";
+
+type ServerRowT = {
+  id: string;
+  name: string;
+  type: string;
+  provider: string;
+  region: string;
+  status: string;
+  agentVersion: string;
+  ip: string;
+  cpu: number;
+  memGb: number;
+  byoVpn: boolean;
+  connectedAt: Date;
+  orgId: string;
+};
+
+type HostedRow = {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  projectName: string;
+  envName: string;
+};
 
 function SpecItem({
   icon: Icon,
@@ -83,13 +103,32 @@ function SpecItem({
   );
 }
 
-function ServerActions({ serverName }: { serverName: string }) {
+function ServerActions({ serverId, serverName }: { serverId: string; serverName: string }) {
+  const router = useRouter();
+  const [pending, startTransition] = React.useTransition();
+
+  function disconnect() {
+    startTransition(async () => {
+      try {
+        await disconnectServer({ serverId });
+        toast.success(`Disconnected ${serverName}`, {
+          description: "The agent tears down its WireGuard tunnel.",
+        });
+        router.push("/dashboard/servers");
+      } catch (err) {
+        toast.error("Couldn’t disconnect", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
-          <Button variant="outline" size="sm" aria-label="Server actions">
-            <MoreHorizontal />
+          <Button variant="outline" size="sm" aria-label="Server actions" disabled={pending}>
+            {pending ? <Loader2 className="animate-spin" /> : <MoreHorizontal />}
             Actions
           </Button>
         }
@@ -114,14 +153,7 @@ function ServerActions({ serverName }: { serverName: string }) {
           Cordon
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem
-          className="gap-2 text-destructive data-[highlighted]:text-destructive"
-          onClick={() =>
-            toast.error(`Disconnect requested for ${serverName}`, {
-              description: "The agent will tear down its WireGuard tunnel.",
-            })
-          }
-        >
+        <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
           <Unplug className="size-4" />
           Disconnect
         </DropdownMenuItem>
@@ -130,50 +162,39 @@ function ServerActions({ serverName }: { serverName: string }) {
   );
 }
 
-function HostedResourceRow({ resource }: { resource: Resource }) {
-  const project = getProject(resource.projectId);
-  const env = getEnvironment(resource.environmentId);
+function HostedResourceRow({ resource }: { resource: HostedRow }) {
   return (
     <TableRow>
       <TableCell className="pl-4 font-medium text-foreground">
         <span className="inline-flex items-center gap-2">
-          <StatusDot status={resource.status} />
+          <StatusDot status={resource.status as Status} />
           {resource.name}
         </span>
       </TableCell>
       <TableCell>
         <Badge variant="outline" className="font-mono font-normal">
-          {RESOURCE_KIND_LABELS[resource.kind]}
+          {RESOURCE_KIND_LABELS[resource.kind as ResourceKind]}
         </Badge>
       </TableCell>
       <TableCell className="text-muted-foreground">
-        {project?.name}
-        <span className="text-muted-foreground/60"> / {env?.name}</span>
+        {resource.projectName}
+        <span className="text-muted-foreground/60"> / {resource.envName}</span>
       </TableCell>
       <TableCell className="pr-4">
-        <StatusBadge status={resource.status} />
+        <StatusBadge status={resource.status as Status} />
       </TableCell>
     </TableRow>
   );
 }
 
-export function ServerDetailView({ serverId }: { serverId: string }) {
-  const { orgId } = useActiveOrg();
-  const server = React.useMemo(() => getServer(serverId), [serverId]);
-
-  // Resources hosted on this server: gather the org's resources and match serverId.
-  const hosted = React.useMemo(() => {
-    if (!server) return [];
-    const projects = getProjects(orgId);
-    return projects
-      .flatMap((p) => getResourcesByProject(p.id))
-      .filter((r) => r.serverId === serverId);
-  }, [orgId, serverId, server]);
-
-  // Guard: a valid id from another org, or an unknown id, is a 404.
-  if (!server || server.orgId !== orgId) {
-    notFound();
-  }
+export function ServerDetailView({
+  server,
+  hosted,
+}: {
+  server: ServerRowT;
+  hosted: HostedRow[];
+}) {
+  const provisioning = server.status === "provisioning";
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -192,7 +213,7 @@ export function ServerDetailView({ serverId }: { serverId: string }) {
               <h1 className="font-mono text-xl font-semibold tracking-tight text-foreground">
                 {server.name}
               </h1>
-              <StatusBadge status={server.status} />
+              <StatusBadge status={server.status as Status} />
               {server.byoVpn && (
                 <Badge variant="outline" className="gap-1 font-normal">
                   <ShieldCheck className="size-3 text-muted-foreground" />
@@ -202,17 +223,24 @@ export function ServerDetailView({ serverId }: { serverId: string }) {
             </div>
             <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <Badge variant="outline" className="font-normal">
-                {SERVER_TYPE_LABELS[server.type]}
+                {SERVER_TYPE_LABELS[server.type as ServerType]}
               </Badge>
               <span>·</span>
               <span className="text-foreground">{server.provider}</span>
               <span>·</span>
               <span>{server.region}</span>
-              <span>·</span>
-              <span className="font-mono text-xs">{server.ip}</span>
+              {server.ip && (
+                <>
+                  <span>·</span>
+                  <span className="font-mono text-xs">{server.ip}</span>
+                </>
+              )}
             </p>
           </div>
-          <ServerActions serverName={server.name} />
+          <div className="flex items-center gap-2">
+            {provisioning && <CheckInButton serverId={server.id} />}
+            <ServerActions serverId={server.id} serverName={server.name} />
+          </div>
         </div>
       </div>
 
@@ -223,12 +251,20 @@ export function ServerDetailView({ serverId }: { serverId: string }) {
               <Activity className="size-4 text-muted-foreground" />
               Metrics
             </CardTitle>
-            <CardDescription>
-              Last 24 hours reported by the agent.
-            </CardDescription>
+            <CardDescription>Last 24 hours reported by the agent.</CardDescription>
           </CardHeader>
           <CardContent>
-            <ServerMetrics seedKey={server.id} />
+            {provisioning ? (
+              <div className="flex flex-col items-center gap-2 py-12 text-center">
+                <Loader2 className="size-5 animate-spin text-muted-foreground" />
+                <p className="text-sm font-medium text-foreground">Waiting for the agent</p>
+                <p className="max-w-sm text-xs text-muted-foreground">
+                  Metrics stream in once the agent checks in.
+                </p>
+              </div>
+            ) : (
+              <ServerMetrics seedKey={server.id} />
+            )}
           </CardContent>
         </Card>
 
@@ -238,37 +274,19 @@ export function ServerDetailView({ serverId }: { serverId: string }) {
             <CardDescription>Reported host capacity.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            <SpecItem
-              icon={Cpu}
-              label="vCPU"
-              value={`${server.cpu} cores`}
-            />
-            <SpecItem
-              icon={MemoryStick}
-              label="Memory"
-              value={`${server.memGb} GB`}
-            />
+            <SpecItem icon={Cpu} label="vCPU" value={provisioning ? "—" : `${server.cpu} cores`} />
+            <SpecItem icon={MemoryStick} label="Memory" value={provisioning ? "—" : `${server.memGb} GB`} />
             <Separator />
             <SpecItem
               icon={Network}
               label="Agent version"
-              value={
-                <span className="font-mono text-sm">{server.agentVersion}</span>
-              }
+              value={<span className="font-mono text-sm">{server.agentVersion || "—"}</span>}
             />
-            <SpecItem
-              icon={CalendarDays}
-              label="Connected"
-              value={formatDate(server.connectedAt)}
-            />
+            <SpecItem icon={CalendarDays} label="Connected" value={formatDate(server.connectedAt)} />
             <SpecItem
               icon={ShieldCheck}
               label="Access"
-              value={
-                server.byoVpn
-                  ? "Via VPN / jump host"
-                  : "Direct outbound WireGuard"
-              }
+              value={server.byoVpn ? "Via VPN / jump host" : "Direct outbound WireGuard"}
             />
           </CardContent>
         </Card>
@@ -290,11 +308,9 @@ export function ServerDetailView({ serverId }: { serverId: string }) {
               <span className="grid size-10 place-items-center rounded-lg bg-muted text-muted-foreground">
                 <Boxes className="size-5" />
               </span>
-              <p className="text-sm font-medium text-foreground">
-                Nothing scheduled here yet
-              </p>
+              <p className="text-sm font-medium text-foreground">Nothing scheduled here yet</p>
               <p className="max-w-sm text-xs text-muted-foreground">
-                {server.status === "provisioning"
+                {provisioning
                   ? "This server is still provisioning."
                   : "Deploy a resource to this server to see it here."}
               </p>

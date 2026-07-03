@@ -1,3 +1,6 @@
+import { notFound, redirect } from "next/navigation";
+import { getActiveOrgId } from "@/server/active-org";
+import { getServer, getServerHosted } from "@/server/queries";
 import { ServerDetailView } from "@/components/dashboard/servers/server-detail-view";
 
 export default async function ServerDetailPage({
@@ -6,5 +9,12 @@ export default async function ServerDetailPage({
   params: Promise<{ serverId: string }>;
 }) {
   const { serverId } = await params;
-  return <ServerDetailView serverId={serverId} />;
+  const orgId = await getActiveOrgId();
+  if (!orgId) redirect("/login");
+
+  const server = await getServer(serverId);
+  if (!server || server.orgId !== orgId) notFound();
+
+  const hosted = await getServerHosted(serverId);
+  return <ServerDetailView server={server} hosted={hosted} />;
 }

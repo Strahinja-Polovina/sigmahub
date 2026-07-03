@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { toast } from "sonner";
 import {
   Server,
@@ -38,18 +37,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import {
-  getServers,
-  getProjects,
-  getProject,
-  getEnvironment,
-  getResourcesByProject,
-  getBillingSummary,
-  getDeployments,
-  CURRENCY,
-} from "@/lib/mock";
-import type { Resource, ResourceKind } from "@/lib/mock";
+import type { ResourceKind, Status } from "@/lib/mock";
 
 const KIND_LABELS: Record<ResourceKind, string> = {
   app: "App",
@@ -61,15 +49,43 @@ const KIND_LABELS: Record<ResourceKind, string> = {
   llm: "LLM",
 };
 
-function formatCurrency(amount: number) {
+type OverviewResource = {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  projectName: string;
+  envName: string;
+  lastDeployAt: string | Date;
+};
+
+type Activity = {
+  id: string;
+  resourceName: string;
+  author: string;
+  sha: string;
+  durationSec: number;
+  status: string;
+};
+
+type Billing = {
+  amount: number;
+  isFree: boolean;
+  freeTier: number;
+  unitPrice: number;
+  connected: number;
+  currency: string;
+};
+
+function formatCurrency(amount: number, currency: string) {
   return new Intl.NumberFormat("en-IE", {
     style: "currency",
-    currency: CURRENCY,
+    currency,
     maximumFractionDigits: 0,
   }).format(amount);
 }
 
-function formatDate(iso: string) {
+function formatDate(iso: string | Date) {
   return new Date(iso).toLocaleDateString("en-GB", {
     day: "numeric",
     month: "short",
@@ -103,39 +119,26 @@ function StatCard({
   );
 }
 
-function ResourceActions({ resource }: { resource: Resource }) {
+function ResourceActions({ resourceName }: { resourceName: string }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label={`Actions for ${resource.name}`}
-          >
+          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${resourceName}`}>
             <MoreHorizontal />
           </Button>
         }
       />
       <DropdownMenuContent align="end" className="w-40">
-        <DropdownMenuItem
-          className="gap-2"
-          onClick={() => toast.success(`Deploy triggered for ${resource.name}`)}
-        >
+        <DropdownMenuItem className="gap-2" onClick={() => toast.success(`Deploy triggered for ${resourceName}`)}>
           <Play className="size-4 text-muted-foreground" />
           Deploy
         </DropdownMenuItem>
-        <DropdownMenuItem
-          className="gap-2"
-          onClick={() => toast(`Streaming logs for ${resource.name}…`)}
-        >
+        <DropdownMenuItem className="gap-2" onClick={() => toast(`Streaming logs for ${resourceName}…`)}>
           <ScrollText className="size-4 text-muted-foreground" />
           Logs
         </DropdownMenuItem>
-        <DropdownMenuItem
-          className="gap-2"
-          onClick={() => toast.success(`Restarting ${resource.name}…`)}
-        >
+        <DropdownMenuItem className="gap-2" onClick={() => toast.success(`Restarting ${resourceName}…`)}>
           <RotateCw className="size-4 text-muted-foreground" />
           Restart
         </DropdownMenuItem>
@@ -144,64 +147,57 @@ function ResourceActions({ resource }: { resource: Resource }) {
   );
 }
 
-export function Overview() {
-  const { orgId, org } = useActiveOrg();
+const DEPLOY_META: Record<string, { label: string; text: string; dot: string }> = {
+  running: { label: "Running", text: "text-blue-700", dot: "bg-blue-500" },
+  success: { label: "Success", text: "text-emerald-700", dot: "bg-emerald-500" },
+  failed: { label: "Failed", text: "text-red-700", dot: "bg-red-500" },
+  building: { label: "Building", text: "text-amber-700", dot: "bg-amber-500" },
+  queued: { label: "Queued", text: "text-muted-foreground", dot: "bg-muted-foreground" },
+};
 
-  const servers = React.useMemo(() => getServers(orgId), [orgId]);
-  const projects = React.useMemo(() => getProjects(orgId), [orgId]);
-  const resources = React.useMemo(
-    () => projects.flatMap((p) => getResourcesByProject(p.id)),
-    [projects]
+function DeployStatusBadge({ status }: { status: string }) {
+  const meta = DEPLOY_META[status] ?? DEPLOY_META.queued;
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs font-medium ${meta.text}`}
+    >
+      <span className={`size-1.5 rounded-full ${meta.dot}`} aria-hidden />
+      {meta.label}
+    </span>
   );
-  const billing = React.useMemo(() => getBillingSummary(orgId), [orgId]);
+}
 
-  const connectedServers = React.useMemo(
-    () => servers.filter((s) => s.status !== "provisioning").length,
-    [servers]
-  );
-  const runningResources = React.useMemo(
-    () => resources.filter((r) => r.status === "running").length,
-    [resources]
-  );
-
-  // Recent deployments across the org's resources, newest first.
-  const activity = React.useMemo(() => {
-    return resources
-      .map((r) => {
-        const dep = getDeployments(r.id)[0];
-        return { resource: r, deployment: dep };
-      })
-      .sort(
-        (a, b) =>
-          new Date(b.deployment.startedAt).getTime() -
-          new Date(a.deployment.startedAt).getTime()
-      )
-      .slice(0, 6);
-  }, [resources]);
-
-  const activeDeploys = React.useMemo(
-    () =>
-      resources.filter((r) => getDeployments(r.id)[0]?.status === "running")
-        .length,
-    [resources]
-  );
-
+export function Overview({
+  orgName,
+  connectedServers,
+  totalServers,
+  runningResources,
+  activeDeploys,
+  billing,
+  resources,
+  activity,
+}: {
+  orgName: string;
+  connectedServers: number;
+  totalServers: number;
+  runningResources: number;
+  activeDeploys: number;
+  billing: Billing;
+  resources: OverviewResource[];
+  activity: Activity[];
+}) {
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-1">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">
-          Overview
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Everything running across {org.name}.
-        </p>
+        <h1 className="text-xl font-semibold tracking-tight text-foreground">Overview</h1>
+        <p className="text-sm text-muted-foreground">Everything running across {orgName}.</p>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Connected servers"
           value={connectedServers}
-          hint={`${servers.length} total · single billing meter`}
+          hint={`${totalServers} total · single billing meter`}
           icon={Server}
         />
         <StatCard
@@ -212,7 +208,7 @@ export function Overview() {
         />
         <StatCard
           label="Monthly cost"
-          value={formatCurrency(billing.amount)}
+          value={formatCurrency(billing.amount, billing.currency)}
           hint={
             billing.isFree ? (
               <span className="inline-flex items-center gap-1.5">
@@ -220,75 +216,70 @@ export function Overview() {
                 Free tier · up to {billing.freeTier} servers
               </span>
             ) : (
-              `${billing.connected} × ${formatCurrency(billing.unitPrice)} per server`
+              `${billing.connected} × ${formatCurrency(billing.unitPrice, billing.currency)} per server`
             )
           }
           icon={CreditCard}
         />
-        <StatCard
-          label="Active deploys"
-          value={activeDeploys}
-          hint="In progress right now"
-          icon={Rocket}
-        />
+        <StatCard label="Active deploys" value={activeDeploys} hint="In progress right now" icon={Rocket} />
       </div>
 
       <Card>
         <CardHeader className="border-b">
           <CardTitle>Resources</CardTitle>
-          <CardDescription>
-            All resources across your projects and environments.
-          </CardDescription>
+          <CardDescription>All resources across your projects and environments.</CardDescription>
         </CardHeader>
         <CardContent className="px-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="pl-4">Name</TableHead>
-                <TableHead>Project / Environment</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Last deploy</TableHead>
-                <TableHead className="w-10 pr-4 text-right">
-                  <span className="sr-only">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {resources.map((r) => {
-                const project = getProject(r.projectId);
-                const env = getEnvironment(r.environmentId);
-                return (
+          {resources.length === 0 ? (
+            <p className="px-4 py-10 text-center text-sm text-muted-foreground">
+              No resources deployed yet.
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="pl-4">Name</TableHead>
+                  <TableHead>Project / Environment</TableHead>
+                  <TableHead>Type</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Last deploy</TableHead>
+                  <TableHead className="w-10 pr-4 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {resources.map((r) => (
                   <TableRow key={r.id}>
                     <TableCell className="pl-4 font-medium text-foreground">
                       <span className="inline-flex items-center gap-2">
-                        <StatusDot status={r.status} />
+                        <StatusDot status={r.status as Status} />
                         {r.name}
                       </span>
                     </TableCell>
                     <TableCell className="text-muted-foreground">
-                      {project?.name}
-                      <span className="text-muted-foreground/60"> / {env?.name}</span>
+                      {r.projectName}
+                      <span className="text-muted-foreground/60"> / {r.envName}</span>
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline" className="font-mono">
-                        {KIND_LABELS[r.kind]}
+                        {KIND_LABELS[r.kind as ResourceKind]}
                       </Badge>
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={r.status} />
+                      <StatusBadge status={r.status as Status} />
                     </TableCell>
                     <TableCell className="text-muted-foreground tabular-nums">
                       {formatDate(r.lastDeployAt)}
                     </TableCell>
                     <TableCell className="pr-4 text-right">
-                      <ResourceActions resource={r} />
+                      <ResourceActions resourceName={r.name} />
                     </TableCell>
                   </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
+                ))}
+              </TableBody>
+            </Table>
+          )}
         </CardContent>
       </Card>
 
@@ -298,59 +289,29 @@ export function Overview() {
           <CardDescription>Latest deployments across the organization.</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col divide-y divide-border">
-          {activity.map(({ resource, deployment }) => (
-            <div
-              key={deployment.id}
-              className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
-            >
-              <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
-                <ArrowUpRight className="size-4" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm text-foreground">
-                  <span className="font-medium">{resource.name}</span>{" "}
-                  <span className="text-muted-foreground">
-                    deployed by {deployment.author}
-                  </span>
-                </p>
-                <p className="truncate text-xs text-muted-foreground">
-                  <span className="font-mono">{deployment.sha}</span> ·{" "}
-                  {deployment.durationSec}s
-                </p>
+          {activity.length === 0 ? (
+            <p className="py-6 text-sm text-muted-foreground">No deploys yet.</p>
+          ) : (
+            activity.map((a) => (
+              <div key={a.id} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+                  <ArrowUpRight className="size-4" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-foreground">
+                    <span className="font-medium">{a.resourceName}</span>{" "}
+                    <span className="text-muted-foreground">deployed by {a.author}</span>
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    <span className="font-mono">{a.sha}</span> · {a.durationSec}s
+                  </p>
+                </div>
+                <DeployStatusBadge status={a.status} />
               </div>
-              <DeployStatusBadge status={deployment.status} />
-            </div>
-          ))}
+            ))
+          )}
         </CardContent>
       </Card>
     </div>
-  );
-}
-
-function DeployStatusBadge({
-  status,
-}: {
-  status: ReturnType<typeof getDeployments>[number]["status"];
-}) {
-  const map: Record<typeof status, { label: string; className: string }> = {
-    running: { label: "Running", className: "text-blue-700" },
-    success: { label: "Success", className: "text-emerald-700" },
-    failed: { label: "Failed", className: "text-red-700" },
-    building: { label: "Building", className: "text-amber-700" },
-  };
-  const meta = map[status];
-  const dot: Record<typeof status, string> = {
-    running: "bg-blue-500",
-    success: "bg-emerald-500",
-    failed: "bg-red-500",
-    building: "bg-amber-500",
-  };
-  return (
-    <span
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs font-medium ${meta.className}`}
-    >
-      <span className={`size-1.5 rounded-full ${dot[status]}`} aria-hidden />
-      {meta.label}
-    </span>
   );
 }

@@ -198,3 +198,83 @@ export async function getEnvironmentPanel(
     .where(eq(s.environments.id, envId));
   return env ? buildEnvPanel(env) : undefined;
 }
+
+// ── Servers read models (V1-4) ─────────────────────────────────────────────
+
+export type ServerWithCount = typeof s.servers.$inferSelect & {
+  resourceCount: number;
+};
+
+/** Org servers with how many resources are scheduled on each. */
+export async function getServersWithCounts(
+  orgId: string
+): Promise<ServerWithCount[]> {
+  const rows = await db
+    .select()
+    .from(s.servers)
+    .where(eq(s.servers.orgId, orgId))
+    .orderBy(s.servers.connectedAt);
+  return Promise.all(
+    rows.map(async (sv) => ({
+      ...sv,
+      resourceCount: await db.$count(
+        s.resources,
+        eq(s.resources.serverId, sv.id)
+      ),
+    }))
+  );
+}
+
+/** Resources scheduled on a server, with their project + environment names. */
+export async function getServerHosted(serverId: string) {
+  return db
+    .select({
+      id: s.resources.id,
+      name: s.resources.name,
+      kind: s.resources.kind,
+      status: s.resources.status,
+      projectName: s.projects.name,
+      envName: s.environments.name,
+    })
+    .from(s.resources)
+    .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
+    .innerJoin(s.environments, eq(s.resources.environmentId, s.environments.id))
+    .where(eq(s.resources.serverId, serverId));
+}
+
+export type OrgResource = typeof s.resources.$inferSelect & {
+  projectName: string;
+  envName: string;
+  latestDeploy: typeof s.deployments.$inferSelect | null;
+};
+
+/** Every resource in the org, with project/environment names and its most
+ *  recent deployment. Powers the Overview + Resources pages. */
+export async function getOrgResources(orgId: string): Promise<OrgResource[]> {
+  const rows = await db
+    .select({
+      resource: s.resources,
+      projectName: s.projects.name,
+      envName: s.environments.name,
+    })
+    .from(s.resources)
+    .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
+    .innerJoin(s.environments, eq(s.resources.environmentId, s.environments.id))
+    .where(eq(s.projects.orgId, orgId));
+  return Promise.all(
+    rows.map(async (row) => {
+      const [latest] = await db
+        .select()
+        .from(s.deployments)
+        .where(eq(s.deployments.resourceId, row.resource.id))
+        .orderBy(desc(s.deployments.startedAt))
+        .limit(1);
+      return {
+        ...row.resource,
+        projectName: row.projectName,
+        envName: row.envName,
+        latestDeploy: latest ?? null,
+      };
+    })
+  );
+}

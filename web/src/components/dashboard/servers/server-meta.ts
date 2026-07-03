@@ -27,7 +27,7 @@ export const SERVER_TYPE_ORDER: ServerType[] = [
   "gpu",
 ];
 
-export function formatDate(iso: string) {
+export function formatDate(iso: string | Date) {
   return new Date(iso).toLocaleDateString("en-GB", {
     day: "numeric",
     month: "short",

@@ -2,7 +2,8 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Server as ServerIcon, ShieldCheck, Boxes } from "lucide-react";
+import { Server as ServerIcon, ShieldCheck, Boxes, Loader2, Radio } from "lucide-react";
+import { toast } from "sonner";
 
 import {
   Card,
@@ -21,10 +22,11 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/dashboard/status-indicator";
-import { useActiveOrg } from "@/components/dashboard/org-context";
-import { getServers } from "@/lib/mock";
-import type { Server, ServerType } from "@/lib/mock";
+import type { ServerType, Status } from "@/lib/mock";
+import type { ServerWithCount } from "@/server/queries";
+import { agentCheckIn } from "@/server/actions/servers";
 import { ConnectServerDialog } from "./connect-server-dialog";
 import { SERVER_TYPE_LABELS, SERVER_TYPE_ORDER } from "./server-meta";
 
@@ -38,7 +40,35 @@ function TypeBadge({ type }: { type: ServerType }) {
   );
 }
 
-function ServerRow({ server }: { server: Server }) {
+export function CheckInButton({ serverId }: { serverId: string }) {
+  const [pending, startTransition] = React.useTransition();
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={pending}
+      onClick={() =>
+        startTransition(async () => {
+          try {
+            await agentCheckIn({ serverId });
+            toast.success("Agent checked in", {
+              description: "The server is now running and billable.",
+            });
+          } catch (err) {
+            toast.error("Check-in failed", {
+              description: err instanceof Error ? err.message : "Please try again.",
+            });
+          }
+        })
+      }
+    >
+      {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Radio className="size-3.5" />}
+      Simulate check-in
+    </Button>
+  );
+}
+
+function ServerRow({ server }: { server: ServerWithCount }) {
   return (
     <TableRow>
       <TableCell className="pl-4">
@@ -50,20 +80,23 @@ function ServerRow({ server }: { server: Server }) {
         </Link>
       </TableCell>
       <TableCell>
-        <TypeBadge type={server.type} />
+        <TypeBadge type={server.type as ServerType} />
       </TableCell>
       <TableCell className="text-muted-foreground">
         <span className="text-foreground">{server.provider}</span>
         <span className="text-muted-foreground/60"> · {server.region}</span>
       </TableCell>
       <TableCell>
-        <StatusBadge status={server.status} />
+        <div className="flex items-center gap-2">
+          <StatusBadge status={server.status as Status} />
+          {server.status === "provisioning" && <CheckInButton serverId={server.id} />}
+        </div>
       </TableCell>
       <TableCell className="font-mono text-xs text-muted-foreground tabular-nums">
-        {server.agentVersion}
+        {server.agentVersion || "—"}
       </TableCell>
       <TableCell className="font-mono text-xs text-muted-foreground tabular-nums">
-        {server.ip}
+        {server.ip || "—"}
       </TableCell>
       <TableCell className="text-muted-foreground tabular-nums">
         {server.resourceCount}
@@ -82,11 +115,18 @@ function ServerRow({ server }: { server: Server }) {
   );
 }
 
-export function ServersView() {
-  const { orgId, org } = useActiveOrg();
+export function ServersView({
+  orgId,
+  orgName,
+  orgSlug,
+  servers,
+}: {
+  orgId: string;
+  orgName: string;
+  orgSlug: string;
+  servers: ServerWithCount[];
+}) {
   const [filter, setFilter] = React.useState<Filter>("all");
-
-  const servers = React.useMemo(() => getServers(orgId), [orgId]);
 
   const counts = React.useMemo(() => {
     const c: Record<Filter, number> = {
@@ -96,33 +136,25 @@ export function ServersView() {
       storage: 0,
       gpu: 0,
     };
-    for (const s of servers) c[s.type] += 1;
+    for (const sv of servers) c[sv.type as ServerType] += 1;
     return c;
   }, [servers]);
 
-  const filtered = React.useMemo(
-    () => (filter === "all" ? servers : servers.filter((s) => s.type === filter)),
-    [servers, filter]
-  );
-
-  const connected = React.useMemo(
-    () => servers.filter((s) => s.status !== "provisioning").length,
-    [servers]
-  );
+  const filtered =
+    filter === "all" ? servers : servers.filter((sv) => sv.type === filter);
+  const connected = servers.filter((sv) => sv.status !== "provisioning").length;
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
         <div className="flex flex-col gap-1">
-          <h1 className="text-xl font-semibold tracking-tight text-foreground">
-            Servers
-          </h1>
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">Servers</h1>
           <p className="text-sm text-muted-foreground">
-            {connected} connected across {org.name} · your infrastructure,
-            single billing meter.
+            {connected} connected across {orgName} · your infrastructure, single
+            billing meter.
           </p>
         </div>
-        <ConnectServerDialog />
+        <ConnectServerDialog orgId={orgId} orgSlug={orgSlug} />
       </div>
 
       <Card>
@@ -136,11 +168,7 @@ export function ServersView() {
               Hosts running the SigmaHub agent over WireGuard.
             </CardDescription>
           </div>
-          <Tabs
-            value={filter}
-            onValueChange={(v) => setFilter(v as Filter)}
-            className="w-fit"
-          >
+          <Tabs value={filter} onValueChange={(v) => setFilter(v as Filter)} className="w-fit">
             <TabsList>
               <TabsTrigger value="all">All ({counts.all})</TabsTrigger>
               {SERVER_TYPE_ORDER.map((t) => (
@@ -158,7 +186,7 @@ export function ServersView() {
                 <Boxes className="size-5" />
               </span>
               <p className="text-sm font-medium text-foreground">
-                No servers of this type
+                {servers.length === 0 ? "No servers connected yet" : "No servers of this type"}
               </p>
               <p className="max-w-sm text-xs text-muted-foreground">
                 Connect a host and pick a type when the agent checks in.
@@ -180,8 +208,8 @@ export function ServersView() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filtered.map((s) => (
-                    <ServerRow key={s.id} server={s} />
+                  {filtered.map((sv) => (
+                    <ServerRow key={sv.id} server={sv} />
                   ))}
                 </TableBody>
               </Table>
