@@ -6,21 +6,7 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { getProject } from "../queries";
-
-function slugify(x: string) {
-  return (
-    x
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40) || "project"
-  );
-}
-
-function rid(prefix: string) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-}
+import { rid, slugify } from "@/lib/ids";
 
 export async function createProject(input: {
   orgId: string;

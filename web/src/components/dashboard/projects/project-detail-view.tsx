@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { ArrowUpRight, FolderX, Layers, Loader2, Server as ServerIcon, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -41,6 +40,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
+import { DeployStatusBadge } from "@/components/dashboard/resources/deploy-status-badge";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import type { EnvPanel } from "@/server/queries";
 import { deleteEnvironment } from "@/server/actions/projects";
@@ -48,26 +48,6 @@ import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared
 import { NewEnvironmentDialog } from "./new-environment-dialog";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
-
-const DEPLOY_META: Record<string, { label: string; text: string; dot: string }> = {
-  running: { label: "Running", text: "text-blue-700", dot: "bg-blue-500" },
-  success: { label: "Success", text: "text-emerald-700", dot: "bg-emerald-500" },
-  failed: { label: "Failed", text: "text-red-700", dot: "bg-red-500" },
-  building: { label: "Building", text: "text-amber-700", dot: "bg-amber-500" },
-  queued: { label: "Queued", text: "text-muted-foreground", dot: "bg-muted-foreground" },
-};
-
-function DeployStatusChip({ status }: { status: string }) {
-  const meta = DEPLOY_META[status] ?? DEPLOY_META.queued;
-  return (
-    <span
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs font-medium ${meta.text}`}
-    >
-      <span className={`size-1.5 rounded-full ${meta.dot}`} aria-hidden />
-      {meta.label}
-    </span>
-  );
-}
 
 function AttachedServers({ servers }: { servers: EnvPanel["servers"] }) {
   return (
@@ -194,7 +174,7 @@ function RecentDeploys({ resources }: { resources: EnvPanel["resources"] }) {
                     {formatDateTime(deployment.startedAt)}
                   </p>
                 </div>
-                <DeployStatusChip status={deployment.status} />
+                <DeployStatusBadge status={deployment.status} />
               </div>
             ))}
           </div>

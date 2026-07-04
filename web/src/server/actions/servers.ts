@@ -5,10 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
-
-function rid(prefix: string) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-}
+import { rid } from "@/lib/ids";
 
 function hashNum(str: string, mod: number) {
   let h = 5381;

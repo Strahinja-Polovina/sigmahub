@@ -6,10 +6,8 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { getProject, getResource } from "../queries";
+import { rid } from "@/lib/ids";
 
-function rid(prefix: string) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-}
 function sha7() {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 7);
 }

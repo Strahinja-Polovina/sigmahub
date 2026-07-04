@@ -37,17 +37,10 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
+import { DeployStatusBadge } from "@/components/dashboard/resources/deploy-status-badge";
+import { KIND_LABELS } from "@/lib/constants";
+import { formatDateShort, formatCurrency } from "@/lib/formatters";
 import type { ResourceKind, Status } from "@/lib/mock";
-
-const KIND_LABELS: Record<ResourceKind, string> = {
-  app: "App",
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mongo: "MongoDB",
-  redis: "Redis",
-  s3: "Object storage",
-  llm: "LLM",
-};
 
 type OverviewResource = {
   id: string;
@@ -76,21 +69,6 @@ type Billing = {
   connected: number;
   currency: string;
 };
-
-function formatCurrency(amount: number, currency: string) {
-  return new Intl.NumberFormat("en-IE", {
-    style: "currency",
-    currency,
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
-function formatDate(iso: string | Date) {
-  return new Date(iso).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-  });
-}
 
 function StatCard({
   label,
@@ -144,26 +122,6 @@ function ResourceActions({ resourceName }: { resourceName: string }) {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-  );
-}
-
-const DEPLOY_META: Record<string, { label: string; text: string; dot: string }> = {
-  running: { label: "Running", text: "text-blue-700", dot: "bg-blue-500" },
-  success: { label: "Success", text: "text-emerald-700", dot: "bg-emerald-500" },
-  failed: { label: "Failed", text: "text-red-700", dot: "bg-red-500" },
-  building: { label: "Building", text: "text-amber-700", dot: "bg-amber-500" },
-  queued: { label: "Queued", text: "text-muted-foreground", dot: "bg-muted-foreground" },
-};
-
-function DeployStatusBadge({ status }: { status: string }) {
-  const meta = DEPLOY_META[status] ?? DEPLOY_META.queued;
-  return (
-    <span
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs font-medium ${meta.text}`}
-    >
-      <span className={`size-1.5 rounded-full ${meta.dot}`} aria-hidden />
-      {meta.label}
-    </span>
   );
 }
 
@@ -270,7 +228,7 @@ export function Overview({
                       <StatusBadge status={r.status as Status} />
                     </TableCell>
                     <TableCell className="text-muted-foreground tabular-nums">
-                      {formatDate(r.lastDeployAt)}
+                      {formatDateShort(r.lastDeployAt)}
                     </TableCell>
                     <TableCell className="pr-4 text-right">
                       <ResourceActions resourceName={r.name} />

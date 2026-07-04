@@ -1,4 +1,4 @@
-import { DEPLOY_STATUS_META } from "./resource-meta";
+import { DEPLOY_STATUS_META } from "@/lib/constants";
 
 export function DeployStatusBadge({ status }: { status: string }) {
   const meta = DEPLOY_STATUS_META[status] ?? DEPLOY_STATUS_META.queued;
