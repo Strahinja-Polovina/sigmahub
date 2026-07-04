@@ -116,7 +116,7 @@ export async function advanceDeployment(input: { deploymentId: string }) {
     .select()
     .from(s.deployments)
     .where(eq(s.deployments.id, input.deploymentId));
-  if (!dep) return { status: null };
+  if (!dep) throw new Error("Deployment not found.");
   await assertResourceMembership(dep.resourceId);
 
   let next: string;
@@ -152,9 +152,10 @@ export async function advanceDeployment(input: { deploymentId: string }) {
 
 export async function deleteResource(input: { resourceId: string }) {
   const resource = await getResource(input.resourceId);
-  if (!resource) return;
+  if (!resource) throw new Error("Resource not found.");
   const project = await getProject(resource.projectId);
-  if (project) await requireMembership(project.orgId);
+  if (!project) throw new Error("Parent project not found.");
+  await requireMembership(project.orgId);
   await db.delete(s.resources).where(eq(s.resources.id, input.resourceId));
   revalidatePath("/dashboard", "layout");
 }

@@ -88,7 +88,7 @@ export async function disconnectServer(input: { serverId: string }) {
     .select()
     .from(s.servers)
     .where(eq(s.servers.id, input.serverId));
-  if (!server) return;
+  if (!server) throw new Error("Server not found.");
   await requireMembership(server.orgId);
   await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
   revalidatePath("/dashboard", "layout");

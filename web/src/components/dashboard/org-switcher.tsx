@@ -11,6 +11,7 @@ import {
   ScrollText,
   Plus,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import {
   DropdownMenu,
@@ -40,10 +41,18 @@ export function OrgSwitcher() {
 
   function switchOrg(id: string) {
     if (id === org.id) return;
+    const prevId = org.id;
     setOrgId(id); // immediate client feedback
     startTransition(async () => {
-      await setActiveOrg(id); // persist cookie so server components follow
-      router.refresh();
+      try {
+        await setActiveOrg(id); // persist cookie so server components follow
+        router.refresh();
+      } catch (err) {
+        setOrgId(prevId);
+        toast.error("Couldn't switch organization", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
     });
   }
 

@@ -65,7 +65,7 @@ export async function renameProject(input: {
 
 export async function deleteProject(input: { projectId: string }) {
   const project = await getProject(input.projectId);
-  if (!project) return;
+  if (!project) throw new Error("Project not found.");
   await requireMembership(project.orgId);
   // FK cascade removes environments, env_servers, resources and deployments.
   await db.delete(s.projects).where(eq(s.projects.id, input.projectId));
@@ -92,9 +92,10 @@ export async function deleteEnvironment(input: { environmentId: string }) {
     .select()
     .from(s.environments)
     .where(eq(s.environments.id, input.environmentId));
-  if (!env) return;
+  if (!env) throw new Error("Environment not found.");
   const project = await getProject(env.projectId);
-  if (project) await requireMembership(project.orgId);
+  if (!project) throw new Error("Parent project not found.");
+  await requireMembership(project.orgId);
   await db.delete(s.environments).where(eq(s.environments.id, input.environmentId));
   revalidatePath("/dashboard", "layout");
 }
