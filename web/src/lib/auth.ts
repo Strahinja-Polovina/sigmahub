@@ -8,6 +8,7 @@ import { db, authSchema } from "../server/db";
 // Prod: swap the adapter to GCP Identity Platform behind the same call sites.
 export const auth = betterAuth({
   appName: "SigmaHub",
+  secret: process.env.BETTER_AUTH_SECRET,
   database: drizzleAdapter(db, { provider: "pg", schema: authSchema }),
   emailAndPassword: { enabled: true },
   plugins: [twoFactor()],

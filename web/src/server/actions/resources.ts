@@ -37,6 +37,7 @@ export async function createResource(input: {
   await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
+  if (name.length > 100) throw new Error("Resource name must be 100 characters or fewer.");
 
   // Don't trust the client-supplied env/server ids: they must belong to this
   // project/org, or a member of one org could plant a resource on another's

@@ -30,6 +30,9 @@ export async function createProject(input: {
   await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
+  if (name.length > 100) throw new Error("Project name must be 100 characters or fewer.");
+  if (input.description && input.description.length > 500)
+    throw new Error("Description must be 500 characters or fewer.");
   const id = rid("proj");
   await db.insert(s.projects).values({
     id,
@@ -52,6 +55,9 @@ export async function renameProject(input: {
   await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
+  if (name.length > 100) throw new Error("Project name must be 100 characters or fewer.");
+  if (input.description && input.description.length > 500)
+    throw new Error("Description must be 500 characters or fewer.");
   await db
     .update(s.projects)
     .set({
@@ -81,6 +87,7 @@ export async function createEnvironment(input: {
   await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Environment name is required.");
+  if (name.length > 50) throw new Error("Environment name must be 50 characters or fewer.");
   const id = rid("env");
   await db.insert(s.environments).values({ id, projectId: input.projectId, name });
   revalidatePath("/dashboard", "layout");

@@ -37,6 +37,7 @@ export async function connectServer(input: {
   await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Server name is required.");
+  if (name.length > 100) throw new Error("Server name must be 100 characters or fewer.");
   const id = rid("srv");
   await db.insert(s.servers).values({
     id,
@@ -54,7 +55,8 @@ export async function connectServer(input: {
     byoVpn: Boolean(input.byoVpn),
   });
   revalidatePath("/dashboard", "layout");
-  return { id, bootstrapToken: `sk_boot_${id.slice(4, 12)}` };
+  const token = crypto.randomUUID().replace(/-/g, "");
+  return { id, bootstrapToken: `sk_boot_${token}` };
 }
 
 /** Simulated agent check-in: flips provisioning → running and fills in the
