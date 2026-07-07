@@ -1,7 +1,5 @@
 "use client";
 
-import * as React from "react";
-
 import {
   Card,
   CardContent,
@@ -18,67 +16,38 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { getMembers } from "@/lib/mock";
+import type { AuditEntry } from "./settings-view";
 
-type AuditEntry = {
-  actor: string;
-  action: string;
-  category: "deploy" | "server" | "access" | "billing" | "settings";
-  target: string;
-  at: string; // relative time label
-};
-
-// Deterministic, org-scoped mock audit trail (no backend). Actors are drawn
-// from the org's members so the log tracks the active organization.
-function buildAuditLog(orgId: string): AuditEntry[] {
-  const members = getMembers(orgId);
-  const actor = (i: number) => members[i % members.length]?.name ?? "system";
-
-  const template: Omit<AuditEntry, "actor">[] = [
-    { action: "Deployed resource", category: "deploy", target: "api-gateway · v452", at: "2 min ago" },
-    { action: "Connected server", category: "server", target: "ash-general-03", at: "1 hr ago" },
-    { action: "Invited member", category: "access", target: "teammate@company.com · Developer", at: "3 hr ago" },
-    { action: "Restarted resource", category: "deploy", target: "worker", at: "5 hr ago" },
-    { action: "Downloaded invoice", category: "billing", target: "Period Jun 2026", at: "Yesterday" },
-    { action: "Changed role", category: "access", target: "Nikola Petrović → Developer", at: "Yesterday" },
-    { action: "Updated org name", category: "settings", target: "Organization settings", at: "2 days ago" },
-    { action: "Rotated agent token", category: "server", target: "hel-db-01", at: "3 days ago" },
-    { action: "Deployed resource", category: "deploy", target: "storefront · v128", at: "4 days ago" },
-    { action: "Removed member", category: "access", target: "contractor@ext.com", at: "5 days ago" },
-  ];
-
-  return template.map((t, i) => ({ actor: actor(i), ...t }));
+// Derive a category badge from the action verb.
+function categoryOf(action: string): { label: string; variant: "secondary" | "outline" } {
+  const a = action.toLowerCase();
+  if (a.includes("deploy")) return { label: "Deploy", variant: "secondary" };
+  if (a.includes("server") || a.includes("agent")) return { label: "Server", variant: "outline" };
+  if (a.includes("member") || a.includes("role") || a.includes("invit"))
+    return { label: "Access", variant: "outline" };
+  return { label: "Settings", variant: "outline" };
 }
 
-const CATEGORY_VARIANT: Record<
-  AuditEntry["category"],
-  React.ComponentProps<typeof Badge>["variant"]
-> = {
-  deploy: "secondary",
-  server: "outline",
-  access: "outline",
-  billing: "outline",
-  settings: "outline",
-};
+function relativeTime(input: string | Date) {
+  const then = new Date(input).getTime();
+  const diff = Math.max(0, Date.now() - then);
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  const d = Math.floor(h / 24);
+  if (d === 1) return "yesterday";
+  if (d < 30) return `${d} days ago`;
+  return new Date(input).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
 
-const CATEGORY_LABEL: Record<AuditEntry["category"], string> = {
-  deploy: "Deploy",
-  server: "Server",
-  access: "Access",
-  billing: "Billing",
-  settings: "Settings",
-};
-
-export function AuditTab({ orgId }: { orgId: string }) {
-  const entries = React.useMemo(() => buildAuditLog(orgId), [orgId]);
-
+export function AuditTab({ entries }: { entries: AuditEntry[] }) {
   return (
     <Card>
       <CardHeader className="border-b">
         <CardTitle>Audit log</CardTitle>
-        <CardDescription>
-          Recent audited actions across this organization.
-        </CardDescription>
+        <CardDescription>Recent audited actions across this organization.</CardDescription>
       </CardHeader>
       <CardContent className="px-0">
         <Table>
@@ -91,27 +60,35 @@ export function AuditTab({ orgId }: { orgId: string }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {entries.map((e, i) => (
-              <TableRow key={i}>
-                <TableCell className="pl-4 font-medium text-foreground">
-                  {e.actor}
-                </TableCell>
-                <TableCell>
-                  <span className="flex items-center gap-2">
-                    <Badge variant={CATEGORY_VARIANT[e.category]}>
-                      {CATEGORY_LABEL[e.category]}
-                    </Badge>
-                    <span className="text-foreground">{e.action}</span>
-                  </span>
-                </TableCell>
-                <TableCell className="font-mono text-xs text-muted-foreground">
-                  {e.target}
-                </TableCell>
-                <TableCell className="pr-4 text-right text-muted-foreground tabular-nums">
-                  {e.at}
+            {entries.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={4} className="py-10 text-center text-sm text-muted-foreground">
+                  No audited actions yet. Actions like deploys, member changes and server
+                  connections appear here.
                 </TableCell>
               </TableRow>
-            ))}
+            ) : (
+              entries.map((e) => {
+                const cat = categoryOf(e.action);
+                return (
+                  <TableRow key={e.id}>
+                    <TableCell className="pl-4 font-medium text-foreground">{e.actor}</TableCell>
+                    <TableCell>
+                      <span className="flex items-center gap-2">
+                        <Badge variant={cat.variant}>{cat.label}</Badge>
+                        <span className="text-foreground">{e.action}</span>
+                      </span>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {e.target || "—"}
+                    </TableCell>
+                    <TableCell className="pr-4 text-right text-muted-foreground tabular-nums">
+                      {relativeTime(e.createdAt)}
+                    </TableCell>
+                  </TableRow>
+                );
+              })
+            )}
           </TableBody>
         </Table>
       </CardContent>

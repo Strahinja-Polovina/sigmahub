@@ -6,6 +6,7 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { getProject, getResource } from "../queries";
+import { writeAudit } from "../audit";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -18,8 +19,8 @@ async function assertResourceMembership(resourceId: string) {
   const resource = await getResource(resourceId);
   if (!resource) throw new Error("Resource not found.");
   const project = await getProject(resource.projectId);
-  if (project) await requireMembership(project.orgId);
-  return resource;
+  const membership = project ? await requireMembership(project.orgId) : null;
+  return { resource, orgId: project?.orgId ?? null, actor: membership?.user ?? null };
 }
 
 /** Deploy-from-Git result: create a resource and its first (running) deployment. */
@@ -34,7 +35,7 @@ export async function createResource(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  await requireMembership(project.orgId);
+  const { user } = await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
 
@@ -82,13 +83,14 @@ export async function createResource(input: {
     durationSec: 42,
     startedAt: now,
   });
+  await writeAudit({ orgId: project.orgId, actor: user.name, action: "Deployed resource", target: `${name} · ${input.kind}` });
   revalidatePath("/dashboard", "layout");
   return { id };
 }
 
 /** Kick off a redeploy: a new deployment enters the pipeline as `queued`. */
 export async function deployResource(input: { resourceId: string }) {
-  await assertResourceMembership(input.resourceId);
+  const { resource, orgId, actor } = await assertResourceMembership(input.resourceId);
   const id = rid("dep");
   const now = new Date();
   await db.insert(s.deployments).values({
@@ -104,6 +106,11 @@ export async function deployResource(input: { resourceId: string }) {
     .update(s.resources)
     .set({ lastDeployAt: now })
     .where(eq(s.resources.id, input.resourceId));
+  // Audit only after the redeploy is actually enqueued, so a failed insert
+  // can't leave a phantom "Redeployed" row (matches every sibling action).
+  if (orgId && actor) {
+    await writeAudit({ orgId, actor: actor.name, action: "Redeployed resource", target: resource.name });
+  }
   revalidatePath("/dashboard", "layout");
   revalidatePath(`/dashboard/resources/${input.resourceId}`);
   return { deploymentId: id };
@@ -154,7 +161,10 @@ export async function deleteResource(input: { resourceId: string }) {
   const resource = await getResource(input.resourceId);
   if (!resource) return;
   const project = await getProject(resource.projectId);
-  if (project) await requireMembership(project.orgId);
+  const membership = project ? await requireMembership(project.orgId) : null;
   await db.delete(s.resources).where(eq(s.resources.id, input.resourceId));
+  if (project && membership) {
+    await writeAudit({ orgId: project.orgId, actor: membership.user.name, action: "Deleted resource", target: resource.name });
+  }
   revalidatePath("/dashboard", "layout");
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Info } from "lucide-react";
+import { toast } from "sonner";
+import { Info, Loader2, MoreHorizontal, Trash2, UserCog } from "lucide-react";
 
 import {
   Card,
@@ -18,18 +19,27 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { getMembers } from "@/lib/mock";
-import type { Member, Role } from "@/lib/mock";
+import { Button } from "@/components/ui/button";
+import { changeMemberRole, removeMember } from "@/server/actions/members";
+import type { SettingsMember } from "./settings-view";
 import { InviteMemberDialog } from "./invite-member-dialog";
 
-const ROLE_VARIANT: Record<Role, React.ComponentProps<typeof Badge>["variant"]> =
-  {
-    "Org Admin": "default",
-    "Project Admin": "secondary",
-    Developer: "outline",
-  };
+const ROLES = ["Org Admin", "Project Admin", "Developer"] as const;
+const ROLE_VARIANT: Record<string, React.ComponentProps<typeof Badge>["variant"]> = {
+  "Org Admin": "default",
+  "Project Admin": "secondary",
+  Developer: "outline",
+};
 
 function initials(name: string) {
   return name
@@ -39,20 +49,102 @@ function initials(name: string) {
     .join("");
 }
 
-export function MembersTab({ orgId }: { orgId: string }) {
-  const members = React.useMemo(() => getMembers(orgId), [orgId]);
+const msg = (err: unknown) => (err instanceof Error ? err.message : "Please try again.");
 
+function MemberActions({
+  orgId,
+  member,
+  isSelf,
+}: {
+  orgId: string;
+  member: SettingsMember;
+  isSelf: boolean;
+}) {
+  const [pending, startTransition] = React.useTransition();
+
+  function setRole(role: string) {
+    if (role === member.role) return;
+    startTransition(async () => {
+      try {
+        await changeMemberRole({ orgId, userId: member.id, role });
+        toast.success(`${member.name} is now ${role}`);
+      } catch (err) {
+        toast.error("Couldn’t change role", { description: msg(err) });
+      }
+    });
+  }
+
+  function remove() {
+    startTransition(async () => {
+      try {
+        await removeMember({ orgId, userId: member.id });
+        toast.success(`${member.name} removed`);
+      } catch (err) {
+        toast.error("Couldn’t remove member", { description: msg(err) });
+      }
+    });
+  }
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="ghost" size="icon-sm" aria-label={`Manage ${member.name}`} disabled={pending}>
+            {pending ? <Loader2 className="size-4 animate-spin" /> : <MoreHorizontal className="size-4" />}
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuLabel className="flex items-center gap-2 text-xs">
+          <UserCog className="size-3.5 text-muted-foreground" />
+          Change role
+        </DropdownMenuLabel>
+        {ROLES.map((r) => (
+          <DropdownMenuItem
+            key={r}
+            className="gap-2"
+            disabled={r === member.role}
+            onClick={() => setRole(r)}
+          >
+            {r}
+            {r === member.role && <span className="ml-auto text-xs text-muted-foreground">current</span>}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          variant="destructive"
+          className="gap-2"
+          disabled={isSelf}
+          onClick={remove}
+        >
+          <Trash2 className="size-4" />
+          {isSelf ? "Can’t remove yourself" : "Remove from org"}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+export function MembersTab({
+  orgId,
+  members,
+  currentUserId,
+  isAdmin,
+}: {
+  orgId: string;
+  members: SettingsMember[];
+  currentUserId: string;
+  isAdmin: boolean;
+}) {
   return (
     <div className="flex flex-col gap-4">
       <Card>
         <CardHeader className="flex-row items-start justify-between gap-4 border-b">
           <div className="grid gap-1">
             <CardTitle>Members</CardTitle>
-            <CardDescription>
-              People with access to this organization.
-            </CardDescription>
+            <CardDescription>People with access to this organization.</CardDescription>
           </div>
-          <InviteMemberDialog />
+          {isAdmin && <InviteMemberDialog orgId={orgId} />}
         </CardHeader>
         <CardContent className="px-0">
           <Table>
@@ -60,12 +152,40 @@ export function MembersTab({ orgId }: { orgId: string }) {
               <TableRow>
                 <TableHead className="pl-4">Member</TableHead>
                 <TableHead>Email</TableHead>
-                <TableHead className="pr-4 text-right">Role</TableHead>
+                <TableHead className={isAdmin ? "" : "pr-4 text-right"}>Role</TableHead>
+                {isAdmin && (
+                  <TableHead className="w-10 pr-4 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
+                )}
               </TableRow>
             </TableHeader>
             <TableBody>
               {members.map((m) => (
-                <MemberRow key={m.id} member={m} />
+                <TableRow key={m.id}>
+                  <TableCell className="pl-4">
+                    <span className="flex items-center gap-2.5">
+                      <Avatar size="sm">
+                        <AvatarFallback>{initials(m.name)}</AvatarFallback>
+                      </Avatar>
+                      <span className="font-medium text-foreground">
+                        {m.name}
+                        {m.id === currentUserId && (
+                          <span className="ml-1.5 text-xs text-muted-foreground">(you)</span>
+                        )}
+                      </span>
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">{m.email}</TableCell>
+                  <TableCell className={isAdmin ? "" : "pr-4 text-right"}>
+                    <Badge variant={ROLE_VARIANT[m.role] ?? "outline"}>{m.role}</Badge>
+                  </TableCell>
+                  {isAdmin && (
+                    <TableCell className="pr-4 text-right">
+                      <MemberActions orgId={orgId} member={m} isSelf={m.id === currentUserId} />
+                    </TableCell>
+                  )}
+                </TableRow>
               ))}
             </TableBody>
           </Table>
@@ -75,30 +195,11 @@ export function MembersTab({ orgId }: { orgId: string }) {
       <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
         <Info className="mt-0.5 size-3.5 shrink-0" />
         <p>
-          <span className="font-medium text-foreground">RBAC (v0.1):</span>{" "}
-          roles are scoped at the organization and project level. Fine-grained,
-          environment-scoped permissions are deferred to a later release.
+          <span className="font-medium text-foreground">RBAC (v0.1):</span> roles are scoped at the
+          organization and project level. Fine-grained, environment-scoped permissions are deferred
+          to a later release.
         </p>
       </div>
     </div>
-  );
-}
-
-function MemberRow({ member }: { member: Member }) {
-  return (
-    <TableRow>
-      <TableCell className="pl-4">
-        <span className="flex items-center gap-2.5">
-          <Avatar size="sm">
-            <AvatarFallback>{initials(member.name)}</AvatarFallback>
-          </Avatar>
-          <span className="font-medium text-foreground">{member.name}</span>
-        </span>
-      </TableCell>
-      <TableCell className="text-muted-foreground">{member.email}</TableCell>
-      <TableCell className="pr-4 text-right">
-        <Badge variant={ROLE_VARIANT[member.role]}>{member.role}</Badge>
-      </TableCell>
-    </TableRow>
   );
 }

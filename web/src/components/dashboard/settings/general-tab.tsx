@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { toast } from "sonner";
+import { Loader2 } from "lucide-react";
 
 import {
   Card,
@@ -15,25 +16,33 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import type { Org } from "@/lib/mock";
+import { updateOrg } from "@/server/actions/org";
+import type { SettingsOrg } from "./settings-view";
 
-const PLAN_LABELS: Record<Org["plan"], string> = {
-  free: "Free",
-  cloud: "Cloud",
-};
+const PLAN_LABELS: Record<string, string> = { free: "Free", cloud: "Cloud" };
 
-export function GeneralTab({ org }: { org: Org }) {
-  // Reset local edits whenever the active org changes.
+export function GeneralTab({ org, isAdmin }: { org: SettingsOrg; isAdmin: boolean }) {
   const [name, setName] = React.useState(org.name);
+  const [pending, startTransition] = React.useTransition();
+
   React.useEffect(() => setName(org.name), [org.id, org.name]);
 
   const dirty = name.trim() !== org.name && name.trim().length > 0;
 
   function handleSave(e: React.FormEvent) {
     e.preventDefault();
-    if (!dirty) return;
-    toast.success("Organization settings saved", {
-      description: `Name updated to “${name.trim()}”.`,
+    if (!dirty || !isAdmin) return;
+    startTransition(async () => {
+      try {
+        await updateOrg({ orgId: org.id, name: name.trim() });
+        toast.success("Organization settings saved", {
+          description: `Name updated to “${name.trim()}”.`,
+        });
+      } catch (err) {
+        toast.error("Couldn’t save settings", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
     });
   }
 
@@ -42,9 +51,7 @@ export function GeneralTab({ org }: { org: Org }) {
       <Card>
         <CardHeader className="border-b">
           <CardTitle>General</CardTitle>
-          <CardDescription>
-            Basic details for this organization.
-          </CardDescription>
+          <CardDescription>Basic details for this organization.</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-5 py-1">
           <div className="grid gap-2 sm:max-w-sm">
@@ -54,18 +61,19 @@ export function GeneralTab({ org }: { org: Org }) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Acme Cloud"
+              disabled={!isAdmin || pending}
+              readOnly={!isAdmin}
             />
+            {!isAdmin && (
+              <p className="text-xs text-muted-foreground">
+                Only organization admins can change these settings.
+              </p>
+            )}
           </div>
 
           <div className="grid gap-2 sm:max-w-sm">
             <Label htmlFor="org-slug">Organization ID</Label>
-            <Input
-              id="org-slug"
-              value={org.slug}
-              readOnly
-              disabled
-              className="font-mono"
-            />
+            <Input id="org-slug" value={org.slug} readOnly disabled className="font-mono" />
             <p className="text-xs text-muted-foreground">
               Used in URLs and the CLI. Contact support to change it.
             </p>
@@ -74,11 +82,8 @@ export function GeneralTab({ org }: { org: Org }) {
           <div className="grid gap-2">
             <Label>Plan</Label>
             <div className="flex items-center gap-2">
-              <Badge
-                variant={org.plan === "cloud" ? "default" : "outline"}
-                className="capitalize"
-              >
-                {PLAN_LABELS[org.plan]}
+              <Badge variant={org.plan === "cloud" ? "default" : "outline"} className="capitalize">
+                {PLAN_LABELS[org.plan] ?? org.plan}
               </Badge>
               <span className="text-xs text-muted-foreground">
                 Single-meter pricing · manage usage in Billing.
@@ -90,12 +95,13 @@ export function GeneralTab({ org }: { org: Org }) {
           <Button
             type="button"
             variant="outline"
-            disabled={!dirty}
+            disabled={!dirty || pending}
             onClick={() => setName(org.name)}
           >
             Reset
           </Button>
-          <Button type="submit" disabled={!dirty}>
+          <Button type="submit" disabled={!dirty || !isAdmin || pending}>
+            {pending && <Loader2 className="size-4 animate-spin" />}
             Save changes
           </Button>
         </CardFooter>

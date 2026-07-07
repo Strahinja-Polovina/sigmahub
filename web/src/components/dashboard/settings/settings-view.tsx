@@ -1,22 +1,49 @@
 "use client";
 
-import * as React from "react";
-
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useActiveOrg } from "@/components/dashboard/org-context";
 import { GeneralTab } from "./general-tab";
 import { MembersTab } from "./members-tab";
 import { AuditTab } from "./audit-tab";
 
-export function SettingsView() {
-  const { orgId, org } = useActiveOrg();
+export type SettingsOrg = {
+  id: string;
+  name: string;
+  slug: string;
+  plan: string;
+};
+export type SettingsMember = {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+};
+export type AuditEntry = {
+  id: string;
+  actor: string;
+  action: string;
+  target: string;
+  createdAt: string | Date;
+};
+
+export function SettingsView({
+  org,
+  members,
+  audit,
+  currentUserId,
+  currentUserRole,
+}: {
+  org: SettingsOrg;
+  members: SettingsMember[];
+  audit: AuditEntry[];
+  currentUserId: string;
+  currentUserRole: string;
+}) {
+  const isAdmin = currentUserRole === "Org Admin";
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-1">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">
-          Settings
-        </h1>
+        <h1 className="text-xl font-semibold tracking-tight text-foreground">Settings</h1>
         <p className="text-sm text-muted-foreground">
           Manage {org.name}: general details, members, and the audit log.
         </p>
@@ -30,13 +57,18 @@ export function SettingsView() {
         </TabsList>
 
         <TabsContent value="general">
-          <GeneralTab org={org} />
+          <GeneralTab org={org} isAdmin={isAdmin} />
         </TabsContent>
         <TabsContent value="members">
-          <MembersTab orgId={orgId} />
+          <MembersTab
+            orgId={org.id}
+            members={members}
+            currentUserId={currentUserId}
+            isAdmin={isAdmin}
+          />
         </TabsContent>
         <TabsContent value="audit">
-          <AuditTab orgId={orgId} />
+          <AuditTab entries={audit} />
         </TabsContent>
       </Tabs>
     </div>

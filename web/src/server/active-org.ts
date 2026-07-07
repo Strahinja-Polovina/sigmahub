@@ -53,3 +53,12 @@ export async function requireMembership(orgId: string) {
   if (!m) throw new Error("You are not a member of this organization.");
   return { user, role: m.role };
 }
+
+/** Assert the session user is an Org Admin of `orgId`. Returns the user. */
+export async function requireOrgAdmin(orgId: string) {
+  const { user, role } = await requireMembership(orgId);
+  if (role !== "Org Admin") {
+    throw new Error("Only organization admins can perform this action.");
+  }
+  return user;
+}

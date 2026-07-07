@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
+import { writeAudit } from "../audit";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -34,7 +35,7 @@ export async function connectServer(input: {
   region: string;
   byoVpn?: boolean;
 }) {
-  await requireMembership(input.orgId);
+  const { user } = await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Server name is required.");
   const id = rid("srv");
@@ -53,6 +54,7 @@ export async function connectServer(input: {
     memGb: 0,
     byoVpn: Boolean(input.byoVpn),
   });
+  await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected server", target: name });
   revalidatePath("/dashboard", "layout");
   return { id, bootstrapToken: `sk_boot_${id.slice(4, 12)}` };
 }
@@ -65,7 +67,7 @@ export async function agentCheckIn(input: { serverId: string }) {
     .from(s.servers)
     .where(eq(s.servers.id, input.serverId));
   if (!server) throw new Error("Server not found.");
-  await requireMembership(server.orgId);
+  const { user } = await requireMembership(server.orgId);
   if (server.status !== "provisioning") return; // idempotent
   const spec = SPEC[server.type] ?? SPEC.general;
   await db
@@ -79,6 +81,7 @@ export async function agentCheckIn(input: { serverId: string }) {
       connectedAt: new Date(),
     })
     .where(eq(s.servers.id, input.serverId));
+  await writeAudit({ orgId: server.orgId, actor: user.name, action: "Agent checked in", target: server.name });
   revalidatePath("/dashboard", "layout");
 }
 
@@ -89,7 +92,8 @@ export async function disconnectServer(input: { serverId: string }) {
     .from(s.servers)
     .where(eq(s.servers.id, input.serverId));
   if (!server) return;
-  await requireMembership(server.orgId);
+  const { user } = await requireMembership(server.orgId);
   await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
+  await writeAudit({ orgId: server.orgId, actor: user.name, action: "Disconnected server", target: server.name });
   revalidatePath("/dashboard", "layout");
 }
