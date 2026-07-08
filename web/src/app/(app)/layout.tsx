@@ -1,6 +1,15 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId } from "@/server/active-org";
-import { getProjectsWithEnvs } from "@/server/queries";
+import {
+  ensurePersonalOrg,
+  getActiveOrgId,
+  getMyOrgs,
+  getSessionUser,
+} from "@/server/active-org";
+import {
+  getProjectsWithEnvs,
+  getServerCounts,
+  getCommandIndex,
+} from "@/server/queries";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { OrgProvider } from "@/components/dashboard/org-context";
 import { AppSidebar } from "@/components/dashboard/app-sidebar";
@@ -13,16 +22,40 @@ export default async function AppLayout({
 }) {
   // Gate the whole dashboard on a valid session (getActiveOrgId → getSessionUser
   // redirects to /login when unauthenticated) and resolve the active org.
-  const orgId = await getActiveOrgId();
+  let orgId = await getActiveOrgId();
+  if (!orgId) {
+    // Fresh signup: the user is authenticated but belongs to no org yet.
+    await ensurePersonalOrg();
+    orgId = await getActiveOrgId();
+  }
   if (!orgId) redirect("/login");
-  const projects = await getProjectsWithEnvs(orgId);
+
+  const [myOrgs, sessionUser, projects, commandIndex] = await Promise.all([
+    getMyOrgs(),
+    getSessionUser(),
+    getProjectsWithEnvs(orgId),
+    getCommandIndex(orgId),
+  ]);
+  const counts = await getServerCounts(myOrgs.map((o) => o.id));
+  const orgs = myOrgs.map((o) => ({
+    id: o.id,
+    name: o.name,
+    slug: o.slug,
+    plan: o.plan,
+    serverCount: counts[o.id] ?? 0,
+  }));
+  const user = {
+    id: sessionUser.id,
+    name: sessionUser.name,
+    email: sessionUser.email,
+  };
 
   return (
-    <OrgProvider initialOrgId={orgId}>
+    <OrgProvider orgs={orgs} activeOrgId={orgId} user={user}>
       <SidebarProvider>
         <AppSidebar projects={projects} />
         <SidebarInset>
-          <TopBar />
+          <TopBar commandIndex={commandIndex} />
           <div className="flex flex-1 flex-col">{children}</div>
         </SidebarInset>
       </SidebarProvider>

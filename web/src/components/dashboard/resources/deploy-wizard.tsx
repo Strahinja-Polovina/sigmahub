@@ -40,7 +40,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { canHost } from "@/lib/mock";
+import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import { createResource } from "@/server/actions/resources";
 import {

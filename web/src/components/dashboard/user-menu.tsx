@@ -16,7 +16,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { getMembers } from "@/lib/mock";
 import { useActiveOrg } from "@/components/dashboard/org-context";
 
 function initials(name: string) {
@@ -30,9 +29,7 @@ function initials(name: string) {
 
 export function UserMenu() {
   const router = useRouter();
-  const { orgId } = useActiveOrg();
-  // The first member is the signed-in Org Admin in this prototype.
-  const user = getMembers(orgId)[0];
+  const { user } = useActiveOrg();
 
   const onLogout = async () => {
     await authClient.signOut();

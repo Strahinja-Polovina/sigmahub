@@ -18,6 +18,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { CommandMenu, useCommandMenu } from "@/components/dashboard/command-menu";
 import { UserMenu } from "@/components/dashboard/user-menu";
+import type { CommandIndex } from "@/server/queries";
 
 // Human-readable labels for the first known path segments.
 const SEGMENT_LABELS: Record<string, string> = {
@@ -57,7 +58,7 @@ function useBreadcrumbs() {
   }, [pathname]);
 }
 
-export function TopBar() {
+export function TopBar({ commandIndex }: { commandIndex: CommandIndex }) {
   const { open, setOpen } = useCommandMenu();
   const crumbs = useBreadcrumbs();
 
@@ -106,7 +107,7 @@ export function TopBar() {
       <ThemeToggle />
       <UserMenu />
 
-      <CommandMenu open={open} onOpenChange={setOpen} />
+      <CommandMenu open={open} onOpenChange={setOpen} index={commandIndex} />
     </header>
   );
 }

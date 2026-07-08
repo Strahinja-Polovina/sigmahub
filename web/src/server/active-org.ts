@@ -43,6 +43,26 @@ export async function getActiveOrgId(): Promise<string | null> {
   return myOrgs[0].id;
 }
 
+/** v1: every user needs an org to use the dashboard, but signup doesn't create
+ *  one. Called when a signed-in user has no memberships: creates their personal
+ *  org with them as Org Admin. Deterministic ids + onConflictDoNothing make it
+ *  idempotent under concurrent renders. */
+export async function ensurePersonalOrg() {
+  const user = await getSessionUser();
+  const suffix = user.id.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12).toLowerCase();
+  const orgId = `org_p_${suffix}`;
+  const first = user.name?.trim().split(/\s+/)[0] || "Personal";
+  await db
+    .insert(s.orgs)
+    .values({ id: orgId, name: `${first}'s Org`, slug: `personal-${suffix}`, plan: "free" })
+    .onConflictDoNothing();
+  await db
+    .insert(s.memberships)
+    .values({ id: `mem_p_${suffix}`, orgId, userId: user.id, role: "Org Admin" })
+    .onConflictDoNothing();
+  return orgId;
+}
+
 /** Assert the session user belongs to `orgId`; returns their role. Throws otherwise. */
 export async function requireMembership(orgId: string) {
   const user = await getSessionUser();

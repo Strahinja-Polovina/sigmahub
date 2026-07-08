@@ -3,7 +3,16 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowUpRight, FolderX, Layers, Loader2, Server as ServerIcon, Trash2 } from "lucide-react";
+import {
+  ArrowUpRight,
+  FolderX,
+  Layers,
+  Link2,
+  Loader2,
+  Server as ServerIcon,
+  Trash2,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -42,12 +51,30 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type { EnvPanel } from "@/server/queries";
-import { deleteEnvironment } from "@/server/actions/projects";
+import {
+  attachServerToEnv,
+  deleteEnvironment,
+  detachServerFromEnv,
+} from "@/server/actions/projects";
 import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared";
 import { NewEnvironmentDialog } from "./new-environment-dialog";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
+export type OrgServer = {
+  id: string;
+  name: string;
+  type: string;
+  region: string;
+  status: string;
+};
 
 const DEPLOY_META: Record<string, { label: string; text: string; dot: string }> = {
   running: { label: "Running", text: "text-blue-700", dot: "bg-blue-500" },
@@ -69,19 +96,89 @@ function DeployStatusChip({ status }: { status: string }) {
   );
 }
 
-function AttachedServers({ servers }: { servers: EnvPanel["servers"] }) {
+function AttachedServers({
+  environmentId,
+  servers,
+  orgServers,
+}: {
+  environmentId: string;
+  servers: EnvPanel["servers"];
+  orgServers: OrgServer[];
+}) {
+  const [pending, startTransition] = React.useTransition();
+  const attached = new Set(servers.map((sv) => sv.id));
+  const available = orgServers.filter((sv) => !attached.has(sv.id));
+
+  function attach(sv: OrgServer) {
+    startTransition(async () => {
+      try {
+        await attachServerToEnv({ environmentId, serverId: sv.id });
+        toast.success(`${sv.name} attached`);
+      } catch (err) {
+        toast.error("Couldn’t attach server", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
+
+  function detach(serverId: string, name: string) {
+    startTransition(async () => {
+      try {
+        await detachServerFromEnv({ environmentId, serverId });
+        toast.success(`${name} detached`);
+      } catch (err) {
+        toast.error("Couldn’t detach server", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
+
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <ServerIcon className="size-4 text-muted-foreground" />
-          Attached servers
-        </CardTitle>
-        <CardDescription>Servers backing resources in this environment.</CardDescription>
+      <CardHeader className="flex-row items-start justify-between gap-2">
+        <div className="grid gap-1">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <ServerIcon className="size-4 text-muted-foreground" />
+            Attached servers
+          </CardTitle>
+          <CardDescription>Servers backing resources in this environment.</CardDescription>
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button variant="outline" size="sm" className="gap-1.5" disabled={pending}>
+                {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Link2 className="size-3.5" />}
+                Attach
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="end" className="w-56">
+            <DropdownMenuLabel className="text-xs">Connected servers</DropdownMenuLabel>
+            {available.length === 0 ? (
+              <DropdownMenuItem disabled>
+                {orgServers.length === 0
+                  ? "No servers connected yet"
+                  : "All servers already attached"}
+              </DropdownMenuItem>
+            ) : (
+              available.map((sv) => (
+                <DropdownMenuItem key={sv.id} className="gap-2" onClick={() => attach(sv)}>
+                  <StatusDot status={sv.status as Status} />
+                  <span className="flex-1 truncate">{sv.name}</span>
+                  <ServerTypeBadge type={sv.type as ServerType} />
+                </DropdownMenuItem>
+              ))
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </CardHeader>
       <CardContent>
         {servers.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No servers attached yet.</p>
+          <p className="text-sm text-muted-foreground">
+            No servers attached yet. Attach a connected server to deploy here.
+          </p>
         ) : (
           <ul className="flex flex-col divide-y divide-border">
             {servers.map((server) => (
@@ -92,7 +189,18 @@ function AttachedServers({ servers }: { servers: EnvPanel["servers"] }) {
                 <StatusDot status={server.status as Status} />
                 <span className="font-medium text-foreground">{server.name}</span>
                 <ServerTypeBadge type={server.type as ServerType} />
-                <span className="ml-auto text-xs text-muted-foreground">{server.region}</span>
+                <span className="ml-auto inline-flex items-center gap-1">
+                  <span className="text-xs text-muted-foreground">{server.region}</span>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Detach ${server.name}`}
+                    disabled={pending}
+                    onClick={() => detach(server.id, server.name)}
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                </span>
               </li>
             ))}
           </ul>
@@ -263,14 +371,24 @@ function DeleteEnvironmentButton({
   );
 }
 
-function EnvironmentPanel({ panel }: { panel: EnvPanel }) {
+function EnvironmentPanel({
+  panel,
+  orgServers,
+}: {
+  panel: EnvPanel;
+  orgServers: OrgServer[];
+}) {
   return (
     <div className="flex flex-col gap-4 pt-4">
       <div className="flex items-center justify-end">
         <DeleteEnvironmentButton environmentId={panel.env.id} name={panel.env.name} />
       </div>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        <AttachedServers servers={panel.servers} />
+        <AttachedServers
+          environmentId={panel.env.id}
+          servers={panel.servers}
+          orgServers={orgServers}
+        />
         <ResourcesSummary resources={panel.resources} />
         <RecentDeploys resources={panel.resources} />
       </div>
@@ -309,9 +427,11 @@ function NotFound() {
 export function ProjectDetailView({
   project,
   panels,
+  orgServers,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
+  orgServers: OrgServer[];
 }) {
   if (!project) return <NotFound />;
 
@@ -385,7 +505,7 @@ export function ProjectDetailView({
           </TabsList>
           {panels.map((panel) => (
             <TabsContent key={panel.env.id} value={panel.env.id}>
-              <EnvironmentPanel panel={panel} />
+              <EnvironmentPanel panel={panel} orgServers={orgServers} />
             </TabsContent>
           ))}
         </Tabs>

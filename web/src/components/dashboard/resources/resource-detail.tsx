@@ -42,7 +42,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
-import { getMetrics, getLogs } from "@/lib/mock";
+import { getMetrics, getLogs } from "@/lib/sample-telemetry";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import {
   advanceDeployment,

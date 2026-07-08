@@ -21,13 +21,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
-import {
-  getProjects,
-  getEnvironments,
-  getServers,
-  getResourcesByProject,
-} from "@/lib/mock";
-import { useActiveOrg } from "@/components/dashboard/org-context";
+import type { CommandIndex } from "@/server/queries";
 
 const NAV_ITEMS: { label: string; href: string; icon: React.ElementType }[] = [
   { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
@@ -41,23 +35,14 @@ const NAV_ITEMS: { label: string; href: string; icon: React.ElementType }[] = [
 export function CommandMenu({
   open,
   onOpenChange,
+  index,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  index: CommandIndex;
 }) {
   const router = useRouter();
-  const { orgId } = useActiveOrg();
-
-  const projects = React.useMemo(() => getProjects(orgId), [orgId]);
-  const servers = React.useMemo(() => getServers(orgId), [orgId]);
-  const environments = React.useMemo(
-    () => projects.flatMap((p) => getEnvironments(p.id).map((e) => ({ env: e, project: p }))),
-    [projects]
-  );
-  const resources = React.useMemo(
-    () => projects.flatMap((p) => getResourcesByProject(p.id).map((r) => ({ res: r, project: p }))),
-    [projects]
-  );
+  const { projects, environments, servers, resources } = index;
 
   const go = React.useCallback(
     (href: string) => {
@@ -73,63 +58,71 @@ export function CommandMenu({
       <CommandList>
         <CommandEmpty>No results found.</CommandEmpty>
 
-        <CommandGroup heading="Projects">
-          {projects.map((p) => (
-            <CommandItem
-              key={p.id}
-              value={`project ${p.name} ${p.slug}`}
-              onSelect={() => go("/dashboard/projects")}
-            >
-              <FolderKanban />
-              <span>{p.name}</span>
-              <span className="ml-auto text-xs text-muted-foreground">Project</span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {projects.length > 0 && (
+          <CommandGroup heading="Projects">
+            {projects.map((p) => (
+              <CommandItem
+                key={p.id}
+                value={`project ${p.name} ${p.slug}`}
+                onSelect={() => go(`/dashboard/projects/${p.id}`)}
+              >
+                <FolderKanban />
+                <span>{p.name}</span>
+                <span className="ml-auto text-xs text-muted-foreground">Project</span>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
 
-        <CommandGroup heading="Environments">
-          {environments.map(({ env, project }) => (
-            <CommandItem
-              key={env.id}
-              value={`environment ${project.name} ${env.name}`}
-              onSelect={() => go("/dashboard/projects")}
-            >
-              <Layers />
-              <span>
-                {project.name}
-                <span className="text-muted-foreground"> / {env.name}</span>
-              </span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {environments.length > 0 && (
+          <CommandGroup heading="Environments">
+            {environments.map((e) => (
+              <CommandItem
+                key={e.id}
+                value={`environment ${e.projectName} ${e.name}`}
+                onSelect={() => go(`/dashboard/projects/${e.projectId}/environments/${e.id}`)}
+              >
+                <Layers />
+                <span>
+                  {e.projectName}
+                  <span className="text-muted-foreground"> / {e.name}</span>
+                </span>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
 
-        <CommandGroup heading="Servers">
-          {servers.map((s) => (
-            <CommandItem
-              key={s.id}
-              value={`server ${s.name} ${s.type} ${s.region}`}
-              onSelect={() => go("/dashboard/servers")}
-            >
-              <Server />
-              <span>{s.name}</span>
-              <span className="ml-auto text-xs text-muted-foreground">{s.type}</span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {servers.length > 0 && (
+          <CommandGroup heading="Servers">
+            {servers.map((sv) => (
+              <CommandItem
+                key={sv.id}
+                value={`server ${sv.name} ${sv.type} ${sv.region}`}
+                onSelect={() => go(`/dashboard/servers/${sv.id}`)}
+              >
+                <Server />
+                <span>{sv.name}</span>
+                <span className="ml-auto text-xs text-muted-foreground">{sv.type}</span>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
 
-        <CommandGroup heading="Resources">
-          {resources.map(({ res, project }) => (
-            <CommandItem
-              key={res.id}
-              value={`resource ${res.name} ${res.kind} ${project.name}`}
-              onSelect={() => go("/dashboard/resources")}
-            >
-              <Boxes />
-              <span>{res.name}</span>
-              <span className="ml-auto text-xs text-muted-foreground">{res.kind}</span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {resources.length > 0 && (
+          <CommandGroup heading="Resources">
+            {resources.map((r) => (
+              <CommandItem
+                key={r.id}
+                value={`resource ${r.name} ${r.kind} ${r.projectName}`}
+                onSelect={() => go(`/dashboard/resources/${r.id}`)}
+              >
+                <Boxes />
+                <span>{r.name}</span>
+                <span className="ml-auto text-xs text-muted-foreground">{r.kind}</span>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
 
         <CommandSeparator />
 

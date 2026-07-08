@@ -64,6 +64,69 @@ export async function getMembers(orgId: string) {
     .innerJoin(user, eq(s.memberships.userId, user.id))
     .where(eq(s.memberships.orgId, orgId));
 }
+
+/** Server count per org, for the org switcher (id → count). */
+export async function getServerCounts(
+  orgIds: string[]
+): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  for (const id of orgIds) counts[id] = 0;
+  if (orgIds.length === 0) return counts;
+  const rows = await db
+    .select({ orgId: s.servers.orgId })
+    .from(s.servers)
+    .where(inArray(s.servers.orgId, orgIds));
+  for (const r of rows) counts[r.orgId] = (counts[r.orgId] ?? 0) + 1;
+  return counts;
+}
+
+export type CommandIndex = {
+  projects: { id: string; name: string; slug: string }[];
+  environments: { id: string; name: string; projectId: string; projectName: string }[];
+  servers: { id: string; name: string; type: string; region: string }[];
+  resources: { id: string; name: string; kind: string; projectName: string }[];
+};
+
+/** Flat, org-scoped search index that powers the ⌘K command menu. */
+export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
+  const [projects, environments, servers, resources] = await Promise.all([
+    db
+      .select({ id: s.projects.id, name: s.projects.name, slug: s.projects.slug })
+      .from(s.projects)
+      .where(eq(s.projects.orgId, orgId)),
+    db
+      .select({
+        id: s.environments.id,
+        name: s.environments.name,
+        projectId: s.environments.projectId,
+        projectName: s.projects.name,
+      })
+      .from(s.environments)
+      .innerJoin(s.projects, eq(s.environments.projectId, s.projects.id))
+      .where(eq(s.projects.orgId, orgId)),
+    db
+      .select({
+        id: s.servers.id,
+        name: s.servers.name,
+        type: s.servers.type,
+        region: s.servers.region,
+      })
+      .from(s.servers)
+      .where(eq(s.servers.orgId, orgId)),
+    db
+      .select({
+        id: s.resources.id,
+        name: s.resources.name,
+        kind: s.resources.kind,
+        projectName: s.projects.name,
+      })
+      .from(s.resources)
+      .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
+      .where(eq(s.projects.orgId, orgId)),
+  ]);
+  return { projects, environments, servers, resources };
+}
+
 export async function getDeployments(resourceId: string) {
   return db
     .select()

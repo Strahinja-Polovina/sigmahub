@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
@@ -95,6 +95,98 @@ export async function createEnvironment(input: {
   await writeAudit({ orgId: project.orgId, actor: user.name, action: "Created environment", target: `${project.name} / ${name}` });
   revalidatePath("/dashboard", "layout");
   return { id };
+}
+
+/** Resolve an environment to its project + assert the caller's membership.
+ *  Shared by the attach/detach actions below. */
+async function requireEnvMembership(environmentId: string) {
+  const [env] = await db
+    .select()
+    .from(s.environments)
+    .where(eq(s.environments.id, environmentId));
+  if (!env) throw new Error("Environment not found.");
+  const project = await getProject(env.projectId);
+  if (!project) throw new Error("Project not found.");
+  const { user } = await requireMembership(project.orgId);
+  return { env, project, user };
+}
+
+/** Attach an org server to an environment so deploys can target it. */
+export async function attachServerToEnv(input: {
+  environmentId: string;
+  serverId: string;
+}) {
+  const { env, project, user } = await requireEnvMembership(input.environmentId);
+  // The server must belong to the same org (don't trust the client id — IDOR).
+  const [sv] = await db
+    .select({ orgId: s.servers.orgId, name: s.servers.name })
+    .from(s.servers)
+    .where(eq(s.servers.id, input.serverId));
+  if (!sv || sv.orgId !== project.orgId) {
+    throw new Error("Server does not belong to this organization.");
+  }
+  await db
+    .insert(s.envServers)
+    .values({ environmentId: input.environmentId, serverId: input.serverId })
+    .onConflictDoNothing();
+  await writeAudit({
+    orgId: project.orgId,
+    actor: user.name,
+    action: "Attached server",
+    target: `${sv.name} → ${project.name} / ${env.name}`,
+  });
+  revalidatePath("/dashboard", "layout");
+}
+
+export async function detachServerFromEnv(input: {
+  environmentId: string;
+  serverId: string;
+}) {
+  const { env, project, user } = await requireEnvMembership(input.environmentId);
+  // Same ownership rule as attach: never resolve another org's server (IDOR /
+  // cross-org name disclosure via the audit log).
+  const [sv] = await db
+    .select({ orgId: s.servers.orgId, name: s.servers.name })
+    .from(s.servers)
+    .where(eq(s.servers.id, input.serverId));
+  if (!sv || sv.orgId !== project.orgId) {
+    throw new Error("Server does not belong to this organization.");
+  }
+  // Don't silently orphan workloads: resources in this environment still
+  // running on the server keep their serverId, so block until they're gone.
+  const hosted = await db
+    .select({ id: s.resources.id })
+    .from(s.resources)
+    .where(
+      and(
+        eq(s.resources.environmentId, input.environmentId),
+        eq(s.resources.serverId, input.serverId)
+      )
+    );
+  if (hosted.length > 0) {
+    throw new Error(
+      `${hosted.length} resource${hosted.length === 1 ? "" : "s"} in this environment still run${hosted.length === 1 ? "s" : ""} on this server. Delete or redeploy them first.`
+    );
+  }
+  const deleted = await db
+    .delete(s.envServers)
+    .where(
+      and(
+        eq(s.envServers.environmentId, input.environmentId),
+        eq(s.envServers.serverId, input.serverId)
+      )
+    )
+    .returning({ serverId: s.envServers.serverId });
+  // No row deleted → nothing happened; don't fabricate an audit event.
+  if (deleted.length > 0) {
+    await writeAudit({
+      orgId: project.orgId,
+      actor: user.name,
+      action: "Detached server",
+      target: `${sv.name} ← ${project.name} / ${env.name}`,
+    });
+  }
+  revalidatePath("/dashboard", "layout");
 }
 
 export async function deleteEnvironment(input: { environmentId: string }) {

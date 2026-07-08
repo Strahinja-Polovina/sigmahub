@@ -9,7 +9,7 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
-import { getMetrics } from "@/lib/mock";
+import { getMetrics } from "@/lib/sample-telemetry";
 
 const chartConfig = {
   cpu: { label: "CPU %", color: "var(--chart-1)" },

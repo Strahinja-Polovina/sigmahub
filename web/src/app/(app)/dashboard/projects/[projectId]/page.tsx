@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getActiveOrgId } from "@/server/active-org";
-import { getEnvironmentPanels, getProject } from "@/server/queries";
+import { getEnvironmentPanels, getProject, getServers } from "@/server/queries";
 import { ProjectDetailView } from "@/components/dashboard/projects/project-detail-view";
 
 export default async function ProjectDetailPage({
@@ -15,9 +15,21 @@ export default async function ProjectDetailPage({
   const project = await getProject(projectId);
   // Guard: missing project, or one that belongs to a different org.
   if (!project || project.orgId !== orgId) {
-    return <ProjectDetailView project={null} panels={[]} />;
+    return <ProjectDetailView project={null} panels={[]} orgServers={[]} />;
   }
 
-  const panels = await getEnvironmentPanels(projectId);
-  return <ProjectDetailView project={project} panels={panels} />;
+  const [panels, servers] = await Promise.all([
+    getEnvironmentPanels(projectId),
+    getServers(orgId),
+  ]);
+  const orgServers = servers.map((sv) => ({
+    id: sv.id,
+    name: sv.name,
+    type: sv.type,
+    region: sv.region,
+    status: sv.status,
+  }));
+  return (
+    <ProjectDetailView project={project} panels={panels} orgServers={orgServers} />
+  );
 }
