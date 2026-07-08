@@ -52,7 +52,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.New(log, st.Pool).Handler(),
+		Handler:           api.New(log, st, st, cfg.ServiceToken).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

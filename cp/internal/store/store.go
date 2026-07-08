@@ -33,6 +33,8 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (s *Store) Close() { s.Pool.Close() }
 
+func (s *Store) Ping(ctx context.Context) error { return s.Pool.Ping(ctx) }
+
 // Migrate applies embedded migrations in filename order. Each migration runs
 // in a transaction and is recorded in schema_migrations, so re-running on
 // boot is idempotent.
