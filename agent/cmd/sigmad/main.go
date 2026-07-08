@@ -17,6 +17,7 @@ import (
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 )
 
@@ -90,9 +91,16 @@ func run() error {
 	backoff := *interval
 	for {
 		f, _ := json.Marshal(facts.Collect())
+		sample := metrics.Collect(ctx)
 		err := c.Heartbeat(ctx, st.AgentToken, client.HeartbeatRequest{
 			AgentVersion: version,
 			Facts:        f,
+			Metrics: &client.MetricSample{
+				CPUPct:  sample.CPUPct,
+				MemPct:  sample.MemPct,
+				DiskPct: sample.DiskPct,
+				Load1:   sample.Load1,
+			},
 		})
 		var apiErr *client.APIError
 		switch {

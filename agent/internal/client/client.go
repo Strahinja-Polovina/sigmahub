@@ -35,9 +35,17 @@ type RegisterResponse struct {
 	AgentToken string `json:"agentToken"`
 }
 
+type MetricSample struct {
+	CPUPct  float64 `json:"cpuPct"`
+	MemPct  float64 `json:"memPct"`
+	DiskPct float64 `json:"diskPct"`
+	Load1   float64 `json:"load1"`
+}
+
 type HeartbeatRequest struct {
 	AgentVersion string          `json:"agentVersion"`
 	Facts        json.RawMessage `json:"facts"`
+	Metrics      *MetricSample   `json:"metrics,omitempty"`
 }
 
 // apiError distinguishes definitive rejections (4xx: bad/used token, revoked

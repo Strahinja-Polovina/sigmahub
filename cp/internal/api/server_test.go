@@ -21,6 +21,7 @@ func (f fakePinger) Ping(context.Context) error { return f.err }
 type fakeStore struct {
 	registerErr error
 	servers     []store.Server
+	metrics     []store.MetricPoint
 }
 
 func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, provider, region, createdBy string, ttl time.Duration) (string, time.Time, error) {
@@ -41,8 +42,12 @@ func (f *fakeStore) ServerByAgentToken(context.Context, string) (store.Server, e
 	return store.Server{}, store.ErrNotFound
 }
 
-func (f *fakeStore) RecordHeartbeat(context.Context, string, string, json.RawMessage) error {
+func (f *fakeStore) RecordHeartbeat(context.Context, string, store.HeartbeatInput) error {
 	return nil
+}
+
+func (f *fakeStore) MetricsSince(context.Context, string, string, time.Time) ([]store.MetricPoint, error) {
+	return f.metrics, nil
 }
 
 func (f *fakeStore) ListServers(context.Context, string) ([]store.Server, error) {

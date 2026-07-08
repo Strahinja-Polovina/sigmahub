@@ -14,6 +14,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
 )
 
 func main() {
@@ -49,6 +50,14 @@ func run() error {
 	if err := st.Migrate(ctx, log); err != nil {
 		return err
 	}
+
+	// Background maintenance: flip silent servers to unreachable, prune old
+	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
+	go sweeper.Run(ctx, log, st, sweeper.Config{
+		Interval:   30 * time.Second,
+		StaleAfter: 90 * time.Second,
+		Retention:  24 * time.Hour,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

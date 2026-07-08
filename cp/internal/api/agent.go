@@ -43,8 +43,9 @@ func serverFrom(r *http.Request) store.Server {
 }
 
 type heartbeatRequest struct {
-	AgentVersion string          `json:"agentVersion"`
-	Facts        json.RawMessage `json:"facts"`
+	AgentVersion string              `json:"agentVersion"`
+	Facts        json.RawMessage     `json:"facts"`
+	Metrics      *store.MetricSample `json:"metrics"`
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +55,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	srv := serverFrom(r)
-	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, req.AgentVersion, req.Facts); err != nil {
+	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, store.HeartbeatInput{
+		AgentVersion: req.AgentVersion,
+		Facts:        req.Facts,
+		Metrics:      req.Metrics,
+	}); err != nil {
 		s.log.Error("heartbeat", "err", err, "server", srv.ID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return

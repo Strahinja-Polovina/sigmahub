@@ -22,7 +22,8 @@ type StoreAPI interface {
 	IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (string, time.Time, error)
 	RegisterServer(ctx context.Context, bootstrapToken, name, agentVersion string, facts json.RawMessage, pubkey string) (store.RegisterResult, error)
 	ServerByAgentToken(ctx context.Context, token string) (store.Server, error)
-	RecordHeartbeat(ctx context.Context, serverID, agentVersion string, facts json.RawMessage) error
+	RecordHeartbeat(ctx context.Context, serverID string, in store.HeartbeatInput) error
+	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 }
@@ -48,6 +49,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(s.handleIssueBootstrapToken))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(s.handleGetServer))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(s.handleGetMetrics))
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))
