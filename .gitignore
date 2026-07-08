@@ -25,3 +25,7 @@ out/
 Thumbs.db
 *.log
 .codex/
+
+# Go build artifacts
+cp/bin/
+agent/bin/

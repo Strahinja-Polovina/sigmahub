@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sigmahub-cp-pg
+    environment:
+      POSTGRES_USER: sigmahub
+      POSTGRES_PASSWORD: sigmahub
+      POSTGRES_DB: sigmahub_cp
+    ports:
+      - "5433:5432"
+    volumes:
+      - cp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sigmahub -d sigmahub_cp"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  cp_pgdata:
