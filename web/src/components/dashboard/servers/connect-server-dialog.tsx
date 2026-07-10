@@ -78,10 +78,12 @@ function TrustNote() {
 export function ConnectServerDialog({
   orgId,
   orgSlug,
+  cpMode,
   trigger,
 }: {
   orgId: string;
   orgSlug: string;
+  cpMode?: boolean;
   trigger?: React.ReactNode;
 }) {
   const [open, setOpen] = React.useState(false);
@@ -91,6 +93,8 @@ export function ConnectServerDialog({
   const [provider, setProvider] = React.useState("");
   const [region, setRegion] = React.useState("");
   const [vpn, setVpn] = React.useState(false);
+  // CP mode: the real one-time bootstrap command, shown after issuance.
+  const [issued, setIssued] = React.useState<{ command: string; expiresAt: string } | null>(null);
   const [pending, startTransition] = React.useTransition();
 
   function reset() {
@@ -100,6 +104,7 @@ export function ConnectServerDialog({
     setProvider("");
     setRegion("");
     setVpn(false);
+    setIssued(null);
   }
 
   function connect() {
@@ -107,7 +112,7 @@ export function ConnectServerDialog({
     if (!n) return;
     startTransition(async () => {
       try {
-        const { bootstrapToken } = await connectServer({
+        const res = await connectServer({
           orgId,
           name: n,
           type,
@@ -115,8 +120,17 @@ export function ConnectServerDialog({
           region,
           byoVpn: vpn,
         });
+        if (res.mode === "cp") {
+          // Keep the dialog open: the token inside the command is shown
+          // exactly once and has to be copied to the host.
+          setIssued({ command: res.command, expiresAt: res.expiresAt });
+          toast.success(`Bootstrap token issued for ${n}`, {
+            description: "Run the command on the host; the server appears once sigmad registers.",
+          });
+          return;
+        }
         toast.success(`${n} registered — provisioning`, {
-          description: `Bootstrap token ${bootstrapToken}. Run the command on the host, or simulate the agent check-in from the list.`,
+          description: `Bootstrap token ${res.bootstrapToken}. Run the command on the host, or simulate the agent check-in from the list.`,
         });
         setOpen(false);
         reset();
@@ -226,10 +240,30 @@ export function ConnectServerDialog({
             </div>
 
             <div className="flex flex-col gap-2">
-              <Label className="text-xs text-muted-foreground">
-                Run this on the server you want to connect
-              </Label>
-              <CopyField value={bootstrapCommand(orgSlug)} ariaLabel="Copy bootstrap command" />
+              {cpMode ? (
+                issued ? (
+                  <>
+                    <Label className="text-xs text-muted-foreground">
+                      Run this on the server you want to connect — the token is
+                      shown once and expires at{" "}
+                      {new Date(issued.expiresAt).toLocaleTimeString()}
+                    </Label>
+                    <CopyField value={issued.command} ariaLabel="Copy bootstrap command" />
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    A one-time bootstrap command is generated when you press
+                    “Connect server”.
+                  </p>
+                )
+              ) : (
+                <>
+                  <Label className="text-xs text-muted-foreground">
+                    Run this on the server you want to connect
+                  </Label>
+                  <CopyField value={bootstrapCommand(orgSlug)} ariaLabel="Copy bootstrap command" />
+                </>
+              )}
             </div>
 
             <Separator />
@@ -275,9 +309,12 @@ export function ConnectServerDialog({
 
         <DialogFooter>
           <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
-            Cancel
+            {issued ? "Done" : "Cancel"}
           </DialogClose>
-          <Button onClick={connect} disabled={tab !== "ssh" || !name.trim() || pending}>
+          <Button
+            onClick={connect}
+            disabled={tab !== "ssh" || !name.trim() || pending || Boolean(issued)}
+          >
             {pending && <Loader2 className="size-4 animate-spin" />}
             Connect server
           </Button>

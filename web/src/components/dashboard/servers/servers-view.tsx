@@ -68,7 +68,7 @@ export function CheckInButton({ serverId }: { serverId: string }) {
   );
 }
 
-function ServerRow({ server }: { server: ServerWithCount }) {
+function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boolean }) {
   return (
     <TableRow>
       <TableCell className="pl-4">
@@ -89,7 +89,10 @@ function ServerRow({ server }: { server: ServerWithCount }) {
       <TableCell>
         <div className="flex items-center gap-2">
           <StatusBadge status={server.status as Status} />
-          {server.status === "provisioning" && <CheckInButton serverId={server.id} />}
+          {/* CP mode: the real sigmad checks in — nothing to simulate. */}
+          {!cpMode && server.status === "provisioning" && (
+            <CheckInButton serverId={server.id} />
+          )}
         </div>
       </TableCell>
       <TableCell className="font-mono text-xs text-muted-foreground tabular-nums">
@@ -120,11 +123,13 @@ export function ServersView({
   orgName,
   orgSlug,
   servers,
+  cpMode,
 }: {
   orgId: string;
   orgName: string;
   orgSlug: string;
   servers: ServerWithCount[];
+  cpMode?: boolean;
 }) {
   const [filter, setFilter] = React.useState<Filter>("all");
 
@@ -154,7 +159,7 @@ export function ServersView({
             billing meter.
           </p>
         </div>
-        <ConnectServerDialog orgId={orgId} orgSlug={orgSlug} />
+        <ConnectServerDialog orgId={orgId} orgSlug={orgSlug} cpMode={cpMode} />
       </div>
 
       <Card>
@@ -209,7 +214,7 @@ export function ServersView({
                 </TableHeader>
                 <TableBody>
                   {filtered.map((sv) => (
-                    <ServerRow key={sv.id} server={sv} />
+                    <ServerRow key={sv.id} server={sv} cpMode={cpMode} />
                   ))}
                 </TableBody>
               </Table>
