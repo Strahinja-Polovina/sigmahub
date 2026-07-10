@@ -17,6 +17,7 @@ import (
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 )
@@ -45,6 +46,7 @@ func run() error {
 		dataDir   = flag.String("data-dir", envOr("SIGMAD_DATA_DIR", defaultDataDir()), "directory for persisted identity")
 		interval  = flag.Duration("interval", 30*time.Second, "heartbeat interval")
 		name      = flag.String("name", "", "server display name (defaults to hostname)")
+		wgUp      = flag.Bool("wg-up", false, "apply the rendered WireGuard config via wg-quick (Linux only; default renders config only)")
 	)
 	flag.Parse()
 
@@ -53,6 +55,13 @@ func run() error {
 	defer stop()
 
 	c := client.New(*endpoint)
+
+	// Mesh identity exists before registration so the pubkey rides along on
+	// the very first request. The private key never leaves the data dir.
+	meshPriv, meshPub, err := mesh.LoadOrCreateKey(*dataDir)
+	if err != nil {
+		return err
+	}
 
 	st, ok, err := state.Load(*dataDir)
 	if err != nil {
@@ -72,6 +81,7 @@ func run() error {
 			Name:           hostname,
 			AgentVersion:   version,
 			Facts:          f,
+			Pubkey:         meshPub,
 		})
 		if err != nil {
 			return err
@@ -95,6 +105,7 @@ func run() error {
 		err := c.Heartbeat(ctx, st.AgentToken, client.HeartbeatRequest{
 			AgentVersion: version,
 			Facts:        f,
+			Pubkey:       meshPub,
 			Metrics: &client.MetricSample{
 				CPUPct:  sample.CPUPct,
 				MemPct:  sample.MemPct,
@@ -107,6 +118,7 @@ func run() error {
 		case err == nil:
 			backoff = *interval
 			log.Info("heartbeat ok", "server_id", st.ServerID)
+			syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp)
 		case errors.As(err, &apiErr) && apiErr.Permanent():
 			return err
 		case ctx.Err() != nil:
@@ -125,6 +137,32 @@ func run() error {
 			log.Info("shutting down")
 			return nil
 		case <-time.After(backoff + jitter):
+		}
+	}
+}
+
+// syncMesh refreshes the WireGuard peer config after a successful heartbeat.
+// Mesh trouble never fails the heartbeat loop — the coordination plane is
+// best-effort in v0.
+func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToken, dataDir, meshPriv string, wgUp bool) {
+	res, err := c.MeshPeers(ctx, agentToken)
+	if err != nil {
+		log.Warn("mesh: peer fetch failed", "err", err)
+		return
+	}
+	if res.Self.MeshIP == nil || *res.Self.MeshIP == "" {
+		log.Warn("mesh: no mesh IP allocated yet")
+		return
+	}
+	path, changed, err := mesh.WriteConfig(dataDir, mesh.RenderConfig(meshPriv, *res.Self.MeshIP, res.Peers))
+	if err != nil {
+		log.Warn("mesh: config write failed", "err", err)
+		return
+	}
+	if changed {
+		log.Info("mesh: peer config updated", "config", path, "peers", len(res.Peers), "mesh_ip", *res.Self.MeshIP)
+		if wgUp {
+			mesh.Apply(ctx, log, path)
 		}
 	}
 }

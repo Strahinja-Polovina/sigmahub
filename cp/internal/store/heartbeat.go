@@ -28,6 +28,7 @@ type MetricPoint struct {
 type HeartbeatInput struct {
 	AgentVersion string
 	Facts        json.RawMessage
+	Pubkey       string
 	Metrics      *MetricSample
 }
 
@@ -52,11 +53,12 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 		   SET last_seen_at = now(),
 		       agent_version = COALESCE(NULLIF($2, ''), s.agent_version),
 		       facts = $3,
+		       pubkey = COALESCE(NULLIF($4, ''), s.pubkey),
 		       status = CASE WHEN s.status IN ('provisioning', 'unreachable') THEN 'running' ELSE s.status END
 		  FROM servers old
 		 WHERE s.id = $1 AND old.id = s.id
 		 RETURNING s.org_id, s.name, old.status, s.status`,
-		serverID, in.AgentVersion, facts).Scan(&orgID, &name, &prevStatus, &status)
+		serverID, in.AgentVersion, facts, in.Pubkey).Scan(&orgID, &name, &prevStatus, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}

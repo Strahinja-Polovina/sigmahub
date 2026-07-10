@@ -45,6 +45,7 @@ func serverFrom(r *http.Request) store.Server {
 type heartbeatRequest struct {
 	AgentVersion string              `json:"agentVersion"`
 	Facts        json.RawMessage     `json:"facts"`
+	Pubkey       string              `json:"pubkey"`
 	Metrics      *store.MetricSample `json:"metrics"`
 }
 
@@ -58,6 +59,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, store.HeartbeatInput{
 		AgentVersion: req.AgentVersion,
 		Facts:        req.Facts,
+		Pubkey:       req.Pubkey,
 		Metrics:      req.Metrics,
 	}); err != nil {
 		s.log.Error("heartbeat", "err", err, "server", srv.ID)
@@ -65,4 +67,25 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleMeshPeers returns the requesting agent's own mesh identity plus its
+// same-org peers. Org isolation falls out of the query: peers are looked up
+// by the authenticated server's org, never by caller-supplied input.
+func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	peers, err := s.store.MeshPeers(r.Context(), srv.OrgID, srv.ID)
+	if err != nil {
+		s.log.Error("mesh peers", "err", err, "server", srv.ID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"self": map[string]any{
+			"serverId": srv.ID,
+			"meshIp":   srv.MeshIP,
+			"pubkey":   srv.Pubkey,
+		},
+		"peers": peers,
+	})
 }

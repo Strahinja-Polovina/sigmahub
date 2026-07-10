@@ -55,6 +55,10 @@ func (f *fakeStore) RecordHeartbeat(context.Context, string, store.HeartbeatInpu
 	return nil
 }
 
+func (f *fakeStore) MeshPeers(context.Context, string, string) ([]store.MeshPeer, error) {
+	return []store.MeshPeer{}, nil
+}
+
 func (f *fakeStore) MetricsSince(context.Context, string, string, time.Time) ([]store.MetricPoint, error) {
 	return f.metrics, nil
 }

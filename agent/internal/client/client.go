@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 )
 
 type Client struct {
@@ -28,6 +30,7 @@ type RegisterRequest struct {
 	Name           string          `json:"name"`
 	AgentVersion   string          `json:"agentVersion"`
 	Facts          json.RawMessage `json:"facts"`
+	Pubkey         string          `json:"pubkey"`
 }
 
 type RegisterResponse struct {
@@ -45,7 +48,20 @@ type MetricSample struct {
 type HeartbeatRequest struct {
 	AgentVersion string          `json:"agentVersion"`
 	Facts        json.RawMessage `json:"facts"`
+	Pubkey       string          `json:"pubkey"`
 	Metrics      *MetricSample   `json:"metrics,omitempty"`
+}
+
+// MeshSelf is this server's own mesh identity as the control plane sees it.
+type MeshSelf struct {
+	ServerID string  `json:"serverId"`
+	MeshIP   *string `json:"meshIp"`
+	Pubkey   *string `json:"pubkey"`
+}
+
+type MeshPeersResponse struct {
+	Self  MeshSelf    `json:"self"`
+	Peers []mesh.Peer `json:"peers"`
 }
 
 // apiError distinguishes definitive rejections (4xx: bad/used token, revoked
@@ -69,16 +85,33 @@ func (c *Client) Heartbeat(ctx context.Context, agentToken string, req Heartbeat
 	return c.post(ctx, "/v1/agent/heartbeat", agentToken, req, nil)
 }
 
+// MeshPeers fetches this agent's mesh identity and same-org peer list.
+func (c *Client) MeshPeers(ctx context.Context, agentToken string) (MeshPeersResponse, error) {
+	var res MeshPeersResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/mesh/peers", agentToken, nil, &res)
+	return res, err
+}
+
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {
-	buf, err := json.Marshal(body)
+	return c.do(ctx, http.MethodPost, path, bearer, body, out)
+}
+
+func (c *Client) do(ctx context.Context, method, path, bearer string, body, out any) error {
+	var payload io.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		payload = bytes.NewReader(buf)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+path, bytes.NewReader(buf))
-	if err != nil {
-		return err
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Content-Type", "application/json")
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
