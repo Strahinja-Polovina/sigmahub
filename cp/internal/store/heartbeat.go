@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // MetricSample is one resource-usage reading from an agent heartbeat.
@@ -31,6 +34,7 @@ type HeartbeatInput struct {
 // RecordHeartbeat updates a server's liveness and appends a metrics sample.
 // First heartbeat (or one after a stale gap) flips provisioning/unreachable →
 // running; the sweeper handles running → unreachable on missed heartbeats.
+// Status flips are audited.
 func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in HeartbeatInput) error {
 	facts := normalizeFacts(in.Facts)
 
@@ -40,19 +44,31 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tag, err := tx.Exec(ctx, `
-		UPDATE servers
+	// The self-join FROM clause exposes the pre-update row, so one statement
+	// both applies the update and reports whether the status flipped.
+	var orgID, name, prevStatus, status string
+	err = tx.QueryRow(ctx, `
+		UPDATE servers s
 		   SET last_seen_at = now(),
-		       agent_version = COALESCE(NULLIF($2, ''), agent_version),
+		       agent_version = COALESCE(NULLIF($2, ''), s.agent_version),
 		       facts = $3,
-		       status = CASE WHEN status IN ('provisioning', 'unreachable') THEN 'running' ELSE status END
-		 WHERE id = $1`,
-		serverID, in.AgentVersion, facts)
+		       status = CASE WHEN s.status IN ('provisioning', 'unreachable') THEN 'running' ELSE s.status END
+		  FROM servers old
+		 WHERE s.id = $1 AND old.id = s.id
+		 RETURNING s.org_id, s.name, old.status, s.status`,
+		serverID, in.AgentVersion, facts).Scan(&orgID, &name, &prevStatus, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("record heartbeat: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	if prevStatus != status {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO cp_audit_log (org_id, actor, action, target)
+			VALUES ($1, 'sigmad', 'Server running', $2)`, orgID, name); err != nil {
+			return fmt.Errorf("audit: %w", err)
+		}
 	}
 
 	if in.Metrics != nil {
@@ -94,15 +110,21 @@ func (s *Store) MetricsSince(ctx context.Context, orgID, serverID string, since 
 }
 
 // MarkStaleUnreachable flips running servers with no heartbeat within the
-// threshold to unreachable. Returns how many changed. The cutoff is computed
-// in SQL (now() - interval) so it stays in the DB clock domain that wrote
-// last_seen_at — CP↔DB clock skew must not make live servers flap.
+// threshold to unreachable, writing one audit row per flipped server. Returns
+// how many changed. The cutoff is computed in SQL (now() - interval) so it
+// stays in the DB clock domain that wrote last_seen_at — CP↔DB clock skew
+// must not make live servers flap.
 func (s *Store) MarkStaleUnreachable(ctx context.Context, threshold time.Duration) (int64, error) {
 	tag, err := s.Pool.Exec(ctx, `
-		UPDATE servers
-		   SET status = 'unreachable'
-		 WHERE status = 'running'
-		   AND (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $1))`,
+		WITH flipped AS (
+			UPDATE servers
+			   SET status = 'unreachable'
+			 WHERE status = 'running'
+			   AND (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $1))
+			 RETURNING org_id, name
+		)
+		INSERT INTO cp_audit_log (org_id, actor, action, target)
+		SELECT org_id, 'sweeper', 'Server unreachable', name FROM flipped`,
 		threshold.Seconds())
 	if err != nil {
 		return 0, err

@@ -22,6 +22,7 @@ type StoreAPI interface {
 	IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (string, time.Time, error)
 	RegisterServer(ctx context.Context, bootstrapToken, name, agentVersion string, facts json.RawMessage, pubkey string) (store.RegisterResult, error)
 	ServerByAgentToken(ctx context.Context, token string) (store.Server, error)
+	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
 	RecordHeartbeat(ctx context.Context, serverID string, in store.HeartbeatInput) error
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
@@ -29,15 +30,17 @@ type StoreAPI interface {
 }
 
 type Server struct {
-	log          *slog.Logger
-	db           Pinger
-	store        StoreAPI
-	serviceToken string
-	mux          *http.ServeMux
+	log             *slog.Logger
+	db              Pinger
+	store           StoreAPI
+	devServiceToken string
+	mux             *http.ServeMux
 }
 
-func New(log *slog.Logger, db Pinger, st StoreAPI, serviceToken string) *Server {
-	s := &Server{log: log, db: db, store: st, serviceToken: serviceToken, mux: http.NewServeMux()}
+// New builds the HTTP surface. devServiceToken is the dev-mode static bypass;
+// pass "" (prod) to require real org-scoped service tokens.
+func New(log *slog.Logger, db Pinger, st StoreAPI, devServiceToken string) *Server {
+	s := &Server{log: log, db: db, store: st, devServiceToken: devServiceToken, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -45,11 +48,12 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, serviceToken string) *Server 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
-	// Dashboard-facing (service token).
-	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(s.handleIssueBootstrapToken))
-	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(s.handleListServers))
-	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(s.handleGetServer))
-	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(s.handleGetMetrics))
+	// Dashboard-facing (org-scoped service tokens): reads need any role,
+	// mutations need at least Project Admin — mirroring the v1 web RBAC.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueBootstrapToken))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))

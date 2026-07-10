@@ -1,11 +1,9 @@
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -30,19 +28,6 @@ type registerRequest struct {
 
 var validServerTypes = map[string]bool{"general": true, "database": true, "storage": true, "gpu": true}
 
-// requireService gates dashboard-facing endpoints with the static service
-// token (placeholder auth until the P0-6 token model lands).
-func (s *Server) requireService(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if tok == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(s.serviceToken)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid service token"})
-			return
-		}
-		next(w, r)
-	}
-}
-
 func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	var req issueTokenRequest
@@ -59,7 +44,7 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	token, expiresAt, err := s.store.IssueBootstrapToken(
-		r.Context(), orgID, req.Name, typ, req.Provider, req.Region, "dashboard", defaultBootstrapTTL)
+		r.Context(), orgID, req.Name, typ, req.Provider, req.Region, principalFrom(r).Name, defaultBootstrapTTL)
 	if err != nil {
 		s.log.Error("issue bootstrap token", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
