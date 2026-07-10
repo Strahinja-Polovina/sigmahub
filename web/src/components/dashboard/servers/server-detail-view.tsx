@@ -48,7 +48,7 @@ import { Separator } from "@/components/ui/separator";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import { disconnectServer } from "@/server/actions/servers";
-import { ServerMetrics } from "./server-metrics";
+import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
 import {
   SERVER_TYPE_LABELS,
@@ -103,7 +103,15 @@ function SpecItem({
   );
 }
 
-function ServerActions({ serverId, serverName }: { serverId: string; serverName: string }) {
+function ServerActions({
+  serverId,
+  serverName,
+  cpMode,
+}: {
+  serverId: string;
+  serverName: string;
+  cpMode?: boolean;
+}) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
 
@@ -152,11 +160,17 @@ function ServerActions({ serverId, serverName }: { serverId: string; serverName:
           <MinusCircle className="size-4 text-muted-foreground" />
           Cordon
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
-          <Unplug className="size-4" />
-          Disconnect
-        </DropdownMenuItem>
+        {/* CP-managed servers are deregistered host-side (stop sigmad); the
+            control plane has no delete endpoint yet. */}
+        {!cpMode && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
+              <Unplug className="size-4" />
+              Disconnect
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -190,9 +204,13 @@ function HostedResourceRow({ resource }: { resource: HostedRow }) {
 export function ServerDetailView({
   server,
   hosted,
+  cpMode,
+  metricsPoints,
 }: {
   server: ServerRowT;
   hosted: HostedRow[];
+  cpMode?: boolean;
+  metricsPoints?: MetricsPoint[];
 }) {
   const provisioning = server.status === "provisioning";
 
@@ -238,8 +256,8 @@ export function ServerDetailView({
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {provisioning && <CheckInButton serverId={server.id} />}
-            <ServerActions serverId={server.id} serverName={server.name} />
+            {!cpMode && provisioning && <CheckInButton serverId={server.id} />}
+            <ServerActions serverId={server.id} serverName={server.name} cpMode={cpMode} />
           </div>
         </div>
       </div>
@@ -263,7 +281,7 @@ export function ServerDetailView({
                 </p>
               </div>
             ) : (
-              <ServerMetrics seedKey={server.id} />
+              <ServerMetrics seedKey={server.id} points={metricsPoints} />
             )}
           </CardContent>
         </Card>

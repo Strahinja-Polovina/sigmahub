@@ -6,6 +6,7 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { writeAudit } from "../audit";
+import { cpEnabled, cpIssueBootstrapToken, cpPublicUrl } from "../cp";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -25,8 +26,23 @@ const SPEC: Record<string, { cpu: number; memGb: number }> = {
   gpu: { cpu: 16, memGb: 128 },
 };
 
-/** Register a BYO host. It lands in `provisioning` until its agent checks in.
- *  Returns a bootstrap token (org-scoped + single-use in the real product). */
+export type ConnectServerResult =
+  | {
+      mode: "cp";
+      /** Full sigmad invocation with the one-time bootstrap token embedded. */
+      command: string;
+      expiresAt: string;
+    }
+  | { mode: "sim"; id: string; bootstrapToken: string };
+
+/** Register a BYO host.
+ *
+ *  CP mode (SIGMAHUB_CP_URL set): asks the control plane for a real one-time
+ *  bootstrap token; the server record appears once the actual sigmad agent
+ *  registers with it.
+ *
+ *  Demo mode: inserts a simulated `provisioning` row that the fake check-in
+ *  button flips to running. */
 export async function connectServer(input: {
   orgId: string;
   name: string;
@@ -34,10 +50,32 @@ export async function connectServer(input: {
   provider: string;
   region: string;
   byoVpn?: boolean;
-}) {
+}): Promise<ConnectServerResult> {
   const { user } = await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Server name is required.");
+
+  if (cpEnabled()) {
+    const { token, expiresAt } = await cpIssueBootstrapToken(input.orgId, {
+      name,
+      type: input.type,
+      provider: input.provider.trim(),
+      region: input.region.trim(),
+    });
+    await writeAudit({
+      orgId: input.orgId,
+      actor: user.name,
+      action: "Issued bootstrap token",
+      target: name,
+    });
+    revalidatePath("/dashboard", "layout");
+    return {
+      mode: "cp",
+      command: `sigmad --endpoint ${cpPublicUrl()} --bootstrap-token ${token} --name ${name}`,
+      expiresAt,
+    };
+  }
+
   const id = rid("srv");
   await db.insert(s.servers).values({
     id,
@@ -56,7 +94,7 @@ export async function connectServer(input: {
   });
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected server", target: name });
   revalidatePath("/dashboard", "layout");
-  return { id, bootstrapToken: `sk_boot_${id.slice(4, 12)}` };
+  return { mode: "sim", id, bootstrapToken: `sk_boot_${id.slice(4, 12)}` };
 }
 
 /** Simulated agent check-in: flips provisioning → running and fills in the

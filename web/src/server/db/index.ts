@@ -9,13 +9,15 @@ import * as authSchema from "./auth-schema";
 
 const DATA_DIR = process.env.PGLITE_DIR ?? ".data/pg";
 
-// Singleton across Next dev HMR / repeated imports. PGlite serializes its own
-// query/transaction access internally (a shared exclusive lock), so concurrent
-// reads from parallel server components are safe on one instance.
+// Singleton across Next dev HMR / repeated imports — and across route chunks
+// in `next start`, where each compiled route would otherwise open its own
+// PGlite over the same data dir and read a stale snapshot of the others'
+// writes. PGlite serializes its own query/transaction access internally (a
+// shared exclusive lock), so concurrent reads from parallel server components
+// are safe on one instance.
 const g = globalThis as unknown as { __sigmaPglite?: PGlite };
 mkdirSync(DATA_DIR, { recursive: true }); // PGlite's own mkdir isn't recursive
-const client = g.__sigmaPglite ?? new PGlite(DATA_DIR);
-if (process.env.NODE_ENV !== "production") g.__sigmaPglite = client;
+const client = (g.__sigmaPglite ??= new PGlite(DATA_DIR));
 
 const fullSchema = { ...schema, ...authSchema };
 export const db = drizzle(client, {
