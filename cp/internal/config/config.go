@@ -13,8 +13,9 @@ type Config struct {
 	DatabaseURL string
 	// Env is "dev" or "prod"; switches log format.
 	Env string
-	// ServiceToken gates dashboard-facing endpoints (placeholder until the
-	// P0-6 token model). Defaults in dev, required in prod.
+	// ServiceToken is the dev-only static bypass for dashboard-facing
+	// endpoints (accepted as a wildcard Org Admin). Forbidden in prod, where
+	// org-scoped tokens are minted via `sigmahub-cp mint-service-token`.
 	ServiceToken string
 }
 
@@ -35,10 +36,12 @@ func FromEnv() (Config, error) {
 	default:
 		return Config{}, fmt.Errorf(`CP_ENV must be "dev" or "prod", got %q`, cfg.Env)
 	}
-	if cfg.ServiceToken == "" {
-		if cfg.Env != "dev" {
-			return Config{}, fmt.Errorf("CP_SERVICE_TOKEN is required unless CP_ENV=dev")
-		}
+	// The static token is a dev convenience with org-wildcard admin power; in
+	// prod it must not exist so every caller is org-scoped and role-checked.
+	if cfg.Env == "prod" && cfg.ServiceToken != "" {
+		return Config{}, fmt.Errorf("CP_SERVICE_TOKEN is dev-only; mint org-scoped tokens with `sigmahub-cp mint-service-token` instead")
+	}
+	if cfg.Env == "dev" && cfg.ServiceToken == "" {
 		cfg.ServiceToken = "dev-service-token"
 	}
 	return cfg, nil

@@ -70,16 +70,32 @@ func normalizeFacts(facts json.RawMessage) json.RawMessage {
 }
 
 // IssueBootstrapToken creates a single-use, expiring registration token for
-// an org. The plaintext is returned once and never stored.
+// an org and audits the issuance. The plaintext is returned once and never
+// stored.
 func (s *Store) IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (token string, expiresAt time.Time, err error) {
 	tok, digest := newToken("sbt")
 	expiresAt = time.Now().Add(ttl)
-	_, err = s.Pool.Exec(ctx, `
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO bootstrap_tokens (id, org_id, token_hash, server_name, server_type, provider, region, created_by, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		newID("bt"), orgID, digest, serverName, serverType, provider, region, createdBy, expiresAt)
-	if err != nil {
+		newID("bt"), orgID, digest, serverName, serverType, provider, region, createdBy, expiresAt); err != nil {
 		return "", time.Time{}, fmt.Errorf("insert bootstrap token: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO cp_audit_log (org_id, actor, action, target)
+		VALUES ($1, $2, 'Bootstrap token issued', $3)`,
+		orgID, createdBy, serverName); err != nil {
+		return "", time.Time{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", time.Time{}, err
 	}
 	return tok, expiresAt, nil
 }

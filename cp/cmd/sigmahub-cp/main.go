@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,10 +20,61 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "mint-service-token" {
+		if err := mintServiceToken(os.Args[2:]); err != nil {
+			slog.Error("fatal", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// mintServiceToken is the operator-side bootstrap for dashboard credentials:
+// it writes straight to the database, so no pre-existing token is needed.
+func mintServiceToken(args []string) error {
+	fs := flag.NewFlagSet("mint-service-token", flag.ExitOnError)
+	org := fs.String("org", "", "organization id the token is scoped to (required)")
+	roleFlag := fs.String("role", string(store.RoleDeveloper), `token role: "Org Admin", "Project Admin" or "Developer"`)
+	name := fs.String("name", "", "token label, shown as the audit actor (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *org == "" || *name == "" {
+		fs.Usage()
+		return errors.New("both -org and -name are required")
+	}
+	role, err := store.ParseRole(*roleFlag)
+	if err != nil {
+		return err
+	}
+
+	databaseURL := os.Getenv("CP_DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("CP_DATABASE_URL is required")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	st, err := store.Open(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, slog.Default()); err != nil {
+		return err
+	}
+
+	tok, p, err := st.IssueServiceToken(ctx, *org, *name, role, "cli")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("service token %s (org %s, role %s):\n\n  %s\n\nShown once — only its hash is stored.\n", p.ID, p.OrgID, p.Role, tok)
+	return nil
 }
 
 func run() error {

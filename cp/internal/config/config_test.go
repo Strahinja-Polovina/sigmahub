@@ -12,8 +12,8 @@ func TestFromEnv(t *testing.T) {
 	}{
 		{"dev defaults service token", map[string]string{"CP_DATABASE_URL": db}, false, "dev-service-token"},
 		{"missing db", map[string]string{}, true, ""},
-		{"prod requires token", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "prod"}, true, ""},
-		{"prod with token ok", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "prod", "CP_SERVICE_TOKEN": "s3cret"}, false, "s3cret"},
+		{"prod without static token ok", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "prod"}, false, ""},
+		{"prod rejects static token", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "prod", "CP_SERVICE_TOKEN": "s3cret"}, true, ""},
 		{"unknown env rejected", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "production"}, true, ""},
 		{"unknown env rejected even with token", map[string]string{"CP_DATABASE_URL": db, "CP_ENV": "staging", "CP_SERVICE_TOKEN": "s3cret"}, true, ""},
 	} {
