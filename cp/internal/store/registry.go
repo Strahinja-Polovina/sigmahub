@@ -144,12 +144,17 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 	}
 	facts = normalizeFacts(facts)
 
+	meshIP, err := allocateMeshIP(ctx, tx, orgID)
+	if err != nil {
+		return RegisterResult{}, err
+	}
+
 	srv := Server{ID: newID("srv")}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO servers (id, org_id, name, type, provider, region, agent_version, facts, pubkey)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''))
+		INSERT INTO servers (id, org_id, name, type, provider, region, agent_version, facts, pubkey, mesh_ip)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
 		RETURNING id, org_id, name, type, provider, region, status, agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at`,
-		srv.ID, orgID, serverName, tokType, tokProvider, tokRegion, agentVersion, facts, pubkey,
+		srv.ID, orgID, serverName, tokType, tokProvider, tokRegion, agentVersion, facts, pubkey, meshIP,
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
 	if err != nil {

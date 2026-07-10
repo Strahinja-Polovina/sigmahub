@@ -24,6 +24,7 @@ type StoreAPI interface {
 	ServerByAgentToken(ctx context.Context, token string) (store.Server, error)
 	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
 	RecordHeartbeat(ctx context.Context, serverID string, in store.HeartbeatInput) error
+	MeshPeers(ctx context.Context, orgID, selfServerID string) ([]store.MeshPeer, error)
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
@@ -57,6 +58,7 @@ func (s *Server) routes() {
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))
+	s.mux.HandleFunc("GET /v1/agent/mesh/peers", s.requireAgent(s.handleMeshPeers))
 }
 
 func (s *Server) Handler() http.Handler {
