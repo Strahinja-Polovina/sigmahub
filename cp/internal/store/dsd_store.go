@@ -184,12 +184,14 @@ type PendingDestructiveOp struct {
 }
 
 // PendingDestructiveOpsForServer returns a server's still-unapplied destructive
-// ops (applied_at IS NULL), oldest first for deterministic op ordering.
-func (s *Store) PendingDestructiveOpsForServer(ctx context.Context, serverID string) ([]PendingDestructiveOp, error) {
+// ops (applied_at IS NULL) for the given org, oldest first for deterministic op
+// ordering. The org filter is defence in depth: rows are only written for
+// org-owned servers, but rendering must never leak an op across tenants.
+func (s *Store) PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]PendingDestructiveOp, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, op_kind, target FROM pending_destructive_ops
-		WHERE server_id = $1 AND applied_at IS NULL ORDER BY created_at, id`,
-		serverID)
+		WHERE server_id = $1 AND org_id = $2 AND applied_at IS NULL ORDER BY created_at, id`,
+		serverID, orgID)
 	if err != nil {
 		return nil, err
 	}

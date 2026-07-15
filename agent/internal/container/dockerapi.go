@@ -174,14 +174,24 @@ func (d *DockerClient) NetworkCreate(ctx context.Context, name string, labels ma
 // --- Volumes ---
 
 func (d *DockerClient) VolumeExists(ctx context.Context, name string) (bool, error) {
-	err := d.do(ctx, http.MethodGet, "/volumes/"+url.PathEscape(name), nil, &struct{}{})
+	_, exists, err := d.VolumeInspect(ctx, name)
+	return exists, err
+}
+
+// VolumeInspect returns a volume's labels and whether it exists. Used to gate
+// removal to sigmahub-managed volumes only.
+func (d *DockerClient) VolumeInspect(ctx context.Context, name string) (map[string]string, bool, error) {
+	var v struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	err := d.do(ctx, http.MethodGet, "/volumes/"+url.PathEscape(name), nil, &v)
 	if err == nil {
-		return true, nil
+		return v.Labels, true, nil
 	}
 	if isNotFound(err) {
-		return false, nil
+		return nil, false, nil
 	}
-	return false, err
+	return nil, false, err
 }
 
 func (d *DockerClient) VolumeCreate(ctx context.Context, name string, labels map[string]string) error {

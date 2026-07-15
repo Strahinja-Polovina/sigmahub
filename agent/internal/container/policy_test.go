@@ -7,16 +7,20 @@ import (
 )
 
 func TestPolicyDenies(t *testing.T) {
-	base := ContainerSpec{Image: "nginx:1.27"}
+	base := ContainerSpec{Image: "nginx:1.27", Network: "sigmahub-proj_x"}
 	cases := []struct {
 		name string
 		mut  func(*ContainerSpec)
 		rule string
 	}{
 		{"privileged", func(s *ContainerSpec) { s.Privileged = true }, "privileged"},
-		{"host network", func(s *ContainerSpec) { s.HostNetwork = true }, "host-network"},
+		{"host network flag", func(s *ContainerSpec) { s.HostNetwork = true }, "host-network"},
 		{"host pid", func(s *ContainerSpec) { s.HostPID = true }, "host-pid"},
 		{"host mount", func(s *ContainerSpec) { s.HostMounts = []HostMount{{Source: "/etc", Target: "/etc"}} }, "host-mount"},
+		{"network host mode", func(s *ContainerSpec) { s.Network = "host" }, "network"},
+		{"network container join", func(s *ContainerSpec) { s.Network = "container:abc123" }, "network"},
+		{"network raw ns", func(s *ContainerSpec) { s.Network = "ns:/proc/1/ns/net" }, "network"},
+		{"empty network", func(s *ContainerSpec) { s.Network = "" }, "network"},
 		{"floating latest", func(s *ContainerSpec) { s.Image = "nginx:latest" }, "image"},
 		{"untagged", func(s *ContainerSpec) { s.Image = "nginx" }, "image"},
 		{"empty image", func(s *ContainerSpec) { s.Image = "" }, "image"},
@@ -48,9 +52,48 @@ func TestPolicyAllows(t *testing.T) {
 		"registry.example.com:5000/team/app:2024-01",
 		"nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	} {
-		if err := CheckPolicy(ContainerSpec{Image: img}); err != nil {
+		if err := CheckPolicy(ContainerSpec{Image: img, Network: "sigmahub-proj_x"}); err != nil {
 			t.Errorf("image %q rejected: %v", img, err)
 		}
+	}
+	// "none" is a safe non-namespace-sharing mode and is allowed.
+	if err := CheckPolicy(ContainerSpec{Image: "nginx:1.27", Network: "none"}); err != nil {
+		t.Errorf("network none rejected: %v", err)
+	}
+}
+
+func TestTerminalRestart(t *testing.T) {
+	// A hash-matching stopped container is converged under a terminal policy but
+	// is drift under a keep-running policy. The observed container's spec-hash
+	// label must match the spec being converged.
+	spec := ContainerSpec{Name: "c", Image: "nginx:1.27", Network: "sigmahub-x"}
+	hashState := func(s ContainerSpec, running bool) ContainerState {
+		return ContainerState{Labels: map[string]string{LabelSpecHash: s.SpecHash()}, Running: running}
+	}
+
+	if !converged(spec, hashState(spec, true), true) {
+		t.Error("a running hash-matching container must be converged")
+	}
+	for _, policy := range []string{"no", "on-failure"} {
+		s := spec
+		s.Restart = policy
+		if !converged(s, hashState(s, false), true) {
+			t.Errorf("stopped container under %q should be converged", policy)
+		}
+	}
+	for _, policy := range []string{"", "always", "unless-stopped"} {
+		s := spec
+		s.Restart = policy
+		if converged(s, hashState(s, false), true) {
+			t.Errorf("stopped container under keep-running policy %q must be drift", policy)
+		}
+	}
+	if converged(spec, ContainerState{}, false) {
+		t.Error("absent container is never converged")
+	}
+	// A hash MISMATCH is never converged, even if running.
+	if converged(spec, ContainerState{Labels: map[string]string{LabelSpecHash: "stale"}, Running: true}, true) {
+		t.Error("a stale-hash container must not be converged")
 	}
 }
 
