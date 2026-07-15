@@ -148,6 +148,15 @@ func (f *fakeDomain) IssueConfirmToken(_ context.Context, _, _, _, _, _ string, 
 func (f *fakeDomain) ConfirmDestructiveOp(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	return "pdo_1", nil
 }
+func (f *fakeDomain) DeleteServer(_ context.Context, _, _, _ string) error       { return nil }
+func (f *fakeDomain) RevokeAgentToken(_ context.Context, _, _, _ string) error   { return nil }
+func (f *fakeDomain) ListServiceTokens(_ context.Context, _ string) ([]store.ServiceTokenInfo, error) {
+	return []store.ServiceTokenInfo{}, nil
+}
+func (f *fakeDomain) RevokeServiceToken(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeDomain) RotateServiceToken(_ context.Context, _, _, _ string) (string, store.ServicePrincipal, error) {
+	return "sst_rotated", store.ServicePrincipal{}, nil
+}
 
 const (
 	testServiceToken   = "test-service-token"

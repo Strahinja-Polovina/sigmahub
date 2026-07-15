@@ -46,6 +46,7 @@ type heartbeatRequest struct {
 	AgentVersion string              `json:"agentVersion"`
 	Facts        json.RawMessage     `json:"facts"`
 	Pubkey       string              `json:"pubkey"`
+	Endpoint     string              `json:"endpoint"`
 	Metrics      *store.MetricSample `json:"metrics"`
 }
 
@@ -60,6 +61,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		AgentVersion: req.AgentVersion,
 		Facts:        req.Facts,
 		Pubkey:       req.Pubkey,
+		Endpoint:     req.Endpoint,
 		Metrics:      req.Metrics,
 	}); err != nil {
 		s.log.Error("heartbeat", "err", err, "server", srv.ID)

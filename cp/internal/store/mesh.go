@@ -48,9 +48,10 @@ type MeshPeer struct {
 // ever see peers of the org its server belongs to.
 func (s *Store) MeshPeers(ctx context.Context, orgID, selfServerID string) ([]MeshPeer, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, name, pubkey, mesh_ip
+		SELECT id, name, pubkey, mesh_ip, endpoint
 		  FROM servers
 		 WHERE org_id = $1 AND id <> $2 AND pubkey IS NOT NULL AND mesh_ip IS NOT NULL
+		   AND deleted_at IS NULL
 		 ORDER BY created_at`, orgID, selfServerID)
 	if err != nil {
 		return nil, err
@@ -60,7 +61,7 @@ func (s *Store) MeshPeers(ctx context.Context, orgID, selfServerID string) ([]Me
 	out := []MeshPeer{}
 	for rows.Next() {
 		var p MeshPeer
-		if err := rows.Scan(&p.ServerID, &p.Name, &p.Pubkey, &p.MeshIP); err != nil {
+		if err := rows.Scan(&p.ServerID, &p.Name, &p.Pubkey, &p.MeshIP, &p.Endpoint); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

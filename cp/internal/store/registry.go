@@ -203,7 +203,7 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 		       s.agent_version, s.facts, s.mesh_ip, s.pubkey, s.last_seen_at, s.created_at
 		  FROM agent_tokens t
 		  JOIN servers s ON s.id = t.server_id
-		 WHERE t.token_hash = $1 AND t.revoked_at IS NULL`,
+		 WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND s.deleted_at IS NULL`,
 		s.hashToken(token),
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
@@ -220,7 +220,7 @@ func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error)
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, org_id, name, type, source, proxy_role, provider, region, status,
 		       agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at
-		  FROM servers WHERE org_id = $1 ORDER BY created_at`, orgID)
+		  FROM servers WHERE org_id = $1 AND deleted_at IS NULL ORDER BY created_at`, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +243,7 @@ func (s *Store) GetServer(ctx context.Context, orgID, serverID string) (Server, 
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id, org_id, name, type, source, proxy_role, provider, region, status,
 		       agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at
-		  FROM servers WHERE org_id = $1 AND id = $2`, orgID, serverID,
+		  FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`, orgID, serverID,
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
