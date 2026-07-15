@@ -57,6 +57,7 @@ import {
 } from "./resource-meta";
 import { MetricsChart } from "./metrics-chart";
 import { LogsViewer } from "./logs-viewer";
+import { VolumeDeleteDialog } from "./volume-delete-dialog";
 import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
 
@@ -467,6 +468,20 @@ export function ResourceDetail({ detail }: { detail: Detail }) {
                     Stop
                   </Button>
                 </div>
+                {resource.kind === "app" && resource.serverId && (
+                  <>
+                    <Separator />
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">Delete a data volume</p>
+                        <p className="text-sm text-muted-foreground">
+                          Permanently destroy a named volume’s data. Requires a confirmation token and approval.
+                        </p>
+                      </div>
+                      <VolumeDeleteDialog resourceId={resource.id} resourceName={resource.name} />
+                    </div>
+                  </>
+                )}
                 <Separator />
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
