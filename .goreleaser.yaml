@@ -1,0 +1,63 @@
+version: 2
+
+project_name: sigmahub
+
+# cp/ and agent/ are separate Go modules; each build runs in its own dir so it
+# resolves against that module's go.mod.
+builds:
+  - id: sigmahub-cp
+    dir: cp
+    main: ./cmd/sigmahub-cp
+    binary: sigmahub-cp
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+  - id: sigmad
+    dir: agent
+    main: ./cmd/sigmad
+    binary: sigmad
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: sigmahub-cp
+    ids: [sigmahub-cp]
+    name_template: "sigmahub-cp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: sigmad
+    ids: [sigmad]
+    name_template: "sigmad_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+# Software bill of materials per archive (syft).
+sboms:
+  - artifacts: archive
+
+# Keyless signing via the ambient GitHub OIDC token (Fulcio + Rekor). The
+# release job grants id-token: write; no long-lived keys.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+    artifacts: checksum
+    output: true
+
+release:
+  prerelease: auto
+
+changelog:
+  disable: true
