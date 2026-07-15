@@ -51,6 +51,7 @@ type HeartbeatRequest struct {
 	AgentVersion string          `json:"agentVersion"`
 	Facts        json.RawMessage `json:"facts"`
 	Pubkey       string          `json:"pubkey"`
+	Endpoint     string          `json:"endpoint,omitempty"`
 	Metrics      *MetricSample   `json:"metrics,omitempty"`
 }
 

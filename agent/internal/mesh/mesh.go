@@ -79,7 +79,7 @@ func RenderConfig(privB64, selfMeshIP string, peers []Peer) string {
 	b.WriteString("[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", privB64)
 	fmt.Fprintf(&b, "Address = %s/16\n", selfMeshIP)
-	b.WriteString("ListenPort = 51820\n")
+	fmt.Fprintf(&b, "ListenPort = %d\n", ListenPort)
 	for _, p := range peers {
 		b.WriteString("\n[Peer]\n")
 		fmt.Fprintf(&b, "# %s (%s)\n", p.Name, p.ServerID)
@@ -107,9 +107,16 @@ func WriteConfig(dataDir, content string) (path string, changed bool, err error)
 	return path, true, os.Rename(tmp, path)
 }
 
-// Apply brings the rendered config up via wg-quick. v0 scaffolding: Linux
-// only, config-only everywhere else; a missing wg-quick is reported, not
-// fatal, so the coordination plane keeps running.
+// ifaceName is the WireGuard interface name, derived from the config basename
+// (sigma0.conf → sigma0), matching wg-quick's convention.
+func ifaceName() string { return strings.TrimSuffix(ConfigFile, ".conf") }
+
+// Apply reconciles the WireGuard interface to the rendered config. v1: the
+// first bring-up uses `wg-quick up`, but subsequent peer changes are applied
+// incrementally with `wg syncconf` — adding/removing peers WITHOUT tearing the
+// tunnel down, so an existing connection survives a peer-list change (P1-4).
+// Linux only; a missing tool is reported, not fatal, so coordination keeps
+// running.
 func Apply(ctx context.Context, log *slog.Logger, configPath string) {
 	if runtime.GOOS != "linux" {
 		log.Info("mesh: config-only mode (tunnel bring-up is Linux-only)", "config", configPath)
@@ -119,11 +126,53 @@ func Apply(ctx context.Context, log *slog.Logger, configPath string) {
 		log.Warn("mesh: wg-quick not found; config rendered but not applied", "config", configPath)
 		return
 	}
-	// Re-sync by down+up: idempotent for v0's small meshes.
-	_ = exec.CommandContext(ctx, "wg-quick", "down", configPath).Run()
+	iface := ifaceName()
+	if interfaceExists(ctx, iface) {
+		// Incremental peer sync — no disruptive down/up.
+		if err := syncConf(ctx, iface, configPath); err != nil {
+			log.Warn("mesh: incremental syncconf failed; falling back to full re-up", "err", err)
+			_ = exec.CommandContext(ctx, "wg-quick", "down", configPath).Run()
+			if out, err := exec.CommandContext(ctx, "wg-quick", "up", configPath).CombinedOutput(); err != nil {
+				log.Warn("mesh: wg-quick up failed", "err", err, "output", strings.TrimSpace(string(out)))
+			}
+			return
+		}
+		log.Info("mesh: peers synced incrementally", "iface", iface)
+		return
+	}
+	// First bring-up creates the interface, address and link.
 	if out, err := exec.CommandContext(ctx, "wg-quick", "up", configPath).CombinedOutput(); err != nil {
 		log.Warn("mesh: wg-quick up failed", "err", err, "output", strings.TrimSpace(string(out)))
 		return
 	}
 	log.Info("mesh: WireGuard interface applied", "config", configPath)
+}
+
+// interfaceExists reports whether the WireGuard device is already up (`wg show`
+// exits non-zero for an absent device).
+func interfaceExists(ctx context.Context, iface string) bool {
+	if _, err := exec.LookPath("wg"); err != nil {
+		return false
+	}
+	return exec.CommandContext(ctx, "wg", "show", iface).Run() == nil
+}
+
+// syncConf applies peer changes to a live interface without a teardown.
+// `wg-quick strip` yields a wg-native config (drops the Address/wg-quick keys)
+// which `wg syncconf` reconciles peer-by-peer. The stripped file embeds the
+// private key, so it is written 0600 and removed after.
+func syncConf(ctx context.Context, iface, configPath string) error {
+	stripped, err := exec.CommandContext(ctx, "wg-quick", "strip", configPath).Output()
+	if err != nil {
+		return fmt.Errorf("wg-quick strip: %w", err)
+	}
+	tmp := configPath + ".stripped"
+	if err := os.WriteFile(tmp, stripped, 0o600); err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp) }()
+	if out, err := exec.CommandContext(ctx, "wg", "syncconf", iface, tmp).CombinedOutput(); err != nil {
+		return fmt.Errorf("wg syncconf: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
