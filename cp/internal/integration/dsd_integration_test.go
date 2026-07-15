@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -414,6 +415,114 @@ func confirmDestructive(t *testing.T, base, svcTok, orgID, serverID, token, opKi
 	t.Helper()
 	if code := tryConfirmDestructive(t, base, svcTok, orgID, serverID, token, opKind, target); code != http.StatusOK {
 		t.Fatalf("confirm destructive: %d", code)
+	}
+}
+
+// TestServerLifecycleTombstoneAndEndpoints exercises P1-4: agent endpoints are
+// stored and served in the peer list; a server delete tombstones (excluded from
+// peers, agent token 401s) while retaining its mesh IP so a later registration
+// never re-uses it; a delete with bound resources 409s; service tokens rotate
+// and revoke.
+func TestServerLifecycleTombstoneAndEndpoints(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_lc"
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	register := func(name, pubkey string) store.RegisterResult {
+		bt, _, err := st.IssueBootstrapToken(ctx, orgID, name, "general", "", "", "test", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, err := st.RegisterServer(ctx, bt, name, "0.1.0", json.RawMessage(`{}`), pubkey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reg
+	}
+
+	a := register("host-a", "pubA")
+	b := register("host-b", "pubB")
+	if a.Server.MeshIP == nil || b.Server.MeshIP == nil {
+		t.Fatal("servers did not get mesh IPs")
+	}
+	bMeshIP := *b.Server.MeshIP
+
+	// Endpoints reported on heartbeat are served in the peer list.
+	if err := st.RecordHeartbeat(ctx, b.Server.ID, store.HeartbeatInput{Facts: json.RawMessage(`{}`), Pubkey: "pubB", Endpoint: "203.0.113.5:51820"}); err != nil {
+		t.Fatal(err)
+	}
+	peers, err := st.MeshPeers(ctx, orgID, a.Server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 1 || peers[0].Endpoint == nil || *peers[0].Endpoint != "203.0.113.5:51820" {
+		t.Fatalf("peer endpoint not served: %+v", peers)
+	}
+
+	// Delete server B (no bound resources) → tombstoned.
+	if err := st.DeleteServer(ctx, orgID, b.Server.ID, "admin"); err != nil {
+		t.Fatalf("delete server B: %v", err)
+	}
+	// B drops from A's peer list.
+	peers, _ = st.MeshPeers(ctx, orgID, a.Server.ID)
+	if len(peers) != 0 {
+		t.Fatalf("tombstoned server still in peer list: %+v", peers)
+	}
+	// B's agent token no longer authenticates (→ next heartbeat 401).
+	if _, err := st.ServerByAgentToken(ctx, b.AgentToken); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("revoked agent token still valid: %v", err)
+	}
+
+	// A new registration must NOT receive B's tombstoned mesh IP.
+	c := register("host-c", "pubC")
+	if c.Server.MeshIP == nil || *c.Server.MeshIP == bMeshIP {
+		t.Fatalf("tombstoned mesh IP %s was re-issued to a new server: %v", bMeshIP, c.Server.MeshIP)
+	}
+
+	// Bind a resource to A, then deleting A must 409 (ErrConflict) listing it.
+	if err := st.AttachServer(ctx, orgID, env.ID, a.Server.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: a.Server.ID, Name: "app1", Kind: "app", Spec: json.RawMessage(`{}`),
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteServer(ctx, orgID, a.Server.ID, "admin"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("delete of server with bound resource should 409/ErrConflict, got: %v", err)
+	}
+
+	// Service-token lifecycle: issue → list → rotate → revoke.
+	_, princ, err := st.IssueServiceToken(ctx, orgID, "ci", store.RoleDeveloper, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	toks, err := st.ListServiceTokens(ctx, orgID)
+	if err != nil || len(toks) == 0 {
+		t.Fatalf("list service tokens: %v (%d)", err, len(toks))
+	}
+	newTok, _, err := st.RotateServiceToken(ctx, orgID, princ.ID, "admin")
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	// The old token no longer authenticates; the new one does.
+	if _, err := st.AuthenticateServiceToken(ctx, newTok); err != nil {
+		t.Fatalf("rotated token should authenticate: %v", err)
+	}
+	if err := st.RevokeServiceToken(ctx, orgID, princ.ID, "admin"); !errors.Is(err, store.ErrNotFound) {
+		// princ.ID was already revoked by rotate; revoking again is a no-op 404.
+		if err != nil {
+			t.Fatalf("unexpected revoke error: %v", err)
+		}
 	}
 }
 

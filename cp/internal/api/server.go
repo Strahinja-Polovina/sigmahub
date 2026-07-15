@@ -96,6 +96,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/proxy-role", s.requireService(store.RoleProjectAdmin, s.handleProxyRole))
+	// Server + token lifecycle (P1-4). Server delete and agent-token revoke are
+	// Project Admin+; service-token lifecycle is Org Admin only.
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteServer))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/revoke-token", s.requireService(store.RoleProjectAdmin, s.handleRevokeAgentToken))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/service-tokens", s.requireService(store.RoleOrgAdmin, s.handleListServiceTokens))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/service-tokens/{tokenId}", s.requireService(store.RoleOrgAdmin, s.handleRevokeServiceToken))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/service-tokens/{tokenId}/rotate", s.requireService(store.RoleOrgAdmin, s.handleRotateServiceToken))
 	// Two-phase destructive-op confirm (P1-3). Not idempotency-wrapped: a
 	// replayed mint must issue a fresh single-use token, never replay a stored
 	// one. Both phases are Project Admin+ and audited by the store.

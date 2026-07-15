@@ -41,6 +41,11 @@ type DomainAPI interface {
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
 	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
 	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)
+	DeleteServer(ctx context.Context, orgID, serverID, actor string) error
+	RevokeAgentToken(ctx context.Context, orgID, serverID, actor string) error
+	ListServiceTokens(ctx context.Context, orgID string) ([]store.ServiceTokenInfo, error)
+	RevokeServiceToken(ctx context.Context, orgID, tokenID, actor string) error
+	RotateServiceToken(ctx context.Context, orgID, tokenID, actor string) (string, store.ServicePrincipal, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,
