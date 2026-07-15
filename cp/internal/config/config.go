@@ -17,14 +17,19 @@ type Config struct {
 	// endpoints (accepted as a wildcard Org Admin). Forbidden in prod, where
 	// org-scoped tokens are minted via `sigmahub-cp mint-service-token`.
 	ServiceToken string
+	// ProvisionToken gates POST /v1/orgs (org provisioning: mints the
+	// org-scoped web credential). Defaults in dev; required in prod for the
+	// provisioning endpoint to be usable.
+	ProvisionToken string
 }
 
 func FromEnv() (Config, error) {
 	cfg := Config{
-		Addr:         getenv("CP_ADDR", ":8080"),
-		DatabaseURL:  os.Getenv("CP_DATABASE_URL"),
-		Env:          getenv("CP_ENV", "dev"),
-		ServiceToken: os.Getenv("CP_SERVICE_TOKEN"),
+		Addr:           getenv("CP_ADDR", ":8080"),
+		DatabaseURL:    os.Getenv("CP_DATABASE_URL"),
+		Env:            getenv("CP_ENV", "dev"),
+		ServiceToken:   os.Getenv("CP_SERVICE_TOKEN"),
+		ProvisionToken: os.Getenv("CP_PROVISION_TOKEN"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
@@ -43,6 +48,9 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.Env == "dev" && cfg.ServiceToken == "" {
 		cfg.ServiceToken = "dev-service-token"
+	}
+	if cfg.Env == "dev" && cfg.ProvisionToken == "" {
+		cfg.ProvisionToken = "dev-provision-token"
 	}
 	return cfg, nil
 }

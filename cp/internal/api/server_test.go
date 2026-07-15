@@ -71,14 +71,90 @@ func (f *fakeStore) GetServer(context.Context, string, string) (store.Server, er
 	return store.Server{}, store.ErrNotFound
 }
 
-const testServiceToken = "test-service-token"
+// fakeDomain implements DomainAPI in-memory for handler tests.
+type fakeDomain struct {
+	idem map[string]store.IdempotentResponse
+	// createCount counts CreateProject executions to prove replay skips them.
+	createCount int
+}
+
+func (f *fakeDomain) CreateProject(_ context.Context, orgID, name, desc, actor string) (store.Project, error) {
+	f.createCount++
+	return store.Project{ID: "prj_1", OrgID: orgID, Name: name, Description: desc, CreatedBy: actor}, nil
+}
+func (f *fakeDomain) ListProjects(context.Context, string) ([]store.Project, error) {
+	return []store.Project{}, nil
+}
+func (f *fakeDomain) GetProject(context.Context, string, string) (store.Project, error) {
+	return store.Project{}, store.ErrNotFound
+}
+func (f *fakeDomain) UpdateProject(_ context.Context, orgID, projectID, name, desc, _ string) (store.Project, error) {
+	return store.Project{ID: projectID, OrgID: orgID, Name: name, Description: desc}, nil
+}
+func (f *fakeDomain) DeleteProject(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) CreateEnvironment(_ context.Context, orgID, projectID, name string, prod bool, _ string) (store.Environment, error) {
+	return store.Environment{ID: "env_1", OrgID: orgID, ProjectID: projectID, Name: name, Production: prod}, nil
+}
+func (f *fakeDomain) ListEnvironments(context.Context, string, string) ([]store.Environment, error) {
+	return []store.Environment{}, nil
+}
+func (f *fakeDomain) DeleteEnvironment(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) AttachServer(context.Context, string, string, string, string) error {
+	return nil
+}
+func (f *fakeDomain) DetachServer(context.Context, string, string, string, string) error {
+	return nil
+}
+func (f *fakeDomain) EnvServerIDs(context.Context, string, string) ([]string, error) {
+	return []string{}, nil
+}
+func (f *fakeDomain) CreateResource(_ context.Context, orgID string, in store.CreateResourceInput, _ string) (store.Resource, error) {
+	if store.AllowedServerTypes(in.Kind) == nil {
+		return store.Resource{}, store.ErrInvalid{Msg: "unknown resource kind"}
+	}
+	return store.Resource{ID: "res_1", OrgID: orgID, Name: in.Name, Kind: in.Kind}, nil
+}
+func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Resource, error) {
+	return []store.Resource{}, nil
+}
+func (f *fakeDomain) DeleteResource(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) SetProxyRole(context.Context, string, string, bool, string) error {
+	return nil
+}
+func (f *fakeDomain) ListAudit(context.Context, string, int) ([]store.AuditEntry, error) {
+	return []store.AuditEntry{}, nil
+}
+func (f *fakeDomain) IdempotencyLookup(_ context.Context, orgID, key string) (store.IdempotentResponse, error) {
+	if r, ok := f.idem[orgID+"/"+key]; ok {
+		return r, nil
+	}
+	return store.IdempotentResponse{}, store.ErrNotFound
+}
+func (f *fakeDomain) IdempotencySave(_ context.Context, orgID, key string, in store.IdempotentResponse) (store.IdempotentResponse, error) {
+	if f.idem == nil {
+		f.idem = map[string]store.IdempotentResponse{}
+	}
+	f.idem[orgID+"/"+key] = in
+	return in, nil
+}
+func (f *fakeDomain) IssueServiceToken(_ context.Context, orgID, name string, role store.Role, _ string) (string, store.ServicePrincipal, error) {
+	return "sst_provisioned", store.ServicePrincipal{ID: "st_p", OrgID: orgID, Name: name, Role: role}, nil
+}
+
+const (
+	testServiceToken   = "test-service-token"
+	testProvisionToken = "test-provision-token"
+)
 
 func newTestServer(t *testing.T, fs *fakeStore) *Server {
 	t.Helper()
 	if fs == nil {
 		fs = &fakeStore{}
 	}
-	return New(slog.Default(), fakePinger{}, fs, testServiceToken)
+	return New(slog.Default(), fakePinger{}, fs, &fakeDomain{}, Options{
+		DevServiceToken: testServiceToken,
+		ProvisionToken:  testProvisionToken,
+	})
 }
 
 func TestHealthz(t *testing.T) {
@@ -100,7 +176,7 @@ func TestReadyz(t *testing.T) {
 		{"db down", errors.New("nope"), 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := New(slog.Default(), fakePinger{err: tc.err}, &fakeStore{}, testServiceToken)
+			s := New(slog.Default(), fakePinger{err: tc.err}, &fakeStore{}, &fakeDomain{}, Options{DevServiceToken: testServiceToken})
 			rec := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
 			if rec.Code != tc.want {
@@ -154,7 +230,7 @@ func TestServiceAuth(t *testing.T) {
 // TestServiceAuthNoDevToken pins the prod posture: with no static dev token
 // configured, only real service tokens pass.
 func TestServiceAuthNoDevToken(t *testing.T) {
-	s := New(slog.Default(), fakePinger{}, &fakeStore{}, "")
+	s := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{})
 	req := httptest.NewRequest("GET", "/v1/orgs/org_1/servers", nil)
 	req.Header.Set("Authorization", "Bearer "+testServiceToken)
 	rec := httptest.NewRecorder()

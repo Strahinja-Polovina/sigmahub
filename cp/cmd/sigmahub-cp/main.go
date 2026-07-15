@@ -142,8 +142,11 @@ func run() error {
 	})
 
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           api.New(log, st, st, cfg.ServiceToken).Handler(),
+		Addr: cfg.Addr,
+		Handler: api.New(log, st, st, st, api.Options{
+			DevServiceToken: cfg.ServiceToken,
+			ProvisionToken:  cfg.ProvisionToken,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
