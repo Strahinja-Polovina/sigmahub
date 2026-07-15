@@ -17,6 +17,7 @@ import (
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/container"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
@@ -48,8 +49,9 @@ func run() error {
 		bootstrap = flag.String("bootstrap-token", os.Getenv("SIGMAD_BOOTSTRAP_TOKEN"), "one-time bootstrap token (first run only)")
 		dataDir   = flag.String("data-dir", envOr("SIGMAD_DATA_DIR", defaultDataDir()), "directory for persisted identity")
 		interval  = flag.Duration("interval", 30*time.Second, "heartbeat interval")
-		name      = flag.String("name", "", "server display name (defaults to hostname)")
-		wgUp      = flag.Bool("wg-up", false, "apply the rendered WireGuard config via wg-quick (Linux only; default renders config only)")
+		name       = flag.String("name", "", "server display name (defaults to hostname)")
+		wgUp       = flag.Bool("wg-up", false, "apply the rendered WireGuard config via wg-quick (Linux only; default renders config only)")
+		dockerSock = flag.String("docker-socket", envOr("SIGMAD_DOCKER_SOCKET", "/var/run/docker.sock"), "Docker Engine unix socket")
 	)
 	flag.Parse()
 
@@ -107,17 +109,48 @@ func run() error {
 	}
 	defer journal.Close()
 	registry := apply.NewRegistry()
+	// resource.sync stays as a no-op for resource kinds not yet containerised
+	// (databases etc. land in P1-10); "app" resources render into the container
+	// ops registered by the Docker driver below.
 	registry.Register("resource.sync", func(context.Context, dsd.Op) error { return nil })
 
-	// The DSD loop runs alongside the heartbeat loop, outbound-only.
-	go runDSDLoop(ctx, log, c, st, journal, registry)
+	// Container runtime (P1-3): the Docker driver registers the typed container
+	// op kinds and owns actual state. Opening the client is lazy (no connection
+	// until a call), so a host without Docker still runs — its container ops
+	// simply fail and are reported as such. The desired-state store lets the
+	// reconcile loop repair drift with no control-plane round-trip.
+	cstore, err := container.OpenStore(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer cstore.Close()
+	docker := container.NewDockerClient(*dockerSock, os.Getenv("DOCKER_HOST"))
+	driver := container.NewDriver(docker, cstore, log)
+	driver.Register(registry)
+	if avail, ver := container.Probe(ctx, docker); avail {
+		log.Info("docker runtime available", "version", ver)
+	} else {
+		log.Warn("docker runtime unavailable; container ops will fail until a daemon is reachable", "socket", *dockerSock)
+	}
+	// Actual-state reconcile: converge managed containers every 30s (well under
+	// the 60s drift-repair SLO); survives control-plane outages.
+	go driver.RunReconcile(ctx, 30*time.Second)
+
+	// The DSD loop runs alongside the heartbeat loop, outbound-only. After each
+	// applied DSD it garbage-collects containers the document no longer describes.
+	go runDSDLoop(ctx, log, c, st, journal, registry, driver)
 
 	// Heartbeat loop: fixed interval with jitter; exponential backoff on
 	// transient failures; permanent (4xx) failures mean the credential is
 	// gone — exit so the operator re-bootstraps.
 	backoff := *interval
 	for {
-		f, _ := json.Marshal(facts.Collect())
+		hostFacts := facts.Collect()
+		if avail, ver := container.Probe(ctx, docker); avail {
+			hostFacts.DockerAvailable = true
+			hostFacts.DockerVersion = ver
+		}
+		f, _ := json.Marshal(hostFacts)
 		sample := metrics.Collect(ctx)
 		err := c.Heartbeat(ctx, st.AgentToken, client.HeartbeatRequest{
 			AgentVersion: version,
@@ -163,7 +196,7 @@ func run() error {
 // dependency order (resuming from the journal), and reports status. It never
 // applies a DSD whose version is <= the last applied one (replay/downgrade
 // rejection) and never applies an unsigned/tampered/wrongly-keyed DSD.
-func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st state.State, journal *apply.Journal, registry *apply.Registry) {
+func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st state.State, journal *apply.Journal, registry *apply.Registry, driver *container.Driver) {
 	if st.DSDPublicKey == "" {
 		log.Warn("no pinned DSD key; DSD sync disabled (re-bootstrap to enrol)")
 		return
@@ -229,6 +262,11 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 			continue
 		}
 		log.Info("dsd applied", "version", signed.Document.Version, "ops", len(results))
+		// Converge actual state to the document: remove managed containers this
+		// DSD no longer describes (e.g. a deleted resource).
+		if driver != nil {
+			driver.GC(ctx, signed.Document)
+		}
 		if err := c.PostDSDStatus(ctx, st.AgentToken, signed.Document.Version, apply.StatusPayload(results)); err != nil {
 			log.Warn("dsd: status report failed", "err", err)
 		}

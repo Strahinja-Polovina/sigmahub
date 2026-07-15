@@ -18,6 +18,11 @@ type Facts struct {
 	MemTotalMB uint64 `json:"memTotalMb,omitempty"`
 	GoVer      string `json:"goVersion"`
 	PID        int    `json:"pid"`
+	// DockerAvailable / DockerVersion report the container runtime the agent can
+	// drive (P1-3). Populated by the caller from a short-timeout probe, left
+	// zero when Docker is absent so the CP can surface capacity accurately.
+	DockerAvailable bool   `json:"dockerAvailable"`
+	DockerVersion   string `json:"dockerVersion,omitempty"`
 }
 
 // Collect gathers host facts; fields that can't be read on a platform stay
