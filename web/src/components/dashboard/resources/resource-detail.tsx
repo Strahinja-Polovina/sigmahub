@@ -86,6 +86,8 @@ type Detail = {
   envName: string;
   server: { id: string; name: string; type: string } | null;
   deployments: Deployment[];
+  secrets: { id: string; name: string; envVar: boolean; scope: "project" | "environment" }[];
+  canManage: boolean;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -173,7 +175,7 @@ function DeleteResourceButton({ resourceId, name }: { resourceId: string; name: 
 }
 
 export function ResourceDetail({ detail }: { detail: Detail }) {
-  const { resource, projectName, envName, server, deployments } = detail;
+  const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
 
   const metrics = React.useMemo(() => getMetrics(resource.id), [resource.id]);
   const logs = React.useMemo(() => getLogs(resource.id), [resource.id]);
@@ -380,11 +382,17 @@ export function ResourceDetail({ detail }: { detail: Detail }) {
             <CardHeader className="border-b">
               <CardTitle>Environment &amp; secrets</CardTitle>
               <CardDescription>
-                Values are masked by default. Revealing a secret requires confirmation.
+                Effective secrets for this resource — its environment plus shared project secrets.
+                Values are masked; revealing one is audited.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <EnvVarsTable seedKey={resource.id} />
+              <EnvVarsTable
+                resourceId={resource.id}
+                envName={envName}
+                secrets={secrets}
+                canManage={canManage}
+              />
             </CardContent>
           </Card>
         </TabsContent>

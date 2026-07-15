@@ -416,6 +416,78 @@ export async function cpConfirmDestructive(
   }, { orgId, actor });
 }
 
+// ── Secrets (P1-6) ──────────────────────────────────────────────────────────
+// Metadata only ever crosses this boundary on list/create; a plaintext value is
+// returned solely by the audited reveal, gated Project Admin+ on the CP.
+
+export type CpSecret = {
+  id: string;
+  projectId: string;
+  environmentId: string | null;
+  name: string;
+  envVar: boolean;
+  createdBy: string;
+};
+
+/** List secret METADATA for a project. envId "" returns every secret in the
+ *  project (project-scoped + all environments); envId set narrows to that
+ *  environment's own secrets. Developer+ on the CP. */
+export async function cpListSecrets(
+  orgId: string,
+  projectId: string,
+  envId?: string
+): Promise<CpSecret[]> {
+  const qs = envId ? `?environmentId=${encodeURIComponent(envId)}` : "";
+  const { secrets } = await cpFetch<{ secrets: CpSecret[] }>(
+    `${org(orgId)}/projects/${encodeURIComponent(projectId)}/secrets${qs}`,
+    undefined,
+    { orgId }
+  );
+  return secrets;
+}
+
+export async function cpCreateSecret(
+  orgId: string,
+  projectId: string,
+  input: { name: string; value: string; environmentId?: string; envVar: boolean },
+  actor: CpActor
+): Promise<CpSecret> {
+  return cpFetch(
+    `${org(orgId)}/projects/${encodeURIComponent(projectId)}/secrets`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        name: input.name,
+        value: input.value,
+        environmentId: input.environmentId ?? "",
+        envVar: input.envVar,
+      }),
+    },
+    { orgId, actor, idempotencyKey: crypto.randomUUID() }
+  );
+}
+
+/** Reveal a secret's plaintext value — audited server-side, actor forwarded so
+ *  the CP records who read it. Project Admin+ on the CP (Developer 403s). */
+export async function cpRevealSecret(
+  orgId: string,
+  secretId: string,
+  actor: CpActor
+): Promise<string> {
+  const { value } = await cpFetch<{ value: string }>(
+    `${org(orgId)}/secrets/${encodeURIComponent(secretId)}/value`,
+    undefined,
+    { orgId, actor }
+  );
+  return value;
+}
+
+export async function cpDeleteSecret(orgId: string, secretId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/secrets/${encodeURIComponent(secretId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
 export async function cpListResources(orgId: string, environmentId?: string): Promise<CpResource[]> {
   const qs = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
   const { resources } = await cpFetch<{ resources: CpResource[] }>(

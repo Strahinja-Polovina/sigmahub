@@ -1,8 +1,19 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { Eye, EyeOff, Copy, KeyRound, Lock } from "lucide-react";
+import {
+  Eye,
+  EyeOff,
+  Copy,
+  KeyRound,
+  Lock,
+  Plus,
+  Trash2,
+  Loader2,
+  ShieldAlert,
+} from "lucide-react";
 
 import {
   Table,
@@ -14,6 +25,18 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -23,89 +46,146 @@ import {
   DialogFooter,
   DialogClose,
 } from "@/components/ui/dialog";
+import {
+  createSecretAction,
+  revealSecretAction,
+  deleteSecretAction,
+} from "@/server/actions/secrets";
 
-type Secret = {
-  key: string;
-  value: string;
-  secret: boolean;
+type SecretScope = "project" | "environment";
+
+type SecretRow = {
+  id: string;
+  name: string;
+  envVar: boolean;
+  scope: SecretScope;
 };
 
-// A deterministic mock secret set, seeded off the resource id so it's stable.
-function buildSecrets(seedKey: string): Secret[] {
-  let h = 0;
-  for (const c of seedKey) h = (h * 31 + c.charCodeAt(0)) % 9973;
-  const token = h.toString(16).padStart(6, "0");
-  return [
-    { key: "NODE_ENV", value: "production", secret: false },
-    { key: "PORT", value: "3000", secret: false },
-    { key: "LOG_LEVEL", value: "info", secret: false },
-    {
-      key: "DATABASE_URL",
-      value: `postgres://app:${token}@db.internal:5432/app`,
-      secret: true,
-    },
-    { key: "REDIS_URL", value: "redis://cache.internal:6379/0", secret: false },
-    { key: "JWT_SECRET", value: `sk_live_${token}${token}`, secret: true },
-    { key: "STRIPE_KEY", value: `rk_live_${token}9f2a`, secret: true },
-  ];
-}
+const MASK = "•".repeat(16);
 
-function mask(value: string) {
-  return "•".repeat(Math.min(Math.max(value.length, 8), 24));
-}
+export function EnvVarsTable({
+  resourceId,
+  envName,
+  secrets,
+  canManage,
+}: {
+  resourceId: string;
+  envName: string;
+  secrets: SecretRow[];
+  canManage: boolean;
+}) {
+  const router = useRouter();
+  // Revealed plaintext values, keyed by secret id. A value only ever lives here
+  // after an explicit, audited reveal — never in the props.
+  const [values, setValues] = React.useState<Record<string, string>>({});
+  const [revealing, setRevealing] = React.useState<string | null>(null);
+  const [confirmReveal, setConfirmReveal] = React.useState<SecretRow | null>(null);
+  const [deleting, setDeleting] = React.useState<SecretRow | null>(null);
+  const [createOpen, setCreateOpen] = React.useState(false);
 
-export function EnvVarsTable({ seedKey }: { seedKey: string }) {
-  const secrets = React.useMemo(() => buildSecrets(seedKey), [seedKey]);
-  const [revealed, setRevealed] = React.useState<Record<string, boolean>>({});
-  const [confirmKey, setConfirmKey] = React.useState<string | null>(null);
-
-  function toggle(secret: Secret) {
-    if (revealed[secret.key]) {
-      setRevealed((r) => ({ ...r, [secret.key]: false }));
-      return;
-    }
-    // Non-sensitive values reveal immediately; sensitive ones require confirmation.
-    if (secret.secret) {
-      setConfirmKey(secret.key);
-    } else {
-      setRevealed((r) => ({ ...r, [secret.key]: true }));
+  async function doReveal(secret: SecretRow) {
+    setRevealing(secret.id);
+    try {
+      const { value } = await revealSecretAction({ resourceId, secretId: secret.id });
+      setValues((v) => ({ ...v, [secret.id]: value }));
+    } catch (err) {
+      toast.error("Couldn’t reveal secret", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    } finally {
+      setRevealing(null);
+      setConfirmReveal(null);
     }
   }
 
-  function confirmReveal() {
-    if (confirmKey) {
-      setRevealed((r) => ({ ...r, [confirmKey]: true }));
-      setConfirmKey(null);
+  function hide(id: string) {
+    setValues((v) => {
+      const next = { ...v };
+      delete next[id];
+      return next;
+    });
+  }
+
+  async function copyValue(secret: SecretRow) {
+    try {
+      const value =
+        values[secret.id] ??
+        (await revealSecretAction({ resourceId, secretId: secret.id })).value;
+      await navigator.clipboard.writeText(value);
+      toast.success(`Copied ${secret.name}`);
+    } catch (err) {
+      toast.error("Couldn’t copy", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    }
+  }
+
+  async function doDelete(secret: SecretRow) {
+    try {
+      await deleteSecretAction({ resourceId, secretId: secret.id });
+      toast.success(`Deleted ${secret.name}`);
+      router.refresh();
+    } catch (err) {
+      toast.error("Couldn’t delete", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    } finally {
+      setDeleting(null);
     }
   }
 
   return (
-    <>
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-sm text-muted-foreground">
+          {canManage
+            ? "Secrets are encrypted at rest and injected at container start. File-mode secrets land in an in-memory tmpfs; env-var mode is opt-in."
+            : "Values are hidden. Ask a Project Admin to reveal or manage secrets."}
+        </p>
+        {canManage && (
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Plus className="size-4" />
+            New secret
+          </Button>
+        )}
+      </div>
+
       <div className="overflow-hidden rounded-lg border border-border">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead className="pl-4">Key</TableHead>
               <TableHead>Value</TableHead>
-              <TableHead className="w-28 pr-4 text-right">Actions</TableHead>
+              <TableHead className="w-32 pr-4 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
+            {secrets.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={3} className="py-8 text-center text-sm text-muted-foreground">
+                  No secrets yet.
+                  {canManage ? " Add one to inject it at the next deploy." : ""}
+                </TableCell>
+              </TableRow>
+            )}
             {secrets.map((s) => {
-              const isRevealed = Boolean(revealed[s.key]);
+              const revealed = s.id in values;
               return (
-                <TableRow key={s.key}>
+                <TableRow key={s.id}>
                   <TableCell className="pl-4">
                     <span className="inline-flex items-center gap-2 font-mono text-sm text-foreground">
-                      {s.secret ? (
-                        <Lock className="size-3.5 text-muted-foreground" />
-                      ) : (
+                      {s.envVar ? (
                         <KeyRound className="size-3.5 text-muted-foreground" />
+                      ) : (
+                        <Lock className="size-3.5 text-muted-foreground" />
                       )}
-                      {s.key}
-                      {s.secret && (
+                      {s.name}
+                      <Badge variant="outline" className="text-[10px]">
+                        {s.scope === "environment" ? envName : "project"}
+                      </Badge>
+                      {s.envVar && (
                         <Badge variant="outline" className="text-[10px]">
-                          secret
+                          env var
                         </Badge>
                       )}
                     </span>
@@ -113,12 +193,12 @@ export function EnvVarsTable({ seedKey }: { seedKey: string }) {
                   <TableCell>
                     <span
                       className={
-                        isRevealed
-                          ? "font-mono text-sm text-foreground"
+                        revealed
+                          ? "font-mono text-sm break-all text-foreground"
                           : "font-mono text-sm tracking-wider text-muted-foreground"
                       }
                     >
-                      {isRevealed ? s.value : mask(s.value)}
+                      {revealed ? values[s.id] : MASK}
                     </span>
                   </TableCell>
                   <TableCell className="pr-4 text-right">
@@ -126,10 +206,14 @@ export function EnvVarsTable({ seedKey }: { seedKey: string }) {
                       <Button
                         variant="ghost"
                         size="icon-sm"
-                        aria-label={isRevealed ? "Hide value" : "Reveal value"}
-                        onClick={() => toggle(s)}
+                        disabled={!canManage || revealing === s.id}
+                        aria-label={revealed ? "Hide value" : "Reveal value"}
+                        title={canManage ? undefined : "Project Admin only"}
+                        onClick={() => (revealed ? hide(s.id) : setConfirmReveal(s))}
                       >
-                        {isRevealed ? (
+                        {revealing === s.id ? (
+                          <Loader2 className="size-4 animate-spin text-muted-foreground" />
+                        ) : revealed ? (
                           <EyeOff className="size-4 text-muted-foreground" />
                         ) : (
                           <Eye className="size-4 text-muted-foreground" />
@@ -138,10 +222,20 @@ export function EnvVarsTable({ seedKey }: { seedKey: string }) {
                       <Button
                         variant="ghost"
                         size="icon-sm"
+                        disabled={!canManage}
                         aria-label="Copy value"
-                        onClick={() => toast.success(`Copied ${s.key}`)}
+                        onClick={() => copyValue(s)}
                       >
                         <Copy className="size-4 text-muted-foreground" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={!canManage}
+                        aria-label="Delete secret"
+                        onClick={() => setDeleting(s)}
+                      >
+                        <Trash2 className="size-4 text-muted-foreground" />
                       </Button>
                     </div>
                   </TableCell>
@@ -152,28 +246,199 @@ export function EnvVarsTable({ seedKey }: { seedKey: string }) {
         </Table>
       </div>
 
-      <Dialog
-        open={confirmKey !== null}
-        onOpenChange={(o) => !o && setConfirmKey(null)}
-      >
+      {/* Reveal confirmation — a deliberate, audited action. */}
+      <Dialog open={confirmReveal !== null} onOpenChange={(o) => !o && setConfirmReveal(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Reveal secret value?</DialogTitle>
             <DialogDescription>
               You&apos;re about to display the plaintext value of{" "}
-              <span className="font-mono text-foreground">{confirmKey}</span>.
-              Make sure no one is looking over your shoulder.
+              <span className="font-mono text-foreground">{confirmReveal?.name}</span>. This read is
+              recorded in the audit log. Make sure no one is looking over your shoulder.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
-            <Button onClick={confirmReveal}>
-              <Eye className="size-4" />
+            <Button
+              disabled={revealing !== null}
+              onClick={() => confirmReveal && doReveal(confirmReveal)}
+            >
+              {revealing ? <Loader2 className="size-4 animate-spin" /> : <Eye className="size-4" />}
               Reveal
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </>
+
+      {/* Delete confirmation. */}
+      <Dialog open={deleting !== null} onOpenChange={(o) => !o && setDeleting(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete secret?</DialogTitle>
+            <DialogDescription>
+              <span className="font-mono text-foreground">{deleting?.name}</span> will be removed
+              and no longer injected on the next deploy. This can&apos;t be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+            <Button variant="destructive" onClick={() => deleting && doDelete(deleting)}>
+              <Trash2 className="size-4" />
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {canManage && (
+        <NewSecretDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          resourceId={resourceId}
+          envName={envName}
+          onCreated={() => router.refresh()}
+        />
+      )}
+    </div>
+  );
+}
+
+function NewSecretDialog({
+  open,
+  onOpenChange,
+  resourceId,
+  envName,
+  onCreated,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  resourceId: string;
+  envName: string;
+  onCreated: () => void;
+}) {
+  const [name, setName] = React.useState("");
+  const [value, setValue] = React.useState("");
+  const [scope, setScope] = React.useState<SecretScope>("environment");
+  const [envVar, setEnvVar] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  function reset() {
+    setName("");
+    setValue("");
+    setScope("environment");
+    setEnvVar(false);
+  }
+
+  async function submit() {
+    setBusy(true);
+    try {
+      await createSecretAction({ resourceId, name, value, scope, envVar });
+      toast.success(`Secret ${name} created`);
+      reset();
+      onOpenChange(false);
+      onCreated();
+    } catch (err) {
+      toast.error("Couldn’t create secret", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) reset();
+        onOpenChange(o);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>New secret</DialogTitle>
+          <DialogDescription>
+            Stored encrypted under your organization&apos;s key and injected when the container
+            starts.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-4 py-2">
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="secret-name">Key</Label>
+            <Input
+              id="secret-name"
+              placeholder="DATABASE_URL"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="font-mono"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="secret-value">Value</Label>
+            <Textarea
+              id="secret-value"
+              placeholder="postgres://…"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              className="font-mono min-h-20"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="secret-scope">Scope</Label>
+            <Select value={scope} onValueChange={(v) => setScope(v as SecretScope)}>
+              <SelectTrigger id="secret-scope">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="environment">
+                  Environment — {envName} (this resource only)
+                </SelectItem>
+                <SelectItem value="project">Project — shared by every environment</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="secret-envvar" className="cursor-pointer">
+                Inject as environment variable
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Off (default): mounted as an in-memory tmpfs file, never on disk. On: exported into
+                the process environment.
+              </p>
+            </div>
+            <Switch id="secret-envvar" checked={envVar} onCheckedChange={setEnvVar} />
+          </div>
+
+          {envVar && (
+            <Alert variant="destructive">
+              <ShieldAlert className="size-4" />
+              <AlertTitle>Environment variables are visible on the host</AlertTitle>
+              <AlertDescription>
+                An env-var secret appears in <span className="font-mono">docker inspect</span> and
+                the container config on the host&apos;s disk. Only enable this on a host with disk
+                encryption. Prefer file mode for anything sensitive.
+              </AlertDescription>
+            </Alert>
+          )}
+        </div>
+
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+          <Button disabled={busy || !name.trim() || value.length === 0} onClick={submit}>
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
+            Create secret
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
