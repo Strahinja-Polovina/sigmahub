@@ -25,12 +25,16 @@ export function Reveal({
     const el = ref.current;
     if (!el) return;
 
+    // Reduced motion: reveal instantly and skip the observer. The transition
+    // itself is already disabled via `motion-reduce:transition-none`, so this
+    // just short-circuits the scroll-in. setShown here runs inside a passive
+    // rAF tick, not synchronously in the effect body.
     if (
       typeof window !== "undefined" &&
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
     ) {
-      setShown(true);
-      return;
+      const raf = requestAnimationFrame(() => setShown(true));
+      return () => cancelAnimationFrame(raf);
     }
 
     const io = new IntersectionObserver(

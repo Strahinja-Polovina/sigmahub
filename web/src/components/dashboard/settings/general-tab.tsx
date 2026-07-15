@@ -25,7 +25,14 @@ export function GeneralTab({ org, isAdmin }: { org: SettingsOrg; isAdmin: boolea
   const [name, setName] = React.useState(org.name);
   const [pending, startTransition] = React.useTransition();
 
-  React.useEffect(() => setName(org.name), [org.id, org.name]);
+  // Re-seed the field when the org identity or its persisted name changes
+  // (switch, or after a successful save). Adjusting during render avoids the
+  // setState-in-effect round-trip.
+  const [prevOrg, setPrevOrg] = React.useState(`${org.id}:${org.name}`);
+  if (prevOrg !== `${org.id}:${org.name}`) {
+    setPrevOrg(`${org.id}:${org.name}`);
+    setName(org.name);
+  }
 
   const dirty = name.trim() !== org.name && name.trim().length > 0;
 

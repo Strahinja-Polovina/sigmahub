@@ -160,7 +160,7 @@ export function EnvVarsTable({ seedKey }: { seedKey: string }) {
           <DialogHeader>
             <DialogTitle>Reveal secret value?</DialogTitle>
             <DialogDescription>
-              You're about to display the plaintext value of{" "}
+              You&apos;re about to display the plaintext value of{" "}
               <span className="font-mono text-foreground">{confirmKey}</span>.
               Make sure no one is looking over your shoulder.
             </DialogDescription>

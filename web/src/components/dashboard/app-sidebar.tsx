@@ -71,10 +71,14 @@ function ProjectNavItem({
   );
   const [open, setOpen] = React.useState(projectActive);
 
-  // Auto-open when this project becomes active (e.g. via ⌘K or a direct link).
-  React.useEffect(() => {
+  // Auto-open when this project becomes active (e.g. via ⌘K or a direct link),
+  // while still letting the user collapse it manually. Adjusting during render
+  // reacts to the transition without a setState-in-effect.
+  const [prevActive, setPrevActive] = React.useState(projectActive);
+  if (projectActive !== prevActive) {
+    setPrevActive(projectActive);
     if (projectActive) setOpen(true);
-  }, [projectActive]);
+  }
 
   return (
     <Collapsible open={open} onOpenChange={setOpen} render={<SidebarMenuItem />}>
