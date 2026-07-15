@@ -22,7 +22,8 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 )
 
-const version = "0.1.0"
+// version is stamped at release time via -ldflags "-X main.version=…".
+var version = "dev"
 
 func main() {
 	if err := run(); err != nil {

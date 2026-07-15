@@ -21,6 +21,9 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
 )
 
+// version is stamped at release time via -ldflags "-X main.version=…".
+var version = "dev"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "mint-service-token" {
 		if err := mintServiceToken(os.Args[2:]); err != nil {
@@ -146,7 +149,7 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("control plane listening", "addr", cfg.Addr)
+		log.Info("control plane listening", "addr", cfg.Addr, "version", version)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
