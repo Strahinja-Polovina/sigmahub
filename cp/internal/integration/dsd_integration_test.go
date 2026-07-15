@@ -49,7 +49,7 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 	}
 	// Fresh, isolated state per run. cp_secrets is cleared too so the pepper
 	// and DSD key are re-wrapped under this run's throwaway KMS key.
-	for _, tbl := range []string{"server_dsd", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "servers", "cp_audit_log", "cp_secrets"} {
+	for _, tbl := range []string{"server_dsd", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "servers", "cp_audit_log", "cp_secrets"} {
 		if _, err := st.Pool.Exec(ctx, "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
@@ -63,6 +63,7 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 		t.Fatal(err)
 	}
 	st.SetPepper(pepper)
+	st.SetCustody(custody)
 	dsdKey, err := st.LoadDSDSigningKey(ctx, custody)
 	if err != nil {
 		t.Fatal(err)
@@ -523,6 +524,129 @@ func TestServerLifecycleTombstoneAndEndpoints(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected revoke error: %v", err)
 		}
+	}
+}
+
+// TestSecretsEnvelopeRotationAAD exercises P1-6 at the store layer: DEK envelope
+// encryption, reveal auditing, env-over-project resolution, AAD binding
+// (cross-row swap fails), and both rotation kinds.
+func TestSecretsEnvelopeRotationAAD(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_sec"
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Env secret overrides a project default of the same name; a second env-only
+	// secret is file-mode.
+	if _, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{ProjectID: proj.ID, Name: "API_KEY", Value: "proj-default"}); err != nil {
+		t.Fatal(err)
+	}
+	envSec, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{ProjectID: proj.ID, EnvironmentID: env.ID, Name: "API_KEY", Value: "env-value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{ProjectID: proj.ID, EnvironmentID: env.ID, Name: "DB_URL", Value: "postgres://x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reveal returns the value and writes an audit row.
+	val, err := st.RevealSecret(ctx, orgID, envSec.ID, "admin")
+	if err != nil || val != "env-value" {
+		t.Fatalf("reveal = %q err=%v, want env-value", val, err)
+	}
+	var reveals int
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM cp_audit_log WHERE org_id=$1 AND action='Secret revealed'`, orgID).Scan(&reveals)
+	if reveals < 1 {
+		t.Fatal("reveal did not write an audit row")
+	}
+
+	// Resolve for a resource in the env: env API_KEY wins over the project
+	// default; DB_URL present. (Bind a server + resource first.)
+	bt, _, _ := st.IssueBootstrapToken(ctx, orgID, "h", "general", "", "", "test", time.Hour)
+	reg, _ := st.RegisterServer(ctx, bt, "h", "0.1.0", json.RawMessage(`{}`), "")
+	st.AttachServer(ctx, orgID, env.ID, reg.Server.ID, "test")
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{EnvironmentID: env.ID, ServerID: reg.Server.ID, Name: "app1", Kind: "app", Spec: json.RawMessage(`{}`)}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := st.ResolveSecretsForResource(ctx, orgID, reg.Server.ID, res.ID, "sigmad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range resolved {
+		got[r.Name] = r.Value
+	}
+	if got["API_KEY"] != "env-value" || got["DB_URL"] != "postgres://x" {
+		t.Fatalf("resolve = %+v, want API_KEY=env-value (env override) + DB_URL", got)
+	}
+
+	// Server scoping (anti-BOLA): a DIFFERENT server in the same org must not be
+	// able to resolve this resource's secrets, even though it shares the org.
+	bt2, _, _ := st.IssueBootstrapToken(ctx, orgID, "h2", "general", "", "", "test", time.Hour)
+	reg2, _ := st.RegisterServer(ctx, bt2, "h2", "0.1.0", json.RawMessage(`{}`), "")
+	if _, err := st.ResolveSecretsForResource(ctx, orgID, reg2.Server.ID, res.ID, "sigmad"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-server resolve = %v, want ErrNotFound (a server must not read another server's secrets)", err)
+	}
+
+	// AAD binding: swap another secret's ciphertext into envSec's row → decrypt
+	// must fail (the AAD no longer matches the row identity).
+	otherProj, _ := st.CreateProject(ctx, orgID, "p2", "", "test")
+	other, _ := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{ProjectID: otherProj.ID, Name: "X", Value: "other"})
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE secrets SET ciphertext=(SELECT ciphertext FROM secrets WHERE id=$2), nonce=(SELECT nonce FROM secrets WHERE id=$2) WHERE id=$1`,
+		envSec.ID, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RevealSecret(ctx, orgID, envSec.ID, "admin"); err == nil {
+		t.Fatal("AAD: a ciphertext swapped from another row decrypted — AAD binding is broken")
+	}
+
+	// KEK rotation: wrapped-DEK versions advance; other secrets still decrypt.
+	var beforeVer int
+	st.Pool.QueryRow(ctx, `SELECT max(wrap_version) FROM org_deks WHERE org_id=$1`, orgID).Scan(&beforeVer)
+	if _, err := st.RotateKEK(ctx, orgID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	var afterVer int
+	st.Pool.QueryRow(ctx, `SELECT max(wrap_version) FROM org_deks WHERE org_id=$1`, orgID).Scan(&afterVer)
+	if afterVer <= beforeVer {
+		t.Fatalf("KEK rotation did not advance wrap_version (%d -> %d)", beforeVer, afterVer)
+	}
+	if v, err := st.RevealSecret(ctx, orgID, other.ID, "admin"); err != nil || v != "other" {
+		t.Fatalf("reveal after KEK rotation = %q err=%v, want other", v, err)
+	}
+
+	// DEK rotation: a new active DEK is created; ReencryptSecrets migrates all
+	// rows and retires the drained old DEK; secrets still decrypt.
+	if _, err := st.RotateDEK(ctx, orgID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReencryptSecrets(ctx, orgID); err != nil {
+		t.Fatal(err)
+	}
+	var retired, active int
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM org_deks WHERE org_id=$1 AND retired_at IS NOT NULL`, orgID).Scan(&retired)
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM org_deks WHERE org_id=$1 AND active`, orgID).Scan(&active)
+	if retired < 1 || active != 1 {
+		t.Fatalf("DEK rotation: retired=%d active=%d, want retired>=1 active=1", retired, active)
+	}
+	if v, err := st.RevealSecret(ctx, orgID, other.ID, "admin"); err != nil || v != "other" {
+		t.Fatalf("reveal after DEK rotation = %q err=%v, want other", v, err)
+	}
+	// Every remaining secret now sits on the active DEK.
+	var stale int
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM secrets s WHERE s.org_id=$1 AND s.dek_id <> (SELECT id FROM org_deks WHERE org_id=$1 AND active)`, orgID).Scan(&stale)
+	if stale != 0 {
+		t.Fatalf("%d secrets still on a non-active DEK after re-encrypt", stale)
 	}
 }
 
