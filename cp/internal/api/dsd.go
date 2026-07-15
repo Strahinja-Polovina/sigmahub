@@ -43,13 +43,23 @@ func (s *Server) handleGetDSD(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 
 	for {
+		// Subscribe BEFORE reading the version. A notify only wakes waiters
+		// that are already registered, so reading first and subscribing second
+		// would lose a change committed in that window (the channel is closed
+		// against an empty waiter set) and stall delivery until timeout. With
+		// this ordering, any change committed after Wait fires our channel, and
+		// any change committed before Wait is caught by the read below.
+		ch, cancel := s.dsdWaiter.Wait(srv.ID)
+
 		cur, err := s.dsdStore.CurrentDSDVersion(r.Context(), srv.ID)
 		if err != nil {
+			cancel()
 			s.log.Error("dsd version", "err", err, "server", srv.ID)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
 		if cur > after {
+			cancel()
 			signed, err := s.dsdStore.GetDSD(r.Context(), srv.ID)
 			if err != nil {
 				s.log.Error("dsd fetch", "err", err, "server", srv.ID)
@@ -60,14 +70,10 @@ func (s *Server) handleGetDSD(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Subscribe BEFORE re-checking would race a mutation; subscribe then
-		// wait. A change between the version read and here still fires the
-		// channel.
-		ch, cancel := s.dsdWaiter.Wait(srv.ID)
 		select {
 		case <-ch:
 			cancel()
-			// Loop: re-read version and return the new DSD.
+			// Loop: re-subscribe, re-read version, and return the new DSD.
 		case <-time.After(longPollTimeout):
 			cancel()
 			w.WriteHeader(http.StatusNoContent)

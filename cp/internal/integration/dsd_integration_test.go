@@ -178,6 +178,15 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	// not regress applied_version.
 	postDSDStatus(t, ts.URL, agentTok, 0, statusOps)
 
+	// Bogus version rejection: the reported version is agent-supplied, so a
+	// report claiming a version above the DSD the CP actually issued must NOT
+	// poison applied_version — otherwise every honest report afterwards would
+	// read as superseded and permanently freeze this server's status.
+	postDSDStatus(t, ts.URL, agentTok, 1<<40, statusOps)
+	if av := appliedVersion(t, st, serverID); av != 1 {
+		t.Fatalf("over-large status report poisoned applied_version to %d, want 1", av)
+	}
+
 	// Resync convergence: delete the resource directly in the store (bypassing
 	// the API's event-driven reconcile), then run a reconcile tick (what the
 	// 60s resync loop does) — the DSD must bump to v2 with zero ops.
@@ -239,6 +248,16 @@ func postDSDStatus(t *testing.T, base, agentTok string, version int64, ops map[s
 	if resp.StatusCode != 200 {
 		t.Fatalf("post status: %d", resp.StatusCode)
 	}
+}
+
+func appliedVersion(t *testing.T, st *store.Store, serverID string) int64 {
+	t.Helper()
+	var v int64
+	if err := st.Pool.QueryRow(context.Background(),
+		"SELECT applied_version FROM server_dsd WHERE server_id = $1", serverID).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
 }
 
 func resourceStatusState(t *testing.T, st *store.Store, resourceID string) string {

@@ -201,17 +201,22 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var applied int64
+	var applied, issued int64
 	err = tx.QueryRow(ctx,
-		`SELECT applied_version FROM server_dsd WHERE server_id = $1 FOR UPDATE`, serverID).Scan(&applied)
+		`SELECT applied_version, version FROM server_dsd WHERE server_id = $1 FOR UPDATE`, serverID).Scan(&applied, &issued)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
 	}
 	if err != nil {
 		return false, err
 	}
-	if version < applied {
-		return false, tx.Commit(ctx) // superseded
+	// Reject superseded (below last-applied) and bogus (above the version the
+	// CP has actually issued) reports. The reported version is agent-supplied,
+	// so without the upper bound a compromised/buggy agent could set
+	// applied_version arbitrarily high and permanently freeze this server's
+	// status — every honest report would then read as superseded.
+	if version < applied || version > issued {
+		return false, tx.Commit(ctx)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE server_dsd SET applied_version = $2 WHERE server_id = $1`, serverID, version); err != nil {
