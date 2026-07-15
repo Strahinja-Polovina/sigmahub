@@ -125,7 +125,20 @@ func run() error {
 	}
 	defer cstore.Close()
 	docker := container.NewDockerClient(*dockerSock, os.Getenv("DOCKER_HOST"))
-	driver := container.NewDriver(docker, cstore, log)
+	// The driver resolves a resource's secrets from the CP at container-create
+	// over the authenticated agent channel.
+	secretFetcher := func(ctx context.Context, resourceID string) ([]container.Secret, error) {
+		res, err := c.FetchSecrets(ctx, st.AgentToken, resourceID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]container.Secret, 0, len(res.Secrets))
+		for _, s := range res.Secrets {
+			out = append(out, container.Secret{Name: s.Name, Value: s.Value, EnvVar: s.EnvVar})
+		}
+		return out, nil
+	}
+	driver := container.NewDriver(docker, cstore, log, secretFetcher)
 	driver.Register(registry)
 	if avail, ver := container.Probe(ctx, docker); avail {
 		log.Info("docker runtime available", "version", ver)

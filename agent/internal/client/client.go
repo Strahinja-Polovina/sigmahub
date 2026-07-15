@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -122,6 +123,24 @@ func (c *Client) GetDSD(ctx context.Context, agentToken string, after int64) (ds
 		return dsd.Signed{}, false, err
 	}
 	return signed, true, nil
+}
+
+// SecretsResponse is the CP's resolved secrets for a resource (values over the
+// already-authenticated agent channel).
+type SecretsResponse struct {
+	Secrets []struct {
+		Name   string `json:"name"`
+		Value  string `json:"value"`
+		EnvVar bool   `json:"envVar"`
+	} `json:"secrets"`
+}
+
+// FetchSecrets resolves a resource's secrets at container-create time. Org/env
+// scope is derived server-side from the agent token, never sent by the caller.
+func (c *Client) FetchSecrets(ctx context.Context, agentToken, resourceID string) (SecretsResponse, error) {
+	var res SecretsResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/secrets?resourceId="+url.QueryEscape(resourceID), agentToken, nil, &res)
+	return res, err
 }
 
 // PostDSDStatus reports per-op results for an applied DSD version.

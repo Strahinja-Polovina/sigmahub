@@ -24,6 +24,9 @@ type Driver struct {
 	log       *slog.Logger
 	limiter   *rateLimiter
 	allowlist ImageAllowlist
+	// secrets resolves a resource's secret values from the control plane at
+	// container-create; nil disables secret injection (e.g. in tests).
+	secrets SecretFetcher
 	// mu serialises the reconcile loop's per-container converge against GC's
 	// prune+remove, so a container GC just removed cannot be resurrected by a
 	// concurrent reconcile working from a stale desired snapshot.
@@ -31,12 +34,14 @@ type Driver struct {
 }
 
 // NewDriver builds a driver. The allowlist ships disabled (see allowlist.go).
-func NewDriver(docker *DockerClient, store *Store, log *slog.Logger) *Driver {
+// fetcher may be nil to disable secret injection.
+func NewDriver(docker *DockerClient, store *Store, log *slog.Logger, fetcher SecretFetcher) *Driver {
 	return &Driver{
 		docker:  docker,
 		store:   store,
 		log:     log,
 		limiter: newRateLimiter(20, 5), // burst 20, 5 ops/sec sustained
+		secrets: fetcher,
 	}
 }
 
@@ -166,7 +171,11 @@ func terminalRestart(policy string) bool {
 }
 
 // converge inspects the named container and (re)creates it unless it already
-// satisfies the spec (see converged).
+// satisfies the spec (see converged). Secret references are resolved from the
+// control plane and injected at create: env-mode values into the container's
+// environment, file-mode values seeded into an in-memory tmpfs so they never
+// touch host disk. The spec hash used for the label/drift check is computed
+// from the reference-only spec, so it stays stable and leaks no values.
 func (d *Driver) converge(ctx context.Context, spec ContainerSpec) error {
 	cur, exists, err := d.docker.ContainerInspect(ctx, spec.Name)
 	if err != nil {
@@ -175,12 +184,45 @@ func (d *Driver) converge(ctx context.Context, spec ContainerSpec) error {
 	if converged(spec, cur, exists) {
 		return nil
 	}
+
+	// Resolve secrets before create. Env-mode values go into a COPY of Env so
+	// the persisted/hashed spec keeps references only; file-mode values are
+	// seeded post-create into the tmpfs.
+	want := spec.SpecHash()
+	effective := spec
+	var fileSecrets []Secret
+	if len(spec.SecretRefs) > 0 && d.secrets != nil {
+		fetched, err := d.secrets(ctx, spec.ResourceID)
+		if err != nil {
+			return fmt.Errorf("fetch secrets: %w", err)
+		}
+		byName := make(map[string]Secret, len(fetched))
+		for _, s := range fetched {
+			byName[s.Name] = s
+		}
+		effective.Env = map[string]string{}
+		for k, v := range spec.Env {
+			effective.Env[k] = v
+		}
+		for _, ref := range spec.SecretRefs {
+			s, ok := byName[ref.Name]
+			if !ok {
+				return fmt.Errorf("secret %q referenced but not provided by the control plane", ref.Name)
+			}
+			if ref.EnvVar {
+				effective.Env[ref.Name] = s.Value
+			} else {
+				fileSecrets = append(fileSecrets, s)
+			}
+		}
+	}
+
 	if exists {
 		if err := d.docker.ContainerRemove(ctx, cur.ID, true); err != nil {
 			return fmt.Errorf("remove stale container: %w", err)
 		}
 	}
-	body := d.buildCreateBody(spec, spec.SpecHash())
+	body := d.buildCreateBody(effective, want)
 	id, err := d.docker.ContainerCreate(ctx, spec.Name, body)
 	if err != nil {
 		return fmt.Errorf("create container: %w", err)
@@ -188,7 +230,40 @@ func (d *Driver) converge(ctx context.Context, spec ContainerSpec) error {
 	if err := d.docker.ContainerStart(ctx, id); err != nil {
 		return fmt.Errorf("start container: %w", err)
 	}
+	// Seed file-mode secrets AFTER start, through the RUNNING container's mount
+	// namespace (see writeFileSecrets). A tmpfs is a runtime mount that only
+	// exists while the container runs, so we must re-inspect for a live pid first.
+	// If the container has already exited (a crash, or a one-shot workload), we do
+	// NOT seed: writing to a stopped container would land the plaintext on the
+	// host disk layer. Instead we roll the container back so the next reconcile
+	// retries, rather than leave a half-provisioned workload or leak to disk.
+	if len(fileSecrets) > 0 {
+		cur, ok, err := d.docker.ContainerInspect(ctx, id)
+		if err != nil {
+			d.removeQuietly(ctx, id)
+			return fmt.Errorf("inspect for secret seeding: %w", err)
+		}
+		if !ok || !cur.Running || cur.Pid <= 0 {
+			d.removeQuietly(ctx, id)
+			return fmt.Errorf("container %q not running after start; refusing to seed secrets to disk", spec.Name)
+		}
+		if err := writeFileSecrets(cur.Pid, fileSecrets); err != nil {
+			// A running container without its required secret files is a broken
+			// half-provisioned state; remove it so the next reconcile recreates
+			// cleanly rather than leaving a workload that can never read its config.
+			d.removeQuietly(ctx, id)
+			return fmt.Errorf("seed secret files: %w", err)
+		}
+	}
 	return nil
+}
+
+// removeQuietly force-removes a container ignoring errors, used to roll back a
+// partially-provisioned container so a later reconcile can recreate it.
+func (d *Driver) removeQuietly(ctx context.Context, id string) {
+	if err := d.docker.ContainerRemove(ctx, id, true); err != nil {
+		d.log.Warn("rollback container remove failed", "id", id, "err", err)
+	}
 }
 
 func (d *Driver) opVolumeRemove(ctx context.Context, op dsd.Op) error {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +30,7 @@ const (
 	e2eVolume    = "sigmahub-res_e2e-data"
 )
 
-func e2eDriver(t *testing.T) (*Driver, *DockerClient) {
+func e2eDriver(t *testing.T, fetcher SecretFetcher) (*Driver, *DockerClient) {
 	t.Helper()
 	if os.Getenv("SIGMAD_DOCKER_E2E") == "" {
 		t.Skip("set SIGMAD_DOCKER_E2E=1 to run the real-Docker e2e")
@@ -42,7 +44,7 @@ func e2eDriver(t *testing.T) (*Driver, *DockerClient) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	d := NewDriver(docker, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d := NewDriver(docker, store, slog.New(slog.NewTextHandler(io.Discard, nil)), fetcher)
 	return d, docker
 }
 
@@ -140,7 +142,7 @@ func hasOpt(opts []string, want string) bool {
 }
 
 func TestDockerE2EConvergeIsolationDriftGC(t *testing.T) {
-	d, docker := e2eDriver(t)
+	d, docker := e2eDriver(t, nil)
 	ctx := context.Background()
 	e2eCleanup(ctx, docker)
 	t.Cleanup(func() { e2eCleanup(context.Background(), docker) })
@@ -218,7 +220,7 @@ func TestDockerE2EConvergeIsolationDriftGC(t *testing.T) {
 }
 
 func TestDockerE2EPolicyDenial(t *testing.T) {
-	d, docker := e2eDriver(t)
+	d, docker := e2eDriver(t, nil)
 	ctx := context.Background()
 	e2eCleanup(ctx, docker)
 	t.Cleanup(func() { e2eCleanup(context.Background(), docker) })
@@ -238,8 +240,164 @@ func TestDockerE2EPolicyDenial(t *testing.T) {
 	}
 }
 
+// inspectRuntime returns the runtime tmpfs mounts and env of a container so the
+// secrets test can prove /run/secrets is a RAM mount and env-mode secrets landed
+// in the environment.
+func inspectRuntime(t *testing.T, docker *DockerClient, name string) (map[string]string, []string) {
+	t.Helper()
+	var out struct {
+		Config struct {
+			Env []string `json:"Env"`
+		} `json:"Config"`
+		HostConfig struct {
+			Tmpfs map[string]string `json:"Tmpfs"`
+		} `json:"HostConfig"`
+	}
+	if err := docker.do(context.Background(), http.MethodGet, "/containers/"+name+"/json", nil, &out); err != nil {
+		t.Fatalf("inspect %s: %v", name, err)
+	}
+	return out.HostConfig.Tmpfs, out.Config.Env
+}
+
+func hasEnv(env []string, want string) bool {
+	for _, e := range env {
+		if e == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEnvKey(env []string, key string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDockerE2ESecretsTmpfsInjection is the P1-6 acceptance test on the P1-3
+// harness: a DSD-driven container create with secret references makes a
+// file-mode secret readable from a tmpfs (RAM, never disk) and an env-mode
+// secret readable from the environment (the opt-in caveat), while the agent's
+// persisted desired-state keeps references only — never values.
+func TestDockerE2ESecretsTmpfsInjection(t *testing.T) {
+	const (
+		fileSecretName  = "API_KEY"
+		fileSecretValue = "top-secret\nmulti=line\n" // newline + '=' prove byte-exact, non-env-mangled handling
+		envSecretName   = "DB_PASSWORD"
+		envSecretValue  = "env-mode-value-42"
+	)
+	fetcher := func(ctx context.Context, resourceID string) ([]Secret, error) {
+		if resourceID != e2eResource {
+			return nil, fmt.Errorf("fetch for unexpected resource %q", resourceID)
+		}
+		return []Secret{
+			{Name: fileSecretName, Value: fileSecretValue, EnvVar: false},
+			{Name: envSecretName, Value: envSecretValue, EnvVar: true},
+		}, nil
+	}
+
+	d, docker := e2eDriver(t, fetcher)
+	ctx := context.Background()
+	e2eCleanup(ctx, docker)
+	t.Cleanup(func() { e2eCleanup(context.Background(), docker) })
+
+	if err := d.opNetworkEnsure(ctx, opFor(t, KindNetworkEnsure, "net", nil, NetworkSpec{Name: e2eNetwork})); err != nil {
+		t.Fatalf("network ensure: %v", err)
+	}
+	if err := d.opImagePull(ctx, opFor(t, KindImagePull, "img", nil, ImageSpec{Image: e2eImage})); err != nil {
+		t.Fatalf("image pull: %v", err)
+	}
+
+	spec := e2eContainerSpec(true, false)
+	spec.Tmpfs = append(spec.Tmpfs, SecretsMountDir)
+	spec.SecretRefs = []SecretRef{
+		{Name: fileSecretName},              // file mode (default): tmpfs file
+		{Name: envSecretName, EnvVar: true}, // env mode (explicit opt-in)
+	}
+	if err := d.opContainerApply(ctx, opFor(t, KindContainerApply, "res:"+e2eResource, []string{"net", "img"}, spec)); err != nil {
+		t.Fatalf("container apply: %v", err)
+	}
+	waitRunning(t, docker, e2eContainer)
+
+	// The file secret is readable from the tmpfs, byte-for-byte, as the workload
+	// sees it: read through the container's own mount namespace via /proc — the
+	// same path the agent seeds through. (docker cp read-back is unreliable here:
+	// on the containerd snapshotter it reads the on-disk layer, not the tmpfs, so
+	// it 404s on a file that only exists in RAM.)
+	cs, ok, err := docker.ContainerInspect(ctx, e2eContainer)
+	if err != nil || !ok {
+		t.Fatalf("inspect for pid: ok=%v err=%v", ok, err)
+	}
+	if cs.Pid <= 0 {
+		t.Fatalf("container has no pid: %d", cs.Pid)
+	}
+	got, err := os.ReadFile(fmt.Sprintf("/proc/%d/root%s/%s", cs.Pid, SecretsMountDir, fileSecretName))
+	if err != nil {
+		t.Fatalf("read seeded secret via /proc: %v", err)
+	}
+	if string(got) != fileSecretValue {
+		t.Errorf("tmpfs secret value = %q, want %q", got, fileSecretValue)
+	}
+
+	tmpfs, env := inspectRuntime(t, docker, e2eContainer)
+
+	// /run/secrets MUST be a tmpfs mount: that is what keeps the value in RAM and
+	// off the graphdriver disk layer (the "secrets never touch disk" invariant).
+	if _, ok := tmpfs[SecretsMountDir]; !ok {
+		t.Errorf("%s is not a tmpfs mount (secret would be on disk): %v", SecretsMountDir, tmpfs)
+	}
+	// Env-mode secret is injected (and, as documented, visible in `docker inspect`).
+	if !hasEnv(env, envSecretName+"="+envSecretValue) {
+		t.Errorf("env-mode secret %q not injected into environment: %v", envSecretName, env)
+	}
+	// File-mode secret must NEVER be exposed as an environment variable.
+	if hasEnvKey(env, fileSecretName) {
+		t.Errorf("file-mode secret %q leaked into environment: %v", fileSecretName, env)
+	}
+
+	// Disk-scan (acceptance): docker diff reports only the on-disk graphdriver
+	// layer — tmpfs writes never appear. The seeded secret path must therefore be
+	// ABSENT, proving it lives in RAM and never landed on host disk. (Had the
+	// agent seeded before start, the file would sit in the rw layer and show up
+	// here as an added path.)
+	changes, err := docker.ContainerChanges(ctx, e2eContainer)
+	if err != nil {
+		t.Fatalf("container changes: %v", err)
+	}
+	for _, c := range changes {
+		if strings.HasPrefix(c.Path, SecretsMountDir) {
+			t.Errorf("secret path %q leaked to the on-disk layer (docker diff): %+v", c.Path, changes)
+		}
+	}
+
+	// The persisted desired-state keeps references only — a disk read of the
+	// agent's own store must never yield a plaintext secret value.
+	desired, err := d.store.AllDesired()
+	if err != nil {
+		t.Fatalf("read desired store: %v", err)
+	}
+	ps, ok := desired[e2eContainer]
+	if !ok {
+		t.Fatal("desired spec was not persisted")
+	}
+	if got := ps.Env[envSecretName]; got != "" {
+		t.Errorf("persisted desired spec leaked env-secret value: %q", got)
+	}
+	for _, v := range ps.Env {
+		if v == fileSecretValue || v == envSecretValue {
+			t.Errorf("persisted desired spec leaked a secret value: %q", v)
+		}
+	}
+	if len(ps.SecretRefs) != 2 {
+		t.Errorf("persisted desired spec lost secret references: %v", ps.SecretRefs)
+	}
+}
+
 func TestDockerE2EVolumeLifecycle(t *testing.T) {
-	d, docker := e2eDriver(t)
+	d, docker := e2eDriver(t, nil)
 	ctx := context.Background()
 	_ = docker.VolumeRemove(ctx, e2eVolume, true)
 	t.Cleanup(func() { _ = docker.VolumeRemove(context.Background(), e2eVolume, true) })
