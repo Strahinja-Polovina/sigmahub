@@ -6,7 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
+
+// tmpfsMagic is the Linux statfs f_type for tmpfs. Secrets are only ever written
+// where statfs confirms this, so a plaintext value can never reach the on-disk
+// rootfs layer even if the dedicated mount was shadowed or absent.
+const tmpfsMagic = 0x01021994
 
 // SecretFetcher resolves a resource's secrets from the control plane at
 // container-create time. It returns decrypted values that are injected and then
@@ -51,17 +57,34 @@ func writeFileSecrets(pid int, secrets []Secret) error {
 	if pid <= 0 {
 		return fmt.Errorf("container has no pid; cannot seed secret files")
 	}
-	root := fmt.Sprintf("/proc/%d/root", pid)
-	dir := filepath.Join(root, SecretsMountDir)
+	dir := fmt.Sprintf("/proc/%d/root%s", pid, SecretsMountDir)
+	// The dedicated /run/secrets tmpfs can be absent or shadowed by a parent
+	// tmpfs (e.g. a /run mount) depending on the daemon's mount ordering, leaving
+	// the directory missing; (re)create it inside whatever is mounted there. When
+	// the parent is itself a tmpfs (the case that shadows /run/secrets), the file
+	// still lands in RAM.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create secrets dir: %w", err)
+	}
+	// Hard never-on-disk guarantee: only write where statfs confirms the backing
+	// store is tmpfs (RAM). statfs reflects the effective mount at the path, so
+	// this holds even if a dedicated secrets tmpfs was shadowed. If the path
+	// resolved to the on-disk rootfs, refuse rather than leak plaintext.
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return fmt.Errorf("statfs secrets dir: %w", err)
+	}
+	if st.Type != tmpfsMagic {
+		return fmt.Errorf("%s is not tmpfs-backed in the container (fs=0x%x); refusing to seed secrets to disk", SecretsMountDir, uint64(st.Type))
+	}
 	for _, s := range secrets {
 		name, err := safeSecretFileName(s.Name)
 		if err != nil {
 			return err
 		}
 		dst := filepath.Join(dir, name)
-		// Defense in depth: the cleaned destination must stay under the secrets
-		// dir even if validation missed something.
-		if dst != filepath.Join(dir, name) || !strings.HasPrefix(dst+"/", dir+"/") {
+		// Defense in depth: the cleaned destination must stay under the secrets dir.
+		if !strings.HasPrefix(dst+"/", dir+"/") {
 			return fmt.Errorf("secret %q resolves outside %s", s.Name, SecretsMountDir)
 		}
 		if err := os.WriteFile(dst, []byte(s.Value), 0o444); err != nil {
