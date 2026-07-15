@@ -346,6 +346,50 @@ export async function cpDeleteResource(orgId: string, resourceId: string, actor:
   }, { orgId, actor });
 }
 
+// Server + token lifecycle (P1-4). Server delete tombstones the CP record and
+// revokes its agent token; a 409 (with the bound-resource list) surfaces as a
+// thrown "Control plane 409" error the caller can show.
+export async function cpDeleteServer(orgId: string, serverId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/servers/${encodeURIComponent(serverId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export type CpServiceToken = {
+  id: string;
+  name: string;
+  role: string;
+  createdBy: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+};
+
+export async function cpListServiceTokens(orgId: string): Promise<CpServiceToken[]> {
+  const { tokens } = await cpFetch<{ tokens: CpServiceToken[] }>(
+    `${org(orgId)}/service-tokens`,
+    undefined,
+    { orgId }
+  );
+  return tokens;
+}
+
+export async function cpRotateServiceToken(
+  orgId: string,
+  tokenId: string,
+  actor: CpActor
+): Promise<{ token: string; id: string; name: string; role: string }> {
+  return cpFetch(`${org(orgId)}/service-tokens/${encodeURIComponent(tokenId)}/rotate`, {
+    method: "POST",
+  }, { orgId, actor });
+}
+
+export async function cpRevokeServiceToken(orgId: string, tokenId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/service-tokens/${encodeURIComponent(tokenId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
 // Two-phase destructive-op confirm (P1-3). Phase 1 mints a short-lived,
 // single-use token authorising exactly one destructive op on one server; phase
 // 2 presents that token back to execute it. Both are Project Admin+ and audited

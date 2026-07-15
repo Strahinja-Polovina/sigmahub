@@ -4,9 +4,9 @@ import { revalidatePath } from "next/cache";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership } from "../active-org";
+import { requireMembership, requireProjectAdmin } from "../active-org";
 import { writeAudit } from "../audit";
-import { cpEnabled, cpIssueBootstrapToken, cpPublicUrl } from "../cp";
+import { cpEnabled, cpIssueBootstrapToken, cpPublicUrl, cpDeleteServer } from "../cp";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -130,7 +130,14 @@ export async function disconnectServer(input: { serverId: string }) {
     .from(s.servers)
     .where(eq(s.servers.id, input.serverId));
   if (!server) return;
-  const { user } = await requireMembership(server.orgId);
+  // Decommissioning a server is destructive — gate on Project Admin (P1-4), not
+  // bare membership. In CP mode the control plane tombstones the server and
+  // revokes its agent token (409 if resources are still bound, surfaced to the
+  // caller); the local mirror row is then removed to match.
+  const { user, role } = await requireProjectAdmin(server.orgId);
+  if (cpEnabled()) {
+    await cpDeleteServer(server.orgId, input.serverId, { name: user.name, role });
+  }
   await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
   await writeAudit({ orgId: server.orgId, actor: user.name, action: "Disconnected server", target: server.name });
   revalidatePath("/dashboard", "layout");

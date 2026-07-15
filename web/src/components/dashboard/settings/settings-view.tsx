@@ -4,6 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { GeneralTab } from "./general-tab";
 import { MembersTab } from "./members-tab";
 import { AuditTab } from "./audit-tab";
+import { TokensTab } from "./tokens-tab";
 
 export type SettingsOrg = {
   id: string;
@@ -53,6 +54,7 @@ export function SettingsView({
         <TabsList>
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
+          <TabsTrigger value="tokens">Tokens</TabsTrigger>
           <TabsTrigger value="audit">Audit log</TabsTrigger>
         </TabsList>
 
@@ -66,6 +68,9 @@ export function SettingsView({
             currentUserId={currentUserId}
             isAdmin={isAdmin}
           />
+        </TabsContent>
+        <TabsContent value="tokens">
+          <TokensTab orgId={org.id} isAdmin={isAdmin} />
         </TabsContent>
         <TabsContent value="audit">
           <AuditTab entries={audit} />
