@@ -1,0 +1,144 @@
+// Package reconciler renders per-server Desired-State Documents from resource
+// specs and is the ONLY writer of DSDs. It is level-triggered: callers nudge
+// it on a mutation, and a background loop resyncs the whole fleet every 60s so
+// a missed nudge still converges.
+package reconciler
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+// Store is the slice of the persistence layer the reconciler needs.
+type Store interface {
+	ResourceSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
+	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
+	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
+}
+
+// Reconciler renders and versions DSDs and notifies long-poll waiters.
+type Reconciler struct {
+	log  *slog.Logger
+	st   Store
+	priv ed25519.PrivateKey
+
+	mu      sync.Mutex
+	waiters map[string][]chan struct{} // serverID -> notify channels
+}
+
+func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
+	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
+}
+
+// renderOps builds the ordered op list for a server. P1-2 emits one stub
+// "resource.sync" op per resource; P1-3 replaces these with container ops
+// behind the same op registry.
+func renderOps(specs []store.ResourceSpec) ([]dsd.Op, string) {
+	ops := make([]dsd.Op, 0, len(specs))
+	for _, rs := range specs {
+		spec, _ := json.Marshal(map[string]any{
+			"resourceId": rs.ResourceID,
+			"kind":       rs.Kind,
+			"spec":       rs.Spec,
+		})
+		ops = append(ops, dsd.Op{
+			ID:   "res:" + rs.ResourceID,
+			Kind: "resource.sync",
+			Spec: spec,
+		})
+	}
+	return ops, dsd.SpecHash(ops)
+}
+
+// Reconcile renders a server's DSD; on a real change it bumps the version,
+// signs, persists and wakes any long-poll waiter for that server.
+func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) error {
+	specs, err := r.st.ResourceSpecsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(specs)
+	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
+	if err != nil {
+		return err
+	}
+	if changed {
+		r.log.Info("dsd rendered", "server", serverID, "ops", len(ops))
+		r.notify(serverID)
+	}
+	return nil
+}
+
+// ReconcileAsync runs Reconcile in the background (fire-and-forget from an API
+// handler that already returned) with its own short timeout.
+func (r *Reconciler) ReconcileAsync(orgID, serverID string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := r.Reconcile(ctx, orgID, serverID); err != nil {
+			r.log.Error("reconcile", "err", err, "server", serverID)
+		}
+	}()
+}
+
+// Run resyncs the whole fleet every interval until ctx is cancelled. Blocks;
+// run in a goroutine.
+func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			servers, err := r.st.AllServerIDs(ctx)
+			if err != nil {
+				r.log.Error("resync: list servers", "err", err)
+				continue
+			}
+			for _, sv := range servers {
+				if err := r.Reconcile(ctx, sv.OrgID, sv.ServerID); err != nil {
+					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)
+				}
+			}
+		}
+	}
+}
+
+// Wait returns a channel that closes when the server's DSD next changes, plus
+// a cancel to release the subscription. Used by the long-poll handler.
+func (r *Reconciler) Wait(serverID string) (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	r.mu.Lock()
+	r.waiters[serverID] = append(r.waiters[serverID], ch)
+	r.mu.Unlock()
+	cancel := func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		list := r.waiters[serverID]
+		for i, c := range list {
+			if c == ch {
+				r.waiters[serverID] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+	}
+	return ch, cancel
+}
+
+func (r *Reconciler) notify(serverID string) {
+	r.mu.Lock()
+	list := r.waiters[serverID]
+	delete(r.waiters, serverID)
+	r.mu.Unlock()
+	for _, ch := range list {
+		close(ch)
+	}
+}

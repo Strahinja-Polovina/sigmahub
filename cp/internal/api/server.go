@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -30,27 +31,46 @@ type StoreAPI interface {
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 }
 
+// ReconcileTrigger nudges the reconciler after a resource mutation.
+type ReconcileTrigger interface {
+	ReconcileAsync(orgID, serverID string)
+}
+
 type Server struct {
 	log             *slog.Logger
 	db              Pinger
 	store           StoreAPI
 	domain          DomainAPI
+	dsdStore        DSDStore
+	dsdWaiter       DSDWaiter
+	reconcile       ReconcileTrigger
+	dsdPub          ed25519.PublicKey
 	devServiceToken string
 	provisionToken  string
 	mux             *http.ServeMux
 }
 
-// Options carries the API's authn material. DevServiceToken is the dev-mode
-// static bypass (empty in prod); ProvisionToken gates POST /v1/orgs.
+// Options carries the API's authn material and DSD runtime dependencies.
+// DevServiceToken is the dev-mode static bypass (empty in prod); ProvisionToken
+// gates POST /v1/orgs. The DSD* fields are nil in handler unit tests that don't
+// exercise the agent DSD routes.
 type Options struct {
 	DevServiceToken string
 	ProvisionToken  string
+	DSDStore        DSDStore
+	DSDWaiter       DSDWaiter
+	Reconcile       ReconcileTrigger
+	DSDPublicKey    ed25519.PublicKey
 }
 
 // New builds the HTTP surface.
 func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) *Server {
 	s := &Server{
 		log: log, db: db, store: st, domain: dom,
+		dsdStore:        opts.DSDStore,
+		dsdWaiter:       opts.DSDWaiter,
+		reconcile:       opts.Reconcile,
+		dsdPub:          opts.DSDPublicKey,
 		devServiceToken: opts.DevServiceToken,
 		provisionToken:  opts.ProvisionToken,
 		mux:             http.NewServeMux(),
@@ -100,6 +120,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))
 	s.mux.HandleFunc("GET /v1/agent/mesh/peers", s.requireAgent(s.handleMeshPeers))
+	s.mux.HandleFunc("GET /v1/agent/dsd", s.requireAgent(s.handleGetDSD))
+	s.mux.HandleFunc("POST /v1/agent/dsd/status", s.requireAgent(s.handleDSDStatus))
 }
 
 func (s *Server) Handler() http.Handler {

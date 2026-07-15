@@ -457,27 +457,29 @@ func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resou
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor string) error {
+// DeleteResource removes a resource and returns the server it was bound to, so
+// the caller can re-render that server's DSD.
+func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var name string
 	err = tx.QueryRow(ctx,
-		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name`,
-		orgID, resourceID).Scan(&name)
+		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, server_id`,
+		orgID, resourceID).Scan(&name, &serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("delete resource: %w", err)
+		return "", fmt.Errorf("delete resource: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Resource deleted", name); err != nil {
-		return err
+		return "", err
 	}
-	return tx.Commit(ctx)
+	return serverID, tx.Commit(ctx)
 }
 
 // ── Server attributes ───────────────────────────────────────────────────────
