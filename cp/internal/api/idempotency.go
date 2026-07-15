@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -47,7 +48,10 @@ func (s *Server) idempotent(next http.HandlerFunc) http.HandlerFunc {
 
 		// Persist only definitive outcomes; 5xx should be retryable.
 		if rec.status < 500 {
-			stored, err := s.domain.IdempotencySave(r.Context(), orgID, key, store.IdempotentResponse{
+			// WithoutCancel: a client disconnect/timeout mid-handler — the
+			// exact case idempotency guards — must not skip persisting the
+			// key, or the retry re-executes the mutation.
+			stored, err := s.domain.IdempotencySave(context.WithoutCancel(r.Context()), orgID, key, store.IdempotentResponse{
 				RequestHash: reqHash,
 				StatusCode:  rec.status,
 				Response:    rec.buf.Bytes(),

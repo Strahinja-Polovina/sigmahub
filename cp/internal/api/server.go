@@ -68,8 +68,10 @@ func (s *Server) routes() {
 
 	// Dashboard-facing (org-scoped service tokens): reads need any role,
 	// mutations need at least Project Admin — mirroring the v1 web RBAC.
-	// Mutating POSTs support Idempotency-Key replay.
-	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleIssueBootstrapToken)))
+	// Mutating POSTs support Idempotency-Key replay — EXCEPT token minting:
+	// replaying a mint must issue a fresh token, never store/return the
+	// one-time plaintext for later replay.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueBootstrapToken))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
@@ -90,7 +92,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateResource)))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources", s.requireService(store.RoleDeveloper, s.handleListResources))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteResource))
-	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleProjectAdmin, s.handleListAudit))
+	// Audit is member-visible (matches the web settings tab shown to all
+	// members); mutations above stay Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
 
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)

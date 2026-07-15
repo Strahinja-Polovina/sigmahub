@@ -1,6 +1,6 @@
 import { notFound, redirect } from "next/navigation";
 import { getActiveOrgId } from "@/server/active-org";
-import { getEnvironment, getProject, getServer, getServerHosted } from "@/server/queries";
+import { getEnvironment, getProject, getResource, getServer, getServerHosted } from "@/server/queries";
 import {
   cpEnabled,
   cpGetServer,
@@ -33,15 +33,22 @@ export default async function ServerDetailPage({
       cpResources
         .filter((r) => r.serverId === serverId)
         .map(async (r) => {
-          const [project, env] = await Promise.all([
+          const [project, env, mirror] = await Promise.all([
             getProject(r.projectId),
             getEnvironment(r.environmentId),
+            getResource(r.id),
           ]);
           return {
             id: r.id,
             name: r.name,
             kind: r.kind === "mongodb" ? "mongo" : r.kind,
-            status: (r.status as { state?: string }).state ?? "provisioning",
+            // CP status.state is authoritative once the P1-2 reconciler
+            // populates it; until then fall back to the local mirror's status
+            // so the detail page agrees with the project pages.
+            status:
+              (r.status as { state?: string }).state ??
+              mirror?.status ??
+              "provisioning",
             projectName: project?.name ?? r.projectId,
             envName: env?.name ?? r.environmentId,
           };
