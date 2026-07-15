@@ -96,6 +96,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/proxy-role", s.requireService(store.RoleProjectAdmin, s.handleProxyRole))
+	// Two-phase destructive-op confirm (P1-3). Not idempotency-wrapped: a
+	// replayed mint must issue a fresh single-use token, never replay a stored
+	// one. Both phases are Project Admin+ and audited by the store.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/confirm-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueConfirmToken))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/destructive-ops", s.requireService(store.RoleProjectAdmin, s.handleConfirmDestructive))
 
 	// Domain model (P1-1).
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/projects", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateProject)))

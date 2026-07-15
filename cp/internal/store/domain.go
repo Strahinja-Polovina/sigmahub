@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 )
 
 // ErrConflict marks uniqueness violations (duplicate names, key reuse).
@@ -466,10 +468,14 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var name string
+	var (
+		name      string
+		spec      json.RawMessage
+		ephemeral bool
+	)
 	err = tx.QueryRow(ctx,
-		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, server_id`,
-		orgID, resourceID).Scan(&name, &serverID)
+		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, server_id, spec, ephemeral`,
+		orgID, resourceID).Scan(&name, &serverID, &spec, &ephemeral)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -478,6 +484,24 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Resource deleted", name); err != nil {
 		return "", err
+	}
+	// Ephemeral carve-out: a preview resource's volumes are torn down without
+	// interactive approval — the preview opt-in is the pre-authorisation. The
+	// removal is still recorded as a pending destructive op and audited as the
+	// system actor (both request and confirm phases), so the audit trail is
+	// uniform with the interactive path.
+	if ephemeral {
+		for _, vol := range resourceVolumeNames(resourceID, spec) {
+			if _, err := insertPendingDestructiveOpTx(ctx, tx, orgID, serverID, dsd.KindVolumeRemove, vol, "system"); err != nil {
+				return "", err
+			}
+			if err := auditTx(ctx, tx, orgID, "system", "Destructive-op confirm requested (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
+				return "", err
+			}
+			if err := auditTx(ctx, tx, orgID, "system", "Destructive-op confirmed (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
+				return "", err
+			}
+		}
 	}
 	return serverID, tx.Commit(ctx)
 }

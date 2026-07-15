@@ -1,0 +1,29 @@
+package dsd
+
+// Op kinds shared with the agent's apply registry. Defined here (a leaf package)
+// so the reconciler render and the agent apply cannot drift on the wire names.
+const (
+	KindResourceSync   = "resource.sync"
+	KindNetworkEnsure  = "network.ensure"
+	KindVolumeEnsure   = "volume.ensure"
+	KindImagePull      = "image.pull"
+	KindContainerApply = "container.apply"
+	KindVolumeRemove   = "volume.remove"
+)
+
+// Docker object naming. The control plane is the sole authority for these
+// names; it renders them into DSD ops and the agent uses them verbatim, so the
+// two sides never derive names independently. Names are deterministic functions
+// of resource identity so a resync produces byte-identical ops.
+
+// NetworkName is the per-project Docker network. Resources in the same project
+// share it (no cross-project layer-2 adjacency).
+func NetworkName(projectID string) string { return "sigmahub-" + projectID }
+
+// ContainerName is the managed container for a resource.
+func ContainerName(resourceID string) string { return "sigmahub-" + resourceID }
+
+// VolumeName is a named Docker volume for a resource's declared volume.
+func VolumeName(resourceID, vol string) string {
+	return "sigmahub-" + resourceID + "-" + vol
+}

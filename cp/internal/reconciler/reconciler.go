@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 // Store is the slice of the persistence layer the reconciler needs.
 type Store interface {
 	ResourceSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
+	PendingDestructiveOpsForServer(ctx context.Context, serverID string) ([]store.PendingDestructiveOp, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 }
@@ -37,22 +39,43 @@ func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
 }
 
-// renderOps builds the ordered op list for a server. P1-2 emits one stub
-// "resource.sync" op per resource; P1-3 replaces these with container ops
-// behind the same op registry.
-func renderOps(specs []store.ResourceSpec) ([]dsd.Op, string) {
-	ops := make([]dsd.Op, 0, len(specs))
+// renderOps builds the ordered op list for a server. "app" resources fan into
+// container ops (network.ensure → image.pull → volume.ensure → container.apply);
+// other kinds keep the P1-2 no-op "resource.sync" stub until they are
+// containerised. Confirmed destructive ops are appended as volume.remove.
+func renderOps(specs []store.ResourceSpec, pending []store.PendingDestructiveOp) ([]dsd.Op, string) {
+	networks := map[string]string{} // net op id -> network name (deduped per project)
+	var resourceOps []dsd.Op
+
 	for _, rs := range specs {
-		spec, _ := json.Marshal(map[string]any{
-			"resourceId": rs.ResourceID,
-			"kind":       rs.Kind,
-			"spec":       rs.Spec,
-		})
-		ops = append(ops, dsd.Op{
-			ID:   "res:" + rs.ResourceID,
-			Kind: "resource.sync",
-			Spec: spec,
-		})
+		if rs.Kind == "app" {
+			if appOps, netID, ok := renderAppOps(rs); ok {
+				resourceOps = append(resourceOps, appOps...)
+				networks[netID] = dsd.NetworkName(rs.ProjectID)
+				continue
+			}
+		}
+		// Not yet containerised (or an app with no image): a no-op stub keeps the
+		// resource represented in the DSD.
+		stub, _ := json.Marshal(map[string]any{"resourceId": rs.ResourceID, "kind": rs.Kind, "spec": rs.Spec})
+		resourceOps = append(resourceOps, dsd.Op{ID: "res:" + rs.ResourceID, Kind: dsd.KindResourceSync, Spec: stub})
+	}
+
+	// One network.ensure op per distinct project, emitted first in a stable
+	// order so the rendered document (and thus its hash) is deterministic.
+	netIDs := make([]string, 0, len(networks))
+	for id := range networks {
+		netIDs = append(netIDs, id)
+	}
+	sort.Strings(netIDs)
+	ops := make([]dsd.Op, 0, len(netIDs)+len(resourceOps)+len(pending))
+	for _, id := range netIDs {
+		ns, _ := json.Marshal(map[string]string{"name": networks[id]})
+		ops = append(ops, dsd.Op{ID: id, Kind: dsd.KindNetworkEnsure, Spec: ns})
+	}
+	ops = append(ops, resourceOps...)
+	for _, p := range pending {
+		ops = append(ops, renderVolumeRemoveOp(p))
 	}
 	return ops, dsd.SpecHash(ops)
 }
@@ -64,7 +87,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(specs)
+	pending, err := r.st.PendingDestructiveOpsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(specs, pending)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err
