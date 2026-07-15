@@ -140,11 +140,29 @@ func run() error {
 	// applied DSD it garbage-collects containers the document no longer describes.
 	go runDSDLoop(ctx, log, c, st, journal, registry, driver)
 
+	// Discover the reachable WireGuard endpoint once at startup (STUN-style
+	// probe); the CP serves it to peers so tunnels form across NAT. Re-probed
+	// periodically below to track a changing public IP.
+	meshEndpoint, err := mesh.DiscoverEndpoint(ctx)
+	if err != nil {
+		log.Warn("mesh: could not discover reachable endpoint; peers may be unable to dial this host", "err", err)
+	} else {
+		log.Info("mesh: discovered endpoint", "endpoint", meshEndpoint)
+	}
+
 	// Heartbeat loop: fixed interval with jitter; exponential backoff on
 	// transient failures; permanent (4xx) failures mean the credential is
 	// gone — exit so the operator re-bootstraps.
 	backoff := *interval
+	hb := 0
 	for {
+		hb++
+		// Re-probe the endpoint roughly every 10 minutes to track IP changes.
+		if hb%20 == 0 {
+			if ep, err := mesh.DiscoverEndpoint(ctx); err == nil && ep != "" {
+				meshEndpoint = ep
+			}
+		}
 		hostFacts := facts.Collect()
 		if avail, ver := container.Probe(ctx, docker); avail {
 			hostFacts.DockerAvailable = true
@@ -156,6 +174,7 @@ func run() error {
 			AgentVersion: version,
 			Facts:        f,
 			Pubkey:       meshPub,
+			Endpoint:     meshEndpoint,
 			Metrics: &client.MetricSample{
 				CPUPct:  sample.CPUPct,
 				MemPct:  sample.MemPct,
