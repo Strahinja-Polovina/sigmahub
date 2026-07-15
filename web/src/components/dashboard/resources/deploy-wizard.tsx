@@ -209,8 +209,12 @@ export function DeployWizard({
     );
   }, [repoQuery]);
 
-  // Reset all state whenever the dialog is (re)opened.
-  React.useEffect(() => {
+  // Reset all state whenever the dialog is (re)opened. Adjusting during the
+  // render that flips `open` avoids a setState-in-effect and the extra
+  // committed render it would cause.
+  const [prevOpen, setPrevOpen] = React.useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open) {
       setStep(1);
       setRepoQuery("");
@@ -225,13 +229,13 @@ export function DeployWizard({
       setDeployPhase(0);
       setDeploying(false);
     }
-  }, [open]);
+  }
 
-  // Drive the mock deploy animation once step 5 is reached.
+  // Drive the mock deploy animation once step 5 is reached. `deploying`/phase
+  // are primed by next() on the transition into step 5, so this effect only
+  // owns the timer — its setState calls all run inside async callbacks.
   React.useEffect(() => {
     if (step !== 5) return;
-    setDeploying(true);
-    setDeployPhase(0);
     let phase = 0;
     const timer = setInterval(() => {
       phase += 1;
@@ -289,7 +293,16 @@ export function DeployWizard({
   }, [step, repo, projectId, environmentId, serverId, incompatibility]);
 
   function next() {
-    if (step < 5 && canNext) setStep((s) => s + 1);
+    if (step < 5 && canNext) {
+      const target = step + 1;
+      setStep(target);
+      if (target === 5) {
+        // Prime the deploy animation state here (an event handler) so the
+        // step-5 effect only has to start the timer.
+        setDeploying(true);
+        setDeployPhase(0);
+      }
+    }
   }
   function back() {
     if (step > 1 && step < 5) setStep((s) => s - 1);

@@ -38,7 +38,13 @@ export function OrgProvider({
 }) {
   const [orgId, setOrgId] = React.useState(activeOrgId);
   // Re-sync when the server changes the active org (e.g. after a switch).
-  React.useEffect(() => setOrgId(activeOrgId), [activeOrgId]);
+  // Adjusting during render (vs. an effect) applies the new value in the same
+  // pass, with no extra committed render.
+  const [prevActiveOrgId, setPrevActiveOrgId] = React.useState(activeOrgId);
+  if (activeOrgId !== prevActiveOrgId) {
+    setPrevActiveOrgId(activeOrgId);
+    setOrgId(activeOrgId);
+  }
 
   const org = React.useMemo(
     () => orgs.find((o) => o.id === orgId) ?? orgs[0],
