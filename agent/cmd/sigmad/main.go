@@ -209,6 +209,14 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 			log.Error("dsd: rejected", "reason", err, "version", signed.Document.Version)
 			continue
 		}
+		// Identity binding: a validly-signed DSD is scoped to exactly one
+		// server. Delivery is already token-scoped, so this only bites on a CP
+		// misroute/bug, but applying another server's ops here would be
+		// catastrophic — reject anything not addressed to us.
+		if signed.Document.ServerID != st.ServerID {
+			log.Error("dsd: rejected foreign server", "doc_server", signed.Document.ServerID, "self", st.ServerID)
+			continue
+		}
 		// Replay/downgrade rejection: never apply an older-or-equal version.
 		if signed.Document.Version <= after {
 			log.Warn("dsd: rejected stale version", "got", signed.Document.Version, "last_applied", after)
