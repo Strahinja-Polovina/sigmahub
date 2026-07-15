@@ -23,18 +23,30 @@ func (d *Driver) Reconcile(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		cur, exists, err := d.docker.ContainerInspect(ctx, name)
-		if err != nil {
-			d.log.Warn("reconcile: inspect", "container", name, "err", err)
-			continue
-		}
-		if exists && cur.Running && cur.Labels[LabelSpecHash] == spec.SpecHash() {
-			continue // converged
-		}
-		d.log.Info("reconcile: repairing drift", "container", name, "exists", exists, "running", exists && cur.Running)
-		if err := d.converge(ctx, spec); err != nil {
-			d.log.Warn("reconcile: converge", "container", name, "err", err)
-		}
+		d.reconcileOne(ctx, name, spec)
+	}
+}
+
+// reconcileOne converges a single container under the driver lock, re-checking
+// that it is still desired first — so a container GC removed (and pruned from
+// the desired store) between this loop's snapshot and now is not recreated.
+func (d *Driver) reconcileOne(ctx context.Context, name string, spec ContainerSpec) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if still, err := d.store.HasDesired(name); err != nil || !still {
+		return // GC pruned it (or read error) — do not resurrect
+	}
+	cur, exists, err := d.docker.ContainerInspect(ctx, name)
+	if err != nil {
+		d.log.Warn("reconcile: inspect", "container", name, "err", err)
+		return
+	}
+	if converged(spec, cur, exists) {
+		return
+	}
+	d.log.Info("reconcile: repairing drift", "container", name, "exists", exists, "running", exists && cur.Running)
+	if err := d.converge(ctx, spec); err != nil {
+		d.log.Warn("reconcile: converge", "container", name, "err", err)
 	}
 }
 
@@ -61,6 +73,10 @@ func (d *Driver) RunReconcile(ctx context.Context, interval time.Duration) {
 // container.apply ops in that (validly signed) document. The desired-state
 // store is pruned to match.
 func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
+	// Held for the whole prune+remove so a concurrent reconcile cannot recreate
+	// a container between the desired-store prune and the container removal.
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	want := desiredNames(doc)
 
 	// Prune the local desired store first so a restart mid-GC does not resurrect

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
@@ -23,6 +24,10 @@ type Driver struct {
 	log       *slog.Logger
 	limiter   *rateLimiter
 	allowlist ImageAllowlist
+	// mu serialises the reconcile loop's per-container converge against GC's
+	// prune+remove, so a container GC just removed cannot be resurrected by a
+	// concurrent reconcile working from a stale desired snapshot.
+	mu sync.Mutex
 }
 
 // NewDriver builds a driver. The allowlist ships disabled (see allowlist.go).
@@ -134,23 +139,48 @@ func (d *Driver) opContainerApply(ctx context.Context, op dsd.Op) error {
 	return d.store.PutDesired(spec.Name, spec)
 }
 
-// converge inspects the named container and (re)creates it if it is absent,
-// stopped, or its spec-hash label no longer matches the desired spec.
+// converged reports whether an existing container already satisfies the spec.
+// A running container with a matching spec-hash is converged. A STOPPED
+// container with a matching hash is also converged when the spec's restart
+// policy is terminal ("no"/"on-failure" — the operator expects it may stay
+// stopped); under a keep-running policy a stopped container is genuine drift to
+// repair. This stops the reconcile loop from force-recreating a cleanly-exited
+// one-shot container on every tick.
+func converged(spec ContainerSpec, cur ContainerState, exists bool) bool {
+	if !exists || cur.Labels[LabelSpecHash] != spec.SpecHash() {
+		return false
+	}
+	if cur.Running {
+		return true
+	}
+	return terminalRestart(spec.Restart)
+}
+
+func terminalRestart(policy string) bool {
+	switch policy {
+	case "no", "on-failure":
+		return true
+	default: // "" (defaults to unless-stopped), "always", "unless-stopped"
+		return false
+	}
+}
+
+// converge inspects the named container and (re)creates it unless it already
+// satisfies the spec (see converged).
 func (d *Driver) converge(ctx context.Context, spec ContainerSpec) error {
-	want := spec.SpecHash()
 	cur, exists, err := d.docker.ContainerInspect(ctx, spec.Name)
 	if err != nil {
 		return err
 	}
-	if exists && cur.Running && cur.Labels[LabelSpecHash] == want {
-		return nil // already converged
+	if converged(spec, cur, exists) {
+		return nil
 	}
 	if exists {
 		if err := d.docker.ContainerRemove(ctx, cur.ID, true); err != nil {
 			return fmt.Errorf("remove stale container: %w", err)
 		}
 	}
-	body := d.buildCreateBody(spec, want)
+	body := d.buildCreateBody(spec, spec.SpecHash())
 	id, err := d.docker.ContainerCreate(ctx, spec.Name, body)
 	if err != nil {
 		return fmt.Errorf("create container: %w", err)
@@ -168,6 +198,20 @@ func (d *Driver) opVolumeRemove(ctx context.Context, op dsd.Op) error {
 	var spec VolumeSpec
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
 		return fmt.Errorf("decode volume spec: %w", err)
+	}
+	// Managed guard: only ever delete a volume this agent created. Even a
+	// validly-signed, confirmed volume.remove must not destroy an unmanaged or
+	// foreign volume (a mistyped or malicious target), so refuse anything not
+	// carrying our managed label. A missing volume is a no-op (idempotent).
+	labels, exists, err := d.docker.VolumeInspect(ctx, spec.Name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if labels[LabelManaged] != "true" {
+		return &PolicyError{Rule: "volume-unmanaged", Detail: fmt.Sprintf("refusing to remove unmanaged volume %q", spec.Name)}
 	}
 	return d.docker.VolumeRemove(ctx, spec.Name, true)
 }

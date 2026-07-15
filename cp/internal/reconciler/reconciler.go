@@ -20,7 +20,7 @@ import (
 // Store is the slice of the persistence layer the reconciler needs.
 type Store interface {
 	ResourceSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
-	PendingDestructiveOpsForServer(ctx context.Context, serverID string) ([]store.PendingDestructiveOp, error)
+	PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]store.PendingDestructiveOp, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 }
@@ -87,7 +87,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	pending, err := r.st.PendingDestructiveOpsForServer(ctx, serverID)
+	pending, err := r.st.PendingDestructiveOpsForServer(ctx, orgID, serverID)
 	if err != nil {
 		return err
 	}

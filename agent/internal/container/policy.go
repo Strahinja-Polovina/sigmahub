@@ -34,8 +34,31 @@ func CheckPolicy(s ContainerSpec) error {
 	case len(s.HostMounts) > 0:
 		return &PolicyError{Rule: "host-mount", Detail: fmt.Sprintf("host-path mounts are never permitted (%d requested); use named volumes", len(s.HostMounts))}
 	}
+	if err := checkNetwork(s.Network); err != nil {
+		return err
+	}
 	if err := checkImagePinned(s.Image); err != nil {
 		return err
+	}
+	return nil
+}
+
+// checkNetwork gates the container's network mode. NetworkMode is a free string
+// that Docker interprets, so the HostNetwork bool alone is not enough — a spec
+// could set network:"host" (host namespace), "container:<id>" (join another
+// container's namespace), or "ns:<path>" and reach the host regardless of the
+// HostNetwork flag. Only a named managed network (or the safe "none") is
+// allowed; the reserved namespace-sharing modes are refused.
+func checkNetwork(network string) error {
+	switch {
+	case network == "":
+		return &PolicyError{Rule: "network", Detail: "container network must be an explicit managed network"}
+	case network == "host":
+		return &PolicyError{Rule: "network", Detail: "host networking is never permitted; use the project network"}
+	case strings.HasPrefix(network, "container:"):
+		return &PolicyError{Rule: "network", Detail: "joining another container's network namespace is not permitted"}
+	case strings.HasPrefix(network, "ns:"):
+		return &PolicyError{Rule: "network", Detail: "attaching a raw network namespace path is not permitted"}
 	}
 	return nil
 }

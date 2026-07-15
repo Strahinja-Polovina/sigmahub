@@ -345,7 +345,7 @@ func TestContainerRenderAndDestructiveOps(t *testing.T) {
 	if _, err := st.DeleteResource(ctx, orgID, eph.ID, "someuser"); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := st.PendingDestructiveOpsForServer(ctx, serverID)
+	pending, err := st.PendingDestructiveOpsForServer(ctx, orgID, serverID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -55,6 +55,18 @@ func (s *Store) DeleteDesired(name string) error {
 	})
 }
 
+// HasDesired reports whether a container name is still in the desired set. The
+// reconcile loop re-checks this under the driver lock immediately before
+// (re)creating, so a container concurrently pruned by GC is not resurrected.
+func (s *Store) HasDesired(name string) (bool, error) {
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		found = tx.Bucket(desiredBucket).Get([]byte(name)) != nil
+		return nil
+	})
+	return found, err
+}
+
 // AllDesired returns every persisted desired container spec.
 func (s *Store) AllDesired() (map[string]ContainerSpec, error) {
 	out := map[string]ContainerSpec{}
