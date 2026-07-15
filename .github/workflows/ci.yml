@@ -106,14 +106,22 @@ jobs:
         run: |
           go vet ./...
           go test ./...
-      # The real-Docker container-runtime e2e (P1-3): the ubuntu-latest runner
-      # has Docker preinstalled, so run the driver against it. Gated by
-      # SIGMAD_DOCKER_E2E so `go test ./...` above (and local runs) skip it.
-      - name: Docker runtime e2e
+      # The real-Docker container-runtime e2e (P1-3, extended by P1-6): the
+      # ubuntu-latest runner has Docker preinstalled, so run the driver against
+      # it. Gated by SIGMAD_DOCKER_E2E so `go test ./...` above (and local runs)
+      # skip it. Run as ROOT: sigmad runs as root in production, and the P1-6
+      # secrets test seeds file-mode secrets into a container's tmpfs by writing
+      # through /proc/<pid>/root, which requires root (or CAP_SYS_PTRACE) on the
+      # target process. Isolated GOCACHE/GOMODCACHE keep root out of the
+      # runner-owned Go caches so later runner steps still write theirs.
+      - name: Docker runtime e2e (root)
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        env:
-          SIGMAD_DOCKER_E2E: "1"
-        run: go test ./internal/container/ -run TestDockerE2E -v
+        run: |
+          GP="$(go env GOPROXY)"; GS="$(go env GOSUMDB)"; GO="$(command -v go)"
+          sudo env SIGMAD_DOCKER_E2E=1 \
+                   GOCACHE=/tmp/e2e-gocache GOMODCACHE=/tmp/e2e-gomod \
+                   GOFLAGS=-mod=mod GOPROXY="$GP" GOSUMDB="$GS" \
+                   "$GO" test ./internal/container/ -run TestDockerE2E -v
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}

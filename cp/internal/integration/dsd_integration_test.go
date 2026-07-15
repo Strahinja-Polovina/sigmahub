@@ -609,6 +609,12 @@ func TestSecretsEnvelopeRotationAAD(t *testing.T) {
 	if _, err := st.RevealSecret(ctx, orgID, envSec.ID, "admin"); err == nil {
 		t.Fatal("AAD: a ciphertext swapped from another row decrypted — AAD binding is broken")
 	}
+	// That row is now deliberately corrupt (ciphertext no longer matches its AAD),
+	// so drop it before rotation — a later lazy re-encrypt would (correctly) fail
+	// to decrypt it, which is not what the rotation assertions are exercising.
+	if _, err := st.Pool.Exec(ctx, `DELETE FROM secrets WHERE id=$1`, envSec.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	// KEK rotation: wrapped-DEK versions advance; other secrets still decrypt.
 	var beforeVer int
