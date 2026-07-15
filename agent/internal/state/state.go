@@ -13,6 +13,9 @@ import (
 type State struct {
 	ServerID   string `json:"serverId"`
 	AgentToken string `json:"agentToken"`
+	// DSDPublicKey is the CP's Ed25519 DSD-signing key (base64), pinned at
+	// enrollment. Every DSD the agent applies must verify against it.
+	DSDPublicKey string `json:"dsdPublicKey,omitempty"`
 }
 
 func path(dataDir string) string { return filepath.Join(dataDir, "sigmad.json") }

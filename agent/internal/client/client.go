@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 )
 
@@ -34,8 +35,9 @@ type RegisterRequest struct {
 }
 
 type RegisterResponse struct {
-	ServerID   string `json:"serverId"`
-	AgentToken string `json:"agentToken"`
+	ServerID     string `json:"serverId"`
+	AgentToken   string `json:"agentToken"`
+	DSDPublicKey string `json:"dsdPublicKey"`
 }
 
 type MetricSample struct {
@@ -90,6 +92,43 @@ func (c *Client) MeshPeers(ctx context.Context, agentToken string) (MeshPeersRes
 	var res MeshPeersResponse
 	err := c.do(ctx, http.MethodGet, "/v1/agent/mesh/peers", agentToken, nil, &res)
 	return res, err
+}
+
+// GetDSD long-polls for a DSD newer than `after`. The bool is false when the
+// server returned 204 (no newer DSD within the poll window) — the caller
+// simply polls again.
+func (c *Client) GetDSD(ctx context.Context, agentToken string, after int64) (dsd.Signed, bool, error) {
+	path := fmt.Sprintf("/v1/agent/dsd?after=%d", after)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+path, nil)
+	if err != nil {
+		return dsd.Signed{}, false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+agentToken)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return dsd.Signed{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return dsd.Signed{}, false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return dsd.Signed{}, false, &APIError{Status: resp.StatusCode, Body: string(bytes.TrimSpace(b))}
+	}
+	var signed dsd.Signed
+	if err := json.NewDecoder(resp.Body).Decode(&signed); err != nil {
+		return dsd.Signed{}, false, err
+	}
+	return signed, true, nil
+}
+
+// PostDSDStatus reports per-op results for an applied DSD version.
+func (c *Client) PostDSDStatus(ctx context.Context, agentToken string, version int64, ops map[string]json.RawMessage) error {
+	return c.post(ctx, "/v1/agent/dsd/status", agentToken, map[string]any{
+		"version": version,
+		"ops":     ops,
+	}, nil)
 }
 
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {

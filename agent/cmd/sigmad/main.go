@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
@@ -87,7 +89,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		st = state.State{ServerID: res.ServerID, AgentToken: res.AgentToken}
+		st = state.State{ServerID: res.ServerID, AgentToken: res.AgentToken, DSDPublicKey: res.DSDPublicKey}
 		if err := state.Save(*dataDir, st); err != nil {
 			return err
 		}
@@ -95,6 +97,20 @@ func run() error {
 	} else {
 		log.Info("resuming identity", "server_id", st.ServerID)
 	}
+
+	// DSD apply subsystem: open the crash-safe journal and register the op
+	// handlers. P1-2 ships only the stub "resource.sync"; P1-3 registers the
+	// container ops behind this same registry (the no-shell enforcement point).
+	journal, err := apply.Open(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer journal.Close()
+	registry := apply.NewRegistry()
+	registry.Register("resource.sync", func(context.Context, dsd.Op) error { return nil })
+
+	// The DSD loop runs alongside the heartbeat loop, outbound-only.
+	go runDSDLoop(ctx, log, c, st, journal, registry)
 
 	// Heartbeat loop: fixed interval with jitter; exponential backoff on
 	// transient failures; permanent (4xx) failures mean the credential is
@@ -138,6 +154,75 @@ func run() error {
 			log.Info("shutting down")
 			return nil
 		case <-time.After(backoff + jitter):
+		}
+	}
+}
+
+// runDSDLoop long-polls the control plane for the server's Desired-State
+// Document, verifies it against the pinned CP key, applies its ops in
+// dependency order (resuming from the journal), and reports status. It never
+// applies a DSD whose version is <= the last applied one (replay/downgrade
+// rejection) and never applies an unsigned/tampered/wrongly-keyed DSD.
+func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st state.State, journal *apply.Journal, registry *apply.Registry) {
+	if st.DSDPublicKey == "" {
+		log.Warn("no pinned DSD key; DSD sync disabled (re-bootstrap to enrol)")
+		return
+	}
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		after, err := journal.LastAppliedVersion()
+		if err != nil {
+			log.Error("dsd: read journal", "err", err)
+			return
+		}
+		signed, got, err := c.GetDSD(ctx, st.AgentToken, after)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Permanent() {
+				log.Error("dsd: permanent error; stopping loop", "err", err)
+				return
+			}
+			log.Warn("dsd: fetch failed; backing off", "err", err, "retry_in", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		if !got {
+			continue // 204: poll again
+		}
+
+		// Trust anchor: reject anything not signed by the pinned CP key.
+		if err := dsd.Verify(st.DSDPublicKey, signed); err != nil {
+			log.Error("dsd: rejected", "reason", err, "version", signed.Document.Version)
+			continue
+		}
+		// Replay/downgrade rejection: never apply an older-or-equal version.
+		if signed.Document.Version <= after {
+			log.Warn("dsd: rejected stale version", "got", signed.Document.Version, "last_applied", after)
+			continue
+		}
+
+		results, err := registry.Apply(ctx, log, journal, signed.Document)
+		if err != nil {
+			log.Error("dsd: apply", "err", err, "version", signed.Document.Version)
+			continue
+		}
+		log.Info("dsd applied", "version", signed.Document.Version, "ops", len(results))
+		if err := c.PostDSDStatus(ctx, st.AgentToken, signed.Document.Version, apply.StatusPayload(results)); err != nil {
+			log.Warn("dsd: status report failed", "err", err)
 		}
 	}
 }
