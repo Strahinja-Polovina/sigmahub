@@ -34,14 +34,27 @@ type Server struct {
 	log             *slog.Logger
 	db              Pinger
 	store           StoreAPI
+	domain          DomainAPI
 	devServiceToken string
+	provisionToken  string
 	mux             *http.ServeMux
 }
 
-// New builds the HTTP surface. devServiceToken is the dev-mode static bypass;
-// pass "" (prod) to require real org-scoped service tokens.
-func New(log *slog.Logger, db Pinger, st StoreAPI, devServiceToken string) *Server {
-	s := &Server{log: log, db: db, store: st, devServiceToken: devServiceToken, mux: http.NewServeMux()}
+// Options carries the API's authn material. DevServiceToken is the dev-mode
+// static bypass (empty in prod); ProvisionToken gates POST /v1/orgs.
+type Options struct {
+	DevServiceToken string
+	ProvisionToken  string
+}
+
+// New builds the HTTP surface.
+func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) *Server {
+	s := &Server{
+		log: log, db: db, store: st, domain: dom,
+		devServiceToken: opts.DevServiceToken,
+		provisionToken:  opts.ProvisionToken,
+		mux:             http.NewServeMux(),
+	}
 	s.routes()
 	return s
 }
@@ -49,12 +62,36 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, devServiceToken string) *Serv
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// Org provisioning (dedicated token; mints the org's web credential).
+	s.mux.HandleFunc("POST /v1/orgs", s.requireProvision(s.handleProvisionOrg))
+
 	// Dashboard-facing (org-scoped service tokens): reads need any role,
 	// mutations need at least Project Admin — mirroring the v1 web RBAC.
-	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueBootstrapToken))
+	// Mutating POSTs support Idempotency-Key replay.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleIssueBootstrapToken)))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/proxy-role", s.requireService(store.RoleProjectAdmin, s.handleProxyRole))
+
+	// Domain model (P1-1).
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/projects", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateProject)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/projects", s.requireService(store.RoleDeveloper, s.handleListProjects))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/projects/{projectId}", s.requireService(store.RoleDeveloper, s.handleGetProject))
+	s.mux.HandleFunc("PATCH /v1/orgs/{orgId}/projects/{projectId}", s.requireService(store.RoleProjectAdmin, s.handleUpdateProject))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/projects/{projectId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteProject))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/projects/{projectId}/environments", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateEnvironment)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/projects/{projectId}/environments", s.requireService(store.RoleDeveloper, s.handleListEnvironments))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/environments/{envId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteEnvironment))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/environments/{envId}/servers", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleAttachServer)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/environments/{envId}/servers", s.requireService(store.RoleDeveloper, s.handleEnvServers))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/environments/{envId}/servers/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleDetachServer))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateResource)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources", s.requireService(store.RoleDeveloper, s.handleListResources))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteResource))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleProjectAdmin, s.handleListAudit))
+
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))
