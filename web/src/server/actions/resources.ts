@@ -7,6 +7,7 @@ import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
+import { cpEnabled, cpCreateResource, cpDeleteResource, cpKind } from "../cp";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -35,7 +36,7 @@ export async function createResource(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user } = await requireMembership(project.orgId);
+  const { user, role } = await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
 
@@ -59,7 +60,26 @@ export async function createResource(input: {
     }
   }
 
-  const id = rid("res");
+  let id = rid("res");
+  if (cpEnabled()) {
+    // CP mode: the control plane owns the resource record and enforces the
+    // kind/server-type availability matrix + env attachment server-side; the
+    // local row mirrors it under the same id so the (still simulated, P1-9)
+    // deploy timeline keeps rendering.
+    if (!input.serverId) throw new Error("A target server is required.");
+    const created = await cpCreateResource(
+      project.orgId,
+      {
+        environmentId: input.environmentId,
+        serverId: input.serverId,
+        name,
+        kind: cpKind(input.kind),
+        spec: { repo: input.repo ?? null, domain: input.domain ?? null },
+      },
+      { name: user.name, role }
+    );
+    id = created.id;
+  }
   const now = new Date();
   await db.insert(s.resources).values({
     id,
@@ -162,6 +182,12 @@ export async function deleteResource(input: { resourceId: string }) {
   if (!resource) return;
   const project = await getProject(resource.projectId);
   const membership = project ? await requireMembership(project.orgId) : null;
+  if (project && membership && cpEnabled()) {
+    await cpDeleteResource(project.orgId, input.resourceId, {
+      name: membership.user.name,
+      role: membership.role,
+    });
+  }
   await db.delete(s.resources).where(eq(s.resources.id, input.resourceId));
   if (project && membership) {
     await writeAudit({ orgId: project.orgId, actor: membership.user.name, action: "Deleted resource", target: resource.name });

@@ -3,6 +3,7 @@ import { eq, inArray, desc } from "drizzle-orm";
 import { db } from "./db";
 import * as s from "./db/schema";
 import { user } from "./db/auth-schema";
+import { cpEnabled, cpListServers, cpServerToRow } from "./cp";
 
 export const UNIT_PRICE = 5;
 export const FREE_TIER_SERVERS = 3;
@@ -31,7 +32,13 @@ export async function getEnvironment(id: string) {
     await db.select().from(s.environments).where(eq(s.environments.id, id))
   )[0];
 }
+/** Org servers. CP mode reads the control plane (mapped onto the local row
+ *  shape); demo mode reads the simulated PGlite rows. Every server-reading
+ *  query below goes through here so both modes stay consistent. */
 export async function getServers(orgId: string) {
+  if (cpEnabled()) {
+    return (await cpListServers(orgId)).map(cpServerToRow);
+  }
   return db.select().from(s.servers).where(eq(s.servers.orgId, orgId));
 }
 export async function getServer(id: string) {
@@ -72,6 +79,15 @@ export async function getServerCounts(
   const counts: Record<string, number> = {};
   for (const id of orgIds) counts[id] = 0;
   if (orgIds.length === 0) return counts;
+  if (cpEnabled()) {
+    await Promise.all(
+      orgIds.map(async (id) => {
+        // A CP hiccup must not take down the org switcher — show 0 instead.
+        counts[id] = await cpListServers(id).then((l) => l.length).catch(() => 0);
+      })
+    );
+    return counts;
+  }
   const rows = await db
     .select({ orgId: s.servers.orgId })
     .from(s.servers)
@@ -89,7 +105,7 @@ export type CommandIndex = {
 
 /** Flat, org-scoped search index that powers the ⌘K command menu. */
 export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
-  const [projects, environments, servers, resources] = await Promise.all([
+  const [projects, environments, serverRows, resources] = await Promise.all([
     db
       .select({ id: s.projects.id, name: s.projects.name, slug: s.projects.slug })
       .from(s.projects)
@@ -104,15 +120,7 @@ export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
       .from(s.environments)
       .innerJoin(s.projects, eq(s.environments.projectId, s.projects.id))
       .where(eq(s.projects.orgId, orgId)),
-    db
-      .select({
-        id: s.servers.id,
-        name: s.servers.name,
-        type: s.servers.type,
-        region: s.servers.region,
-      })
-      .from(s.servers)
-      .where(eq(s.servers.orgId, orgId)),
+    getServers(orgId),
     db
       .select({
         id: s.resources.id,
@@ -124,6 +132,12 @@ export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
       .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
       .where(eq(s.projects.orgId, orgId)),
   ]);
+  const servers = serverRows.map((sv) => ({
+    id: sv.id,
+    name: sv.name,
+    type: sv.type,
+    region: sv.region,
+  }));
   return { projects, environments, servers, resources };
 }
 
@@ -134,7 +148,7 @@ export async function getDeployments(resourceId: string) {
     .where(eq(s.deployments.resourceId, resourceId));
 }
 export async function getBillingSummary(orgId: string) {
-  const all = await db.select().from(s.servers).where(eq(s.servers.orgId, orgId));
+  const all = await getServers(orgId);
   const connected = all.filter((x) => x.status !== "provisioning").length;
   const isFree = connected <= FREE_TIER_SERVERS;
   return {
@@ -215,13 +229,17 @@ export type EnvPanel = {
 };
 
 async function buildEnvPanel(
-  env: typeof s.environments.$inferSelect
+  env: typeof s.environments.$inferSelect,
+  orgServers: (typeof s.servers.$inferSelect)[]
 ): Promise<EnvPanel> {
-  const serverRows = await db
-    .select()
-    .from(s.servers)
-    .innerJoin(s.envServers, eq(s.envServers.serverId, s.servers.id))
+  // env_servers is the local mirror of the CP attachment rows; the server
+  // rows themselves come from getServers so CP mode renders real CP servers.
+  const attached = await db
+    .select({ serverId: s.envServers.serverId })
+    .from(s.envServers)
     .where(eq(s.envServers.environmentId, env.id));
+  const attachedIds = new Set(attached.map((a) => a.serverId));
+  const servers = orgServers.filter((sv) => attachedIds.has(sv.id));
   const resources = await db
     .select()
     .from(s.resources)
@@ -237,18 +255,20 @@ async function buildEnvPanel(
       return { ...r, latestDeploy: latest ?? null };
     })
   );
-  return { env, servers: serverRows.map((row) => row.servers), resources: withDeploy };
+  return { env, servers, resources: withDeploy };
 }
 
 /** Project detail: each environment with its attached servers + resources
  *  (each resource carrying its most-recent deployment). */
 export async function getEnvironmentPanels(projectId: string): Promise<EnvPanel[]> {
+  const project = await getProject(projectId);
+  const orgServers = project ? await getServers(project.orgId) : [];
   const envs = await db
     .select()
     .from(s.environments)
     .where(eq(s.environments.projectId, projectId))
     .orderBy(s.environments.name);
-  return Promise.all(envs.map(buildEnvPanel));
+  return Promise.all(envs.map((env) => buildEnvPanel(env, orgServers)));
 }
 
 /** Single-environment detail panel. */
@@ -259,7 +279,10 @@ export async function getEnvironmentPanel(
     .select()
     .from(s.environments)
     .where(eq(s.environments.id, envId));
-  return env ? buildEnvPanel(env) : undefined;
+  if (!env) return undefined;
+  const project = await getProject(env.projectId);
+  const orgServers = project ? await getServers(project.orgId) : [];
+  return buildEnvPanel(env, orgServers);
 }
 
 // ── Servers read models (V1-4) ─────────────────────────────────────────────
@@ -314,6 +337,8 @@ export type OrgResource = typeof s.resources.$inferSelect & {
 /** Nested project → environment → server tree for the deploy wizard target step. */
 export async function getDeployTargets(orgId: string) {
   const projs = await getProjects(orgId);
+  const orgServers = await getServers(orgId);
+  const byId = new Map(orgServers.map((sv) => [sv.id, sv]));
   return Promise.all(
     projs.map(async (p) => {
       const envs = await db
@@ -322,20 +347,25 @@ export async function getDeployTargets(orgId: string) {
         .where(eq(s.environments.projectId, p.id))
         .orderBy(s.environments.name);
       const environments = await Promise.all(
-        envs.map(async (e) => ({
-          ...e,
-          servers: await db
-            .select({
-              id: s.servers.id,
-              name: s.servers.name,
-              type: s.servers.type,
-              provider: s.servers.provider,
-              region: s.servers.region,
-            })
-            .from(s.servers)
-            .innerJoin(s.envServers, eq(s.envServers.serverId, s.servers.id))
-            .where(eq(s.envServers.environmentId, e.id)),
-        }))
+        envs.map(async (e) => {
+          const attached = await db
+            .select({ serverId: s.envServers.serverId })
+            .from(s.envServers)
+            .where(eq(s.envServers.environmentId, e.id));
+          return {
+            ...e,
+            servers: attached
+              .map((a) => byId.get(a.serverId))
+              .filter((sv): sv is NonNullable<typeof sv> => Boolean(sv))
+              .map((sv) => ({
+                id: sv.id,
+                name: sv.name,
+                type: sv.type,
+                provider: sv.provider,
+                region: sv.region,
+              })),
+          };
+        })
       );
       return { id: p.id, name: p.name, environments };
     })

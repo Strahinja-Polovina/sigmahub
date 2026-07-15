@@ -1,10 +1,22 @@
 import "server-only";
 
-// Control-plane client (P0-7). When SIGMAHUB_CP_URL is set, the servers
-// vertical reads/writes the real Go control plane instead of the simulated
-// PGlite tables; with the flag unset the v1 demo path is untouched.
+// Control-plane client (P0-7, extended by P1-1). When SIGMAHUB_CP_URL is set
+// the servers vertical and the domain-model writes talk to the real Go
+// control plane instead of the simulated PGlite tables; with the flag unset
+// the v1 demo path is untouched.
+//
+// P1-1 credential model: every org gets its own Org Admin service token,
+// minted once via POST /v1/orgs (provision token) and cached in the local
+// cp_org_tokens table — the wildcard dev token is no longer sent on org
+// calls. Mutations attach the acting user as a signed header the CP verifies
+// and audits (the actor can only narrow the token's role).
 
+import { createHmac } from "node:crypto";
+import { client } from "./db";
 import type * as s from "./db/schema";
+
+/** The acting user forwarded to the CP on mutations. */
+export type CpActor = { name: string; role: string };
 
 export type CpServer = {
   id: string;
@@ -53,28 +65,109 @@ export function cpPublicUrl(): string {
   return (process.env.SIGMAHUB_CP_PUBLIC_URL ?? cpBase()).replace(/\/$/, "");
 }
 
-async function cpFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const token =
-    process.env.SIGMAHUB_CP_SERVICE_TOKEN ?? "dev-service-token";
+// ── Org credential store (P1-1) ─────────────────────────────────────────────
+
+let orgTokenTableReady = false;
+async function ensureOrgTokenTable() {
+  if (orgTokenTableReady) return;
+  // CP-mode-only infrastructure, created lazily so the demo path never touches
+  // it and pre-existing dev databases self-heal without a migration step.
+  await client.query(`CREATE TABLE IF NOT EXISTS cp_org_tokens (
+    org_id     TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  orgTokenTableReady = true;
+}
+
+/** Resolve the org's CP service token, provisioning the org on first use —
+ *  which also self-heals orgs that predate the provisioning hook. */
+async function getOrgToken(orgId: string): Promise<string> {
+  await ensureOrgTokenTable();
+  const existing = await client.query<{ token: string }>(
+    `SELECT token FROM cp_org_tokens WHERE org_id = $1`,
+    [orgId]
+  );
+  if (existing.rows[0]?.token) return existing.rows[0].token;
+
+  const provisionToken =
+    process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+  const res = await fetch(`${cpBase()}/v1/orgs`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${provisionToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ orgId, name: `web:${orgId}` }),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`Control plane org provisioning failed (${res.status})`);
+  }
+  const { token } = (await res.json()) as { token: string };
+  await client.query(
+    `INSERT INTO cp_org_tokens (org_id, token) VALUES ($1, $2)
+     ON CONFLICT (org_id) DO NOTHING`,
+    [orgId, token]
+  );
+  // A concurrent provisioner may have won the insert; use the stored winner so
+  // the web app converges on one credential per org.
+  const winner = await client.query<{ token: string }>(
+    `SELECT token FROM cp_org_tokens WHERE org_id = $1`,
+    [orgId]
+  );
+  return winner.rows[0]?.token ?? token;
+}
+
+/** Signed actor headers: HMAC-SHA256 over the base64url payload, keyed with
+ *  the bearer token both ends already share. */
+function actorHeaders(actor: CpActor, bearerToken: string): Record<string, string> {
+  const payload = Buffer.from(
+    JSON.stringify({ name: actor.name, role: actor.role })
+  ).toString("base64url");
+  const sig = createHmac("sha256", bearerToken).update(payload).digest("hex");
+  return { "X-Sigmahub-Actor": payload, "X-Sigmahub-Actor-Signature": sig };
+}
+
+type CpFetchOpts = {
+  /** Org whose token authenticates the call. */
+  orgId: string;
+  /** Acting user, forwarded signed on mutations for per-user RBAC + audit. */
+  actor?: CpActor;
+  /** Idempotency key for POSTs. */
+  idempotencyKey?: string;
+};
+
+async function cpFetch<T>(path: string, init: RequestInit | undefined, opts: CpFetchOpts): Promise<T> {
+  const token = await getOrgToken(opts.orgId);
   const res = await fetch(`${cpBase()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(opts.actor ? actorHeaders(opts.actor, token) : {}),
+      ...(opts.idempotencyKey ? { "Idempotency-Key": opts.idempotencyKey } : {}),
       ...init?.headers,
     },
     cache: "no-store",
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Control plane ${res.status}: ${body.slice(0, 200)}`);
+    let message = `Control plane ${res.status}`;
+    try {
+      const parsed = JSON.parse(body) as { error?: string };
+      if (parsed.error) message = `${message}: ${parsed.error}`;
+    } catch {
+      message = `${message}: ${body.slice(0, 200)}`;
+    }
+    throw new Error(message);
   }
   return res.json() as Promise<T>;
 }
 
 export async function cpListServers(orgId: string): Promise<CpServer[]> {
   const { servers } = await cpFetch<{ servers: CpServer[] }>(
-    `/v1/orgs/${encodeURIComponent(orgId)}/servers`
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers`, undefined, { orgId }
   );
   return servers;
 }
@@ -85,7 +178,8 @@ export async function cpGetServer(
 ): Promise<CpServer | null> {
   try {
     return await cpFetch<CpServer>(
-      `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}`
+      `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}`,
+      undefined, { orgId }
     );
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Control plane 404")) {
@@ -100,19 +194,173 @@ export async function cpServerMetrics(
   serverId: string
 ): Promise<CpMetricPoint[]> {
   const { points } = await cpFetch<{ points: CpMetricPoint[] }>(
-    `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/metrics`
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/metrics`,
+    undefined, { orgId }
   );
   return points;
 }
 
 export async function cpIssueBootstrapToken(
   orgId: string,
-  input: { name: string; type: string; provider: string; region: string }
+  input: { name: string; type: string; provider: string; region: string },
+  actor?: CpActor
 ): Promise<{ token: string; expiresAt: string }> {
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/bootstrap-tokens`, {
     method: "POST",
     body: JSON.stringify(input),
-  });
+  }, { orgId, actor });
+}
+
+// ── Domain model (P1-1) ─────────────────────────────────────────────────────
+
+export type CpProject = {
+  id: string;
+  orgId: string;
+  name: string;
+  description: string;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CpEnvironment = {
+  id: string;
+  orgId: string;
+  projectId: string;
+  name: string;
+  production: boolean;
+  createdAt: string;
+};
+
+export type CpResource = {
+  id: string;
+  orgId: string;
+  projectId: string;
+  environmentId: string;
+  serverId: string;
+  name: string;
+  kind: string;
+  spec: Record<string, unknown>;
+  status: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CpAuditEntry = {
+  id: number;
+  orgId: string;
+  actor: string;
+  action: string;
+  target: string;
+  createdAt: string;
+};
+
+const org = (orgId: string) => `/v1/orgs/${encodeURIComponent(orgId)}`;
+
+export async function cpCreateProject(
+  orgId: string,
+  input: { name: string; description?: string },
+  actor: CpActor
+): Promise<CpProject> {
+  return cpFetch(`${org(orgId)}/projects`, {
+    method: "POST",
+    body: JSON.stringify({ name: input.name, description: input.description ?? "" }),
+  }, { orgId, actor });
+}
+
+export async function cpUpdateProject(
+  orgId: string,
+  projectId: string,
+  input: { name: string; description?: string },
+  actor: CpActor
+): Promise<CpProject> {
+  return cpFetch(`${org(orgId)}/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name: input.name, description: input.description ?? "" }),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteProject(orgId: string, projectId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpListProjects(orgId: string): Promise<CpProject[]> {
+  const { projects } = await cpFetch<{ projects: CpProject[] }>(
+    `${org(orgId)}/projects`, undefined, { orgId });
+  return projects;
+}
+
+export async function cpCreateEnvironment(
+  orgId: string,
+  projectId: string,
+  input: { name: string; production: boolean },
+  actor: CpActor
+): Promise<CpEnvironment> {
+  return cpFetch(`${org(orgId)}/projects/${encodeURIComponent(projectId)}/environments`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteEnvironment(orgId: string, envId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/environments/${encodeURIComponent(envId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpAttachServer(orgId: string, envId: string, serverId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/environments/${encodeURIComponent(envId)}/servers`, {
+    method: "POST",
+    body: JSON.stringify({ serverId }),
+  }, { orgId, actor });
+}
+
+export async function cpDetachServer(orgId: string, envId: string, serverId: string, actor: CpActor): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/environments/${encodeURIComponent(envId)}/servers/${encodeURIComponent(serverId)}`,
+    { method: "DELETE" }, { orgId, actor });
+}
+
+export async function cpCreateResource(
+  orgId: string,
+  input: {
+    environmentId: string;
+    serverId: string;
+    name: string;
+    kind: string;
+    spec?: Record<string, unknown>;
+  },
+  actor: CpActor
+): Promise<CpResource> {
+  return cpFetch(`${org(orgId)}/resources`, {
+    method: "POST",
+    body: JSON.stringify({ ...input, spec: input.spec ?? {} }),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteResource(orgId: string, resourceId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpListResources(orgId: string, environmentId?: string): Promise<CpResource[]> {
+  const qs = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
+  const { resources } = await cpFetch<{ resources: CpResource[] }>(
+    `${org(orgId)}/resources${qs}`, undefined, { orgId });
+  return resources;
+}
+
+export async function cpListAudit(orgId: string, limit = 50): Promise<CpAuditEntry[]> {
+  const { entries } = await cpFetch<{ entries: CpAuditEntry[] }>(
+    `${org(orgId)}/audit?limit=${limit}`, undefined, { orgId });
+  return entries;
+}
+
+/** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
+export function cpKind(localKind: string): string {
+  return localKind === "mongo" ? "mongodb" : localKind;
 }
 
 type ServerRow = typeof s.servers.$inferSelect;

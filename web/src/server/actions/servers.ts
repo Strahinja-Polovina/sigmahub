@@ -51,7 +51,7 @@ export async function connectServer(input: {
   region: string;
   byoVpn?: boolean;
 }): Promise<ConnectServerResult> {
-  const { user } = await requireMembership(input.orgId);
+  const { user, role } = await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Server name is required.");
 
@@ -61,7 +61,7 @@ export async function connectServer(input: {
       type: input.type,
       provider: input.provider.trim(),
       region: input.region.trim(),
-    });
+    }, { name: user.name, role });
     await writeAudit({
       orgId: input.orgId,
       actor: user.name,
