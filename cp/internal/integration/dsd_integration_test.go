@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,7 +125,7 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	}
 
 	// Register a server (bootstrap → agent token) and attach it.
-	bootTok, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +248,7 @@ func TestContainerRenderAndDestructiveOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootTok, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +440,7 @@ func TestServerLifecycleTombstoneAndEndpoints(t *testing.T) {
 	}
 
 	register := func(name, pubkey string) store.RegisterResult {
-		bt, _, err := st.IssueBootstrapToken(ctx, orgID, name, "general", "", "", "test", time.Hour)
+		bt, _, _, err := st.IssueBootstrapToken(ctx, orgID, name, "general", "", "", "test", time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -570,7 +571,7 @@ func TestSecretsEnvelopeRotationAAD(t *testing.T) {
 
 	// Resolve for a resource in the env: env API_KEY wins over the project
 	// default; DB_URL present. (Bind a server + resource first.)
-	bt, _, _ := st.IssueBootstrapToken(ctx, orgID, "h", "general", "", "", "test", time.Hour)
+	bt, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "h", "general", "", "", "test", time.Hour)
 	reg, _ := st.RegisterServer(ctx, bt, "h", "0.1.0", json.RawMessage(`{}`), "")
 	st.AttachServer(ctx, orgID, env.ID, reg.Server.ID, "test")
 	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{EnvironmentID: env.ID, ServerID: reg.Server.ID, Name: "app1", Kind: "app", Spec: json.RawMessage(`{}`)}, "test")
@@ -591,7 +592,7 @@ func TestSecretsEnvelopeRotationAAD(t *testing.T) {
 
 	// Server scoping (anti-BOLA): a DIFFERENT server in the same org must not be
 	// able to resolve this resource's secrets, even though it shares the org.
-	bt2, _, _ := st.IssueBootstrapToken(ctx, orgID, "h2", "general", "", "", "test", time.Hour)
+	bt2, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "h2", "general", "", "", "test", time.Hour)
 	reg2, _ := st.RegisterServer(ctx, bt2, "h2", "0.1.0", json.RawMessage(`{}`), "")
 	if _, err := st.ResolveSecretsForResource(ctx, orgID, reg2.Server.ID, res.ID, "sigmad"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("cross-server resolve = %v, want ErrNotFound (a server must not read another server's secrets)", err)
@@ -693,6 +694,76 @@ func postDSDStatus(t *testing.T, base, agentTok string, version int64, ops map[s
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("post status: %d", resp.StatusCode)
+	}
+}
+
+// TestBootstrapProvisioning covers the P1-5 onboarding foundation: the SSH
+// provisioner pre-creates the server + a bootstrap keypair, the bootstrap token
+// binds to that server, registration updates the SAME row (not a new one), the
+// token is single-use, and unsupported distros are rejected.
+func TestBootstrapProvisioning(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_prov"
+
+	// Unsupported distro is refused before anything is created.
+	if _, err := st.ProvisionServer(ctx, orgID, store.ProvisionInput{
+		Name: "bad", Type: "general", Distro: "centos-9",
+	}, "admin", 15*time.Minute); !errors.Is(err, store.ErrUnsupportedDistro) {
+		t.Fatalf("provision unsupported distro = %v, want ErrUnsupportedDistro", err)
+	}
+
+	// Provision a supported host: server pre-created, keypair minted, token bound.
+	res, err := st.ProvisionServer(ctx, orgID, store.ProvisionInput{
+		Name: "web1", Type: "general", Provider: "hetzner", Region: "fsn1",
+		ProxyRole: true, Distro: "ubuntu-24.04",
+	}, "admin", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if !strings.HasPrefix(res.BootstrapPubkey, "ssh-ed25519 ") {
+		t.Errorf("bootstrap pubkey not an ssh-ed25519 line: %q", res.BootstrapPubkey)
+	}
+
+	// The pre-created server exists in provisioning state with its attributes,
+	// a mesh IP, and the wrapped bootstrap key — BEFORE any agent registers.
+	var status, source, distro string
+	var proxy bool
+	var meshIP *string
+	var wrapped []byte
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT status, source, proxy_role, distro, mesh_ip, bootstrap_key_wrapped
+		  FROM servers WHERE id = $1`, res.ServerID).
+		Scan(&status, &source, &proxy, &distro, &meshIP, &wrapped); err != nil {
+		t.Fatalf("load pre-created server: %v", err)
+	}
+	if status != "provisioning" || source != "provisioned" || !proxy || distro != "ubuntu-24.04" {
+		t.Errorf("pre-created server = status=%q source=%q proxy=%v distro=%q", status, source, proxy, distro)
+	}
+	if meshIP == nil || *meshIP == "" {
+		t.Error("pre-created server has no mesh IP")
+	}
+	if len(wrapped) == 0 {
+		t.Error("bootstrap key was not wrapped/stored")
+	}
+
+	// Register with the bound token → updates the SAME server row, no new server.
+	reg, err := st.RegisterServer(ctx, res.Token, "web1", "0.1.0", json.RawMessage(`{"os":"linux"}`), "wgpubkey==")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if reg.Server.ID != res.ServerID {
+		t.Errorf("register created a new server %q, want the pre-created %q", reg.Server.ID, res.ServerID)
+	}
+	var count int
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM servers WHERE org_id = $1 AND deleted_at IS NULL`, orgID).Scan(&count)
+	if count != 1 {
+		t.Errorf("server count = %d, want exactly 1 (register must not insert a duplicate)", count)
+	}
+
+	// Single redemption: the token cannot be used a second time.
+	if _, err := st.RegisterServer(ctx, res.Token, "web1", "0.1.0", json.RawMessage(`{}`), "x"); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("second register = %v, want ErrTokenInvalid (single-use)", err)
 	}
 }
 

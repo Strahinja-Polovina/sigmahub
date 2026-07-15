@@ -20,7 +20,8 @@ type Pinger interface {
 // StoreAPI is everything the HTTP handlers need from the store; faked in
 // tests.
 type StoreAPI interface {
-	IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (string, time.Time, error)
+	IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (string, string, time.Time, error)
+	ProvisionServer(ctx context.Context, orgID string, in store.ProvisionInput, createdBy string, ttl time.Duration) (store.ProvisionResult, error)
 	RegisterServer(ctx context.Context, bootstrapToken, name, agentVersion string, facts json.RawMessage, pubkey string) (store.RegisterResult, error)
 	ServerByAgentToken(ctx context.Context, token string) (store.Server, error)
 	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
@@ -93,6 +94,9 @@ func (s *Server) routes() {
 	// replaying a mint must issue a fresh token, never store/return the
 	// one-time plaintext for later replay.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueBootstrapToken))
+	// SSH onboarding (P1-5): pre-create the server + mint a per-server bootstrap
+	// keypair. Project Admin+; like token minting, not idempotency-replayable.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/provision", s.requireService(store.RoleProjectAdmin, s.handleProvisionServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))

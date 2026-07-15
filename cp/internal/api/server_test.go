@@ -26,8 +26,15 @@ type fakeStore struct {
 	serviceTokens map[string]store.ServicePrincipal
 }
 
-func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, provider, region, createdBy string, ttl time.Duration) (string, time.Time, error) {
-	return "sbt_test", time.Now().Add(ttl), nil
+func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, provider, region, createdBy string, ttl time.Duration) (string, string, time.Time, error) {
+	return "sbt_test", "srv_pre", time.Now().Add(ttl), nil
+}
+
+func (f *fakeStore) ProvisionServer(_ context.Context, orgID string, in store.ProvisionInput, createdBy string, ttl time.Duration) (store.ProvisionResult, error) {
+	return store.ProvisionResult{
+		ServerID: "srv_pre", Token: "sbt_test", ExpiresAt: time.Now().Add(ttl),
+		BootstrapPubkey: "ssh-ed25519 AAAA sigmahub-bootstrap",
+	}, nil
 }
 
 func (f *fakeStore) RegisterServer(_ context.Context, tok, name, ver string, facts json.RawMessage, pubkey string) (store.RegisterResult, error) {
