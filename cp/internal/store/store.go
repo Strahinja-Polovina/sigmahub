@@ -17,6 +17,9 @@ var migrationFS embed.FS
 
 type Store struct {
 	Pool *pgxpool.Pool
+	// pepper keys the HMAC used to hash tokens at rest (P0-9). It is loaded
+	// from the KMS custody at boot via LoadTokenPepper/SetPepper.
+	pepper []byte
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {

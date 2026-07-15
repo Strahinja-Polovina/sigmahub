@@ -58,7 +58,7 @@ func (s *Store) IssueServiceToken(ctx context.Context, orgID, name string, role 
 	if _, ok := roleRank[role]; !ok {
 		return "", ServicePrincipal{}, fmt.Errorf("invalid role %q", role)
 	}
-	tok, digest := newToken("sst")
+	tok, digest := s.newToken("sst")
 	p := ServicePrincipal{ID: newID("st"), OrgID: orgID, Name: name, Role: role}
 
 	tx, err := s.Pool.Begin(ctx)
@@ -95,7 +95,7 @@ func (s *Store) AuthenticateServiceToken(ctx context.Context, token string) (Ser
 		   SET last_used_at = now()
 		 WHERE token_hash = $1 AND revoked_at IS NULL
 		 RETURNING id, org_id, name, role`,
-		hashToken(token),
+		s.hashToken(token),
 	).Scan(&p.ID, &p.OrgID, &p.Name, &role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ServicePrincipal{}, ErrNotFound

@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
 )
@@ -60,14 +62,11 @@ func mintServiceToken(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, databaseURL)
+	st, err := setupStore(ctx, slog.Default(), databaseURL)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(ctx, slog.Default()); err != nil {
-		return err
-	}
 
 	tok, p, err := st.IssueServiceToken(ctx, *org, *name, role, "cli")
 	if err != nil {
@@ -75,6 +74,37 @@ func mintServiceToken(args []string) error {
 	}
 	fmt.Printf("service token %s (org %s, role %s):\n\n  %s\n\nShown once — only its hash is stored.\n", p.ID, p.OrgID, p.Role, tok)
 	return nil
+}
+
+// setupStore opens the DB, applies migrations, and installs the KMS-custodied
+// token pepper so token hashing is keyed (P0-9). The dev custody is a
+// file-anchored AES-GCM key at CP_KMS_KEY_FILE (default ./.data/cp-kms.key);
+// its unwrap of the pepper writes one audit row into cp_audit_log.
+func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*store.Store, error) {
+	st, err := store.Open(ctx, databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.Migrate(ctx, log); err != nil {
+		st.Close()
+		return nil, err
+	}
+	keyPath := os.Getenv("CP_KMS_KEY_FILE")
+	if keyPath == "" {
+		keyPath = filepath.Join(".data", "cp-kms.key")
+	}
+	custody, err := kms.LoadOrCreateFileCustody(keyPath, st.AuditUnwrapSink())
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	pepper, err := st.LoadTokenPepper(ctx, custody)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	st.SetPepper(pepper)
+	return st, nil
 }
 
 func run() error {
@@ -94,15 +124,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := setupStore(ctx, log, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-
-	if err := st.Migrate(ctx, log); err != nil {
-		return err
-	}
 
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.

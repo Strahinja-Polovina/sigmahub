@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,19 +44,26 @@ func newID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b)
 }
 
-// newToken returns (plaintext, sha256 digest). Plaintext is shown exactly
-// once; only the digest is persisted.
-func newToken(prefix string) (string, []byte) {
+// newToken returns (plaintext, digest). Plaintext is shown exactly once; only
+// the keyed digest is persisted.
+func (s *Store) newToken(prefix string) (string, []byte) {
 	b := make([]byte, 24)
 	_, _ = rand.Read(b)
 	tok := prefix + "_" + hex.EncodeToString(b)
-	sum := sha256.Sum256([]byte(tok))
-	return tok, sum[:]
+	return tok, s.hashToken(tok)
 }
 
-func hashToken(tok string) []byte {
-	sum := sha256.Sum256([]byte(tok))
-	return sum[:]
+// hashToken keys the token digest with the KMS-custodied pepper (HMAC-SHA256),
+// so a database leak alone can't be brute-forced into valid tokens without the
+// wrapped key material. Pre-pepper deployments fall back to plain SHA-256.
+func (s *Store) hashToken(tok string) []byte {
+	if len(s.pepper) == 0 {
+		sum := sha256.Sum256([]byte(tok))
+		return sum[:]
+	}
+	mac := hmac.New(sha256.New, s.pepper)
+	mac.Write([]byte(tok))
+	return mac.Sum(nil)
 }
 
 // normalizeFacts guarantees the facts column always holds a JSON object.
@@ -73,7 +81,7 @@ func normalizeFacts(facts json.RawMessage) json.RawMessage {
 // an org and audits the issuance. The plaintext is returned once and never
 // stored.
 func (s *Store) IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (token string, expiresAt time.Time, err error) {
-	tok, digest := newToken("sbt")
+	tok, digest := s.newToken("sbt")
 	expiresAt = time.Now().Add(ttl)
 
 	tx, err := s.Pool.Begin(ctx)
@@ -126,7 +134,7 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 		   SET used_at = now()
 		 WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
 		 RETURNING id, org_id, server_name, server_type, provider, region`,
-		hashToken(bootstrapToken),
+		s.hashToken(bootstrapToken),
 	).Scan(&tokenID, &orgID, &tokName, &tokType, &tokProvider, &tokRegion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RegisterResult{}, ErrTokenInvalid
@@ -166,7 +174,7 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 		return RegisterResult{}, fmt.Errorf("link token: %w", err)
 	}
 
-	agentTok, digest := newToken("sat")
+	agentTok, digest := s.newToken("sat")
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO agent_tokens (id, server_id, token_hash) VALUES ($1, $2, $3)`,
 		newID("at"), srv.ID, digest); err != nil {
@@ -194,7 +202,7 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 		  FROM agent_tokens t
 		  JOIN servers s ON s.id = t.server_id
 		 WHERE t.token_hash = $1 AND t.revoked_at IS NULL`,
-		hashToken(token),
+		s.hashToken(token),
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
