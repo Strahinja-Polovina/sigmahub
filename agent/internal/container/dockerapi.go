@@ -277,6 +277,10 @@ type ContainerState struct {
 	Name   string
 	Image  string
 	Running bool
+	// Pid is the container's main-process host PID (0 when not running). Used to
+	// seed secret files through the container's live mount namespace via
+	// /proc/<pid>/root, which lands in the tmpfs and never on the host disk layer.
+	Pid    int
 	Labels map[string]string
 }
 
@@ -285,6 +289,7 @@ type containerInspect struct {
 	Name  string `json:"Name"`
 	State struct {
 		Running bool `json:"Running"`
+		Pid     int  `json:"Pid"`
 	} `json:"State"`
 	Config struct {
 		Image  string            `json:"Image"`
@@ -308,6 +313,7 @@ func (d *DockerClient) ContainerInspect(ctx context.Context, name string) (Conta
 		Name:    strings.TrimPrefix(ci.Name, "/"),
 		Image:   ci.Config.Image,
 		Running: ci.State.Running,
+		Pid:     ci.State.Pid,
 		Labels:  ci.Config.Labels,
 	}, true, nil
 }
@@ -358,6 +364,25 @@ func (d *DockerClient) ContainerCreate(ctx context.Context, name string, body an
 
 func (d *DockerClient) ContainerStart(ctx context.Context, id string) error {
 	return d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/start", nil, nil)
+}
+
+// FSChange is one entry of a container's filesystem diff (docker diff).
+type FSChange struct {
+	Path string `json:"Path"`
+	Kind int    `json:"Kind"` // 0=modified, 1=added, 2=deleted
+}
+
+// ContainerChanges returns the container's filesystem changes relative to its
+// image (the docker-diff endpoint). Crucially, files written into a tmpfs mount
+// do NOT appear here — the diff reports only the on-disk graphdriver (rw) layer.
+// That makes it a portable disk-scan: a secret path showing up here would mean
+// the value leaked onto host disk instead of staying in the in-memory tmpfs.
+func (d *DockerClient) ContainerChanges(ctx context.Context, id string) ([]FSChange, error) {
+	var out []FSChange
+	if err := d.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/changes", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ContainerStop stops a container with a grace period (seconds). A missing or

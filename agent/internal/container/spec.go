@@ -77,6 +77,26 @@ type HostMount struct {
 	Target string `json:"target"`
 }
 
+// SecretsMountDir is the in-memory (tmpfs) directory file-mode secrets are
+// seeded into. Kept in sync with the control plane's secretsMountDir.
+const SecretsMountDir = "/run/secrets"
+
+// SecretRef references a secret the agent fetches and injects at
+// container-create — never the value. EnvVar false = a tmpfs file under
+// SecretsMountDir; true = an environment variable (explicit opt-in).
+type SecretRef struct {
+	Name   string `json:"name"`
+	EnvVar bool   `json:"envVar,omitempty"`
+}
+
+// Secret is a resolved secret value fetched from the control plane for
+// injection. It never enters the persisted desired-state (only references do).
+type Secret struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	EnvVar bool   `json:"envVar"`
+}
+
 // ContainerSpec is the payload of a container.apply op: the full desired state
 // of one workload container. The control plane renders it from a resource's
 // spec; the agent applies it after the local policy gate passes.
@@ -97,6 +117,9 @@ type ContainerSpec struct {
 	CPUs           float64           `json:"cpus,omitempty"`
 	MemoryMB       int64             `json:"memoryMb,omitempty"`
 	Restart        string            `json:"restart,omitempty"` // no|on-failure|always|unless-stopped
+	// SecretRefs are references (never values) to secrets injected at
+	// container-create; the agent resolves them via the control plane.
+	SecretRefs     []SecretRef       `json:"secretRefs,omitempty"`
 
 	// Forbidden by the local policy. The control plane never sets these; they
 	// exist only so the agent can detect and reject a DSD that does.
