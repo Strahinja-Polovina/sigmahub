@@ -145,17 +145,20 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	return dsd.Signed{Document: doc, Signature: sig}, true, nil
 }
 
-// ResourceSpecsForServer returns the (resourceID, kind, spec) rows the
-// reconciler renders a server's DSD from.
+// ResourceSpecsForServer returns the rows the reconciler renders a server's DSD
+// from. ProjectID drives per-project Docker network naming; Ephemeral flags
+// preview resources whose teardown skips interactive approval.
 type ResourceSpec struct {
 	ResourceID string
+	ProjectID  string
 	Kind       string
 	Spec       json.RawMessage
+	Ephemeral  bool
 }
 
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, kind, spec FROM resources WHERE server_id = $1 ORDER BY created_at`,
+		SELECT id, project_id, kind, spec, ephemeral FROM resources WHERE server_id = $1 ORDER BY created_at`,
 		serverID)
 	if err != nil {
 		return nil, err
@@ -164,12 +167,50 @@ func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]
 	out := []ResourceSpec{}
 	for rows.Next() {
 		var r ResourceSpec
-		if err := rows.Scan(&r.ResourceID, &r.Kind, &r.Spec); err != nil {
+		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// PendingDestructiveOp is a confirmed destructive action awaiting agent
+// application, rendered into the server's DSD until applied.
+type PendingDestructiveOp struct {
+	ID      string
+	OpKind  string
+	Target  string
+}
+
+// PendingDestructiveOpsForServer returns a server's still-unapplied destructive
+// ops (applied_at IS NULL), oldest first for deterministic op ordering.
+func (s *Store) PendingDestructiveOpsForServer(ctx context.Context, serverID string) ([]PendingDestructiveOp, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, op_kind, target FROM pending_destructive_ops
+		WHERE server_id = $1 AND applied_at IS NULL ORDER BY created_at, id`,
+		serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PendingDestructiveOp{}
+	for rows.Next() {
+		var p PendingDestructiveOp
+		if err := rows.Scan(&p.ID, &p.OpKind, &p.Target); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// MarkDestructiveOpApplied records that the agent applied a destructive op so it
+// drops out of future DSDs.
+func (s *Store) MarkDestructiveOpApplied(ctx context.Context, id string) error {
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE pending_destructive_ops SET applied_at = now() WHERE id = $1 AND applied_at IS NULL`, id)
+	return err
 }
 
 // AllServerIDs lists every non-deleted server id, for the periodic resync.

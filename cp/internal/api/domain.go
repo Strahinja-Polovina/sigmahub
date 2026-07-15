@@ -39,6 +39,8 @@ type DomainAPI interface {
 	IdempotencyLookup(ctx context.Context, orgID, key string) (store.IdempotentResponse, error)
 	IdempotencySave(ctx context.Context, orgID, key string, in store.IdempotentResponse) (store.IdempotentResponse, error)
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
+	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
+	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,

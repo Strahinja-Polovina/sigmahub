@@ -210,6 +210,213 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	}
 }
 
+// TestContainerRenderAndDestructiveOps drives the P1-3 CP surface end to end:
+// an "app" resource fans into container ops in the signed DSD; the two-phase
+// confirm flow injects a volume.remove op that drops out once the agent reports
+// it applied; and an ephemeral resource's teardown auto-confirms volume removal
+// as the system actor.
+func TestContainerRenderAndDestructiveOps(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rec := reconciler.New(log, st, dsdKey)
+
+	api.SetLongPollTimeout(400 * time.Millisecond)
+	srv := api.New(log, st, st, st, api.Options{
+		DevServiceToken: "dev",
+		DSDStore:        st,
+		DSDWaiter:       rec,
+		Reconcile:       rec,
+		DSDPublicKey:    dsdKey.Public().(ed25519.PublicKey),
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	orgID := "org_ct"
+	svcTok, _, err := st.IssueServiceToken(ctx, orgID, "web", store.RoleProjectAdmin, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, agentTok := reg.Server.ID, reg.AgentToken
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// App resource with a container spec (image + a named volume).
+	appSpec, _ := json.Marshal(map[string]any{
+		"image":          "nginxinc/nginx-unprivileged:1.27-alpine",
+		"volumes":        []map[string]any{{"name": "data", "mountPath": "/data"}},
+		"user":           "101:101",
+		"readOnlyRootfs": true,
+	})
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "app1", Kind: "app", Spec: appSpec,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+
+	signed, code := agentGetDSD(t, ts.URL, agentTok, 0)
+	if code != http.StatusOK {
+		t.Fatalf("delivery code=%d", code)
+	}
+	kinds := map[string]int{}
+	for _, op := range signed.Document.Ops {
+		kinds[op.Kind]++
+	}
+	for _, want := range []string{dsd.KindNetworkEnsure, dsd.KindImagePull, dsd.KindVolumeEnsure, dsd.KindContainerApply} {
+		if kinds[want] == 0 {
+			t.Fatalf("app resource did not render a %s op; ops=%v", want, kinds)
+		}
+	}
+
+	// Two-phase destructive op: request a confirm token, confirm it, and the
+	// next DSD must carry the volume.remove op.
+	volName := dsd.VolumeName(res.ID, "data")
+	token := issueConfirmToken(t, ts.URL, svcTok, orgID, serverID, dsd.KindVolumeRemove, volName)
+	confirmDestructive(t, ts.URL, svcTok, orgID, serverID, token, dsd.KindVolumeRemove, volName)
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := st.GetDSD(ctx, serverID)
+	var volrmOpID string
+	for _, op := range cur.Document.Ops {
+		if op.Kind == dsd.KindVolumeRemove {
+			volrmOpID = op.ID
+		}
+	}
+	if volrmOpID == "" {
+		t.Fatal("no volume.remove op in the DSD after confirm")
+	}
+
+	// A stale/unused confirm token cannot be replayed.
+	if replayCode := tryConfirmDestructive(t, ts.URL, svcTok, orgID, serverID, token, dsd.KindVolumeRemove, volName); replayCode == http.StatusOK {
+		t.Fatal("a used confirm token was replayable")
+	}
+
+	// Agent reports the volume.remove applied → it must drop from future DSDs.
+	postDSDStatus(t, ts.URL, agentTok, cur.Document.Version, map[string]json.RawMessage{
+		volrmOpID: json.RawMessage(`{"state":"applied"}`),
+	})
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := st.GetDSD(ctx, serverID)
+	for _, op := range after.Document.Ops {
+		if op.Kind == dsd.KindVolumeRemove {
+			t.Fatal("volume.remove op did not drop after being reported applied")
+		}
+	}
+
+	// Ephemeral carve-out: an ephemeral resource's teardown auto-confirms volume
+	// removal as the system actor, with no interactive token.
+	ephSpec, _ := json.Marshal(map[string]any{
+		"image":   "nginxinc/nginx-unprivileged:1.27-alpine",
+		"volumes": []map[string]any{{"name": "cache", "mountPath": "/cache"}},
+	})
+	eph, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "preview1", Kind: "app", Spec: ephSpec,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, "UPDATE resources SET ephemeral = TRUE WHERE id = $1", eph.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteResource(ctx, orgID, eph.ID, "someuser"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.PendingDestructiveOpsForServer(ctx, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVol := dsd.VolumeName(eph.ID, "cache")
+	found := false
+	for _, p := range pending {
+		if p.OpKind == dsd.KindVolumeRemove && p.Target == wantVol {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ephemeral teardown did not record a system volume.remove for %s; pending=%v", wantVol, pending)
+	}
+	// The teardown is audited as the system actor (both request and confirm).
+	var sysAudits int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM cp_audit_log WHERE org_id = $1 AND actor = 'system' AND action LIKE 'Destructive-op %(ephemeral)'`,
+		orgID).Scan(&sysAudits); err != nil {
+		t.Fatal(err)
+	}
+	if sysAudits < 2 {
+		t.Fatalf("expected >=2 system-actor ephemeral audit rows, got %d", sysAudits)
+	}
+}
+
+func issueConfirmToken(t *testing.T, base, svcTok, orgID, serverID, opKind, target string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"opKind": opKind, "target": target})
+	req, _ := http.NewRequest("POST", base+"/v1/orgs/"+orgID+"/servers/"+serverID+"/confirm-tokens", bytesReader(body))
+	req.Header.Set("Authorization", "Bearer "+svcTok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("issue confirm token: %d %s", resp.StatusCode, b)
+	}
+	var r struct {
+		Token string `json:"token"`
+	}
+	json.NewDecoder(resp.Body).Decode(&r)
+	if r.Token == "" {
+		t.Fatal("empty confirm token")
+	}
+	return r.Token
+}
+
+func tryConfirmDestructive(t *testing.T, base, svcTok, orgID, serverID, token, opKind, target string) int {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"token": token, "opKind": opKind, "target": target})
+	req, _ := http.NewRequest("POST", base+"/v1/orgs/"+orgID+"/servers/"+serverID+"/destructive-ops", bytesReader(body))
+	req.Header.Set("Authorization", "Bearer "+svcTok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+func confirmDestructive(t *testing.T, base, svcTok, orgID, serverID, token, opKind, target string) {
+	t.Helper()
+	if code := tryConfirmDestructive(t, base, svcTok, orgID, serverID, token, opKind, target); code != http.StatusOK {
+		t.Fatalf("confirm destructive: %d", code)
+	}
+}
+
 func createResourceViaAPI(t *testing.T, base, svcTok, orgID, envID, serverID, name, kind string) string {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"environmentId": envID, "serverId": serverID, "name": name, "kind": kind})

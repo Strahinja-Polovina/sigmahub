@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
@@ -19,6 +20,7 @@ type DSDStore interface {
 	GetDSD(ctx context.Context, serverID string) (dsd.Signed, error)
 	CurrentDSDVersion(ctx context.Context, serverID string) (int64, error)
 	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage) (bool, error)
+	MarkDestructiveOpApplied(ctx context.Context, id string) error
 }
 
 // DSDWaiter lets the long-poll handler block until a server's DSD changes.
@@ -100,11 +102,22 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	// Route "res:<id>" op statuses into resources.status.
+	// Route "res:<id>" op statuses into resources.status, and mark applied
+	// "volrm:<pendingId>" destructive ops so they drop out of future DSDs.
 	byResource := map[string]json.RawMessage{}
 	for opID, st := range req.Ops {
-		if len(opID) > 4 && opID[:4] == "res:" {
-			byResource[opID[4:]] = st
+		switch {
+		case strings.HasPrefix(opID, "res:"):
+			byResource[strings.TrimPrefix(opID, "res:")] = st
+		case strings.HasPrefix(opID, "volrm:"):
+			var os struct {
+				State string `json:"state"`
+			}
+			if json.Unmarshal(st, &os) == nil && os.State == "applied" {
+				if err := s.dsdStore.MarkDestructiveOpApplied(r.Context(), strings.TrimPrefix(opID, "volrm:")); err != nil {
+					s.log.Error("mark destructive op applied", "err", err, "op", opID)
+				}
+			}
 		}
 	}
 	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource)

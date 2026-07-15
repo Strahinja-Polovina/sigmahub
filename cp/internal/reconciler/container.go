@@ -1,0 +1,132 @@
+package reconciler
+
+import (
+	"encoding/json"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+// appResourceSpec is the user-authored `spec` JSONB of an "app" resource. The
+// control plane translates it into the typed container ops the agent applies.
+type appResourceSpec struct {
+	Image          string            `json:"image"`
+	Env            map[string]string `json:"env"`
+	Ports          []struct {
+		Container int    `json:"container"`
+		Host      int    `json:"host"`
+		Protocol  string `json:"protocol"`
+	} `json:"ports"`
+	Volumes []struct {
+		Name      string `json:"name"`
+		MountPath string `json:"mountPath"`
+		ReadOnly  bool   `json:"readOnly"`
+	} `json:"volumes"`
+	Command        []string `json:"command"`
+	User           string   `json:"user"`
+	ReadOnlyRootfs bool     `json:"readOnlyRootfs"`
+	Tmpfs          []string `json:"tmpfs"`
+	CPUs           float64  `json:"cpus"`
+	MemoryMB       int64    `json:"memoryMb"`
+	Restart        string   `json:"restart"`
+}
+
+// The op-spec structs mirror the agent's container package JSON tags exactly.
+// They are the wire contract between renderOps and the agent's op handlers.
+
+type portMapping struct {
+	Container int    `json:"container"`
+	Host      int    `json:"host,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+}
+
+type volumeMount struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+}
+
+type containerOpSpec struct {
+	ResourceID     string            `json:"resourceId"`
+	Name           string            `json:"name"`
+	Image          string            `json:"image"`
+	Network        string            `json:"network"`
+	Env            map[string]string `json:"env,omitempty"`
+	Ports          []portMapping     `json:"ports,omitempty"`
+	Volumes        []volumeMount     `json:"volumes,omitempty"`
+	Command        []string          `json:"command,omitempty"`
+	User           string            `json:"user,omitempty"`
+	ReadOnlyRootfs bool              `json:"readOnlyRootfs,omitempty"`
+	Tmpfs          []string          `json:"tmpfs,omitempty"`
+	CPUs           float64           `json:"cpus,omitempty"`
+	MemoryMB       int64             `json:"memoryMb,omitempty"`
+	Restart        string            `json:"restart,omitempty"`
+}
+
+// renderAppOps expands one "app" resource into its ordered container ops:
+// image.pull → volume.ensure(s) → container.apply, with the container depending
+// on its image, its volumes, and its project network (whose op is emitted once
+// per project by the caller). Returns ok=false when the resource is not yet
+// deployable (no image), so the caller falls back to a no-op resource.sync.
+func renderAppOps(rs store.ResourceSpec) (ops []dsd.Op, networkID string, ok bool) {
+	var spec appResourceSpec
+	if err := json.Unmarshal(rs.Spec, &spec); err != nil || spec.Image == "" {
+		return nil, "", false
+	}
+
+	networkName := dsd.NetworkName(rs.ProjectID)
+	networkID = "net:" + rs.ProjectID
+	imageID := "img:" + rs.ResourceID
+	containerID := "res:" + rs.ResourceID // maps to resources.status on ingest
+
+	// image.pull
+	imgSpec, _ := json.Marshal(map[string]string{"image": spec.Image})
+	ops = append(ops, dsd.Op{ID: imageID, Kind: dsd.KindImagePull, Spec: imgSpec})
+
+	// volume.ensure per declared volume; the container depends on each.
+	deps := []string{networkID, imageID}
+	var mounts []volumeMount
+	for _, v := range spec.Volumes {
+		if v.Name == "" {
+			continue
+		}
+		dockerVol := dsd.VolumeName(rs.ResourceID, v.Name)
+		volID := "vol:" + rs.ResourceID + ":" + v.Name
+		vs, _ := json.Marshal(map[string]string{"name": dockerVol, "resourceId": rs.ResourceID})
+		ops = append(ops, dsd.Op{ID: volID, Kind: dsd.KindVolumeEnsure, Spec: vs})
+		deps = append(deps, volID)
+		mounts = append(mounts, volumeMount{Name: dockerVol, MountPath: v.MountPath, ReadOnly: v.ReadOnly})
+	}
+
+	// container.apply
+	cs := containerOpSpec{
+		ResourceID:     rs.ResourceID,
+		Name:           dsd.ContainerName(rs.ResourceID),
+		Image:          spec.Image,
+		Network:        networkName,
+		Env:            spec.Env,
+		Volumes:        mounts,
+		Command:        spec.Command,
+		User:           spec.User,
+		ReadOnlyRootfs: spec.ReadOnlyRootfs,
+		Tmpfs:          spec.Tmpfs,
+		CPUs:           spec.CPUs,
+		MemoryMB:       spec.MemoryMB,
+		Restart:        spec.Restart,
+	}
+	for _, p := range spec.Ports {
+		cs.Ports = append(cs.Ports, portMapping{Container: p.Container, Host: p.Host, Protocol: p.Protocol})
+	}
+	csBytes, _ := json.Marshal(cs)
+	ops = append(ops, dsd.Op{ID: containerID, Kind: dsd.KindContainerApply, DependsOn: deps, Spec: csBytes})
+
+	return ops, networkID, true
+}
+
+// renderVolumeRemoveOp renders a confirmed destructive volume removal. The op
+// id carries the pending-op id so the agent's status report maps back to the
+// pending_destructive_ops row.
+func renderVolumeRemoveOp(p store.PendingDestructiveOp) dsd.Op {
+	spec, _ := json.Marshal(map[string]string{"name": p.Target})
+	return dsd.Op{ID: "volrm:" + p.ID, Kind: dsd.KindVolumeRemove, Spec: spec}
+}

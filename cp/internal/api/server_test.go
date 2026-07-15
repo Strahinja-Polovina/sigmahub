@@ -142,6 +142,12 @@ func (f *fakeDomain) IdempotencySave(_ context.Context, orgID, key string, in st
 func (f *fakeDomain) IssueServiceToken(_ context.Context, orgID, name string, role store.Role, _ string) (string, store.ServicePrincipal, error) {
 	return "sst_provisioned", store.ServicePrincipal{ID: "st_p", OrgID: orgID, Name: name, Role: role}, nil
 }
+func (f *fakeDomain) IssueConfirmToken(_ context.Context, _, _, _, _, _ string, _ time.Duration) (string, time.Time, error) {
+	return "sct_confirm", time.Now().Add(time.Minute), nil
+}
+func (f *fakeDomain) ConfirmDestructiveOp(_ context.Context, _, _, _, _, _, _ string) (string, error) {
+	return "pdo_1", nil
+}
 
 const (
 	testServiceToken   = "test-service-token"
