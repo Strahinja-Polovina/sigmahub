@@ -1,9 +1,10 @@
 import { notFound, redirect } from "next/navigation";
 import { getActiveOrgId } from "@/server/active-org";
-import { getServer, getServerHosted } from "@/server/queries";
+import { getEnvironment, getProject, getServer, getServerHosted } from "@/server/queries";
 import {
   cpEnabled,
   cpGetServer,
+  cpListResources,
   cpMetricsToPoints,
   cpServerMetrics,
   cpServerToRow,
@@ -22,11 +23,34 @@ export default async function ServerDetailPage({
   if (cpEnabled()) {
     const cpServer = await cpGetServer(orgId, serverId);
     if (!cpServer) notFound();
-    const points = cpMetricsToPoints(await cpServerMetrics(orgId, serverId));
+    const [points, cpResources] = await Promise.all([
+      cpServerMetrics(orgId, serverId).then(cpMetricsToPoints),
+      cpListResources(orgId).catch(() => []),
+    ]);
+    // Hosted resources come from the CP; project/env names resolve from the
+    // local mirror rows (same ids), falling back to raw ids.
+    const hosted = await Promise.all(
+      cpResources
+        .filter((r) => r.serverId === serverId)
+        .map(async (r) => {
+          const [project, env] = await Promise.all([
+            getProject(r.projectId),
+            getEnvironment(r.environmentId),
+          ]);
+          return {
+            id: r.id,
+            name: r.name,
+            kind: r.kind === "mongodb" ? "mongo" : r.kind,
+            status: (r.status as { state?: string }).state ?? "provisioning",
+            projectName: project?.name ?? r.projectId,
+            envName: env?.name ?? r.environmentId,
+          };
+        })
+    );
     return (
       <ServerDetailView
         server={cpServerToRow(cpServer)}
-        hosted={[]}
+        hosted={hosted}
         cpMode
         metricsPoints={points}
       />

@@ -7,6 +7,22 @@ import * as s from "../db/schema";
 import { requireMembership } from "../active-org";
 import { getProject } from "../queries";
 import { writeAudit } from "../audit";
+import {
+  cpEnabled,
+  cpCreateProject,
+  cpUpdateProject,
+  cpDeleteProject,
+  cpCreateEnvironment,
+  cpDeleteEnvironment,
+  cpAttachServer,
+  cpDetachServer,
+} from "../cp";
+
+/** Free-text env names; "production"/"prod" carry the CP production flag. */
+function isProductionName(name: string) {
+  const n = name.trim().toLowerCase();
+  return n === "production" || n === "prod";
+}
 
 function slugify(x: string) {
   return (
@@ -28,10 +44,21 @@ export async function createProject(input: {
   name: string;
   description?: string;
 }) {
-  const { user } = await requireMembership(input.orgId);
+  const { user, role } = await requireMembership(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
-  const id = rid("proj");
+  // CP mode: the control plane is the source of truth (P1-1); the local row
+  // mirrors it under the SAME id so the read models keep working until later
+  // tickets migrate reads to the CP.
+  let id = rid("proj");
+  if (cpEnabled()) {
+    const created = await cpCreateProject(
+      input.orgId,
+      { name, description: input.description?.trim() },
+      { name: user.name, role }
+    );
+    id = created.id;
+  }
   await db.insert(s.projects).values({
     id,
     orgId: input.orgId,
@@ -51,9 +78,17 @@ export async function renameProject(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user } = await requireMembership(project.orgId);
+  const { user, role } = await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
+  if (cpEnabled()) {
+    await cpUpdateProject(
+      project.orgId,
+      input.projectId,
+      { name, description: input.description?.trim() ?? project.description },
+      { name: user.name, role }
+    );
+  }
   await db
     .update(s.projects)
     .set({
@@ -74,7 +109,10 @@ export async function renameProject(input: {
 export async function deleteProject(input: { projectId: string }) {
   const project = await getProject(input.projectId);
   if (!project) return;
-  const { user } = await requireMembership(project.orgId);
+  const { user, role } = await requireMembership(project.orgId);
+  if (cpEnabled()) {
+    await cpDeleteProject(project.orgId, input.projectId, { name: user.name, role });
+  }
   // FK cascade removes environments, env_servers, resources and deployments.
   await db.delete(s.projects).where(eq(s.projects.id, input.projectId));
   await writeAudit({ orgId: project.orgId, actor: user.name, action: "Deleted project", target: project.name });
@@ -87,10 +125,19 @@ export async function createEnvironment(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user } = await requireMembership(project.orgId);
+  const { user, role } = await requireMembership(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Environment name is required.");
-  const id = rid("env");
+  let id = rid("env");
+  if (cpEnabled()) {
+    const created = await cpCreateEnvironment(
+      project.orgId,
+      input.projectId,
+      { name, production: isProductionName(name) },
+      { name: user.name, role }
+    );
+    id = created.id;
+  }
   await db.insert(s.environments).values({ id, projectId: input.projectId, name });
   await writeAudit({ orgId: project.orgId, actor: user.name, action: "Created environment", target: `${project.name} / ${name}` });
   revalidatePath("/dashboard", "layout");
@@ -107,8 +154,8 @@ async function requireEnvMembership(environmentId: string) {
   if (!env) throw new Error("Environment not found.");
   const project = await getProject(env.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user } = await requireMembership(project.orgId);
-  return { env, project, user };
+  const { user, role } = await requireMembership(project.orgId);
+  return { env, project, user, role };
 }
 
 /** Attach an org server to an environment so deploys can target it. */
@@ -116,14 +163,25 @@ export async function attachServerToEnv(input: {
   environmentId: string;
   serverId: string;
 }) {
-  const { env, project, user } = await requireEnvMembership(input.environmentId);
-  // The server must belong to the same org (don't trust the client id — IDOR).
-  const [sv] = await db
-    .select({ orgId: s.servers.orgId, name: s.servers.name })
-    .from(s.servers)
-    .where(eq(s.servers.id, input.serverId));
-  if (!sv || sv.orgId !== project.orgId) {
-    throw new Error("Server does not belong to this organization.");
+  const { env, project, user, role } = await requireEnvMembership(input.environmentId);
+  let serverName = input.serverId;
+  if (cpEnabled()) {
+    // The CP owns servers in CP mode: it 404s ids outside this org (IDOR) and
+    // audits the attach. Mirror the join row locally for the read models.
+    await cpAttachServer(project.orgId, input.environmentId, input.serverId, {
+      name: user.name,
+      role,
+    });
+  } else {
+    // The server must belong to the same org (don't trust the client id — IDOR).
+    const [sv] = await db
+      .select({ orgId: s.servers.orgId, name: s.servers.name })
+      .from(s.servers)
+      .where(eq(s.servers.id, input.serverId));
+    if (!sv || sv.orgId !== project.orgId) {
+      throw new Error("Server does not belong to this organization.");
+    }
+    serverName = sv.name;
   }
   await db
     .insert(s.envServers)
@@ -133,7 +191,7 @@ export async function attachServerToEnv(input: {
     orgId: project.orgId,
     actor: user.name,
     action: "Attached server",
-    target: `${sv.name} → ${project.name} / ${env.name}`,
+    target: `${serverName} → ${project.name} / ${env.name}`,
   });
   revalidatePath("/dashboard", "layout");
 }
@@ -142,15 +200,19 @@ export async function detachServerFromEnv(input: {
   environmentId: string;
   serverId: string;
 }) {
-  const { env, project, user } = await requireEnvMembership(input.environmentId);
-  // Same ownership rule as attach: never resolve another org's server (IDOR /
-  // cross-org name disclosure via the audit log).
-  const [sv] = await db
-    .select({ orgId: s.servers.orgId, name: s.servers.name })
-    .from(s.servers)
-    .where(eq(s.servers.id, input.serverId));
-  if (!sv || sv.orgId !== project.orgId) {
-    throw new Error("Server does not belong to this organization.");
+  const { env, project, user, role } = await requireEnvMembership(input.environmentId);
+  let serverName = input.serverId;
+  if (!cpEnabled()) {
+    // Same ownership rule as attach: never resolve another org's server (IDOR /
+    // cross-org name disclosure via the audit log).
+    const [sv] = await db
+      .select({ orgId: s.servers.orgId, name: s.servers.name })
+      .from(s.servers)
+      .where(eq(s.servers.id, input.serverId));
+    if (!sv || sv.orgId !== project.orgId) {
+      throw new Error("Server does not belong to this organization.");
+    }
+    serverName = sv.name;
   }
   // Don't silently orphan workloads: resources in this environment still
   // running on the server keep their serverId, so block until they're gone.
@@ -168,6 +230,13 @@ export async function detachServerFromEnv(input: {
       `${hosted.length} resource${hosted.length === 1 ? "" : "s"} in this environment still run${hosted.length === 1 ? "s" : ""} on this server. Delete or redeploy them first.`
     );
   }
+  if (cpEnabled()) {
+    // CP-side detach enforces org scoping and audits; local row mirrors it.
+    await cpDetachServer(project.orgId, input.environmentId, input.serverId, {
+      name: user.name,
+      role,
+    });
+  }
   const deleted = await db
     .delete(s.envServers)
     .where(
@@ -183,7 +252,7 @@ export async function detachServerFromEnv(input: {
       orgId: project.orgId,
       actor: user.name,
       action: "Detached server",
-      target: `${sv.name} ← ${project.name} / ${env.name}`,
+      target: `${serverName} ← ${project.name} / ${env.name}`,
     });
   }
   revalidatePath("/dashboard", "layout");
@@ -197,6 +266,12 @@ export async function deleteEnvironment(input: { environmentId: string }) {
   if (!env) return;
   const project = await getProject(env.projectId);
   const membership = project ? await requireMembership(project.orgId) : null;
+  if (project && membership && cpEnabled()) {
+    await cpDeleteEnvironment(project.orgId, input.environmentId, {
+      name: membership.user.name,
+      role: membership.role,
+    });
+  }
   await db.delete(s.environments).where(eq(s.environments.id, input.environmentId));
   if (project && membership) {
     await writeAudit({
