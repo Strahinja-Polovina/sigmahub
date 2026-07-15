@@ -101,6 +101,12 @@ func parseSTUNAddress(msg []byte) (string, error) {
 		if pad := length % 4; pad != 0 {
 			adv += 4 - pad // attributes are padded to a 4-byte boundary
 		}
+		// Bound the advance: a truncated/misaligned final attribute (the padding
+		// bytes may be absent) could push adv past the buffer, and attrs[adv:]
+		// would panic on attacker-controlled STUN bytes (UDP is unauthenticated).
+		if adv > len(attrs) {
+			break
+		}
 		attrs = attrs[adv:]
 	}
 	return "", fmt.Errorf("no mapped address in STUN response")
