@@ -70,6 +70,9 @@ func (f *fakeStore) ListServers(context.Context, string) ([]store.Server, error)
 func (f *fakeStore) GetServer(context.Context, string, string) (store.Server, error) {
 	return store.Server{}, store.ErrNotFound
 }
+func (f *fakeStore) ResolveSecretsForResource(context.Context, string, string, string, string) ([]store.ResolvedSecret, error) {
+	return []store.ResolvedSecret{}, nil
+}
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -157,6 +160,17 @@ func (f *fakeDomain) RevokeServiceToken(_ context.Context, _, _, _ string) error
 func (f *fakeDomain) RotateServiceToken(_ context.Context, _, _, _ string) (string, store.ServicePrincipal, error) {
 	return "sst_rotated", store.ServicePrincipal{}, nil
 }
+func (f *fakeDomain) CreateSecret(_ context.Context, _, _ string, in store.CreateSecretInput) (store.Secret, error) {
+	return store.Secret{ID: "sec_1", ProjectID: in.ProjectID, Name: in.Name, EnvVar: in.EnvVar}, nil
+}
+func (f *fakeDomain) ListSecrets(_ context.Context, _, _, _ string) ([]store.Secret, error) {
+	return []store.Secret{}, nil
+}
+func (f *fakeDomain) RevealSecret(_ context.Context, _, _, _ string) (string, error) { return "value", nil }
+func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error           { return nil }
+func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)          { return 0, nil }
+func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)       { return "dek_2", nil }
+func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error)      { return 0, nil }
 
 const (
 	testServiceToken   = "test-service-token"

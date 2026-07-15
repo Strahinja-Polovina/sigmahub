@@ -46,6 +46,17 @@ type volumeMount struct {
 	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
+// secretRef is a reference (never a value) to a secret the agent fetches and
+// injects at container-create. EnvVar false = tmpfs file under secretsMountDir.
+type secretRef struct {
+	Name   string `json:"name"`
+	EnvVar bool   `json:"envVar,omitempty"`
+}
+
+// secretsMountDir is the in-memory (tmpfs) directory file-mode secrets are
+// seeded into by the agent; shared with the agent's container package.
+const secretsMountDir = "/run/secrets"
+
 type containerOpSpec struct {
 	ResourceID     string            `json:"resourceId"`
 	Name           string            `json:"name"`
@@ -61,6 +72,7 @@ type containerOpSpec struct {
 	CPUs           float64           `json:"cpus,omitempty"`
 	MemoryMB       int64             `json:"memoryMb,omitempty"`
 	Restart        string            `json:"restart,omitempty"`
+	SecretRefs     []secretRef       `json:"secretRefs,omitempty"`
 }
 
 // renderAppOps expands one "app" resource into its ordered container ops:
@@ -68,7 +80,7 @@ type containerOpSpec struct {
 // on its image, its volumes, and its project network (whose op is emitted once
 // per project by the caller). Returns ok=false when the resource is not yet
 // deployable (no image), so the caller falls back to a no-op resource.sync.
-func renderAppOps(rs store.ResourceSpec) (ops []dsd.Op, networkID string, ok bool) {
+func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta) (ops []dsd.Op, networkID string, ok bool) {
 	var spec appResourceSpec
 	if err := json.Unmarshal(rs.Spec, &spec); err != nil || spec.Image == "" {
 		return nil, "", false
@@ -116,6 +128,26 @@ func renderAppOps(rs store.ResourceSpec) (ops []dsd.Op, networkID string, ok boo
 	}
 	for _, p := range spec.Ports {
 		cs.Ports = append(cs.Ports, portMapping{Container: p.Container, Host: p.Host, Protocol: p.Protocol})
+	}
+	// Secret references (never values). File-mode secrets need a tmpfs mount at
+	// secretsMountDir for the agent to seed into; add it once if any exist.
+	fileMode := false
+	for _, r := range refs {
+		cs.SecretRefs = append(cs.SecretRefs, secretRef{Name: r.Name, EnvVar: r.EnvVar})
+		if !r.EnvVar {
+			fileMode = true
+		}
+	}
+	if fileMode {
+		has := false
+		for _, t := range cs.Tmpfs {
+			if t == secretsMountDir {
+				has = true
+			}
+		}
+		if !has {
+			cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
+		}
 	}
 	csBytes, _ := json.Marshal(cs)
 	ops = append(ops, dsd.Op{ID: containerID, Kind: dsd.KindContainerApply, DependsOn: deps, Spec: csBytes})

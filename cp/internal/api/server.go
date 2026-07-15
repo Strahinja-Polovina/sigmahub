@@ -29,6 +29,7 @@ type StoreAPI interface {
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
+	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -128,12 +129,23 @@ func (s *Server) routes() {
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
 
+	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
+	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);
+	// KEK/DEK rotation is Org Admin only.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/projects/{projectId}/secrets", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateSecret)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/projects/{projectId}/secrets", s.requireService(store.RoleDeveloper, s.handleListSecrets))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/secrets/{secretId}/value", s.requireService(store.RoleProjectAdmin, s.handleRevealSecret))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/secrets/{secretId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteSecret))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/secrets/rotate-kek", s.requireService(store.RoleOrgAdmin, s.handleRotateKEK))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/secrets/rotate-dek", s.requireService(store.RoleOrgAdmin, s.handleRotateDEK))
+
 	// Agent-facing.
 	s.mux.HandleFunc("POST /v1/agent/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/agent/heartbeat", s.requireAgent(s.handleHeartbeat))
 	s.mux.HandleFunc("GET /v1/agent/mesh/peers", s.requireAgent(s.handleMeshPeers))
 	s.mux.HandleFunc("GET /v1/agent/dsd", s.requireAgent(s.handleGetDSD))
 	s.mux.HandleFunc("POST /v1/agent/dsd/status", s.requireAgent(s.handleDSDStatus))
+	s.mux.HandleFunc("GET /v1/agent/secrets", s.requireAgent(s.handleAgentSecrets))
 }
 
 func (s *Server) Handler() http.Handler {

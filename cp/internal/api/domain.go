@@ -46,6 +46,13 @@ type DomainAPI interface {
 	ListServiceTokens(ctx context.Context, orgID string) ([]store.ServiceTokenInfo, error)
 	RevokeServiceToken(ctx context.Context, orgID, tokenID, actor string) error
 	RotateServiceToken(ctx context.Context, orgID, tokenID, actor string) (string, store.ServicePrincipal, error)
+	CreateSecret(ctx context.Context, orgID, actor string, in store.CreateSecretInput) (store.Secret, error)
+	ListSecrets(ctx context.Context, orgID, projectID, envID string) ([]store.Secret, error)
+	RevealSecret(ctx context.Context, orgID, secretID, actor string) (string, error)
+	DeleteSecret(ctx context.Context, orgID, secretID, actor string) error
+	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
+	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
+	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,

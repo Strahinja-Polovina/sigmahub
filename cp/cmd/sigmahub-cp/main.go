@@ -109,6 +109,8 @@ func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*sto
 		return nil, err
 	}
 	st.SetPepper(pepper)
+	// Same custody wraps/unwraps per-org secret DEKs (P1-6).
+	st.SetCustody(custody)
 	return st, nil
 }
 

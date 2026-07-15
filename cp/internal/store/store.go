@@ -8,8 +8,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"sort"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 )
 
 //go:embed migrations/*.sql
@@ -20,6 +23,19 @@ type Store struct {
 	// pepper keys the HMAC used to hash tokens at rest (P0-9). It is loaded
 	// from the KMS custody at boot via LoadTokenPepper/SetPepper.
 	pepper []byte
+	// custody wraps/unwraps per-org DEKs (P1-6). Set at boot via SetCustody.
+	custody kms.KeyCustody
+	// dekCache holds unwrapped org DEK plaintexts keyed by dek id, so a DEK is
+	// custody-unwrapped (and audited) once per process, not per secret op.
+	dekMu    sync.Mutex
+	dekCache map[string][]byte
+}
+
+// SetCustody installs the key-custody boundary used to wrap/unwrap per-org DEKs.
+// Must be called at boot before any secret operation.
+func (s *Store) SetCustody(c kms.KeyCustody) {
+	s.custody = c
+	s.dekCache = map[string][]byte{}
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
