@@ -117,7 +117,9 @@ func (f *fakeDomain) CreateResource(_ context.Context, orgID string, in store.Cr
 func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Resource, error) {
 	return []store.Resource{}, nil
 }
-func (f *fakeDomain) DeleteResource(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) DeleteResource(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
 func (f *fakeDomain) SetProxyRole(context.Context, string, string, bool, string) error {
 	return nil
 }

@@ -81,6 +81,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"serverId":   res.Server.ID,
 		"agentToken": res.AgentToken,
 		"server":     res.Server,
+		// The agent pins this to verify every DSD it later receives.
+		"dsdPublicKey": s.dsdPublicKeyB64(),
 	})
 }
 

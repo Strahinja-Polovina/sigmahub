@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
 )
@@ -110,6 +112,20 @@ func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*sto
 	return st, nil
 }
 
+// loadDSDKey unwraps (or creates) the Ed25519 DSD-signing key through the same
+// KMS custody used for the token pepper.
+func loadDSDKey(ctx context.Context, st *store.Store) (ed25519.PrivateKey, error) {
+	keyPath := os.Getenv("CP_KMS_KEY_FILE")
+	if keyPath == "" {
+		keyPath = filepath.Join(".data", "cp-kms.key")
+	}
+	custody, err := kms.LoadOrCreateFileCustody(keyPath, st.AuditUnwrapSink())
+	if err != nil {
+		return nil, err
+	}
+	return st.LoadDSDSigningKey(ctx, custody)
+}
+
 func run() error {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -133,6 +149,14 @@ func run() error {
 	}
 	defer st.Close()
 
+	// DSD signing key (custody-wrapped, stable across restarts) + reconciler.
+	dsdKey, err := loadDSDKey(ctx, st)
+	if err != nil {
+		return err
+	}
+	rec := reconciler.New(log, st, dsdKey)
+	go rec.Run(ctx, 60*time.Second)
+
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
 	go sweeper.Run(ctx, log, st, sweeper.Config{
@@ -146,6 +170,10 @@ func run() error {
 		Handler: api.New(log, st, st, st, api.Options{
 			DevServiceToken: cfg.ServiceToken,
 			ProvisionToken:  cfg.ProvisionToken,
+			DSDStore:        st,
+			DSDWaiter:       rec,
+			Reconcile:       rec,
+			DSDPublicKey:    dsdKey.Public().(ed25519.PublicKey),
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

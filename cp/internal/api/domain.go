@@ -33,7 +33,7 @@ type DomainAPI interface {
 	EnvServerIDs(ctx context.Context, orgID, envID string) ([]string, error)
 	CreateResource(ctx context.Context, orgID string, in store.CreateResourceInput, actor string) (store.Resource, error)
 	ListResources(ctx context.Context, orgID, envID string) ([]store.Resource, error)
-	DeleteResource(ctx context.Context, orgID, resourceID, actor string) error
+	DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	SetProxyRole(ctx context.Context, orgID, serverID string, proxy bool, actor string) error
 	ListAudit(ctx context.Context, orgID string, limit int) ([]store.AuditEntry, error)
 	IdempotencyLookup(ctx context.Context, orgID, key string) (store.IdempotentResponse, error)
@@ -224,6 +224,10 @@ func (s *Server) handleCreateResource(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "create resource")
 		return
 	}
+	// The resource changed the target server's desired state — re-render its DSD.
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(res.OrgID, res.ServerID)
+	}
 	writeJSON(w, http.StatusCreated, res)
 }
 
@@ -237,10 +241,14 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteResource(w http.ResponseWriter, r *http.Request) {
-	err := s.domain.DeleteResource(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"), principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	serverID, err := s.domain.DeleteResource(r.Context(), orgID, r.PathValue("resourceId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "delete resource")
 		return
+	}
+	if s.reconcile != nil && serverID != "" {
+		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

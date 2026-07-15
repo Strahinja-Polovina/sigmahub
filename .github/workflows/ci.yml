@@ -46,6 +46,21 @@ jobs:
     defaults:
       run:
         working-directory: cp
+    # Postgres for the CP+agent integration harness (P1-2); only the native
+    # linux/amd64 leg runs tests against it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sigmahub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -53,9 +68,12 @@ jobs:
           go-version-file: cp/go.mod
           cache-dependency-path: cp/go.sum
       # vet + test only make sense on the native runner (linux/amd64); the
-      # other matrix legs cross-compile to prove the build.
+      # other matrix legs cross-compile to prove the build. The integration
+      # test runs against the postgres service via CP_TEST_DATABASE_URL.
       - name: Vet & test
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          CP_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sigmahub_test
         run: |
           go vet ./...
           go test ./...
