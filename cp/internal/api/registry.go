@@ -9,13 +9,25 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
-const defaultBootstrapTTL = time.Hour
+// defaultBootstrapTTL: SIGMA-A-5 tightens the bootstrap token to 15 minutes,
+// single-redemption, bound to a pre-created server. The automated SSH flow
+// redeems within seconds; the manual/NAT path still fits comfortably.
+const defaultBootstrapTTL = 15 * time.Minute
 
 type issueTokenRequest struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Provider string `json:"provider"`
 	Region   string `json:"region"`
+}
+
+type provisionRequest struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Provider  string `json:"provider"`
+	Region    string `json:"region"`
+	ProxyRole bool   `json:"proxyRole"`
+	Distro    string `json:"distro"` // detected host OS; validated server-side
 }
 
 type registerRequest struct {
@@ -43,7 +55,7 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid server type"})
 		return
 	}
-	token, expiresAt, err := s.store.IssueBootstrapToken(
+	token, serverID, expiresAt, err := s.store.IssueBootstrapToken(
 		r.Context(), orgID, req.Name, typ, req.Provider, req.Region, principalFrom(r).Name, defaultBootstrapTTL)
 	if err != nil {
 		s.log.Error("issue bootstrap token", "err", err)
@@ -52,7 +64,53 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"token":     token,
+		"serverId":  serverID,
 		"expiresAt": expiresAt,
+	})
+}
+
+// handleProvisionServer is the SSH onboarding entry point: it pre-creates the
+// server, mints a per-server ed25519 bootstrap keypair, and returns the bound
+// token plus the public key to drop onto the host. Project Admin+.
+func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	var req provisionRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	typ := req.Type
+	if typ == "" {
+		typ = "general"
+	}
+	if !validServerTypes[typ] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid server type"})
+		return
+	}
+	if req.Distro != "" && !store.DistroSupported(req.Distro) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "unsupported distro: only Ubuntu 22.04/24.04 and Debian 12 can be onboarded"})
+		return
+	}
+	res, err := s.store.ProvisionServer(r.Context(), orgID, store.ProvisionInput{
+		Name: req.Name, Type: typ, Provider: req.Provider, Region: req.Region,
+		ProxyRole: req.ProxyRole, Distro: req.Distro,
+	}, principalFrom(r).Name, defaultBootstrapTTL)
+	if errors.Is(err, store.ErrUnsupportedDistro) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "unsupported distro: only Ubuntu 22.04/24.04 and Debian 12 can be onboarded"})
+		return
+	}
+	if err != nil {
+		s.log.Error("provision server", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"serverId":        res.ServerID,
+		"token":           res.Token,
+		"expiresAt":       res.ExpiresAt,
+		"bootstrapPubkey": res.BootstrapPubkey,
 	})
 }
 
