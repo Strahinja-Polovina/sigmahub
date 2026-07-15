@@ -82,3 +82,14 @@ export async function requireOrgAdmin(orgId: string) {
   }
   return user;
 }
+
+/** Assert the session user can mutate the domain model (create/delete
+ *  projects, environments, resources; attach servers). Matches the CP's
+ *  Project Admin+ gate so both modes agree; returns the user and role. */
+export async function requireProjectAdmin(orgId: string) {
+  const { user, role } = await requireMembership(orgId);
+  if (role !== "Org Admin" && role !== "Project Admin") {
+    throw new Error("Only project admins can perform this action.");
+  }
+  return { user, role };
+}

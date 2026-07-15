@@ -12,7 +12,8 @@ import "server-only";
 // and audits (the actor can only narrow the token's role).
 
 import { createHmac } from "node:crypto";
-import { client } from "./db";
+import { db, client } from "./db";
+import * as schema from "./db/schema";
 import type * as s from "./db/schema";
 
 /** The acting user forwarded to the CP on mutations. */
@@ -361,6 +362,41 @@ export async function cpListAudit(orgId: string, limit = 50): Promise<CpAuditEnt
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
 export function cpKind(localKind: string): string {
   return localKind === "mongo" ? "mongodb" : localKind;
+}
+
+/** Mirror a CP-owned server into the local `servers` table so the mirror
+ *  env_servers/resources rows (which FK to servers.id) stay referentially
+ *  intact in CP mode, where servers live only in the control plane. Returns
+ *  the mapped row; throws if the CP doesn't recognise the id for this org
+ *  (restoring the IDOR guard the local lookup used to provide). */
+export async function cpMirrorServer(
+  orgId: string,
+  serverId: string
+): Promise<ReturnType<typeof cpServerToRow>> {
+  const cp = await cpGetServer(orgId, serverId);
+  if (!cp) throw new Error("Server does not belong to this organization.");
+  const row = cpServerToRow(cp);
+  // Keep the mirror fresh (name/status/ip can change) but never invent rows
+  // the CP didn't confirm.
+  await db
+    .insert(schema.servers)
+    .values(row)
+    .onConflictDoUpdate({
+      target: schema.servers.id,
+      set: {
+        name: row.name,
+        type: row.type,
+        source: row.source,
+        provider: row.provider,
+        region: row.region,
+        status: row.status,
+        agentVersion: row.agentVersion,
+        ip: row.ip,
+        cpu: row.cpu,
+        memGb: row.memGb,
+      },
+    });
+  return row;
 }
 
 type ServerRow = typeof s.servers.$inferSelect;

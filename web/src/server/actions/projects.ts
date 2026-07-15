@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership } from "../active-org";
+import { requireProjectAdmin } from "../active-org";
 import { getProject } from "../queries";
 import { writeAudit } from "../audit";
 import {
@@ -16,6 +16,7 @@ import {
   cpDeleteEnvironment,
   cpAttachServer,
   cpDetachServer,
+  cpMirrorServer,
 } from "../cp";
 
 /** Free-text env names; "production"/"prod" carry the CP production flag. */
@@ -44,7 +45,7 @@ export async function createProject(input: {
   name: string;
   description?: string;
 }) {
-  const { user, role } = await requireMembership(input.orgId);
+  const { user, role } = await requireProjectAdmin(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
   // CP mode: the control plane is the source of truth (P1-1); the local row
@@ -78,7 +79,7 @@ export async function renameProject(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireMembership(project.orgId);
+  const { user, role } = await requireProjectAdmin(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
   if (cpEnabled()) {
@@ -109,7 +110,7 @@ export async function renameProject(input: {
 export async function deleteProject(input: { projectId: string }) {
   const project = await getProject(input.projectId);
   if (!project) return;
-  const { user, role } = await requireMembership(project.orgId);
+  const { user, role } = await requireProjectAdmin(project.orgId);
   if (cpEnabled()) {
     await cpDeleteProject(project.orgId, input.projectId, { name: user.name, role });
   }
@@ -125,7 +126,7 @@ export async function createEnvironment(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireMembership(project.orgId);
+  const { user, role } = await requireProjectAdmin(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Environment name is required.");
   let id = rid("env");
@@ -154,7 +155,7 @@ async function requireEnvMembership(environmentId: string) {
   if (!env) throw new Error("Environment not found.");
   const project = await getProject(env.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireMembership(project.orgId);
+  const { user, role } = await requireProjectAdmin(project.orgId);
   return { env, project, user, role };
 }
 
@@ -167,7 +168,11 @@ export async function attachServerToEnv(input: {
   let serverName = input.serverId;
   if (cpEnabled()) {
     // The CP owns servers in CP mode: it 404s ids outside this org (IDOR) and
-    // audits the attach. Mirror the join row locally for the read models.
+    // audits the attach. Mirror the CP server into the local servers table
+    // FIRST so the env_servers.server_id FK holds (CP servers have no local
+    // row otherwise), then record the CP-side attachment.
+    const mirrored = await cpMirrorServer(project.orgId, input.serverId);
+    serverName = mirrored.name;
     await cpAttachServer(project.orgId, input.environmentId, input.serverId, {
       name: user.name,
       role,
@@ -265,7 +270,7 @@ export async function deleteEnvironment(input: { environmentId: string }) {
     .where(eq(s.environments.id, input.environmentId));
   if (!env) return;
   const project = await getProject(env.projectId);
-  const membership = project ? await requireMembership(project.orgId) : null;
+  const membership = project ? await requireProjectAdmin(project.orgId) : null;
   if (project && membership && cpEnabled()) {
     await cpDeleteEnvironment(project.orgId, input.environmentId, {
       name: membership.user.name,

@@ -4,10 +4,10 @@ import { revalidatePath } from "next/cache";
 import { and, eq, ne } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership } from "../active-org";
+import { requireMembership, requireProjectAdmin } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
-import { cpEnabled, cpCreateResource, cpDeleteResource, cpKind } from "../cp";
+import { cpEnabled, cpCreateResource, cpDeleteResource, cpKind, cpMirrorServer } from "../cp";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -36,7 +36,7 @@ export async function createResource(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireMembership(project.orgId);
+  const { user, role } = await requireProjectAdmin(project.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
 
@@ -50,7 +50,10 @@ export async function createResource(input: {
   if (!env || env.projectId !== input.projectId) {
     throw new Error("Environment does not belong to this project.");
   }
-  if (input.serverId) {
+  // Demo mode resolves the server from the local table; in CP mode servers
+  // live in the control plane, so the ownership check + FK-satisfying local
+  // mirror happen below (cpMirrorServer 404s cross-org ids).
+  if (input.serverId && !cpEnabled()) {
     const [sv] = await db
       .select({ orgId: s.servers.orgId })
       .from(s.servers)
@@ -63,10 +66,12 @@ export async function createResource(input: {
   let id = rid("res");
   if (cpEnabled()) {
     // CP mode: the control plane owns the resource record and enforces the
-    // kind/server-type availability matrix + env attachment server-side; the
+    // kind/server-type availability matrix + env attachment server-side. The
     // local row mirrors it under the same id so the (still simulated, P1-9)
-    // deploy timeline keeps rendering.
+    // deploy timeline keeps rendering; mirror the CP server first so the local
+    // resources.server_id FK holds.
     if (!input.serverId) throw new Error("A target server is required.");
+    await cpMirrorServer(project.orgId, input.serverId);
     const created = await cpCreateResource(
       project.orgId,
       {
@@ -181,7 +186,7 @@ export async function deleteResource(input: { resourceId: string }) {
   const resource = await getResource(input.resourceId);
   if (!resource) return;
   const project = await getProject(resource.projectId);
-  const membership = project ? await requireMembership(project.orgId) : null;
+  const membership = project ? await requireProjectAdmin(project.orgId) : null;
   if (project && membership && cpEnabled()) {
     await cpDeleteResource(project.orgId, input.resourceId, {
       name: membership.user.name,

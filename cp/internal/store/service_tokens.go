@@ -58,6 +58,11 @@ func (s *Store) IssueServiceToken(ctx context.Context, orgID, name string, role 
 	if _, ok := roleRank[role]; !ok {
 		return "", ServicePrincipal{}, fmt.Errorf("invalid role %q", role)
 	}
+	// "*" is the in-memory dev wildcard only; it must never be minted into a
+	// persisted, cross-tenant credential (covers CLI + provisioning paths).
+	if orgID == "" || orgID == "*" {
+		return "", ServicePrincipal{}, fmt.Errorf("invalid org id %q", orgID)
+	}
 	tok, digest := s.newToken("sst")
 	p := ServicePrincipal{ID: newID("st"), OrgID: orgID, Name: name, Role: role}
 

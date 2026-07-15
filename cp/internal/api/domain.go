@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
+
+// orgIDPattern bounds provisionable org ids so "*" (the dev wildcard) and
+// other unexpected shapes can't be minted into a persisted token.
+var orgIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // DomainAPI is the slice of the store the P1-1 domain endpoints need; faked
 // in tests.
@@ -281,6 +286,12 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeJSON(w, r, &req); err != nil || req.OrgID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "orgId is required"})
+		return
+	}
+	// Reject the wildcard and any out-of-shape id before it becomes a stored,
+	// cross-tenant Org Admin token.
+	if !orgIDPattern.MatchString(req.OrgID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid orgId"})
 		return
 	}
 	label := req.Name

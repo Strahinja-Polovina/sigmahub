@@ -120,7 +120,9 @@ export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
       .from(s.environments)
       .innerJoin(s.projects, eq(s.environments.projectId, s.projects.id))
       .where(eq(s.projects.orgId, orgId)),
-    getServers(orgId),
+    // Layout-level ⌘K menu: a CP hiccup must not error every dashboard page,
+    // so degrade to no server entries (mirrors getServerCounts).
+    getServers(orgId).catch(() => []),
     db
       .select({
         id: s.resources.id,
@@ -148,7 +150,7 @@ export async function getDeployments(resourceId: string) {
     .where(eq(s.deployments.resourceId, resourceId));
 }
 export async function getBillingSummary(orgId: string) {
-  const all = await getServers(orgId);
+  const all = await getServers(orgId).catch(() => []);
   const connected = all.filter((x) => x.status !== "provisioning").length;
   const isFree = connected <= FREE_TIER_SERVERS;
   return {
