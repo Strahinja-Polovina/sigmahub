@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../active-org";
 import { writeAudit } from "../audit";
 import { cpEnabled, cpIssueBootstrapToken, cpPublicUrl, cpDeleteServer } from "../cp";
 
@@ -129,16 +129,22 @@ export async function disconnectServer(input: { serverId: string }) {
     .select()
     .from(s.servers)
     .where(eq(s.servers.id, input.serverId));
-  if (!server) return;
-  // Decommissioning a server is destructive — gate on Project Admin (P1-4), not
-  // bare membership. In CP mode the control plane tombstones the server and
-  // revokes its agent token (409 if resources are still bound, surfaced to the
-  // caller); the local mirror row is then removed to match.
-  const { user, role } = await requireProjectAdmin(server.orgId);
+  // In CP mode a connected-but-unattached server has NO local mirror row (only
+  // attached servers get one), so the decommission must not be gated on it —
+  // resolve the org from the row if present, else the active org.
+  const orgId = server?.orgId ?? (await getActiveOrgId());
+  if (!orgId) return;
+  // Decommissioning is destructive — gate on Project Admin (P1-4), not bare
+  // membership. In CP mode the control plane tombstones the server and revokes
+  // its agent token (409 if resources are still bound — the thrown error aborts
+  // before the local row is touched); the local mirror is then removed if present.
+  const { user, role } = await requireProjectAdmin(orgId);
   if (cpEnabled()) {
-    await cpDeleteServer(server.orgId, input.serverId, { name: user.name, role });
+    await cpDeleteServer(orgId, input.serverId, { name: user.name, role });
   }
-  await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
-  await writeAudit({ orgId: server.orgId, actor: user.name, action: "Disconnected server", target: server.name });
+  if (server) {
+    await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
+  }
+  await writeAudit({ orgId, actor: user.name, action: "Disconnected server", target: server?.name ?? input.serverId });
   revalidatePath("/dashboard", "layout");
 }

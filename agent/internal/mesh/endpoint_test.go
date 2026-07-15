@@ -50,6 +50,39 @@ func TestParseSTUNAddressRejectsShort(t *testing.T) {
 	}
 }
 
+// TestParseSTUNAddressMalformedNoPanic feeds attacker-shaped responses (a
+// truncated final attribute whose 4-byte padding is missing) — the parser must
+// return an error, never panic (UDP STUN is unauthenticated; a spoofed reply
+// must not crash the agent).
+func TestParseSTUNAddressMalformedNoPanic(t *testing.T) {
+	// Header (20) + an attribute header claiming length 2 with the value present
+	// but the 2 padding bytes omitted → total 26 bytes, attrs len 6.
+	msg := make([]byte, 20)
+	binary.BigEndian.PutUint16(msg[0:], 0x0101)
+	binary.BigEndian.PutUint32(msg[4:], stunMagicCookie)
+	attr := []byte{0x00, 0x06, 0x00, 0x02, 0xAB, 0xCD} // type, len=2, 2 value bytes, no padding
+	binary.BigEndian.PutUint16(msg[2:], uint16(len(attr)))
+	full := append(msg, attr...)
+	// Give the slice extra capacity (as resp[:n] out of a 512 buffer would) so a
+	// naive attrs[adv:] would read into capacity rather than fail cheaply.
+	buf := make([]byte, len(full), 512)
+	copy(buf, full)
+	if _, err := parseSTUNAddress(buf); err == nil {
+		t.Fatal("malformed attribute should error, not resolve")
+	}
+
+	// A declared length that overruns the buffer must also be rejected safely.
+	over := make([]byte, 24)
+	binary.BigEndian.PutUint16(over[0:], 0x0101)
+	binary.BigEndian.PutUint32(over[4:], stunMagicCookie)
+	binary.BigEndian.PutUint16(over[2:], 4)
+	binary.BigEndian.PutUint16(over[20:], 0x0020) // XOR-MAPPED type
+	binary.BigEndian.PutUint16(over[22:], 0xFFFF) // absurd length
+	if _, err := parseSTUNAddress(over); err == nil {
+		t.Fatal("overrun attribute length should error")
+	}
+}
+
 func TestRenderConfigEmitsEndpoint(t *testing.T) {
 	ep := "203.0.113.9:51820"
 	cfg := RenderConfig("priv", "10.8.0.1", []Peer{
