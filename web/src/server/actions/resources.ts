@@ -7,7 +7,15 @@ import * as s from "../db/schema";
 import { requireMembership, requireProjectAdmin } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
-import { cpEnabled, cpCreateResource, cpDeleteResource, cpKind, cpMirrorServer } from "../cp";
+import {
+  cpEnabled,
+  cpCreateResource,
+  cpDeleteResource,
+  cpKind,
+  cpMirrorServer,
+  cpRequestConfirmToken,
+  cpConfirmDestructive,
+} from "../cp";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -198,4 +206,61 @@ export async function deleteResource(input: { resourceId: string }) {
     await writeAudit({ orgId: project.orgId, actor: membership.user.name, action: "Deleted resource", target: resource.name });
   }
   revalidatePath("/dashboard", "layout");
+}
+
+// ── Two-phase destructive-op confirm (P1-3) ─────────────────────────────────
+// Deleting a named data volume is destructive and irreversible, so it takes an
+// explicit two-phase approval: requestVolumeDeleteConfirm mints a short-lived
+// confirm token from the control plane, the dialog presents it, and
+// confirmVolumeDelete executes it. Both gate on Project Admin. The Docker volume
+// name mirrors the CP's naming (sigmahub-<resourceId>-<name>).
+const VOLUME_REMOVE_KIND = "volume.remove";
+const dockerVolumeName = (resourceId: string, name: string) => `sigmahub-${resourceId}-${name}`;
+
+async function volumeDeleteContext(resourceId: string) {
+  const resource = await getResource(resourceId);
+  if (!resource) throw new Error("Resource not found.");
+  const project = await getProject(resource.projectId);
+  if (!project) throw new Error("Resource not found.");
+  const membership = await requireProjectAdmin(project.orgId);
+  if (!resource.serverId) throw new Error("Resource is not bound to a server.");
+  return { resource, orgId: project.orgId, serverId: resource.serverId, membership };
+}
+
+export async function requestVolumeDeleteConfirm(input: { resourceId: string; volumeName: string }) {
+  const { orgId, serverId, membership } = await volumeDeleteContext(input.resourceId);
+  const target = dockerVolumeName(input.resourceId, input.volumeName);
+  if (cpEnabled()) {
+    const { token, expiresAt } = await cpRequestConfirmToken(
+      orgId,
+      { serverId, opKind: VOLUME_REMOVE_KIND, target },
+      { name: membership.user.name, role: membership.role }
+    );
+    return { mode: "cp" as const, token, expiresAt };
+  }
+  // Demo mode: synthesise a token so the dialog still functions offline.
+  return {
+    mode: "sim" as const,
+    token: `sim_${sha7()}`,
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  };
+}
+
+export async function confirmVolumeDelete(input: { resourceId: string; volumeName: string; token: string }) {
+  const { resource, orgId, serverId, membership } = await volumeDeleteContext(input.resourceId);
+  const target = dockerVolumeName(input.resourceId, input.volumeName);
+  if (cpEnabled()) {
+    await cpConfirmDestructive(
+      orgId,
+      { serverId, token: input.token, opKind: VOLUME_REMOVE_KIND, target },
+      { name: membership.user.name, role: membership.role }
+    );
+  }
+  await writeAudit({
+    orgId,
+    actor: membership.user.name,
+    action: "Deleted data volume",
+    target: `${resource.name} · ${input.volumeName}`,
+  });
+  revalidatePath(`/dashboard/resources/${input.resourceId}`);
 }

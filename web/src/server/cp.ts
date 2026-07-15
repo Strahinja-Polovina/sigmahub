@@ -346,6 +346,32 @@ export async function cpDeleteResource(orgId: string, resourceId: string, actor:
   }, { orgId, actor });
 }
 
+// Two-phase destructive-op confirm (P1-3). Phase 1 mints a short-lived,
+// single-use token authorising exactly one destructive op on one server; phase
+// 2 presents that token back to execute it. Both are Project Admin+ and audited
+// by the CP against the signed actor.
+export async function cpRequestConfirmToken(
+  orgId: string,
+  input: { serverId: string; opKind: string; target: string },
+  actor: CpActor
+): Promise<{ token: string; expiresAt: string }> {
+  return cpFetch(`${org(orgId)}/servers/${encodeURIComponent(input.serverId)}/confirm-tokens`, {
+    method: "POST",
+    body: JSON.stringify({ opKind: input.opKind, target: input.target }),
+  }, { orgId, actor });
+}
+
+export async function cpConfirmDestructive(
+  orgId: string,
+  input: { serverId: string; token: string; opKind: string; target: string },
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`${org(orgId)}/servers/${encodeURIComponent(input.serverId)}/destructive-ops`, {
+    method: "POST",
+    body: JSON.stringify({ token: input.token, opKind: input.opKind, target: input.target }),
+  }, { orgId, actor });
+}
+
 export async function cpListResources(orgId: string, environmentId?: string): Promise<CpResource[]> {
   const qs = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
   const { resources } = await cpFetch<{ resources: CpResource[] }>(
