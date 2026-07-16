@@ -81,6 +81,13 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 				continue
 			}
 		}
+		// Database kinds (P1-10) render through the engine registry: pinned image,
+		// named data volume, mesh-only listener, server-type tuning.
+		if dbOps, netID, ok := renderDBOps(rs, hardening); ok {
+			resourceOps = append(resourceOps, dbOps...)
+			networks[netID] = dsd.NetworkName(rs.ProjectID)
+			continue
+		}
 		// Not yet containerised (or an app with no image): a no-op stub keeps the
 		// resource represented in the DSD.
 		stub, _ := json.Marshal(map[string]any{"resourceId": rs.ResourceID, "kind": rs.Kind, "spec": rs.Spec})

@@ -98,10 +98,14 @@ type ImageSpec struct {
 }
 
 // PortMapping publishes a container port on the host. Host 0 means "do not
-// publish" (the port is only reachable on the project network).
+// publish" (the port is only reachable on the project network). HostIP, when
+// set, binds the published port to that single host address — the P1-10
+// mesh-only database bind (the server's WireGuard IP), so the listener is
+// reachable across the org mesh and from nowhere else.
 type PortMapping struct {
 	Container int    `json:"container"`
 	Host      int    `json:"host,omitempty"`
+	HostIP    string `json:"hostIp,omitempty"`
 	Protocol  string `json:"protocol,omitempty"` // tcp (default) | udp
 }
 

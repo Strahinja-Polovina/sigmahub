@@ -426,6 +426,12 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	if err != nil {
 		return Resource{}, fmt.Errorf("insert resource: %w", err)
 	}
+	// Database kinds (P1-10) get generated credentials (P1-6 envelope) and their
+	// default backup-policy row (the P1-11 hook) in the same transaction, so a
+	// database resource can never exist half-provisioned.
+	if err := s.provisionDatabaseTx(ctx, tx, orgID, r.ID, in.Kind, in.EnvironmentID); err != nil {
+		return Resource{}, fmt.Errorf("provision database: %w", err)
+	}
 	if err := auditTx(ctx, tx, orgID, actor, "Resource created", in.Name+" ("+in.Kind+")"); err != nil {
 		return Resource{}, err
 	}

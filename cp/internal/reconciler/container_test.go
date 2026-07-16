@@ -98,14 +98,16 @@ func TestRenderDedupsProjectNetwork(t *testing.T) {
 }
 
 func TestRenderStubFallback(t *testing.T) {
-	// Non-app kind and an app with no image both fall back to resource.sync.
+	// A not-yet-containerised kind and an app with no image both fall back to
+	// resource.sync. Database kinds render real ops since P1-10 (see
+	// TestRenderDBOps), so the stub check uses an s3 resource.
 	noImage, _ := json.Marshal(map[string]any{"env": map[string]string{"K": "V"}})
 	specs := []store.ResourceSpec{
-		{ResourceID: "res_db", ProjectID: "proj_x", Kind: "postgres", Spec: json.RawMessage(`{}`)},
+		{ResourceID: "res_s3", ProjectID: "proj_x", Kind: "s3", Spec: json.RawMessage(`{}`)},
 		{ResourceID: "res_app", ProjectID: "proj_x", Kind: "app", Spec: noImage},
 	}
 	ops, _ := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, ACMEConfig{})
-	for _, id := range []string{"res:res_db", "res:res_app"} {
+	for _, id := range []string{"res:res_s3", "res:res_app"} {
 		op, ok := opByID(ops, id)
 		if !ok || op.Kind != dsd.KindResourceSync {
 			t.Fatalf("expected resource.sync stub for %s, got %+v (ok=%v)", id, op, ok)

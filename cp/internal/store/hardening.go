@@ -24,6 +24,10 @@ type PortException struct {
 type HostHardening struct {
 	MeshIP        string
 	MeshInterface string
+	// ServerType ("general" | "database" | …) selects the DB engines' tuning
+	// profile (P1-10): prod-grade knobs on database-type servers, dev defaults
+	// elsewhere.
+	ServerType    string
 	ProxyRole     bool
 	KeepPublicSSH bool
 	CISEnabled    bool
@@ -34,21 +38,22 @@ type HostHardening struct {
 // defaulting (lock down SSH, CIS on, no extra ports) when no row has been set.
 func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (HostHardening, error) {
 	var (
-		meshIP      *string
-		proxyRole   bool
-		keepSSH     bool
-		cisEnabled  bool
-		extraRaw    []byte
+		meshIP     *string
+		serverType string
+		proxyRole  bool
+		keepSSH    bool
+		cisEnabled bool
+		extraRaw   []byte
 	)
 	err := s.Pool.QueryRow(ctx, `
-		SELECT s.mesh_ip, s.proxy_role,
+		SELECT s.mesh_ip, s.type, s.proxy_role,
 		       COALESCE(h.keep_public_ssh, FALSE),
 		       COALESCE(h.cis_enabled, TRUE),
 		       COALESCE(h.extra_ports, '[]'::jsonb)
 		  FROM servers s
 		  LEFT JOIN server_hardening h ON h.server_id = s.id
 		 WHERE s.id = $1 AND s.deleted_at IS NULL`, serverID).
-		Scan(&meshIP, &proxyRole, &keepSSH, &cisEnabled, &extraRaw)
+		Scan(&meshIP, &serverType, &proxyRole, &keepSSH, &cisEnabled, &extraRaw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return HostHardening{}, ErrNotFound
 	}
@@ -57,6 +62,7 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 	}
 	hh := HostHardening{
 		MeshInterface: meshInterface,
+		ServerType:    serverType,
 		ProxyRole:     proxyRole,
 		KeepPublicSSH: keepSSH,
 		CISEnabled:    cisEnabled,

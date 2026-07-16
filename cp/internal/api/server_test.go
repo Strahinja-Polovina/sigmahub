@@ -208,6 +208,12 @@ func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, er
 func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]store.Domain, error) {
 	return []store.Domain{}, nil
 }
+func (f *fakeDomain) RevealDBConnection(_ context.Context, orgID, resourceID, _ string) (string, error) {
+	return "postgresql://app_x:pw@10.100.0.2:5432/app", nil
+}
+func (f *fakeDomain) BackupPolicyForResource(_ context.Context, _, resourceID string) (store.BackupPolicy, error) {
+	return store.BackupPolicy{ID: "bkp_1", ResourceID: resourceID, Schedule: "0 3 * * *", RetentionDays: 14, Enabled: true}, nil
+}
 func (f *fakeDomain) ListDeployments(_ context.Context, _, resourceID string, _ int) ([]store.Deployment, error) {
 	return []store.Deployment{}, nil
 }

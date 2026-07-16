@@ -165,6 +165,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/rollback-targets", s.requireService(store.RoleDeveloper, s.handleRollbackTargets))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/rollback", s.requireService(store.RoleProjectAdmin, s.handleRollback))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/deploy", s.requireService(store.RoleProjectAdmin, s.handleRedeploy))
+
+	// Databases (P1-10): connection reveal is Project Admin+ (Developer → 403)
+	// and audited; the backup-policy hook is member-visible; public exposure is
+	// the typed not-enabled error (v1 is mesh-internal only).
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealDBConnection))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/backup-policy", s.requireService(store.RoleDeveloper, s.handleGetBackupPolicy))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/expose", s.requireService(store.RoleProjectAdmin, s.handleExposeDB))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/deployments/{deploymentId}/logs", s.requireService(store.RoleDeveloper, s.handleDeployLogs))
 	// Audit is member-visible (matches the web settings tab shown to all
 	// members); mutations above stay Project Admin+.

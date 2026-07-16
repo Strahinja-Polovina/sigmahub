@@ -330,7 +330,13 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 		key := fmt.Sprintf("%d/%s", p.Container, proto)
 		exposed[key] = map[string]any{}
 		if p.Host > 0 {
-			portBindings[key] = []map[string]string{{"HostPort": fmt.Sprintf("%d", p.Host)}}
+			binding := map[string]string{"HostPort": fmt.Sprintf("%d", p.Host)}
+			// A mesh-only bind (P1-10 databases): publish on the given host address
+			// only, instead of 0.0.0.0.
+			if p.HostIP != "" {
+				binding["HostIp"] = p.HostIP
+			}
+			portBindings[key] = []map[string]string{binding}
 		}
 	}
 

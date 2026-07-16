@@ -63,6 +63,11 @@ type DomainAPI interface {
 	// retained-image candidates; CreateRollback queues a rebuild-free rollback and
 	// returns the server to re-render; GetDeployment + DeployLogsSince back the
 	// build-log stream.
+	// Databases (P1-10): RevealDBConnection decrypts + audits; the API layer's
+	// Project Admin+ gate keeps Developer reveal at 403. BackupPolicyForResource
+	// reads the P1-11 hook row.
+	RevealDBConnection(ctx context.Context, orgID, resourceID, actor string) (string, error)
+	BackupPolicyForResource(ctx context.Context, orgID, resourceID string) (store.BackupPolicy, error)
 	ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (store.Deployment, string, error)

@@ -140,5 +140,15 @@ func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+
+	// Database resources (P1-10) additionally receive their generated credential
+	// via the engine's injection channel (password env var, or a seeded conf
+	// file). Same server-scoping as above (the resource row was already matched
+	// against the requesting server). A nil result for non-DB resources.
+	dbSecrets, err := s.dbSecretsForResource(ctx, orgID, resourceID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, dbSecrets...)
 	return out, nil
 }

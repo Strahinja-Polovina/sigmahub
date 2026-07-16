@@ -55,9 +55,13 @@ type composeServiceSpec struct {
 // They are the wire contract between renderOps and the agent's op handlers.
 
 type portMapping struct {
-	Container int    `json:"container"`
-	Host      int    `json:"host,omitempty"`
-	Protocol  string `json:"protocol,omitempty"`
+	Container int `json:"container"`
+	Host      int `json:"host,omitempty"`
+	// HostIP restricts the published port to one host address — the P1-10
+	// mesh-only bind (the server's WireGuard IP). Empty publishes on all
+	// interfaces (subject to the P1-5 firewall).
+	HostIP   string `json:"hostIp,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 type volumeMount struct {
