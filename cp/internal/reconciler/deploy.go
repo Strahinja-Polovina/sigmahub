@@ -21,12 +21,15 @@ type gitCloneOpSpec struct {
 }
 
 type buildImageOpSpec struct {
-	ResourceID   string `json:"resourceId"`
-	SHA          string `json:"sha"`
-	DedupKey     string `json:"dedupKey"`
-	Dockerfile   string `json:"dockerfile,omitempty"`
-	ImageTag     string `json:"imageTag"`
-	DeploymentID string `json:"deploymentId,omitempty"`
+	ResourceID string `json:"resourceId"`
+	SHA        string `json:"sha"`
+	DedupKey   string `json:"dedupKey"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+	// ContextSubdir is the build context relative to the cloned repo root — a
+	// Compose service's `build:` path (empty ⇒ repo root).
+	ContextSubdir string `json:"contextSubdir,omitempty"`
+	ImageTag      string `json:"imageTag"`
+	DeploymentID  string `json:"deploymentId,omitempty"`
 	// Force skips the build-dedup short-circuit so a manual redeploy rebuilds the
 	// same commit (e.g. to pick up base-image changes) instead of reusing the cached image.
 	Force bool `json:"force,omitempty"`
@@ -92,6 +95,11 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	var spec appResourceSpec
 	if err := json.Unmarshal(rs.Spec, &spec); err != nil {
 		return nil, "", false
+	}
+	// A Compose app deploys its service graph: one shared clone, then a build +
+	// rollout/recreate op per service.
+	if spec.Compose != nil && len(spec.Compose.Services) > 0 {
+		return renderComposeDeployOps(rs, spec, refs, domains, target)
 	}
 
 	networkName := dsd.NetworkName(rs.ProjectID)
@@ -178,6 +186,131 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		dsd.Op{ID: rolloutID, Kind: dsd.KindDeployRollout, DependsOn: []string{networkID, buildID}, Spec: rolloutBytes},
 	)
 	return ops, networkID, true
+}
+
+// renderComposeDeployOps expands a Compose app resource into its per-service
+// pipeline: one shared git.clone (the whole repo), then for each service a build
+// (its `build:` context subdir) or image.pull (prebuilt), and a deploy.rollout
+// (stateless, blue-green) or deploy.recreate (holds an exclusive resource). Each
+// service container joins the shared project network under its service name so
+// siblings resolve each other; depends_on becomes op ordering. Op ids carry the
+// service (`build:<res>:<svc>`, `res:<res>:<svc>`) so status routes per service.
+func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget) (ops []dsd.Op, networkID string, ok bool) {
+	networkName := dsd.NetworkName(rs.ProjectID)
+	networkID = "net:" + rs.ProjectID
+	gen := deployGeneration(target.SHA, target.DeploymentID)
+
+	// Resource-scoped secret refs, applied to every service container.
+	var refsSpec []secretRef
+	fileMode := false
+	for _, r := range refs {
+		refsSpec = append(refsSpec, secretRef{Name: r.Name, EnvVar: r.EnvVar})
+		if !r.EnvVar {
+			fileMode = true
+		}
+	}
+
+	// Clone the whole repo once — the shared build-context root for all services.
+	cloneID := "clone:" + rs.ResourceID
+	clone, _ := json.Marshal(gitCloneOpSpec{
+		ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
+		Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
+	})
+	ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
+
+	// The web-facing service (first that exposes a port) carries the Traefik router
+	// labels when a domain is attached to the resource.
+	webSvc := ""
+	for _, s := range spec.Compose.Services {
+		if len(s.Ports) > 0 {
+			webSvc = s.Name
+			break
+		}
+	}
+
+	for _, s := range spec.Compose.Services {
+		svcKey := rs.ResourceID + ":" + s.Name
+		cs := containerOpSpec{
+			ResourceID:     rs.ResourceID,
+			Service:        s.Name,
+			Name:           dsd.ServiceContainerName(rs.ResourceID, s.Name),
+			Network:        networkName,
+			NetworkAliases: []string{s.Name},
+			Env:            spec.Env,
+			Restart:        spec.Restart,
+			SecretRefs:     refsSpec,
+		}
+		for _, p := range s.Ports {
+			cs.Ports = append(cs.Ports, portMapping{Container: p})
+		}
+		if fileMode {
+			cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
+		}
+		if s.Name == webSvc && len(domains) > 0 {
+			lbPort := 0
+			if len(s.Ports) > 0 {
+				lbPort = s.Ports[0]
+			}
+			cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
+		}
+
+		// Image source: build the service's context, or pull a prebuilt image.
+		var imageDep string
+		if s.Build != "" {
+			imageTag := dsd.DeployServiceImageTag(rs.ResourceID, s.Name, target.SHA)
+			cs.Image = imageTag
+			buildID := "build:" + svcKey
+			build, _ := json.Marshal(buildImageOpSpec{
+				ResourceID: rs.ResourceID, SHA: target.SHA,
+				DedupKey:      target.ConfigHash + ":" + s.Name + ":" + target.SHA,
+				Dockerfile:    s.Dockerfile,
+				ContextSubdir: s.Build,
+				ImageTag:      imageTag,
+				DeploymentID:  target.DeploymentID,
+				Force:         target.Trigger == "manual",
+			})
+			ops = append(ops, dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build})
+			imageDep = buildID
+		} else if s.Image != "" {
+			cs.Image = s.Image
+			pullID := "pull:" + svcKey
+			pull, _ := json.Marshal(map[string]string{"image": s.Image})
+			ops = append(ops, dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull})
+			imageDep = pullID
+		}
+
+		// deploy.rollout (blue-green) unless the service holds an exclusive resource.
+		kind := dsd.KindDeployRollout
+		if s.Rollout == gitRolloutRecreate {
+			kind = dsd.KindDeployRecreate
+		}
+		swap, _ := json.Marshal(rolloutOpSpec{
+			Container: cs, Generation: gen, Health: composeServiceHealth(s), DeploymentID: target.DeploymentID,
+		})
+		deps := []string{networkID}
+		if imageDep != "" {
+			deps = append(deps, imageDep)
+		}
+		for _, d := range s.DependsOn {
+			deps = append(deps, "res:"+rs.ResourceID+":"+d)
+		}
+		ops = append(ops, dsd.Op{ID: "res:" + svcKey, Kind: kind, DependsOn: deps, Spec: swap})
+	}
+	return ops, networkID, true
+}
+
+// gitRolloutRecreate mirrors gitdetect.RolloutRecreate without importing it.
+const gitRolloutRecreate = "recreate"
+
+// composeServiceHealth is a service's readiness probe: a TCP probe on its first
+// declared container port (the never-cut/gate always needs a probe). A service
+// with no ports gets a probe on port 0, which the agent treats as "port 80".
+func composeServiceHealth(s composeServiceSpec) healthProbe {
+	port := 0
+	if len(s.Ports) > 0 {
+		port = s.Ports[0]
+	}
+	return healthProbe{Type: "tcp", Port: port, IntervalSec: 3, TimeoutSec: 120}
 }
 
 // deployHealth resolves the rollout's health probe: the gitdetect-detected probe

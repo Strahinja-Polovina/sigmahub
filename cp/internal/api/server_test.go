@@ -89,6 +89,9 @@ func (f *fakeStore) DeploymentCloneCredential(context.Context, string, string) (
 func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string, string, bool, string) error {
 	return nil
 }
+func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, string, string, bool, string) error {
+	return nil
+}
 func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
 	return nil
 }

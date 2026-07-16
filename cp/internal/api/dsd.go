@@ -102,18 +102,27 @@ func deployPhaseRank(phase string) int {
 	return 3
 }
 
-// deployPhase maps a deploy-pipeline op id to its (phase, resourceID). The
-// rollout op keeps the res:<id> id (so its status also routes to resources.status).
-func deployPhase(opID string) (phase, resourceID string, ok bool) {
+// deployPhase maps a deploy-pipeline op id to its (phase, resourceID, service).
+// A single-container app uses `<phase>:<res>` (service ""); a Compose service uses
+// `<phase>:<res>:<svc>`. The rollout op keeps the res: id so a single-service
+// status also routes to resources.status.
+func deployPhase(opID string) (phase, resourceID, service string, ok bool) {
+	var rest string
 	switch {
 	case strings.HasPrefix(opID, "clone:"):
-		return "clone", strings.TrimPrefix(opID, "clone:"), true
+		phase, rest = "clone", strings.TrimPrefix(opID, "clone:")
 	case strings.HasPrefix(opID, "build:"):
-		return "build", strings.TrimPrefix(opID, "build:"), true
+		phase, rest = "build", strings.TrimPrefix(opID, "build:")
 	case strings.HasPrefix(opID, "res:"):
-		return "rollout", strings.TrimPrefix(opID, "res:"), true
+		phase, rest = "rollout", strings.TrimPrefix(opID, "res:")
+	default:
+		return "", "", "", false
 	}
-	return "", "", false
+	// Resource ids carry no colon, so a remaining ":" delimits the service name.
+	if i := strings.Index(rest, ":"); i >= 0 {
+		return phase, rest[:i], rest[i+1:], true
+	}
+	return phase, rest, "", true
 }
 
 type dsdStatusRequest struct {
@@ -137,8 +146,8 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 	// store transition is independently monotonic; ordering here just fixes the
 	// recorded detail/timing. A no-op for non-git resources (no in-flight deploy).
 	type deployAdvance struct {
-		phase, resID, errText string
-		ok                    bool
+		phase, resID, service, errText string
+		ok                             bool
 	}
 	var advances []deployAdvance
 	// Route "res:<id>" op statuses into resources.status, and mark applied
@@ -150,12 +159,16 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(st, &os)
-		if phase, resID, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
-			advances = append(advances, deployAdvance{phase: phase, resID: resID, ok: os.State == "applied", errText: os.Error})
+		if phase, resID, service, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
+			advances = append(advances, deployAdvance{phase: phase, resID: resID, service: service, ok: os.State == "applied", errText: os.Error})
 		}
 		switch {
 		case strings.HasPrefix(opID, "res:"):
-			byResource[strings.TrimPrefix(opID, "res:")] = st
+			// A Compose service op (res:<res>:<svc>) is not a resource id — only a
+			// bare res:<res> routes to resources.status.
+			if key := strings.TrimPrefix(opID, "res:"); !strings.Contains(key, ":") {
+				byResource[key] = st
+			}
 		case strings.HasPrefix(opID, "volrm:"):
 			var os struct {
 				State string `json:"state"`
@@ -171,8 +184,17 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		return deployPhaseRank(advances[i].phase) < deployPhaseRank(advances[j].phase)
 	})
 	for _, a := range advances {
-		if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, a.resID, a.phase, a.ok, a.errText); err != nil {
-			s.log.Error("advance deployment", "err", err, "phase", a.phase, "resource", a.resID)
+		if a.service == "" {
+			// Single-container app (or the shared clone of a Compose deploy).
+			if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, a.resID, a.phase, a.ok, a.errText); err != nil {
+				s.log.Error("advance deployment", "err", err, "phase", a.phase, "resource", a.resID)
+			}
+			continue
+		}
+		// A Compose service op: track per-service status; the deployment flips to
+		// success only when every service succeeds (failed the moment one does).
+		if err := s.store.AdvanceDeploymentService(r.Context(), srv.ID, a.resID, a.service, a.phase, a.ok, a.errText); err != nil {
+			s.log.Error("advance deployment service", "err", err, "phase", a.phase, "resource", a.resID, "service", a.service)
 		}
 	}
 	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource)

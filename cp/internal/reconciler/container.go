@@ -10,9 +10,9 @@ import (
 // appResourceSpec is the user-authored `spec` JSONB of an "app" resource. The
 // control plane translates it into the typed container ops the agent applies.
 type appResourceSpec struct {
-	Image          string            `json:"image"`
-	Env            map[string]string `json:"env"`
-	Ports          []struct {
+	Image string            `json:"image"`
+	Env   map[string]string `json:"env"`
+	Ports []struct {
 		Container int    `json:"container"`
 		Host      int    `json:"host"`
 		Protocol  string `json:"protocol"`
@@ -29,6 +29,26 @@ type appResourceSpec struct {
 	CPUs           float64  `json:"cpus"`
 	MemoryMB       int64    `json:"memoryMb"`
 	Restart        string   `json:"restart"`
+	// Compose, when present, makes this a multi-service deploy: each service gets
+	// its own build + rollout/recreate op. Populated from gitdetect at connect.
+	Compose *composeDeploySpec `json:"compose,omitempty"`
+}
+
+// composeDeploySpec is the Compose service graph stored on a multi-service app
+// resource — the CP renders per-service ops from it.
+type composeDeploySpec struct {
+	Services []composeServiceSpec `json:"services"`
+}
+
+// composeServiceSpec is one service in a Compose deploy.
+type composeServiceSpec struct {
+	Name       string   `json:"name"`
+	Build      string   `json:"build,omitempty"`      // build-context subdir; empty ⇒ prebuilt Image
+	Dockerfile string   `json:"dockerfile,omitempty"` // relative to the build context
+	Image      string   `json:"image,omitempty"`      // prebuilt image ref (when no Build)
+	Ports      []int    `json:"ports,omitempty"`      // container ports to expose
+	Rollout    string   `json:"rollout,omitempty"`    // blue-green (default) | recreate
+	DependsOn  []string `json:"dependsOn,omitempty"`
 }
 
 // The op-spec structs mirror the agent's container package JSON tags exactly.
@@ -59,9 +79,11 @@ const secretsMountDir = "/run/secrets"
 
 type containerOpSpec struct {
 	ResourceID     string            `json:"resourceId"`
+	Service        string            `json:"service,omitempty"`
 	Name           string            `json:"name"`
 	Image          string            `json:"image"`
 	Network        string            `json:"network"`
+	NetworkAliases []string          `json:"networkAliases,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	Ports          []portMapping     `json:"ports,omitempty"`
 	Volumes        []volumeMount     `json:"volumes,omitempty"`
