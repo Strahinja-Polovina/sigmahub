@@ -57,6 +57,7 @@ func (d *Driver) Register(r *apply.Registry) {
 	r.Register(KindVolumeRemove, d.opVolumeRemove)
 	r.Register(KindProxyTraefik, d.opProxyTraefik)
 	r.Register(KindDeployRollout, d.opRollout)
+	r.Register(KindDeployRecreate, d.opRecreate)
 }
 
 func (d *Driver) throttle() error {
@@ -309,6 +310,9 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 		labels[k] = v
 	}
 	labels[LabelSpecHash] = specHash
+	if spec.Service != "" {
+		labels[LabelService] = spec.Service
+	}
 
 	env := make([]string, 0, len(spec.Env))
 	for k, v := range spec.Env {
@@ -378,6 +382,15 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 		"Env":          env,
 		"ExposedPorts": exposed,
 		"HostConfig":   hostConfig,
+	}
+	// Compose service discovery: publish the service name as a network alias so
+	// sibling services resolve each other by name on the shared project network.
+	if len(spec.NetworkAliases) > 0 && spec.Network != "" {
+		body["NetworkingConfig"] = map[string]any{
+			"EndpointsConfig": map[string]any{
+				spec.Network: map[string]any{"Aliases": spec.NetworkAliases},
+			},
+		}
 	}
 	if len(spec.Command) > 0 {
 		body["Cmd"] = spec.Command

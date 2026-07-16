@@ -41,13 +41,14 @@ func rolloutName(baseName, generation string) string {
 	return baseName + "-" + generation
 }
 
-// olderGenerations returns the managed containers belonging to the resource whose
-// name is not keepName — the previous generations to drain after the new one is
-// healthy.
-func olderGenerations(list []ContainerState, resourceID, keepName string) []ContainerState {
+// olderGenerations returns the managed containers in the same (resource, service)
+// group whose name is not keepName — the previous generations to drain after the
+// new one is healthy. service is "" for a single-container app; a Compose service
+// scopes to its own generations so one service's swap never touches another's.
+func olderGenerations(list []ContainerState, resourceID, service, keepName string) []ContainerState {
 	var out []ContainerState
 	for _, c := range list {
-		if c.Labels[LabelResourceID] == resourceID && c.Name != keepName {
+		if c.Labels[LabelResourceID] == resourceID && c.Labels[LabelService] == service && c.Name != keepName {
 			out = append(out, c)
 		}
 	}
@@ -132,14 +133,14 @@ func gateHealthy(ctx context.Context, dk rolloutDocker, probe Prober, name strin
 }
 
 // drainOld gracefully stops then removes every previous generation of the
-// resource. A graceful stop lets Traefik drop the backend and in-flight requests
-// complete before the container goes away.
-func drainOld(ctx context.Context, dk rolloutDocker, resourceID, keepName string, log logf) error {
+// (resource, service) group. A graceful stop lets Traefik drop the backend and
+// in-flight requests complete before the container goes away.
+func drainOld(ctx context.Context, dk rolloutDocker, resourceID, service, keepName string, log logf) error {
 	list, err := dk.ContainerList(ctx)
 	if err != nil {
 		return err
 	}
-	for _, c := range olderGenerations(list, resourceID, keepName) {
+	for _, c := range olderGenerations(list, resourceID, service, keepName) {
 		if err := dk.ContainerStop(ctx, c.ID, 15*time.Second); err != nil {
 			log("drain: stop old", "container", c.Name, "err", err)
 		}
@@ -242,6 +243,7 @@ func inUseImages(ctx context.Context, dk interface {
 // new container, leaving the previous version serving.
 func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec RolloutSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf) error {
 	resourceID := spec.Container.ResourceID
+	service := spec.Container.Service
 	newName := rolloutName(spec.Container.Name, spec.Generation)
 
 	// Idempotency: an unchanged new generation already running is converged —
@@ -250,7 +252,7 @@ func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec Ro
 		return err
 	} else if ok {
 		if cur.Running && cur.Labels[LabelSpecHash] == hash {
-			return drainOld(ctx, dk, resourceID, newName, log)
+			return drainOld(ctx, dk, resourceID, service, newName, log)
 		}
 		if cur.Running {
 			// A live container already holds this generation's name but with a
@@ -290,7 +292,52 @@ func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec Ro
 	}
 
 	// 3. New is healthy and in the Traefik LB → drain the old generation(s).
-	return drainOld(ctx, dk, resourceID, newName, log)
+	return drainOld(ctx, dk, resourceID, service, newName, log)
+}
+
+// performRecreate is the recreate swap for a Compose service holding an exclusive
+// resource (a named volume or a fixed host port): the old generation(s) are
+// removed FIRST, then the new one is created and started. There is a brief
+// downtime window by design — two generations cannot coexist. Factored from the
+// Docker specifics for testing.
+func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec RecreateSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf) error {
+	resourceID := spec.Container.ResourceID
+	service := spec.Container.Service
+	newName := rolloutName(spec.Container.Name, spec.Generation)
+
+	// Idempotency: the target generation already running and unchanged is converged.
+	if cur, ok, err := dk.ContainerInspect(ctx, newName); err != nil {
+		return err
+	} else if ok && cur.Running && cur.Labels[LabelSpecHash] == hash {
+		return drainOld(ctx, dk, resourceID, service, newName, log)
+	}
+
+	// Remove EVERY generation of this (resource, service) first — the exclusive
+	// resource can't be held twice. keepName is empty so nothing is spared.
+	if err := drainOld(ctx, dk, resourceID, service, "", log); err != nil {
+		return fmt.Errorf("drain before recreate: %w", err)
+	}
+
+	id, err := dk.ContainerCreate(ctx, newName, body)
+	if err != nil {
+		return fmt.Errorf("create recreate generation: %w", err)
+	}
+	if err := dk.ContainerStart(ctx, id); err != nil {
+		_ = dk.ContainerRemove(ctx, id, true)
+		return fmt.Errorf("start recreate generation: %w", err)
+	}
+	if postStart != nil {
+		if err := postStart(ctx, id); err != nil {
+			_ = dk.ContainerRemove(ctx, id, true)
+			return fmt.Errorf("post-start: %w", err)
+		}
+	}
+	// Verify the new generation becomes healthy; on failure report it (there is no
+	// old generation to fall back to — the recreate window is the documented risk).
+	if err := gateHealthy(ctx, dk, probe, newName, spec.Health); err != nil {
+		return fmt.Errorf("recreated service unhealthy: %w", err)
+	}
+	return nil
 }
 
 // opRollout handles a deploy.rollout op: a zero-downtime blue-green swap of a
@@ -335,6 +382,48 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 	}
 	// Keep the last-N built images so a rebuild-free rollback always has a target;
 	// prune older ones. Best-effort — never fails the deploy.
+	retainImages(ctx, d.docker, spec.Container.ResourceID, defaultImageRetention,
+		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)
+	return nil
+}
+
+// opRecreate handles a deploy.recreate op: the recreate swap for a Compose service
+// that holds an exclusive resource and cannot run two generations at once.
+func (d *Driver) opRecreate(ctx context.Context, op dsd.Op) error {
+	if err := d.throttle(); err != nil {
+		return err
+	}
+	var spec RecreateSpec
+	if err := json.Unmarshal(op.Spec, &spec); err != nil {
+		return fmt.Errorf("decode recreate spec: %w", err)
+	}
+	if err := CheckPolicy(spec.Container); err != nil {
+		return err
+	}
+	effective, fileSecrets, err := d.resolveSecrets(ctx, spec.Container)
+	if err != nil {
+		return err
+	}
+	hash := spec.Container.SpecHash()
+	body := d.buildCreateBody(effective, hash)
+
+	postStart := func(ctx context.Context, id string) error {
+		if len(fileSecrets) == 0 {
+			return nil
+		}
+		cur, ok, err := d.docker.ContainerInspect(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok || !cur.Running || cur.Pid <= 0 {
+			return fmt.Errorf("container not running after start; refusing to seed secrets to disk")
+		}
+		return writeFileSecrets(cur.Pid, fileSecrets)
+	}
+
+	if err := performRecreate(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
+		return err
+	}
 	retainImages(ctx, d.docker, spec.Container.ResourceID, defaultImageRetention,
 		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)
 	return nil

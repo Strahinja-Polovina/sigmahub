@@ -124,15 +124,25 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 func rolloutManagedResources(doc dsd.Document) map[string]bool {
 	out := map[string]bool{}
 	for _, op := range doc.Ops {
-		if op.Kind != KindDeployRollout {
+		var container ContainerSpec
+		switch op.Kind {
+		case KindDeployRollout:
+			var rs RolloutSpec
+			if err := json.Unmarshal(op.Spec, &rs); err != nil {
+				continue
+			}
+			container = rs.Container
+		case KindDeployRecreate:
+			var rs RecreateSpec
+			if err := json.Unmarshal(op.Spec, &rs); err != nil {
+				continue
+			}
+			container = rs.Container
+		default:
 			continue
 		}
-		var rs RolloutSpec
-		if err := json.Unmarshal(op.Spec, &rs); err != nil {
-			continue
-		}
-		if rs.Container.ResourceID != "" {
-			out[rs.Container.ResourceID] = true
+		if container.ResourceID != "" {
+			out[container.ResourceID] = true
 		}
 	}
 	return out
@@ -162,6 +172,14 @@ func desiredNames(doc dsd.Document) map[string]bool {
 			// A rollout's live container carries a generation-suffixed name; keep
 			// it so GC doesn't reap the freshly-deployed version.
 			var rs RolloutSpec
+			if err := json.Unmarshal(op.Spec, &rs); err != nil {
+				continue
+			}
+			if rs.Container.Name != "" {
+				names[rolloutName(rs.Container.Name, rs.Generation)] = true
+			}
+		case KindDeployRecreate:
+			var rs RecreateSpec
 			if err := json.Unmarshal(op.Spec, &rs); err != nil {
 				continue
 			}

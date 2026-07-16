@@ -29,6 +29,11 @@ const (
 	// generation of a resource's container is started alongside the old, health-
 	// gated, and only after it passes is the old drained. Name matches the CP.
 	KindDeployRollout = "deploy.rollout"
+	// KindDeployRecreate is the P1-9 recreate swap for a Compose service that holds
+	// an exclusive resource (a named volume or a fixed host port) and so cannot run
+	// two generations at once: the old generation is removed, THEN the new one is
+	// created — a documented, per-service exception to the zero-downtime guarantee.
+	KindDeployRecreate = "deploy.recreate"
 )
 
 // HealthProbe is how the agent decides a new container is ready before draining
@@ -52,6 +57,17 @@ type RolloutSpec struct {
 	DeploymentID string        `json:"deploymentId,omitempty"`
 }
 
+// RecreateSpec is the payload of a deploy.recreate op: the old generation of the
+// (resource, service) is removed before the new one is created, so a service
+// holding an exclusive resource never has two live generations. There is a brief
+// downtime window by design — the documented per-service exception.
+type RecreateSpec struct {
+	Container    ContainerSpec `json:"container"`
+	Generation   string        `json:"generation"`
+	Health       HealthProbe   `json:"health"`
+	DeploymentID string        `json:"deploymentId,omitempty"`
+}
+
 // Managed-object labels. Every container/volume/network the agent creates
 // carries these so the reconcile loop can enumerate and garbage-collect them
 // without a control-plane round-trip.
@@ -59,6 +75,10 @@ const (
 	LabelManaged    = "sigmahub.managed"    // "true"
 	LabelResourceID = "sigmahub.resourceId" // owning resource id
 	LabelSpecHash   = "sigmahub.specHash"   // hash of the applied container config
+	// LabelService names the Compose service a container belongs to, so a
+	// multi-service resource's rollout/recreate and GC scope to one service's
+	// generations. Empty (label absent) for a single-container app.
+	LabelService = "sigmahub.service"
 )
 
 // NetworkSpec is the payload of a network.ensure op.
@@ -126,10 +146,17 @@ type Secret struct {
 // of one workload container. The control plane renders it from a resource's
 // spec; the agent applies it after the local policy gate passes.
 type ContainerSpec struct {
-	ResourceID     string            `json:"resourceId"`
-	Name           string            `json:"name"`
-	Image          string            `json:"image"`
-	Network        string            `json:"network"`
+	ResourceID string `json:"resourceId"`
+	// Service is the Compose service name for a multi-service resource (empty for a
+	// single-container app). It scopes the container's rollout/recreate/GC group
+	// and becomes a network alias so sibling services reach it by service name.
+	Service string `json:"service,omitempty"`
+	Name    string `json:"name"`
+	Image   string `json:"image"`
+	Network string `json:"network"`
+	// NetworkAliases are extra DNS aliases the container answers to on its network
+	// (the Compose service name, so `db`, `web`, … resolve between services).
+	NetworkAliases []string          `json:"networkAliases,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	Ports          []PortMapping     `json:"ports,omitempty"`
 	Volumes        []VolumeMount     `json:"volumes,omitempty"`
