@@ -58,15 +58,29 @@ import {
 } from "@/server/actions/git";
 
 // Local mirrors of the CP shapes (kept off the server-only cp module).
+type HealthCheck = {
+  type: string;
+  path?: string;
+  port?: number;
+  intervalSec: number;
+  source: string;
+};
 type Detected = {
   hasDockerfile: boolean;
   hasCompose: boolean;
   ports: number[];
   env: string[];
-  healthCheck?: string;
+  healthCheck: HealthCheck;
   deployable: boolean;
   reason?: string;
 };
+
+/** Render a probe as "http /health:3000" or "tcp:8080 (default)". */
+function healthLabel(h: HealthCheck): string {
+  const where = h.type === "http" ? `${h.path ?? "/"}${h.port ? `:${h.port}` : ""}` : h.port ? `:${h.port}` : "";
+  const base = `${h.type}${where}`;
+  return h.source === "default" ? `${base} (default)` : base;
+}
 type BranchMap = {
   id: string;
   branch: string;
@@ -94,9 +108,6 @@ function DetectedConfig({ d }: { d: Detected }) {
         {d.hasCompose && (
           <span className="rounded bg-card px-1.5 py-0.5 text-xs font-medium">Compose</span>
         )}
-        {d.healthCheck && (
-          <span className="rounded bg-card px-1.5 py-0.5 text-xs font-medium">health check</span>
-        )}
       </div>
       <div className="grid gap-1 text-xs text-muted-foreground">
         <span>
@@ -110,6 +121,9 @@ function DetectedConfig({ d }: { d: Detected }) {
           <span className="font-mono text-foreground">
             {d.env.length ? d.env.join(", ") : "—"}
           </span>
+        </span>
+        <span>
+          Health check: <span className="font-mono text-foreground">{healthLabel(d.healthCheck)}</span>
         </span>
       </div>
     </div>

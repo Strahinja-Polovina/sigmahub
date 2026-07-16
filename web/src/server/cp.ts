@@ -541,6 +541,16 @@ export async function cpListAudit(orgId: string, limit = 50): Promise<CpAuditEnt
 
 // ── Git integration (P1-7) ───────────────────────────────────────────────────
 
+/** Health probe detected from the repo, or a default TCP probe on the primary
+ *  declared port when nothing is declared (the field P1-9's gate consumes). */
+export type CpHealthCheck = {
+  type: string; // "http" | "tcp"
+  path?: string;
+  port?: number;
+  intervalSec: number;
+  source: string; // "dockerfile" | "compose" | "default"
+};
+
 /** Deploy config detected from a repo's root files — a wizard pre-fill. */
 export type CpDetected = {
   hasDockerfile: boolean;
@@ -549,7 +559,7 @@ export type CpDetected = {
   composePath?: string;
   ports: number[];
   env: string[];
-  healthCheck?: string;
+  healthCheck: CpHealthCheck;
   deployable: boolean;
   reason?: string;
 };
