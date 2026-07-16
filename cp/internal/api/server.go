@@ -32,6 +32,9 @@ type StoreAPI interface {
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
 	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error
+	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
+	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error
+	AppendDeployLog(ctx context.Context, deploymentID, stream, line string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -188,6 +191,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/dsd/status", s.requireAgent(s.handleDSDStatus))
 	s.mux.HandleFunc("GET /v1/agent/secrets", s.requireAgent(s.handleAgentSecrets))
 	s.mux.HandleFunc("POST /v1/agent/domains/status", s.requireAgent(s.handleAgentDomainStatus))
+	s.mux.HandleFunc("GET /v1/agent/git-credential", s.requireAgent(s.handleAgentGitCredential))
+	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
 }
 
 func (s *Server) Handler() http.Handler {

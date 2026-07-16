@@ -83,6 +83,13 @@ func (f *fakeStore) ResolveSecretsForResource(context.Context, string, string, s
 func (f *fakeStore) SetDomainCertStatus(context.Context, string, string, string, string, *time.Time, string) error {
 	return nil
 }
+func (f *fakeStore) DeploymentCloneCredential(context.Context, string, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string, string, bool, string) error {
+	return nil
+}
+func (f *fakeStore) AppendDeployLog(context.Context, string, string, string) error { return nil }
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -165,8 +172,8 @@ func (f *fakeDomain) IssueConfirmToken(_ context.Context, _, _, _, _, _ string, 
 func (f *fakeDomain) ConfirmDestructiveOp(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	return "pdo_1", nil
 }
-func (f *fakeDomain) DeleteServer(_ context.Context, _, _, _ string) error       { return nil }
-func (f *fakeDomain) RevokeAgentToken(_ context.Context, _, _, _ string) error   { return nil }
+func (f *fakeDomain) DeleteServer(_ context.Context, _, _, _ string) error     { return nil }
+func (f *fakeDomain) RevokeAgentToken(_ context.Context, _, _, _ string) error { return nil }
 func (f *fakeDomain) ListServiceTokens(_ context.Context, _ string) ([]store.ServiceTokenInfo, error) {
 	return []store.ServiceTokenInfo{}, nil
 }
@@ -180,15 +187,19 @@ func (f *fakeDomain) CreateSecret(_ context.Context, _, _ string, in store.Creat
 func (f *fakeDomain) ListSecrets(_ context.Context, _, _, _ string) ([]store.Secret, error) {
 	return []store.Secret{}, nil
 }
-func (f *fakeDomain) RevealSecret(_ context.Context, _, _, _ string) (string, error) { return "value", nil }
-func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error           { return nil }
-func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)          { return 0, nil }
-func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)       { return "dek_2", nil }
-func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error)      { return 0, nil }
+func (f *fakeDomain) RevealSecret(_ context.Context, _, _, _ string) (string, error) {
+	return "value", nil
+}
+func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error      { return nil }
+func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)     { return 0, nil }
+func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)  { return "dek_2", nil }
+func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error) { return 0, nil }
 func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
 	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil
 }
-func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, error) { return "srv_1", nil }
+func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, error) {
+	return "srv_1", nil
+}
 func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]store.Domain, error) {
 	return []store.Domain{}, nil
 }
