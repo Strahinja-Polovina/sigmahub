@@ -249,6 +249,81 @@ func deref(s *string) string {
 	return *s
 }
 
+// GetDeployment returns one deployment scoped to the org (BOLA guard for the
+// log-stream endpoint: a caller can only read logs for a deployment in its org).
+func (s *Store) GetDeployment(ctx context.Context, orgID, deploymentID string) (Deployment, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
+		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
+		       created_by, created_at, started_at, finished_at
+		  FROM deployments WHERE org_id = $1 AND id = $2`, orgID, deploymentID)
+	if err != nil {
+		return Deployment{}, err
+	}
+	defer rows.Close()
+	ds, err := scanDeployments(rows)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if len(ds) == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return ds[0], nil
+}
+
+// CreateRollback queues a rebuild-free rollback: it validates the target is a
+// SUCCESSFUL release of the same resource with a retained image, then appends a
+// new deployment that reuses that image digest (trigger=rollback, rollback_of set)
+// so the reconciler renders only the rollout op — no clone/build. Returns the new
+// deployment and the server to re-render. Audited.
+func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (Deployment, string, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var t Deployment
+	var env, srv, conn, ref, sha, digest, cfg *string
+	err = tx.QueryRow(ctx, `
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, status
+		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &t.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Deployment{}, "", ErrNotFound
+	}
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	if t.Status != "success" || digest == nil || *digest == "" {
+		return Deployment{}, "", ErrInvalid{Msg: "rollback target must be a successful release with a built image"}
+	}
+
+	d := Deployment{
+		ID: newID("dep"), OrgID: orgID, ResourceID: resourceID, EnvironmentID: deref(env),
+		ServerID: deref(srv), ConnectionID: deref(conn), Trigger: "rollback", GitRef: deref(ref),
+		GitSHA: deref(sha), ImageDigest: deref(digest), ConfigHash: deref(cfg),
+		RollbackOf: targetDeploymentID, Status: "queued", CreatedBy: actor,
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
+		                         git_ref, git_sha, image_digest, config_hash, rollback_of, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),NULLIF($10,''),$11,'queued',$12)
+		RETURNING created_at`,
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID,
+		d.GitRef, d.GitSHA, d.ImageDigest, d.ConfigHash, targetDeploymentID, actor).Scan(&d.CreatedAt)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Rollback queued to "+targetDeploymentID, resourceID); err != nil {
+		return Deployment{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, "", err
+	}
+	return d, d.ServerID, nil
+}
+
 // LookupBuild returns a resource's build for a dedup key, if one exists — the
 // retry short-circuit: a 'built' row means the image is already present.
 func (s *Store) LookupBuild(ctx context.Context, resourceID, dedupKey string) (Build, error) {

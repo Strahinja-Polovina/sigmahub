@@ -157,6 +157,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleDeveloper, s.handleListDomains))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/domains/{domainId}", s.requireService(store.RoleProjectAdmin, s.handleDetachDomain))
+
+	// Deployments (P1-9): release history + build-log stream are member-visible;
+	// a rollback (re-ships a prior release) is Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/deployments", s.requireService(store.RoleDeveloper, s.handleListDeployments))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/rollback-targets", s.requireService(store.RoleDeveloper, s.handleRollbackTargets))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/rollback", s.requireService(store.RoleProjectAdmin, s.handleRollback))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/deployments/{deploymentId}/logs", s.requireService(store.RoleDeveloper, s.handleDeployLogs))
 	// Audit is member-visible (matches the web settings tab shown to all
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))

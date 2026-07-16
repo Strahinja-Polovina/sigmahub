@@ -126,4 +126,30 @@ func TestDeploymentsLifecycle(t *testing.T) {
 	if len(logs2) != 1 || logs2[0].Line != "step 2/5 : COPY . ." {
 		t.Fatalf("log cursor = %+v", logs2)
 	}
+
+	// GetDeployment is org-scoped (BOLA): the right org resolves it; a foreign
+	// org gets ErrNotFound.
+	one, err := st.GetDeployment(ctx, orgID, dep.ID)
+	if err != nil || one.ID != dep.ID {
+		t.Fatalf("get deployment = %+v (err %v)", one, err)
+	}
+	if _, err := st.GetDeployment(ctx, "org_other", dep.ID); err != store.ErrNotFound {
+		t.Fatalf("cross-org GetDeployment must be ErrNotFound, got %v", err)
+	}
+
+	// Rebuild-free rollback: rolling back to the successful release reuses its
+	// image (trigger=rollback, rollback_of set, image carried forward, status
+	// queued) and targets the same server so the reconciler renders only rollout.
+	rb, rbServer, err := st.CreateRollback(ctx, orgID, res.ID, dep.ID, "operator")
+	if err != nil {
+		t.Fatalf("create rollback: %v", err)
+	}
+	if rb.Trigger != "rollback" || rb.RollbackOf != dep.ID || rb.ImageDigest != "sha256:abc" || rb.Status != "queued" || rbServer != serverID {
+		t.Fatalf("rollback = %+v (server %q)", rb, rbServer)
+	}
+
+	// A failed deployment is not a valid rollback target.
+	if _, _, err := st.CreateRollback(ctx, orgID, res.ID, failDep.ID, "operator"); err == nil {
+		t.Fatal("rollback to a failed release must be rejected")
+	}
 }
