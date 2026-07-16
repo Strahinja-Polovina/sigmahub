@@ -17,7 +17,18 @@ const (
 	// Ingress (P1-8): the Traefik proxy on a proxy-role server. Name must match
 	// the agent's proxy package byte-for-byte.
 	KindProxyTraefik = "proxy.traefik"
+	// Git deploy pipeline (P1-9): clone at SHA → build on target → zero-downtime
+	// rollout. Names must match the agent's build/container packages byte-for-byte.
+	KindGitClone      = "git.clone"
+	KindImageBuild    = "image.build"
+	KindDeployRollout = "deploy.rollout"
 )
+
+// DeployImageTag is the deterministic local image tag for a resource at a SHA,
+// so a clone/build/rollout chain and a rollback reference the same image.
+func DeployImageTag(resourceID, sha string) string {
+	return "sigmahub/" + resourceID + ":" + sha
+}
 
 // TraefikRouterName is the deterministic Traefik router/service name for a
 // resource, so a resync renders byte-identical labels.
