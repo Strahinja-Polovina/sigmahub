@@ -1,0 +1,606 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// WebhookActor is the synthetic audit actor for provider-driven webhook events.
+// Webhooks are unauthenticated (verified only by HMAC signature), so there is no
+// service principal to attribute the row to.
+const WebhookActor = "github-webhook"
+
+// GitConnection links a provider repository to a project. The provider token
+// (a GitHub App installation token, or a PAT) is held only in KMS-wrapped form.
+type GitConnection struct {
+	ID             string    `json:"id"`
+	OrgID          string    `json:"orgId"`
+	ProjectID      string    `json:"projectId"`
+	Provider       string    `json:"provider"`
+	InstallationID string    `json:"installationId"`
+	RepoFullName   string    `json:"repoFullName"`
+	CreatedBy      string    `json:"createdBy"`
+	CreatedAt      time.Time `json:"createdAt"`
+}
+
+// BranchMap routes pushes on one branch to one environment under a deploy policy.
+type BranchMap struct {
+	ID            string     `json:"id"`
+	ConnectionID  string     `json:"connectionId"`
+	Branch        string     `json:"branch"`
+	EnvironmentID string     `json:"environmentId"`
+	Policy        string     `json:"policy"` // "auto" | "manual"
+	LastRef       string     `json:"lastRef,omitempty"`
+	LastSHA       string     `json:"lastSha,omitempty"`
+	LastPushedAt  *time.Time `json:"lastPushedAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+}
+
+// DeployRequest is an enqueued deploy (drained by P1-9) or a recorded PR routing
+// hook (kind='pr_hook', which carries no deploy semantics — that is P1-12).
+type DeployRequest struct {
+	ID            string    `json:"id"`
+	OrgID         string    `json:"orgId"`
+	ConnectionID  string    `json:"connectionId"`
+	EnvironmentID string    `json:"environmentId,omitempty"`
+	Kind          string    `json:"kind"` // "deploy" | "pr_hook"
+	Ref           string    `json:"ref"`
+	SHA           string    `json:"sha"`
+	Branch        string    `json:"branch,omitempty"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// CreateGitConnectionInput is the payload for connecting a repo to a project.
+type CreateGitConnectionInput struct {
+	ProjectID      string
+	Provider       string // defaults to "github"
+	InstallationID string
+	RepoFullName   string // owner/name
+	Token          string // provider token, stored KMS-wrapped (may be empty)
+}
+
+// GitWebhookEvent is the provider-agnostic, already-signature-verified shape the
+// HTTP layer hands to the store after parsing a delivery.
+type GitWebhookEvent struct {
+	DeliveryID   string
+	Provider     string
+	EventType    string // "push" | "pull_request" | ...
+	RepoFullName string
+	Ref          string // refs/heads/<branch> for push
+	SHA          string
+	Branch       string // extracted branch (push head, or PR head ref)
+	Action       string // pull_request action (opened|synchronize|closed|...)
+	Deleted      bool   // push that deleted the branch — never deploys
+}
+
+// WebhookOutcome reports what a delivery did, so the HTTP layer can shape its
+// (always 2xx) acknowledgement and tests can assert routing.
+type WebhookOutcome struct {
+	Duplicate  bool           // redelivered id — no-op
+	Connection *GitConnection // nil when the repo is not connected
+	Enqueued   *DeployRequest // set when an auto-deploy was enqueued
+	PRHook     *DeployRequest // set when a pull_request routing hook was recorded
+}
+
+// gitTokenPurpose namespaces the provider-token wrapping key per org.
+func gitTokenPurpose(orgID string) string { return "git_token:" + orgID }
+
+func normalizeRepo(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+// branchFromRef strips refs/heads/ from a push ref; other ref namespaces (tags)
+// return "" so they never match a branch map.
+func branchFromRef(ref string) string {
+	const p = "refs/heads/"
+	if strings.HasPrefix(ref, p) {
+		return ref[len(p):]
+	}
+	return ""
+}
+
+// CreateGitConnection connects a repo to a project. The project must belong to
+// the org; the repo may drive at most one connection (unique per provider). The
+// provider token is KMS-wrapped before storage; the plaintext never persists.
+func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in CreateGitConnectionInput, actor string) (GitConnection, error) {
+	provider := in.Provider
+	if provider == "" {
+		provider = "github"
+	}
+	repo := strings.TrimSpace(in.RepoFullName)
+	if repo == "" || !strings.Contains(repo, "/") {
+		return GitConnection{}, ErrInvalid{Msg: "repoFullName must be owner/name"}
+	}
+
+	var wrapped []byte
+	if in.Token != "" {
+		w, err := s.custody.Wrap(ctx, gitTokenPurpose(orgID), []byte(in.Token))
+		if err != nil {
+			return GitConnection{}, fmt.Errorf("wrap provider token: %w", err)
+		}
+		wrapped = w
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return GitConnection{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The project must belong to the org (tenant isolation).
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM projects WHERE org_id = $1 AND id = $2)`,
+		orgID, in.ProjectID).Scan(&exists); err != nil {
+		return GitConnection{}, err
+	}
+	if !exists {
+		return GitConnection{}, ErrNotFound
+	}
+
+	c := GitConnection{
+		ID: newID("gcn"), OrgID: orgID, ProjectID: in.ProjectID, Provider: provider,
+		InstallationID: in.InstallationID, RepoFullName: repo, CreatedBy: actor,
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, token_wrapped, created_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		RETURNING created_at`,
+		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy).Scan(&c.CreatedAt)
+	if isUniqueViolation(err) {
+		return GitConnection{}, fmt.Errorf("%w: repository %q is already connected", ErrConflict, repo)
+	}
+	if err != nil {
+		return GitConnection{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git repo connected", repo); err != nil {
+		return GitConnection{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return GitConnection{}, err
+	}
+	return c, nil
+}
+
+// ListGitConnections returns the org's connections, optionally filtered to a
+// project (pass "" for all).
+func (s *Store) ListGitConnections(ctx context.Context, orgID, projectID string) ([]GitConnection, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		  FROM git_connections
+		 WHERE org_id = $1 AND ($2 = '' OR project_id = $2)
+		 ORDER BY created_at DESC`, orgID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GitConnection{}
+	for rows.Next() {
+		var c GitConnection
+		if err := rows.Scan(&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetGitConnection returns one org-scoped connection.
+func (s *Store) GetGitConnection(ctx context.Context, orgID, connID string) (GitConnection, error) {
+	var c GitConnection
+	err := s.Pool.QueryRow(ctx, `
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		  FROM git_connections WHERE org_id = $1 AND id = $2`, orgID, connID).Scan(
+		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GitConnection{}, ErrNotFound
+	}
+	return c, err
+}
+
+// DeleteGitConnection removes a connection (cascading its branch maps).
+func (s *Store) DeleteGitConnection(ctx context.Context, orgID, connID, actor string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var repo string
+	err = tx.QueryRow(ctx,
+		`DELETE FROM git_connections WHERE org_id = $1 AND id = $2 RETURNING repo_full_name`,
+		orgID, connID).Scan(&repo)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git repo disconnected", repo); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SetBranchMap upserts a branch→environment route with a deploy policy. The
+// connection and environment must both belong to the org.
+func (s *Store) SetBranchMap(ctx context.Context, orgID, connID, branch, envID, policy, actor string) (BranchMap, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return BranchMap{}, ErrInvalid{Msg: "branch is required"}
+	}
+	if policy != "auto" && policy != "manual" {
+		return BranchMap{}, ErrInvalid{Msg: `policy must be "auto" or "manual"`}
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return BranchMap{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var connExists, envExists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM git_connections WHERE org_id = $1 AND id = $2)`,
+		orgID, connID).Scan(&connExists); err != nil {
+		return BranchMap{}, err
+	}
+	if !connExists {
+		return BranchMap{}, ErrNotFound
+	}
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM environments WHERE org_id = $1 AND id = $2)`,
+		orgID, envID).Scan(&envExists); err != nil {
+		return BranchMap{}, err
+	}
+	if !envExists {
+		return BranchMap{}, ErrInvalid{Msg: "environment does not belong to this org"}
+	}
+
+	m, err := scanBranchMap(tx.QueryRow(ctx, `
+		INSERT INTO git_branch_map (id, connection_id, branch, environment_id, policy)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (connection_id, branch)
+		DO UPDATE SET environment_id = EXCLUDED.environment_id, policy = EXCLUDED.policy
+		RETURNING id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, created_at`,
+		newID("gbm"), connID, branch, envID, policy))
+	if err != nil {
+		return BranchMap{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git branch mapped ("+branch+" → "+policy+")", envID); err != nil {
+		return BranchMap{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return BranchMap{}, err
+	}
+	return m, nil
+}
+
+// ListBranchMaps returns a connection's branch routes (org-scoped).
+func (s *Store) ListBranchMaps(ctx context.Context, orgID, connID string) ([]BranchMap, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT m.id, m.connection_id, m.branch, m.environment_id, m.policy, m.last_ref, m.last_sha, m.last_pushed_at, m.created_at
+		  FROM git_branch_map m
+		  JOIN git_connections c ON c.id = m.connection_id
+		 WHERE c.org_id = $1 AND m.connection_id = $2
+		 ORDER BY m.branch`, orgID, connID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []BranchMap{}
+	for rows.Next() {
+		m, err := scanBranchMap(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// DeleteBranchMap removes a branch route (org-scoped via the connection join).
+func (s *Store) DeleteBranchMap(ctx context.Context, orgID, mapID, actor string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var branch string
+	err = tx.QueryRow(ctx, `
+		DELETE FROM git_branch_map m
+		 USING git_connections c
+		 WHERE m.connection_id = c.id AND c.org_id = $1 AND m.id = $2
+		 RETURNING m.branch`, orgID, mapID).Scan(&branch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git branch unmapped", branch); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// PromoteBranch enqueues a deploy of a manual branch's last-seen commit. It is
+// the "promote" half of the manual policy: the push recorded the commit but
+// enqueued nothing; this turns that remembered sha into a deploy request.
+func (s *Store) PromoteBranch(ctx context.Context, orgID, mapID, actor string) (DeployRequest, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var connID, envID, branch string
+	var lastRef, lastSHA *string
+	err = tx.QueryRow(ctx, `
+		SELECT m.connection_id, m.environment_id, m.branch, m.last_ref, m.last_sha
+		  FROM git_branch_map m
+		  JOIN git_connections c ON c.id = m.connection_id
+		 WHERE c.org_id = $1 AND m.id = $2`, orgID, mapID).Scan(&connID, &envID, &branch, &lastRef, &lastSHA)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeployRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	if lastSHA == nil || *lastSHA == "" {
+		return DeployRequest{}, ErrInvalid{Msg: "no push has been recorded on this branch to promote"}
+	}
+	ref := ""
+	if lastRef != nil {
+		ref = *lastRef
+	}
+	dr, err := enqueueDeployTx(ctx, tx, orgID, connID, envID, ref, *lastSHA, branch)
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git deploy promoted ("+branch+")", envID); err != nil {
+		return DeployRequest{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeployRequest{}, err
+	}
+	return dr, nil
+}
+
+// HandleGitWebhook processes one already-signature-verified delivery atomically:
+// it dedupes on the provider delivery id (a redelivery is a no-op), resolves the
+// repo to a connection, and — for a push on an 'auto' mapped branch — enqueues
+// exactly one deploy request. 'manual' branches record the commit but enqueue
+// nothing; pull_request events persist a routing hook with no deploy. Every
+// delivery that maps to a connection writes an audit row.
+func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (WebhookOutcome, error) {
+	provider := ev.Provider
+	if provider == "" {
+		provider = "github"
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return WebhookOutcome{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Idempotency: the delivery id is the dedup key. A redelivery finds the row
+	// already present (ON CONFLICT DO NOTHING → 0 rows) and short-circuits before
+	// any routing, so no deploy is enqueued twice.
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO webhook_deliveries (delivery_id, provider, event_type)
+		VALUES ($1,$2,$3) ON CONFLICT (delivery_id) DO NOTHING`,
+		ev.DeliveryID, provider, ev.EventType)
+	if err != nil {
+		return WebhookOutcome{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return WebhookOutcome{Duplicate: true}, nil
+	}
+
+	// Resolve the connected repo. An unconnected repo still had its delivery
+	// recorded above (keeping redeliveries idempotent); nothing else to do.
+	conn, err := gitConnectionByRepoTx(ctx, tx, provider, ev.RepoFullName)
+	if errors.Is(err, ErrNotFound) {
+		if err := tx.Commit(ctx); err != nil {
+			return WebhookOutcome{}, err
+		}
+		return WebhookOutcome{}, nil
+	}
+	if err != nil {
+		return WebhookOutcome{}, err
+	}
+	out := WebhookOutcome{Connection: &conn}
+
+	switch ev.EventType {
+	case "push":
+		branch := ev.Branch
+		if branch == "" {
+			branch = branchFromRef(ev.Ref)
+		}
+		action := "Git push"
+		if ev.Deleted {
+			// A branch deletion never deploys; record + audit only.
+			action = "Git branch deleted"
+			if branch != "" {
+				action = "Git branch deleted (" + branch + ")"
+			}
+		} else if branch != "" {
+			m, err := branchMapTx(ctx, tx, conn.ID, branch)
+			switch {
+			case errors.Is(err, ErrNotFound):
+				action = "Git push " + branch + " (branch not mapped)"
+			case err != nil:
+				return WebhookOutcome{}, err
+			default:
+				// Remember the commit on the branch map for both policies, so a
+				// manual branch can be promoted later to exactly this sha.
+				if _, err := tx.Exec(ctx,
+					`UPDATE git_branch_map SET last_ref = $1, last_sha = $2, last_pushed_at = now() WHERE id = $3`,
+					ev.Ref, ev.SHA, m.ID); err != nil {
+					return WebhookOutcome{}, err
+				}
+				if m.Policy == "auto" {
+					dr, err := enqueueDeployTx(ctx, tx, conn.OrgID, conn.ID, m.EnvironmentID, ev.Ref, ev.SHA, branch)
+					if err != nil {
+						return WebhookOutcome{}, err
+					}
+					out.Enqueued = &dr
+					action = "Git push " + branch + " → deploy enqueued"
+				} else {
+					action = "Git push " + branch + " (manual — awaiting promotion)"
+				}
+			}
+		}
+		if err := auditTx(ctx, tx, conn.OrgID, WebhookActor, action, conn.RepoFullName); err != nil {
+			return WebhookOutcome{}, err
+		}
+
+	case "pull_request":
+		dr, err := recordPRHookTx(ctx, tx, conn.OrgID, conn.ID, ev.Ref, ev.SHA, ev.Branch)
+		if err != nil {
+			return WebhookOutcome{}, err
+		}
+		out.PRHook = &dr
+		if err := auditTx(ctx, tx, conn.OrgID, WebhookActor,
+			"Git pull_request "+strings.TrimSpace(ev.Action)+" ("+ev.Branch+")", conn.RepoFullName); err != nil {
+			return WebhookOutcome{}, err
+		}
+
+	default:
+		// Acknowledge + audit any other subscribed event; no routing.
+		if err := auditTx(ctx, tx, conn.OrgID, WebhookActor, "Git webhook "+ev.EventType, conn.RepoFullName); err != nil {
+			return WebhookOutcome{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return WebhookOutcome{}, err
+	}
+	return out, nil
+}
+
+// ListDeployRequests returns an org's deploy requests, newest first.
+func (s *Store) ListDeployRequests(ctx context.Context, orgID string, limit int) ([]DeployRequest, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, org_id, connection_id, environment_id, kind, ref, sha, branch, status, created_at
+		  FROM deploy_requests WHERE org_id = $1
+		 ORDER BY created_at DESC, id DESC LIMIT $2`, orgID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DeployRequest{}
+	for rows.Next() {
+		var d DeployRequest
+		var env, branch *string
+		if err := rows.Scan(&d.ID, &d.OrgID, &d.ConnectionID, &env, &d.Kind, &d.Ref, &d.SHA, &branch, &d.Status, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		if env != nil {
+			d.EnvironmentID = *env
+		}
+		if branch != nil {
+			d.Branch = *branch
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// gitProviderToken unwraps the stored provider token for a connection (used by
+// the repo-detection service to read the repo through the GitHub API). Returns
+// "" with no error when the connection carries no stored token.
+func (s *Store) gitProviderToken(ctx context.Context, orgID, connID string) (string, error) {
+	var wrapped []byte
+	err := s.Pool.QueryRow(ctx,
+		`SELECT token_wrapped FROM git_connections WHERE org_id = $1 AND id = $2`,
+		orgID, connID).Scan(&wrapped)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if len(wrapped) == 0 {
+		return "", nil
+	}
+	plain, err := s.custody.Unwrap(ctx, gitTokenPurpose(orgID), wrapped)
+	if err != nil {
+		return "", fmt.Errorf("unwrap provider token: %w", err)
+	}
+	return string(plain), nil
+}
+
+// ── tx helpers ──────────────────────────────────────────────────────────────
+
+func gitConnectionByRepoTx(ctx context.Context, tx pgx.Tx, provider, repo string) (GitConnection, error) {
+	var c GitConnection
+	err := tx.QueryRow(ctx, `
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		  FROM git_connections
+		 WHERE provider = $1 AND lower(repo_full_name) = $2`, provider, normalizeRepo(repo)).Scan(
+		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GitConnection{}, ErrNotFound
+	}
+	return c, err
+}
+
+func branchMapTx(ctx context.Context, tx pgx.Tx, connID, branch string) (BranchMap, error) {
+	m, err := scanBranchMap(tx.QueryRow(ctx, `
+		SELECT id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, created_at
+		  FROM git_branch_map WHERE connection_id = $1 AND branch = $2`, connID, branch))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BranchMap{}, ErrNotFound
+	}
+	return m, err
+}
+
+// scanBranchMap reads a branch-map row, tolerating NULL last_ref/last_sha (a
+// branch that has not yet seen a push). Works for both pgx.Row and pgx.Rows.
+func scanBranchMap(row pgx.Row) (BranchMap, error) {
+	var m BranchMap
+	var lastRef, lastSHA *string
+	err := row.Scan(&m.ID, &m.ConnectionID, &m.Branch, &m.EnvironmentID, &m.Policy, &lastRef, &lastSHA, &m.LastPushedAt, &m.CreatedAt)
+	if lastRef != nil {
+		m.LastRef = *lastRef
+	}
+	if lastSHA != nil {
+		m.LastSHA = *lastSHA
+	}
+	return m, err
+}
+
+func enqueueDeployTx(ctx context.Context, tx pgx.Tx, orgID, connID, envID, ref, sha, branch string) (DeployRequest, error) {
+	d := DeployRequest{
+		ID: newID("dpr"), OrgID: orgID, ConnectionID: connID, EnvironmentID: envID,
+		Kind: "deploy", Ref: ref, SHA: sha, Branch: branch, Status: "queued",
+	}
+	err := tx.QueryRow(ctx, `
+		INSERT INTO deploy_requests (id, org_id, connection_id, environment_id, kind, ref, sha, branch, status)
+		VALUES ($1,$2,$3,$4,'deploy',$5,$6,$7,'queued')
+		RETURNING created_at`,
+		d.ID, orgID, connID, envID, ref, sha, branch).Scan(&d.CreatedAt)
+	return d, err
+}
+
+func recordPRHookTx(ctx context.Context, tx pgx.Tx, orgID, connID, ref, sha, branch string) (DeployRequest, error) {
+	d := DeployRequest{
+		ID: newID("dpr"), OrgID: orgID, ConnectionID: connID,
+		Kind: "pr_hook", Ref: ref, SHA: sha, Branch: branch, Status: "recorded",
+	}
+	err := tx.QueryRow(ctx, `
+		INSERT INTO deploy_requests (id, org_id, connection_id, environment_id, kind, ref, sha, branch, status)
+		VALUES ($1,$2,$3,NULL,'pr_hook',$4,$5,$6,'recorded')
+		RETURNING created_at`,
+		d.ID, orgID, connID, ref, sha, branch).Scan(&d.CreatedAt)
+	return d, err
+}

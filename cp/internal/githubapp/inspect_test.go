@@ -1,0 +1,101 @@
+package githubapp
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// stubContents serves the GitHub Contents API for a fixed file set.
+func stubContents(files map[string]string, wantAuth string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if wantAuth != "" && r.Header.Get("Authorization") != wantAuth {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// /repos/{owner}/{name}/contents/{path}
+		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/repos/"), "/contents/", 2)
+		if len(parts) != 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		content, ok := files[parts[1]]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// The real API wraps base64 in 60-col lines; emulate a newline.
+		enc := base64.StdEncoding.EncodeToString([]byte(content))
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"type": "file", "encoding": "base64", "content": enc[:len(enc)/2] + "\n" + enc[len(enc)/2:],
+		})
+	}))
+}
+
+func TestInspectDockerfile(t *testing.T) {
+	srv := stubContents(map[string]string{
+		"Dockerfile": "FROM node:20\nEXPOSE 3000\nENV PORT=3000\n",
+	}, "")
+	defer srv.Close()
+
+	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
+	d, err := insp.Inspect(context.Background(), "owner/repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.HasDockerfile || !d.Deployable {
+		t.Fatalf("expected deployable Dockerfile detection, got %+v", d)
+	}
+	if len(d.Ports) != 1 || d.Ports[0] != 3000 {
+		t.Errorf("ports = %v, want [3000]", d.Ports)
+	}
+}
+
+func TestInspectAuthForwarded(t *testing.T) {
+	srv := stubContents(map[string]string{
+		"compose.yaml": "services:\n  a:\n    ports:\n      - \"80:80\"\n",
+	}, "Bearer tok123")
+	defer srv.Close()
+
+	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
+	// Without the token → 401 surfaces as an error.
+	if _, err := insp.Inspect(context.Background(), "o/r", ""); err == nil {
+		t.Error("expected auth error without token")
+	}
+	// With the token → detection succeeds.
+	d, err := insp.Inspect(context.Background(), "o/r", "tok123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.HasCompose {
+		t.Errorf("expected compose detection, got %+v", d)
+	}
+}
+
+func TestInspectUndeployable(t *testing.T) {
+	srv := stubContents(map[string]string{"README.md": "# hi"}, "")
+	defer srv.Close()
+
+	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
+	d, err := insp.Inspect(context.Background(), "o/r", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Deployable {
+		t.Fatal("repo with no Dockerfile/compose must be undeployable")
+	}
+	if d.Reason == "" {
+		t.Error("expected actionable reason")
+	}
+}
+
+func TestInspectBadRepo(t *testing.T) {
+	insp := NewInspector()
+	if _, err := insp.Inspect(context.Background(), "no-slash", ""); err == nil {
+		t.Error("expected error for malformed repo name")
+	}
+}

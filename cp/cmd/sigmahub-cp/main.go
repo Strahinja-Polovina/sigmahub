@@ -17,6 +17,7 @@ import (
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -170,12 +171,15 @@ func run() error {
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: api.New(log, st, st, st, api.Options{
-			DevServiceToken: cfg.ServiceToken,
-			ProvisionToken:  cfg.ProvisionToken,
-			DSDStore:        st,
-			DSDWaiter:       rec,
-			Reconcile:       rec,
-			DSDPublicKey:    dsdKey.Public().(ed25519.PublicKey),
+			DevServiceToken:     cfg.ServiceToken,
+			ProvisionToken:      cfg.ProvisionToken,
+			Git:                 st,
+			Inspector:           githubapp.NewInspector(),
+			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
+			DSDStore:            st,
+			DSDWaiter:           rec,
+			Reconcile:           rec,
+			DSDPublicKey:        dsdKey.Public().(ed25519.PublicKey),
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

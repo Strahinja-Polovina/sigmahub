@@ -21,15 +21,20 @@ type Config struct {
 	// org-scoped web credential). Defaults in dev; required in prod for the
 	// provisioning endpoint to be usable.
 	ProvisionToken string
+	// GitHubWebhookSecret verifies inbound GitHub webhook deliveries
+	// (X-Hub-Signature-256 HMAC-SHA256). Empty disables the webhook receiver
+	// (returns 503) rather than accepting unverifiable deliveries.
+	GitHubWebhookSecret string
 }
 
 func FromEnv() (Config, error) {
 	cfg := Config{
-		Addr:           getenv("CP_ADDR", ":8080"),
-		DatabaseURL:    os.Getenv("CP_DATABASE_URL"),
-		Env:            getenv("CP_ENV", "dev"),
-		ServiceToken:   os.Getenv("CP_SERVICE_TOKEN"),
-		ProvisionToken: os.Getenv("CP_PROVISION_TOKEN"),
+		Addr:                getenv("CP_ADDR", ":8080"),
+		DatabaseURL:         os.Getenv("CP_DATABASE_URL"),
+		Env:                 getenv("CP_ENV", "dev"),
+		ServiceToken:        os.Getenv("CP_SERVICE_TOKEN"),
+		ProvisionToken:      os.Getenv("CP_PROVISION_TOKEN"),
+		GitHubWebhookSecret: os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
