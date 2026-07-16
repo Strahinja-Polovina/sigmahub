@@ -1,0 +1,21 @@
+[Unit]
+Description=sigmahub agent (sigmad)
+Documentation=https://github.com/Strahinja-Polovina/sigmahub
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root is required: host hardening (nftables/sshd/CIS), the WireGuard mesh, the
+# Docker socket, and tmpfs secret seeding all need it. The connection to the
+# control plane is strictly outbound.
+User=root
+EnvironmentFile=/etc/sigmad/env
+ExecStart=/usr/local/bin/sigmad -wg-up
+Restart=always
+RestartSec=5
+# Fleet updates during the beta re-run the idempotent installer, which swaps this
+# binary and restarts the unit (the staged self-update channel is Phase 2).
+
+[Install]
+WantedBy=multi-user.target
