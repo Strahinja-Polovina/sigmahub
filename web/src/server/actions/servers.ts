@@ -6,7 +6,27 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../active-org";
 import { writeAudit } from "../audit";
-import { cpEnabled, cpIssueBootstrapToken, cpPublicUrl, cpDeleteServer } from "../cp";
+import {
+  cpEnabled,
+  cpIssueBootstrapToken,
+  cpProvisionServer,
+  cpSetHardening,
+  cpPublicUrl,
+  cpDeleteServer,
+} from "../cp";
+
+/** Release version the installer pins (installer requires an explicit tag). */
+const AGENT_VERSION = process.env.SIGMAHUB_AGENT_VERSION ?? "latest";
+
+/** The one-line, cosign-verified install command the wizard hands the operator. */
+function installCommand(token: string): string {
+  const ep = cpPublicUrl();
+  return (
+    `curl -fsSL ${ep}/install.sh | ` +
+    `SIGMAHUB_ENDPOINT=${ep} SIGMAHUB_BOOTSTRAP_TOKEN=${token} ` +
+    `SIGMAHUB_VERSION=${AGENT_VERSION} sudo -E bash`
+  );
+}
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -95,6 +115,116 @@ export async function connectServer(input: {
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected server", target: name });
   revalidatePath("/dashboard", "layout");
   return { mode: "sim", id, bootstrapToken: `sk_boot_${id.slice(4, 12)}` };
+}
+
+export type ProvisionResult =
+  | {
+      mode: "cp";
+      serverId: string;
+      /** curl|sh install command with the one-time bootstrap token embedded. */
+      command: string;
+      /** OpenSSH public key the operator adds to the host for one login. */
+      bootstrapPubkey: string;
+      expiresAt: string;
+    }
+  | { mode: "sim"; id: string };
+
+/** SSH-onboarding wizard: pre-create the server (with type + proxy role +
+ *  detected distro), mint the per-server bootstrap keypair, and return the
+ *  cosign-verified install command. keepPublicSsh opts out of the SSH lockdown
+ *  (a warned choice). Project Admin+ — provisioning is a privileged action. */
+export async function provisionServer(input: {
+  orgId: string;
+  name: string;
+  type: string;
+  provider: string;
+  region: string;
+  proxyRole: boolean;
+  distro?: string;
+  keepPublicSsh?: boolean;
+}): Promise<ProvisionResult> {
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  const name = input.name.trim();
+  if (!name) throw new Error("Server name is required.");
+
+  if (!cpEnabled()) {
+    // Demo mode: fall back to a simulated provisioning row.
+    const id = rid("srv");
+    await db.insert(s.servers).values({
+      id,
+      orgId: input.orgId,
+      name,
+      type: input.type,
+      source: "byo",
+      provider: input.provider.trim() || "BYO",
+      region: input.region.trim() || "—",
+      status: "provisioning",
+      agentVersion: "",
+      ip: "",
+      cpu: 0,
+      memGb: 0,
+      byoVpn: false,
+    });
+    await writeAudit({ orgId: input.orgId, actor: user.name, action: "Provisioned server (demo)", target: name });
+    revalidatePath("/dashboard", "layout");
+    return { mode: "sim", id };
+  }
+
+  const actor = { name: user.name, role };
+  const res = await cpProvisionServer(
+    input.orgId,
+    {
+      name,
+      type: input.type,
+      provider: input.provider.trim(),
+      region: input.region.trim(),
+      proxyRole: input.proxyRole,
+      distro: input.distro,
+    },
+    actor
+  );
+  // The opt-out (keep public SSH) is a hardening-config change on the new server.
+  if (input.keepPublicSsh) {
+    await cpSetHardening(input.orgId, res.serverId, { keepPublicSsh: true, cisEnabled: true }, actor);
+  }
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: input.keepPublicSsh ? "Provisioned server (public SSH kept)" : "Provisioned server",
+    target: name,
+  });
+  revalidatePath("/dashboard", "layout");
+  return {
+    mode: "cp",
+    serverId: res.serverId,
+    command: installCommand(res.token),
+    bootstrapPubkey: res.bootstrapPubkey,
+    expiresAt: res.expiresAt,
+  };
+}
+
+/** Toggle a server's hardening config from the dashboard (keep-public-SSH
+ *  opt-out, CIS, extra inbound ports). Project Admin+. */
+export async function setServerHardening(input: {
+  orgId: string;
+  serverId: string;
+  keepPublicSsh: boolean;
+  cisEnabled: boolean;
+}) {
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  if (cpEnabled()) {
+    await cpSetHardening(input.orgId, input.serverId, {
+      keepPublicSsh: input.keepPublicSsh,
+      cisEnabled: input.cisEnabled,
+    }, { name: user.name, role });
+  }
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Updated server hardening",
+    target: input.serverId,
+  });
+  revalidatePath("/dashboard", "layout");
 }
 
 /** Simulated agent check-in: flips provisioning → running and fills in the

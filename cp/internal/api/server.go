@@ -101,6 +101,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/proxy-role", s.requireService(store.RoleProjectAdmin, s.handleProxyRole))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/hardening", s.requireService(store.RoleProjectAdmin, s.handleSetHardening))
 	// Server + token lifecycle (P1-4). Server delete and agent-token revoke are
 	// Project Admin+; service-token lifecycle is Org Admin only.
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteServer))

@@ -35,6 +35,7 @@ type DomainAPI interface {
 	ListResources(ctx context.Context, orgID, envID string) ([]store.Resource, error)
 	DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	SetProxyRole(ctx context.Context, orgID, serverID string, proxy bool, actor string) error
+	SetHardeningConfig(ctx context.Context, orgID, serverID string, keepPublicSSH, cisEnabled bool, extraPorts []store.PortException, actor string) error
 	ListAudit(ctx context.Context, orgID string, limit int) ([]store.AuditEntry, error)
 	IdempotencyLookup(ctx context.Context, orgID, key string) (store.IdempotentResponse, error)
 	IdempotencySave(ctx context.Context, orgID, key string, in store.IdempotentResponse) (store.IdempotentResponse, error)
@@ -283,6 +284,41 @@ func (s *Server) handleProxyRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "proxy": req.Proxy})
+}
+
+// handleSetHardening updates a server's desired hardening config (the
+// keep-public-SSH opt-out, CIS, and inbound exceptions). The change re-renders
+// the host.* DSD ops on the next reconcile. Project Admin+; audited.
+func (s *Server) handleSetHardening(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KeepPublicSSH bool `json:"keepPublicSsh"`
+		CISEnabled    bool `json:"cisEnabled"`
+		ExtraPorts    []struct {
+			Port  int    `json:"port"`
+			Proto string `json:"proto"`
+		} `json:"extraPorts"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	ports := make([]store.PortException, 0, len(req.ExtraPorts))
+	for _, p := range req.ExtraPorts {
+		if p.Port <= 0 || p.Port > 65535 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid port"})
+			return
+		}
+		ports = append(ports, store.PortException{Port: p.Port, Proto: p.Proto})
+	}
+	orgID, serverID := r.PathValue("orgId"), r.PathValue("serverId")
+	if err := s.domain.SetHardeningConfig(r.Context(), orgID, serverID, req.KeepPublicSSH, req.CISEnabled, ports, principalFrom(r).Name); err != nil {
+		s.writeStoreErr(w, err, "set hardening")
+		return
+	}
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {

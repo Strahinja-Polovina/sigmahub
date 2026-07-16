@@ -40,6 +40,13 @@ export type CpServer = {
   pubkey: string | null;
   lastSeenAt: string | null;
   createdAt: string;
+  // P1-5 onboarding + hardening posture.
+  distro?: string | null;
+  ready?: boolean;
+  meshPeerCount?: number;
+  hardeningScore?: number | null;
+  diskEncrypted?: boolean | null;
+  sshLocked?: boolean | null;
 };
 
 export type CpMetricPoint = {
@@ -205,10 +212,41 @@ export async function cpIssueBootstrapToken(
   orgId: string,
   input: { name: string; type: string; provider: string; region: string },
   actor?: CpActor
-): Promise<{ token: string; expiresAt: string }> {
+): Promise<{ token: string; serverId: string; expiresAt: string }> {
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/bootstrap-tokens`, {
     method: "POST",
     body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+/** SSH onboarding: pre-create the server + mint a per-server bootstrap keypair.
+ *  Returns the bound token + the OpenSSH public key to place on the host. */
+export async function cpProvisionServer(
+  orgId: string,
+  input: { name: string; type: string; provider: string; region: string; proxyRole: boolean; distro?: string },
+  actor: CpActor
+): Promise<{ serverId: string; token: string; expiresAt: string; bootstrapPubkey: string }> {
+  return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/provision`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+/** Update a server's hardening config (the keep-public-SSH opt-out, CIS, extra
+ *  inbound ports). Project Admin+ on the CP; audited. */
+export async function cpSetHardening(
+  orgId: string,
+  serverId: string,
+  input: { keepPublicSsh: boolean; cisEnabled: boolean; extraPorts?: { port: number; proto: string }[] },
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/hardening`, {
+    method: "POST",
+    body: JSON.stringify({
+      keepPublicSsh: input.keepPublicSsh,
+      cisEnabled: input.cisEnabled,
+      extraPorts: input.extraPorts ?? [],
+    }),
   }, { orgId, actor });
 }
 

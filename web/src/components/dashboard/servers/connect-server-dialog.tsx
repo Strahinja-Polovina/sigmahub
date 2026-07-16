@@ -8,6 +8,7 @@ import {
   Check,
   Copy,
   ShieldCheck,
+  ShieldAlert,
   Network,
   Loader2,
   Lock,
@@ -29,8 +30,22 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
-import { connectServer } from "@/server/actions/servers";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { connectServer, provisionServer } from "@/server/actions/servers";
 import { SERVER_TYPE_LABELS, SERVER_TYPE_ORDER } from "./server-meta";
+
+const DISTROS = [
+  { id: "ubuntu-24.04", label: "Ubuntu 24.04 LTS" },
+  { id: "ubuntu-22.04", label: "Ubuntu 22.04 LTS" },
+  { id: "debian-12", label: "Debian 12" },
+];
 
 function bootstrapCommand(orgSlug: string) {
   return `curl -fsSL https://get.sigmahub.io/agent | sh -s -- --org ${orgSlug} --token sk_boot_${orgSlug}_x92f`;
@@ -89,20 +104,28 @@ export function ConnectServerDialog({
   const [open, setOpen] = React.useState(false);
   const [tab, setTab] = React.useState("ssh");
   const [name, setName] = React.useState("");
+  const [ip, setIp] = React.useState("");
   const [type, setType] = React.useState<string>("general");
   const [provider, setProvider] = React.useState("");
   const [region, setRegion] = React.useState("");
+  const [distro, setDistro] = React.useState("ubuntu-24.04");
+  const [proxyRole, setProxyRole] = React.useState(false);
+  const [keepPublicSsh, setKeepPublicSsh] = React.useState(false);
   const [vpn, setVpn] = React.useState(false);
-  // CP mode: the real one-time bootstrap command, shown after issuance.
-  const [issued, setIssued] = React.useState<{ command: string; expiresAt: string } | null>(null);
+  // CP mode: the real one-time install command + bootstrap key, shown once.
+  const [issued, setIssued] = React.useState<{ command: string; expiresAt: string; bootstrapPubkey?: string } | null>(null);
   const [pending, startTransition] = React.useTransition();
 
   function reset() {
     setTab("ssh");
     setName("");
+    setIp("");
     setType("general");
     setProvider("");
     setRegion("");
+    setDistro("ubuntu-24.04");
+    setProxyRole(false);
+    setKeepPublicSsh(false);
     setVpn(false);
     setIssued(null);
   }
@@ -112,28 +135,36 @@ export function ConnectServerDialog({
     if (!n) return;
     startTransition(async () => {
       try {
-        const res = await connectServer({
-          orgId,
-          name: n,
-          type,
-          provider,
-          region,
-          byoVpn: vpn,
-        });
-        if (res.mode === "cp") {
-          // Keep the dialog open: the token inside the command is shown
-          // exactly once and has to be copied to the host.
-          setIssued({ command: res.command, expiresAt: res.expiresAt });
-          toast.success(`Bootstrap token issued for ${n}`, {
-            description: "Run the command on the host; the server appears once sigmad registers.",
+        if (cpMode) {
+          // SSH onboarding wizard: pre-create the server + mint the bootstrap
+          // keypair; the operator runs the returned cosign-verified installer.
+          const res = await provisionServer({
+            orgId,
+            name: n,
+            type,
+            provider,
+            region,
+            proxyRole,
+            distro,
+            keepPublicSsh,
           });
+          if (res.mode === "cp") {
+            setIssued({ command: res.command, expiresAt: res.expiresAt, bootstrapPubkey: res.bootstrapPubkey });
+            toast.success(`Provisioned ${n}`, {
+              description: "Run the installer on the host; it joins the mesh and appears as Ready.",
+            });
+          }
           return;
         }
-        toast.success(`${n} registered — provisioning`, {
-          description: `Bootstrap token ${res.bootstrapToken}. Run the command on the host, or simulate the agent check-in from the list.`,
-        });
-        setOpen(false);
-        reset();
+        // Demo mode: the simulated one-liner path.
+        const res = await connectServer({ orgId, name: n, type, provider, region, byoVpn: vpn });
+        if (res.mode === "sim") {
+          toast.success(`${n} registered — provisioning`, {
+            description: `Run the command on the host, or simulate the agent check-in from the list.`,
+          });
+          setOpen(false);
+          reset();
+        }
       } catch (err) {
         toast.error("Couldn’t connect server", {
           description: err instanceof Error ? err.message : "Please try again.",
@@ -237,22 +268,107 @@ export function ConnectServerDialog({
                   onChange={(e) => setRegion(e.target.value)}
                 />
               </div>
+              {cpMode && (
+                <>
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="srv-ip" className="text-xs text-muted-foreground">
+                      Host IP / address
+                    </Label>
+                    <Input
+                      id="srv-ip"
+                      placeholder="203.0.113.7"
+                      value={ip}
+                      onChange={(e) => setIp(e.target.value)}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="srv-distro" className="text-xs text-muted-foreground">
+                      OS
+                    </Label>
+                    <Select value={distro} onValueChange={(v) => setDistro(v ?? "ubuntu-24.04")}>
+                      <SelectTrigger id="srv-distro">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {DISTROS.map((d) => (
+                          <SelectItem key={d.id} value={d.id}>
+                            {d.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </>
+              )}
             </div>
+
+            {cpMode && (
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <Label htmlFor="srv-proxy" className="flex items-center gap-2 text-sm font-medium text-foreground">
+                    <Network className="size-4 text-muted-foreground" />
+                    Proxy / edge role
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Opens 80/443 in the firewall for the ingress proxy (P1-8).
+                  </p>
+                </div>
+                <Switch id="srv-proxy" checked={proxyRole} onCheckedChange={setProxyRole} />
+              </div>
+            )}
+
+            {/* SSH lockdown is the default; keeping public SSH is the warned opt-out. */}
+            {cpMode && (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex flex-col gap-0.5">
+                    <Label htmlFor="keep-ssh" className="flex items-center gap-2 text-sm font-medium text-foreground">
+                      <Lock className="size-4 text-muted-foreground" />
+                      Keep public SSH open
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Off (default): after enrollment sshd is bound to the mesh and
+                      port 22 is firewalled off.
+                    </p>
+                  </div>
+                  <Switch id="keep-ssh" checked={keepPublicSsh} onCheckedChange={setKeepPublicSsh} />
+                </div>
+                {keepPublicSsh && (
+                  <Alert variant="destructive">
+                    <ShieldAlert className="size-4" />
+                    <AlertTitle>Public SSH stays exposed</AlertTitle>
+                    <AlertDescription>
+                      Port 22 remains open to the internet and password auth is the
+                      only lockdown applied. Prefer mesh-only SSH unless a bastion
+                      requires it.
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-col gap-2">
               {cpMode ? (
                 issued ? (
                   <>
                     <Label className="text-xs text-muted-foreground">
-                      Run this on the server you want to connect — the token is
-                      shown once and expires at{" "}
-                      {new Date(issued.expiresAt).toLocaleTimeString()}
+                      Run this on the host — cosign-verified, the token is shown
+                      once and expires at {new Date(issued.expiresAt).toLocaleTimeString()}
                     </Label>
-                    <CopyField value={issued.command} ariaLabel="Copy bootstrap command" />
+                    <CopyField value={issued.command} ariaLabel="Copy install command" />
+                    {issued.bootstrapPubkey && (
+                      <>
+                        <Label className="pt-1 text-xs text-muted-foreground">
+                          Or, for hands-off SSH provisioning, authorize this
+                          one-time key (the installer removes it afterward):
+                        </Label>
+                        <CopyField value={issued.bootstrapPubkey} ariaLabel="Copy bootstrap key" />
+                      </>
+                    )}
                   </>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    A one-time bootstrap command is generated when you press
+                    A cosign-verified install command is generated when you press
                     “Connect server”.
                   </p>
                 )
@@ -275,7 +391,8 @@ export function ConnectServerDialog({
                   Connect over a VPN / jump host
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  For servers that are not publicly SSH-reachable.
+                  For servers that are not publicly SSH-reachable (the same
+                  one-liner runs over your bastion).
                 </p>
               </div>
               <Switch id="connect-vpn" checked={vpn} onCheckedChange={setVpn} />

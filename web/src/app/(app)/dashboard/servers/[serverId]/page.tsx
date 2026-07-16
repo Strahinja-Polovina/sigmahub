@@ -60,6 +60,13 @@ export default async function ServerDetailPage({
         hosted={hosted}
         cpMode
         metricsPoints={points}
+        hardening={{
+          ready: Boolean(cpServer.ready),
+          score: cpServer.hardeningScore ?? null,
+          diskEncrypted: cpServer.diskEncrypted ?? null,
+          sshLocked: cpServer.sshLocked ?? null,
+          distro: cpServer.distro ?? null,
+        }}
       />
     );
   }
