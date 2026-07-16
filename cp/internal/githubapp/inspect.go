@@ -103,7 +103,7 @@ func (i *Inspector) fetchFile(ctx context.Context, base, repo, path, token strin
 		return nil, false, fmt.Errorf("github contents %s: unexpected status %s", path, resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, false, err
 	}
@@ -111,16 +111,16 @@ func (i *Inspector) fetchFile(ctx context.Context, base, repo, path, token strin
 	if err := json.Unmarshal(body, &cr); err != nil {
 		return nil, false, fmt.Errorf("github contents %s: decode: %w", path, err)
 	}
-	if cr.Type != "file" {
+	// A per-file condition that isn't a base64 file — a directory/submodule, or a
+	// file too large to inline (GitHub returns encoding "none" above ~1 MB) — is
+	// SKIPPED, not fatal: one odd candidate must not abort detection of the rest.
+	if cr.Type != "file" || cr.Encoding != "base64" {
 		return nil, false, nil
-	}
-	if cr.Encoding != "base64" {
-		return nil, false, fmt.Errorf("github contents %s: unexpected encoding %q", path, cr.Encoding)
 	}
 	// The API wraps base64 content at 60 cols with newlines.
 	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(cr.Content, "\n", ""))
 	if err != nil {
-		return nil, false, fmt.Errorf("github contents %s: base64: %w", path, err)
+		return nil, false, nil
 	}
 	return decoded, true, nil
 }

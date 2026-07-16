@@ -15,6 +15,12 @@ import (
 // zeroSHA is git's all-zero object id, sent as `after` on a branch delete.
 const zeroSHA = "0000000000000000000000000000000000000000"
 
+// maxWebhookBytes caps a webhook body. GitHub push payloads embed the full
+// commits array and can legitimately exceed the 1 MiB default used for small
+// authenticated posts, so a large merge push isn't silently dropped; GitHub's
+// own delivery ceiling is 25 MiB.
+const maxWebhookBytes = 25 << 20
+
 // handleGitHubWebhook is the public, unauthenticated webhook receiver. Trust is
 // established purely by the HMAC-SHA256 signature over the raw body: a forged or
 // unsigned delivery is rejected before any parsing or state change. Processing
@@ -27,7 +33,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBytes))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unreadable body"})
 		return

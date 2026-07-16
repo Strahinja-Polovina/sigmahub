@@ -99,3 +99,32 @@ func TestInspectBadRepo(t *testing.T) {
 		t.Error("expected error for malformed repo name")
 	}
 }
+
+// TestInspectSkipsOversizeCandidate proves a candidate GitHub returns with
+// encoding "none" (too large to inline) is skipped, not fatal — a valid
+// Dockerfile in the same repo is still detected.
+func TestInspectSkipsOversizeCandidate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/contents/Dockerfile") {
+			enc := base64.StdEncoding.EncodeToString([]byte("FROM x\nEXPOSE 3000\n"))
+			_ = json.NewEncoder(w).Encode(map[string]string{"type": "file", "encoding": "base64", "content": enc})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/contents/docker-compose.yml") {
+			// Too large to inline → GitHub returns encoding "none", empty content.
+			_ = json.NewEncoder(w).Encode(map[string]string{"type": "file", "encoding": "none", "content": ""})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
+	d, err := insp.Inspect(context.Background(), "o/r", "")
+	if err != nil {
+		t.Fatalf("a skippable candidate must not abort detection: %v", err)
+	}
+	if !d.HasDockerfile || len(d.Ports) != 1 || d.Ports[0] != 3000 {
+		t.Errorf("Dockerfile should still be detected: %+v", d)
+	}
+}

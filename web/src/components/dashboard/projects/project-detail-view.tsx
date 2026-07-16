@@ -429,18 +429,22 @@ export function ProjectDetailView({
   panels,
   orgServers,
   orgId,
+  gitEnabled = false,
   gitConnections,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
   orgServers: OrgServer[];
   orgId?: string;
+  /** True only when the control plane backs git integration; the panel is
+   *  hidden in demo mode where every git action would error. */
+  gitEnabled?: boolean;
   gitConnections?: GitConnectionPanel[];
 }) {
   if (!project) return <NotFound />;
 
   const environments = panels.map((p) => ({ id: p.env.id, name: p.env.name }));
-  const showGit = Boolean(orgId && gitConnections);
+  const showGit = Boolean(gitEnabled && orgId && gitConnections);
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">

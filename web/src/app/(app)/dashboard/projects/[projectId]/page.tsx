@@ -59,6 +59,7 @@ export default async function ProjectDetailPage({
       panels={panels}
       orgServers={orgServers}
       orgId={orgId}
+      gitEnabled={cpEnabled()}
       gitConnections={gitConnections}
     />
   );
