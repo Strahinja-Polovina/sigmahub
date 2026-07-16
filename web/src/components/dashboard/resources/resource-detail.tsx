@@ -60,6 +60,7 @@ import { LogsViewer } from "./logs-viewer";
 import { VolumeDeleteDialog } from "./volume-delete-dialog";
 import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
+import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 
 type Deployment = {
   id: string;
@@ -174,8 +175,21 @@ function DeleteResourceButton({ resourceId, name }: { resourceId: string; name: 
   );
 }
 
-export function ResourceDetail({ detail }: { detail: Detail }) {
+export function ResourceDetail({
+  detail,
+  orgId,
+  domains = [],
+  domainsEnabled = false,
+}: {
+  detail: Detail;
+  orgId?: string;
+  domains?: DomainRow[];
+  /** True only when the control plane backs custom domains; the panel is hidden
+   *  in demo mode where the attach/detach actions would error. */
+  domainsEnabled?: boolean;
+}) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
+  const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
 
   const metrics = React.useMemo(() => getMetrics(resource.id), [resource.id]);
   const logs = React.useMemo(() => getLogs(resource.id), [resource.id]);
@@ -457,6 +471,15 @@ export function ResourceDetail({ detail }: { detail: Detail }) {
                 </FactRow>
               </CardContent>
             </Card>
+
+            {showDomains && (
+              <ResourceDomainsPanel
+                orgId={orgId!}
+                resourceId={resource.id}
+                domains={domains}
+                canManage={canManage}
+              />
+            )}
 
             <Card className="ring-destructive/20">
               <CardHeader className="border-b">

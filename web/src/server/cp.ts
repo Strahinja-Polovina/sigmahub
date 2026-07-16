@@ -701,6 +701,47 @@ export async function cpListGitConnectionsWithMaps(
   return settled;
 }
 
+// ── Custom domains (P1-8) ────────────────────────────────────────────────────
+
+export type CpDomain = {
+  id: string;
+  orgId: string;
+  resourceId: string;
+  domain: string;
+  challengeType: string;
+  certStatus: string; // pending | issuing | issued | failed
+  certSerial?: string;
+  certExpiresAt?: string;
+  lastError?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export async function cpListDomains(orgId: string, resourceId: string): Promise<CpDomain[]> {
+  const { domains } = await cpFetch<{ domains: CpDomain[] }>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/domains`, undefined, { orgId });
+  return domains;
+}
+
+export async function cpAttachDomain(
+  orgId: string,
+  resourceId: string,
+  input: { domain: string; challengeType?: string },
+  actor: CpActor
+): Promise<CpDomain> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/domains`, {
+    method: "POST",
+    body: JSON.stringify({ domain: input.domain, challengeType: input.challengeType ?? "http" }),
+  }, { orgId, actor });
+}
+
+export async function cpDetachDomain(orgId: string, domainId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/domains/${encodeURIComponent(domainId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
 export function cpKind(localKind: string): string {
   return localKind === "mongo" ? "mongodb" : localKind;
