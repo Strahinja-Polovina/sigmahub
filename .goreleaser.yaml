@@ -58,6 +58,12 @@ signs:
 
 release:
   prerelease: auto
+  # Ship the P1-5 onboarding installer + systemd unit as release assets so the
+  # connect-server wizard can point a host at a stable URL. install.sh itself is
+  # served over HTTPS and cosign-verifies the sigmad binary it downloads.
+  extra_files:
+    - glob: ./agent/packaging/install.sh
+    - glob: ./agent/packaging/sigmad.service
 
 changelog:
   disable: true
