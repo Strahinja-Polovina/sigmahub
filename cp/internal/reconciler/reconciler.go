@@ -91,7 +91,11 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	// already opened 80/443 (proxyRole feeds renderHostOps), so this only stands
 	// up the proxy + ACME resolver; the router labels ride on the app containers.
 	if hardening.ProxyRole {
-		ops = append(ops, renderTraefikOp(serverID, acme))
+		var serverDomains []store.Domain
+		for _, ds := range domains {
+			serverDomains = append(serverDomains, ds...)
+		}
+		ops = append(ops, renderTraefikOp(serverID, acme, serverDomains))
 	}
 	for _, p := range pending {
 		ops = append(ops, renderVolumeRemoveOp(p))

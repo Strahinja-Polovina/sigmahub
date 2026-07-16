@@ -50,10 +50,10 @@ type hardeningReport struct {
 }
 
 type heartbeatRequest struct {
-	AgentVersion string              `json:"agentVersion"`
-	Facts        json.RawMessage     `json:"facts"`
-	Pubkey       string              `json:"pubkey"`
-	Endpoint     string              `json:"endpoint"`
+	AgentVersion  string              `json:"agentVersion"`
+	Facts         json.RawMessage     `json:"facts"`
+	Pubkey        string              `json:"pubkey"`
+	Endpoint      string              `json:"endpoint"`
 	Metrics       *store.MetricSample `json:"metrics"`
 	Hardening     *hardeningReport    `json:"hardening"`
 	MeshApplied   bool                `json:"meshApplied"`
@@ -76,10 +76,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, store.HeartbeatInput{
-		AgentVersion: req.AgentVersion,
-		Facts:        req.Facts,
-		Pubkey:       req.Pubkey,
-		Endpoint:     req.Endpoint,
+		AgentVersion:  req.AgentVersion,
+		Facts:         req.Facts,
+		Pubkey:        req.Pubkey,
+		Endpoint:      req.Endpoint,
 		Metrics:       req.Metrics,
 		Hardening:     hardening,
 		MeshApplied:   req.MeshApplied,
@@ -113,6 +113,10 @@ func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validCertStatus bounds the cert-status values an agent may report, so a buggy
+// or compromised agent can't persist an arbitrary status string.
+var validCertStatus = map[string]bool{"pending": true, "issuing": true, "issued": true, "failed": true}
+
 // handleAgentDomainStatus ingests the ACME certificate state the agent reads
 // from Traefik's acme store. Each entry is scoped to the reporting server, so an
 // agent can only update cert state for domains routed to a resource it hosts.
@@ -133,8 +137,8 @@ func (s *Server) handleAgentDomainStatus(w http.ResponseWriter, r *http.Request)
 	srv := serverFrom(r)
 	applied := 0
 	for _, d := range req.Domains {
-		if strings.TrimSpace(d.Domain) == "" {
-			continue
+		if strings.TrimSpace(d.Domain) == "" || !validCertStatus[d.Status] {
+			continue // ignore blank domains and unknown status values
 		}
 		err := s.store.SetDomainCertStatus(r.Context(), srv.ID, d.Domain, d.Status, d.Serial, d.ExpiresAt, d.Error)
 		if errors.Is(err, store.ErrNotFound) {

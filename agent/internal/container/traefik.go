@@ -82,9 +82,15 @@ func traefikArgs(spec TraefikSpec) []string {
 
 // buildTraefikCreateBody assembles the Docker create body for the proxy. The
 // container carries the same isolation defaults as workloads (no-new-privileges,
-// apparmor), publishes 80/443, mounts the Docker socket read-only (the provider
-// reads router labels) and a persistent ACME volume (the idempotency mechanism:
-// the held certificate survives a recreate, so no new ACME order is placed).
+// apparmor), publishes 80/443, and mounts a persistent ACME volume (the
+// idempotency mechanism: the held certificate survives a recreate, so no new
+// ACME order is placed).
+//
+// The Docker socket is mounted for the label provider. The `:ro` bind only makes
+// the socket FILE read-only — it does NOT restrict the Docker API, so the proxy
+// still has effective host-root through the daemon. This is inherent to Traefik's
+// docker provider; a socket-proxy that exposes a read-only API subset is the
+// hardening follow-up (tracked for a later phase), not shipped here.
 func buildTraefikCreateBody(spec TraefikSpec) map[string]any {
 	labels := map[string]string{
 		LabelManaged:         "true",

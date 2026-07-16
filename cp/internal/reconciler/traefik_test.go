@@ -70,6 +70,55 @@ func TestRenderAppLabelsWhenDomainAttached(t *testing.T) {
 	}
 }
 
+func TestTraefikChallengeTypeFromDomains(t *testing.T) {
+	spec, _ := json.Marshal(map[string]any{"image": "nginx", "ports": []map[string]any{{"container": 8080}}})
+	specs := []store.ResourceSpec{{ResourceID: "res_a", ProjectID: "proj_x", Kind: "app", Spec: spec}}
+
+	// Every domain requests tls-alpn → resolver uses tls-alpn.
+	allAlpn := map[string][]store.Domain{"res_a": {
+		{Domain: "a.example.com", ChallengeType: "tls-alpn"},
+		{Domain: "b.example.com", ChallengeType: "tls-alpn"},
+	}}
+	ops, _ := renderOps("srv_p", specs, nil, nil, store.HostHardening{ProxyRole: true}, allAlpn, ACMEConfig{})
+	op, _ := opByID(ops, "proxy:traefik:srv_p")
+	var ts traefikOpSpec
+	_ = json.Unmarshal(op.Spec, &ts)
+	if ts.ChallengeType != "tls-alpn" {
+		t.Errorf("all-tls-alpn domains → challenge %q, want tls-alpn", ts.ChallengeType)
+	}
+
+	// A mix → fall back to http (never silently break an http-01 domain).
+	mixed := map[string][]store.Domain{"res_a": {
+		{Domain: "a.example.com", ChallengeType: "tls-alpn"},
+		{Domain: "b.example.com", ChallengeType: "http"},
+	}}
+	ops, _ = renderOps("srv_p", specs, nil, nil, store.HostHardening{ProxyRole: true}, mixed, ACMEConfig{})
+	op, _ = opByID(ops, "proxy:traefik:srv_p")
+	_ = json.Unmarshal(op.Spec, &ts)
+	if ts.ChallengeType != "http" {
+		t.Errorf("mixed challenge domains → %q, want http", ts.ChallengeType)
+	}
+}
+
+func TestRenderNoPortLabelWhenAppDeclaresNone(t *testing.T) {
+	// App with no declared ports + a domain → no loadbalancer port label (Traefik
+	// auto-detects) instead of a misleading default of 80.
+	spec, _ := json.Marshal(map[string]any{"image": "nginx"})
+	specs := []store.ResourceSpec{{ResourceID: "res_a", ProjectID: "proj_x", Kind: "app", Spec: spec}}
+	domains := map[string][]store.Domain{"res_a": {{Domain: "app.example.com"}}}
+	ops, _ := renderOps("srv_p", specs, nil, nil, store.HostHardening{ProxyRole: true}, domains, ACMEConfig{})
+	ctr, _ := opByID(ops, "res:res_a")
+	var cs containerOpSpec
+	_ = json.Unmarshal(ctr.Spec, &cs)
+	router := dsd.TraefikRouterName("res_a")
+	if _, ok := cs.Labels["traefik.http.services."+router+".loadbalancer.server.port"]; ok {
+		t.Errorf("portless app must not pin a loadbalancer port: %v", cs.Labels)
+	}
+	if cs.Labels["traefik.enable"] != "true" {
+		t.Error("router should still be enabled")
+	}
+}
+
 func TestRenderNoLabelsWithoutDomain(t *testing.T) {
 	spec, _ := json.Marshal(map[string]any{"image": "nginx", "ports": []map[string]any{{"container": 8080}}})
 	specs := []store.ResourceSpec{{ResourceID: "res_a", ProjectID: "proj_x", Kind: "app", Spec: spec}}

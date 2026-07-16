@@ -108,19 +108,26 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 	}
 }
 
-// desiredNames is the set of container names the document wants running.
+// desiredNames is the set of container names the document wants running — the
+// GC keep-set. It covers both container.apply workloads AND the Traefik proxy
+// (a proxy.traefik op), which carries the managed label but is not a
+// container.apply, so it would otherwise be force-removed by GC on every apply.
+// Keying the proxy off the op's presence also gives correct teardown: when the
+// proxy role is cleared the op disappears from the document and GC removes it.
 func desiredNames(doc dsd.Document) map[string]bool {
 	names := map[string]bool{}
 	for _, op := range doc.Ops {
-		if op.Kind != KindContainerApply {
-			continue
-		}
-		var spec ContainerSpec
-		if err := json.Unmarshal(op.Spec, &spec); err != nil {
-			continue
-		}
-		if spec.Name != "" {
-			names[spec.Name] = true
+		switch op.Kind {
+		case KindProxyTraefik:
+			names[traefikContainerName] = true
+		case KindContainerApply:
+			var spec ContainerSpec
+			if err := json.Unmarshal(op.Spec, &spec); err != nil {
+				continue
+			}
+			if spec.Name != "" {
+				names[spec.Name] = true
+			}
 		}
 	}
 	return names

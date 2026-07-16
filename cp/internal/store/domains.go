@@ -4,11 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// hostnameRe is a strict RFC-1123 FQDN: dot-separated labels of [a-z0-9-] (no
+// leading/trailing hyphen), at least two labels. This is the ONLY shape allowed
+// as a domain, so a value can never carry Traefik router-rule syntax (backticks,
+// parentheses, `||`, `*`) into the signed DSD's Host(`…`) labels.
+var hostnameRe = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // Domain is a custom domain attached to an app resource, plus the reported ACME
 // certificate state.
@@ -37,8 +44,8 @@ var validChallengeTypes = map[string]bool{"http": true, "tls-alpn": true, "dns":
 // can re-render its DSD.
 func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (Domain, string, error) {
 	domain = strings.ToLower(strings.TrimSpace(domain))
-	if domain == "" || !strings.Contains(domain, ".") || strings.ContainsAny(domain, " /") {
-		return Domain{}, "", ErrInvalid{Msg: "domain must be a valid fully-qualified hostname"}
+	if len(domain) > 253 || !hostnameRe.MatchString(domain) {
+		return Domain{}, "", ErrInvalid{Msg: "domain must be a valid fully-qualified hostname (e.g. app.example.com); wildcards are not supported until DNS-01 (P1-12)"}
 	}
 	if challengeType == "" {
 		challengeType = "http"

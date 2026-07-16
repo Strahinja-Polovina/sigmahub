@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
 
 func hasArg(args []string, substr string) bool {
@@ -136,6 +138,31 @@ func TestParseLeaf(t *testing.T) {
 	}
 	if expiry == nil || !expiry.Equal(notAfter) {
 		t.Errorf("expiry = %v, want %v", expiry, notAfter)
+	}
+}
+
+// TestDesiredNamesKeepsProxy proves GC's keep-set includes the Traefik proxy
+// when the document carries a proxy.traefik op — without this, GC (which lists
+// every managed container) force-removes the proxy after every apply.
+func TestDesiredNamesKeepsProxy(t *testing.T) {
+	appSpec, _ := json.Marshal(ContainerSpec{Name: "sigmahub-res_a"})
+	doc := dsd.Document{Ops: []dsd.Op{
+		{ID: "res:res_a", Kind: KindContainerApply, Spec: appSpec},
+		{ID: "proxy:traefik:srv", Kind: KindProxyTraefik, Spec: []byte(`{}`)},
+	}}
+	names := desiredNames(doc)
+	if !names[traefikContainerName] {
+		t.Errorf("keep-set must include the Traefik proxy %q; got %v", traefikContainerName, names)
+	}
+	if !names["sigmahub-res_a"] {
+		t.Error("keep-set must still include app containers")
+	}
+
+	// With the proxy role cleared (no proxy.traefik op), the proxy is NOT kept —
+	// so GC correctly tears it down.
+	doc2 := dsd.Document{Ops: []dsd.Op{{ID: "res:res_a", Kind: KindContainerApply, Spec: appSpec}}}
+	if desiredNames(doc2)[traefikContainerName] {
+		t.Error("without a proxy.traefik op the proxy must not be in the keep-set")
 	}
 }
 
