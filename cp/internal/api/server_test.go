@@ -130,6 +130,10 @@ func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Res
 func (f *fakeDomain) DeleteResource(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
+func (f *fakeDomain) SetHardeningConfig(context.Context, string, string, bool, bool, []store.PortException, string) error {
+	return nil
+}
+
 func (f *fakeDomain) SetProxyRole(context.Context, string, string, bool, string) error {
 	return nil
 }

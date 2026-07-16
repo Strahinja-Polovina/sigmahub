@@ -201,16 +201,26 @@ function HostedResourceRow({ resource }: { resource: HostedRow }) {
   );
 }
 
+export type HardeningInfo = {
+  ready: boolean;
+  score: number | null;
+  diskEncrypted: boolean | null;
+  sshLocked: boolean | null;
+  distro: string | null;
+};
+
 export function ServerDetailView({
   server,
   hosted,
   cpMode,
   metricsPoints,
+  hardening,
 }: {
   server: ServerRowT;
   hosted: HostedRow[];
   cpMode?: boolean;
   metricsPoints?: MetricsPoint[];
+  hardening?: HardeningInfo | null;
 }) {
   const provisioning = server.status === "provisioning";
 
@@ -309,6 +319,70 @@ export function ServerDetailView({
           </CardContent>
         </Card>
       </div>
+
+      {hardening && (
+        <Card>
+          <CardHeader className="border-b">
+            <CardTitle>Security &amp; hardening</CardTitle>
+            <CardDescription>
+              Firewall, SSH lockdown, and CIS controls are applied as signed
+              desired-state ops; posture is re-checked daily.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <SpecItem
+              icon={ShieldCheck}
+              label="Mesh readiness"
+              value={
+                <Badge variant={hardening.ready ? "default" : "outline"} className="font-normal">
+                  {hardening.ready ? "Ready" : "Not yet ready"}
+                </Badge>
+              }
+            />
+            <SpecItem
+              icon={ShieldCheck}
+              label="Hardening score"
+              value={
+                hardening.score == null ? (
+                  "—"
+                ) : (
+                  <span className="inline-flex items-center gap-2">
+                    <span
+                      className={
+                        hardening.score >= 80
+                          ? "font-medium text-emerald-600"
+                          : hardening.score >= 50
+                            ? "font-medium text-amber-600"
+                            : "font-medium text-red-600"
+                      }
+                    >
+                      {hardening.score}
+                    </span>
+                    <span className="text-muted-foreground">/ 100</span>
+                  </span>
+                )
+              }
+            />
+            <SpecItem
+              icon={ShieldCheck}
+              label="SSH"
+              value={hardening.sshLocked == null ? "—" : hardening.sshLocked ? "Locked down" : "Password auth on"}
+            />
+            <SpecItem
+              icon={ShieldCheck}
+              label="Disk encryption"
+              value={
+                hardening.diskEncrypted == null
+                  ? "—"
+                  : hardening.diskEncrypted
+                    ? "Enabled"
+                    : "Not detected"
+              }
+            />
+            {hardening.distro && <SpecItem icon={Network} label="OS" value={hardening.distro} />}
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader className="border-b">
