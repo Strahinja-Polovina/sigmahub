@@ -21,11 +21,35 @@ type Detected struct {
 	ComposePath   string   `json:"composePath,omitempty"`
 	Ports         []int    `json:"ports"`
 	Env           []string `json:"env"`
-	HealthCheck   string   `json:"healthCheck,omitempty"`
+	// HealthCheck is always populated: a probe detected from the repo, or — when
+	// nothing is declared — a default TCP probe on the primary declared port. It
+	// is the spec field the P1-9 zero-downtime gate consumes.
+	HealthCheck HealthCheck `json:"healthCheck"`
 	// Deployable is false when the repo ships neither a Dockerfile nor a Compose
 	// file; Reason then carries an actionable message for the UI.
 	Deployable bool   `json:"deployable"`
 	Reason     string `json:"reason,omitempty"`
+}
+
+// HealthCheck is the resource's readiness probe. Type is "http" when a path was
+// detected, otherwise "tcp". Source records where it came from ("dockerfile",
+// "compose", or "default" when synthesized as a TCP probe on the primary port).
+type HealthCheck struct {
+	Type        string `json:"type"`
+	Path        string `json:"path,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	IntervalSec int    `json:"intervalSec"`
+	Source      string `json:"source"`
+}
+
+// healthAccum collects health-check hints while scanning; finalized against the
+// detected ports so a repo with no declared probe still gets a TCP default.
+type healthAccum struct {
+	found       bool
+	source      string
+	path        string
+	port        int
+	intervalSec int
 }
 
 // Candidate file names, in precedence order.
@@ -61,12 +85,13 @@ func Detect(files map[string][]byte) Detected {
 
 	portSet := map[int]bool{}
 	envSet := map[string]bool{}
+	var hc healthAccum
 
 	if d.HasDockerfile {
-		parseDockerfile(dockerfile, portSet, envSet, &d)
+		parseDockerfile(dockerfile, portSet, envSet, &hc)
 	}
 	if d.HasCompose {
-		parseCompose(compose, portSet, envSet, &d)
+		parseCompose(compose, portSet, envSet, &hc)
 	}
 
 	for p := range portSet {
@@ -78,6 +103,8 @@ func Detect(files map[string][]byte) Detected {
 	}
 	sort.Strings(d.Env)
 
+	d.HealthCheck = finalizeHealth(hc, d.Ports)
+
 	d.Deployable = d.HasDockerfile || d.HasCompose
 	if !d.Deployable {
 		d.Reason = "no Dockerfile or Compose file found at the repository root — sigmahub needs one to build and run this app"
@@ -85,18 +112,81 @@ func Detect(files map[string][]byte) Detected {
 	return d
 }
 
+// finalizeHealth turns collected hints into a probe. A declared HTTP path wins
+// (http probe); a declared-but-command-only check becomes a TCP probe on the
+// primary port; nothing declared synthesizes a default TCP probe — matching the
+// SIGMA-46 requirement that a health check is always pre-filled.
+func finalizeHealth(hc healthAccum, ports []int) HealthCheck {
+	primary := 0
+	if len(ports) > 0 {
+		primary = ports[0]
+	}
+	out := HealthCheck{IntervalSec: 10}
+	if hc.intervalSec > 0 {
+		out.IntervalSec = hc.intervalSec
+	}
+	switch {
+	case hc.found && hc.path != "":
+		out.Type, out.Path, out.Source = "http", hc.path, hc.source
+		out.Port = hc.port
+		if out.Port == 0 {
+			out.Port = primary
+		}
+	case hc.found:
+		out.Type, out.Port, out.Source = "tcp", primary, hc.source
+	default:
+		out.Type, out.Port, out.Source = "tcp", primary, "default"
+	}
+	return out
+}
+
 var (
 	exposeRe   = regexp.MustCompile(`(?i)^\s*EXPOSE\s+(.+)$`)
 	envRe      = regexp.MustCompile(`(?i)^\s*ENV\s+(.+)$`)
 	argRe      = regexp.MustCompile(`(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	healthRe   = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s`)
-	portNumRe  = regexp.MustCompile(`(\d{1,5})`)
-	envNameRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	quoteTrim  = "\"'"
-	composePad = regexp.MustCompile(`^\s*`)
+	healthRe    = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s`)
+	portNumRe   = regexp.MustCompile(`(\d{1,5})`)
+	envNameRe   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	quoteTrim   = "\"'"
+	composePad  = regexp.MustCompile(`^\s*`)
+	urlRe       = regexp.MustCompile(`https?://[^/\s"']+(?::(\d+))?(/[^\s"'\],)]*)?`)
+	intervalRe  = regexp.MustCompile(`(?i)--interval[= ](\d+)(ms|s|m)?`)
+	cIntervalRe = regexp.MustCompile(`(?i)^\s*interval:\s*(\d+)(ms|s|m)?`)
 )
 
-func parseDockerfile(b []byte, ports map[int]bool, env map[string]bool, d *Detected) {
+// httpProbeFromLine extracts an HTTP path (and optional port) from a health-check
+// command line that curls/wgets a URL. Returns ok=false when no URL is present.
+func httpProbeFromLine(line string) (path string, port int, ok bool) {
+	m := urlRe.FindStringSubmatch(line)
+	if m == nil {
+		return "", 0, false
+	}
+	if m[1] != "" {
+		if p, err := strconv.Atoi(m[1]); err == nil {
+			port = p
+		}
+	}
+	path = m[2]
+	if path == "" {
+		path = "/"
+	}
+	return path, port, true
+}
+
+// durationSec parses a compact "30s" / "2m" / "500ms" duration to whole seconds
+// (ms floors to 0, which the caller treats as "use the default interval").
+func durationSec(n int, unit string) int {
+	switch strings.ToLower(unit) {
+	case "m":
+		return n * 60
+	case "ms":
+		return 0
+	default: // "s" or empty
+		return n
+	}
+}
+
+func parseDockerfile(b []byte, ports map[int]bool, env map[string]bool, hc *healthAccum) {
 	for _, raw := range strings.Split(string(b), "\n") {
 		line := strings.TrimRight(raw, "\r")
 		if m := exposeRe.FindStringSubmatch(line); m != nil {
@@ -106,7 +196,15 @@ func parseDockerfile(b []byte, ports map[int]bool, env map[string]bool, d *Detec
 			continue
 		}
 		if healthRe.MatchString(line) && !strings.Contains(strings.ToUpper(line), "NONE") {
-			d.HealthCheck = "docker HEALTHCHECK"
+			hc.found = true
+			hc.source = "dockerfile"
+			if p, port, ok := httpProbeFromLine(line); ok {
+				hc.path, hc.port = p, port
+			}
+			if m := intervalRe.FindStringSubmatch(line); m != nil {
+				n, _ := strconv.Atoi(m[1])
+				hc.intervalSec = durationSec(n, m[2])
+			}
 			continue
 		}
 		if m := envRe.FindStringSubmatch(line); m != nil {
@@ -163,9 +261,9 @@ func addPort(ports map[int]bool, tok string) {
 // three fields the wizard pre-fills: published ports, environment keys, and
 // whether any service declares a healthcheck. It is not a general YAML parser;
 // it recognizes the common `ports:`/`environment:`/`healthcheck:` block shapes.
-func parseCompose(b []byte, ports map[int]bool, env map[string]bool, d *Detected) {
+func parseCompose(b []byte, ports map[int]bool, env map[string]bool, hc *healthAccum) {
 	lines := strings.Split(string(b), "\n")
-	mode := "" // "ports" | "env"
+	mode := "" // "ports" | "env" | "health"
 	blockIndent := -1
 	for _, raw := range lines {
 		line := strings.TrimRight(raw, "\r")
@@ -197,7 +295,9 @@ func parseCompose(b []byte, ports map[int]bool, env map[string]bool, d *Detected
 			}
 			continue
 		case trimmed == "healthcheck:" || strings.HasPrefix(trimmed, "healthcheck:"):
-			d.HealthCheck = "compose healthcheck"
+			mode, blockIndent = "health", indent
+			hc.found = true
+			hc.source = "compose"
 			continue
 		}
 
@@ -208,6 +308,18 @@ func parseCompose(b []byte, ports map[int]bool, env map[string]bool, d *Detected
 			}
 		case "env":
 			composeEnvItem(trimmed, env)
+		case "health":
+			// Inside the healthcheck block: pull an HTTP path from the test
+			// command and the interval, if present.
+			if hc.path == "" {
+				if p, port, ok := httpProbeFromLine(trimmed); ok {
+					hc.path, hc.port = p, port
+				}
+			}
+			if m := cIntervalRe.FindStringSubmatch(trimmed); m != nil {
+				n, _ := strconv.Atoi(m[1])
+				hc.intervalSec = durationSec(n, m[2])
+			}
 		}
 	}
 }

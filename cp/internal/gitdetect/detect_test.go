@@ -30,15 +30,33 @@ CMD ["node","server.js"]`)
 	if !reflect.DeepEqual(d.Env, wantEnv) {
 		t.Errorf("env = %v, want %v", d.Env, wantEnv)
 	}
-	if d.HealthCheck == "" {
-		t.Error("HEALTHCHECK should be detected")
+	hc := d.HealthCheck
+	if hc.Type != "http" || hc.Path != "/health" || hc.Port != 3000 || hc.Source != "dockerfile" {
+		t.Errorf("health check = %+v, want http /health:3000 from dockerfile", hc)
+	}
+	if hc.IntervalSec != 30 {
+		t.Errorf("interval = %d, want 30 (from --interval=30s)", hc.IntervalSec)
 	}
 }
 
 func TestDetectHealthcheckNone(t *testing.T) {
-	d := Detect(map[string][]byte{"Dockerfile": []byte("FROM x\nHEALTHCHECK NONE\n")})
-	if d.HealthCheck != "" {
-		t.Errorf("HEALTHCHECK NONE must not register a health check, got %q", d.HealthCheck)
+	// HEALTHCHECK NONE declares no probe → a default TCP probe on the primary
+	// declared port is synthesized (SIGMA-46: always pre-filled).
+	d := Detect(map[string][]byte{"Dockerfile": []byte("FROM x\nEXPOSE 8080\nHEALTHCHECK NONE\n")})
+	hc := d.HealthCheck
+	if hc.Type != "tcp" || hc.Source != "default" || hc.Port != 8080 {
+		t.Errorf("HEALTHCHECK NONE → health check = %+v, want default tcp:8080", hc)
+	}
+}
+
+func TestDetectDefaultTCPProbe(t *testing.T) {
+	// No health check declared at all → default TCP probe on the primary port.
+	d := Detect(map[string][]byte{"Dockerfile": []byte("FROM x\nEXPOSE 5000\n")})
+	if d.HealthCheck.Type != "tcp" || d.HealthCheck.Port != 5000 || d.HealthCheck.Source != "default" {
+		t.Errorf("default probe = %+v, want tcp:5000 default", d.HealthCheck)
+	}
+	if d.HealthCheck.IntervalSec != 10 {
+		t.Errorf("default interval = %d, want 10", d.HealthCheck.IntervalSec)
 	}
 }
 
@@ -75,8 +93,12 @@ func TestDetectCompose(t *testing.T) {
 	if !reflect.DeepEqual(d.Env, wantEnv) {
 		t.Errorf("env = %v, want %v", d.Env, wantEnv)
 	}
-	if d.HealthCheck == "" {
-		t.Error("compose healthcheck should be detected")
+	if d.HealthCheck.Source != "compose" {
+		t.Errorf("compose healthcheck should be detected, got %+v", d.HealthCheck)
+	}
+	// The healthcheck test curls http://localhost → an HTTP probe on path "/".
+	if d.HealthCheck.Type != "http" || d.HealthCheck.Path != "/" {
+		t.Errorf("compose health probe = %+v, want http /", d.HealthCheck)
 	}
 }
 
