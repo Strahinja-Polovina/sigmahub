@@ -1,0 +1,323 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// Deployment is one immutable release-history row: the git SHA + built image
+// digest + config hash that were rolled out, plus the outcome and duration.
+type Deployment struct {
+	ID              string     `json:"id"`
+	OrgID           string     `json:"orgId"`
+	ResourceID      string     `json:"resourceId"`
+	EnvironmentID   string     `json:"environmentId,omitempty"`
+	ServerID        string     `json:"serverId,omitempty"`
+	ConnectionID    string     `json:"connectionId,omitempty"`
+	Trigger         string     `json:"trigger"` // git | manual | rollback
+	GitRef          string     `json:"gitRef,omitempty"`
+	GitSHA          string     `json:"gitSha,omitempty"`
+	ImageDigest     string     `json:"imageDigest,omitempty"`
+	ConfigHash      string     `json:"configHash,omitempty"`
+	Status          string     `json:"status"`
+	Detail          string     `json:"detail,omitempty"`
+	RollbackOf      string     `json:"rollbackOf,omitempty"`
+	BuildSeconds    *int       `json:"buildSeconds,omitempty"`
+	DurationSeconds *int       `json:"durationSeconds,omitempty"`
+	CreatedBy       string     `json:"createdBy,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	StartedAt       *time.Time `json:"startedAt,omitempty"`
+	FinishedAt      *time.Time `json:"finishedAt,omitempty"`
+}
+
+// Build tracks a dedup-keyed image build so a retry of the same inputs reuses the
+// already-built image instead of rebuilding.
+type Build struct {
+	ID          string    `json:"id"`
+	OrgID       string    `json:"orgId"`
+	ResourceID  string    `json:"resourceId"`
+	ServerID    string    `json:"serverId,omitempty"`
+	DedupKey    string    `json:"dedupKey"`
+	GitSHA      string    `json:"gitSha,omitempty"`
+	ImageRef    string    `json:"imageRef,omitempty"`
+	ImageDigest string    `json:"imageDigest,omitempty"`
+	Status      string    `json:"status"` // pending|building|built|failed
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+// terminalDeployStatus is true for statuses that freeze the row (the immutable
+// history invariant): a terminal deployment is never transitioned again.
+func terminalDeployStatus(s string) bool {
+	switch s {
+	case "success", "failed", "superseded", "rolled_back":
+		return true
+	}
+	return false
+}
+
+// CreateDeploymentInput queues a new deploy.
+type CreateDeploymentInput struct {
+	ResourceID    string
+	EnvironmentID string
+	ServerID      string
+	ConnectionID  string
+	Trigger       string // git | manual | rollback
+	GitRef        string
+	GitSHA        string
+	ConfigHash    string
+	RollbackOf    string
+	ImageDigest   string // set immediately for a rollback (reuses a built image)
+}
+
+// CreateDeployment appends a queued deployment row (org-scoped via the resource).
+// Audited.
+func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDeploymentInput, actor string) (Deployment, error) {
+	trigger := in.Trigger
+	if trigger == "" {
+		trigger = "manual"
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The resource must belong to the org; capture its server if not supplied.
+	var serverID string
+	err = tx.QueryRow(ctx,
+		`SELECT server_id FROM resources WHERE org_id = $1 AND id = $2`, orgID, in.ResourceID).Scan(&serverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Deployment{}, ErrNotFound
+	}
+	if err != nil {
+		return Deployment{}, err
+	}
+	if in.ServerID != "" {
+		serverID = in.ServerID
+	}
+
+	d := Deployment{
+		ID: newID("dep"), OrgID: orgID, ResourceID: in.ResourceID, EnvironmentID: in.EnvironmentID,
+		ServerID: serverID, ConnectionID: in.ConnectionID, Trigger: trigger, GitRef: in.GitRef,
+		GitSHA: in.GitSHA, ConfigHash: in.ConfigHash, ImageDigest: in.ImageDigest,
+		RollbackOf: in.RollbackOf, Status: "queued", CreatedBy: actor,
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
+		                         git_ref, git_sha, image_digest, config_hash, rollback_of, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,$8,$9,NULLIF($10,''),$11,NULLIF($12,''),'queued',$13)
+		RETURNING created_at`,
+		d.ID, orgID, in.ResourceID, in.EnvironmentID, serverID, in.ConnectionID, trigger,
+		in.GitRef, in.GitSHA, in.ImageDigest, in.ConfigHash, in.RollbackOf, actor).Scan(&d.CreatedAt)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Deploy queued ("+trigger+")", in.ResourceID); err != nil {
+		return Deployment{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, err
+	}
+	return d, nil
+}
+
+// DeploymentStatusUpdate carries an outcome transition. Fields left nil/empty are
+// unchanged; timings are stamped by the DB.
+type DeploymentStatusUpdate struct {
+	Status       string
+	Detail       string
+	ImageDigest  string
+	BuildSeconds *int
+	MarkStarted  bool
+	MarkFinished bool
+}
+
+// SetDeploymentStatus transitions a deployment. A terminal row is frozen (the
+// immutable-history invariant): transitioning it is a no-op that returns
+// ErrConflict, so a late/duplicate report can't rewrite a finished release.
+func (s *Store) SetDeploymentStatus(ctx context.Context, deploymentID string, up DeploymentStatusUpdate) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var cur string
+	var startedAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT status, started_at FROM deployments WHERE id = $1 FOR UPDATE`, deploymentID).Scan(&cur, &startedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if terminalDeployStatus(cur) {
+		return ErrConflict
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE deployments SET
+			status = $2,
+			detail = CASE WHEN $3 = '' THEN detail ELSE $3 END,
+			image_digest = COALESCE(NULLIF($4,''), image_digest),
+			build_seconds = COALESCE($5, build_seconds),
+			started_at = CASE WHEN $6 AND started_at IS NULL THEN now() ELSE started_at END,
+			finished_at = CASE WHEN $7 THEN now() ELSE finished_at END,
+			duration_seconds = CASE WHEN $7 THEN
+				GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int)
+				ELSE duration_seconds END
+		WHERE id = $1`,
+		deploymentID, up.Status, up.Detail, up.ImageDigest, up.BuildSeconds, up.MarkStarted, up.MarkFinished)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ListDeployments returns a resource's release history newest-first (org-scoped).
+func (s *Store) ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]Deployment, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
+		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
+		       created_by, created_at, started_at, finished_at
+		  FROM deployments WHERE org_id = $1 AND resource_id = $2
+		 ORDER BY created_at DESC LIMIT $3`, orgID, resourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+// RollbackTargets returns a resource's last N SUCCESSFUL releases (each with a
+// built image digest), newest-first — the candidates a &lt;30s rebuild-free
+// rollback can pick from.
+func (s *Store) RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]Deployment, error) {
+	if limit <= 0 || limit > 10 {
+		limit = 10
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
+		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
+		       created_by, created_at, started_at, finished_at
+		  FROM deployments
+		 WHERE org_id = $1 AND resource_id = $2 AND status = 'success' AND image_digest IS NOT NULL
+		 ORDER BY created_at DESC LIMIT $3`, orgID, resourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
+	out := []Deployment{}
+	for rows.Next() {
+		var d Deployment
+		var env, srv, conn, ref, sha, digest, cfg, rollback *string
+		if err := rows.Scan(&d.ID, &d.OrgID, &d.ResourceID, &env, &srv, &conn, &d.Trigger, &ref, &sha,
+			&digest, &cfg, &d.Status, &d.Detail, &rollback, &d.BuildSeconds, &d.DurationSeconds,
+			&d.CreatedBy, &d.CreatedAt, &d.StartedAt, &d.FinishedAt); err != nil {
+			return nil, err
+		}
+		d.EnvironmentID = deref(env)
+		d.ServerID = deref(srv)
+		d.ConnectionID = deref(conn)
+		d.GitRef = deref(ref)
+		d.GitSHA = deref(sha)
+		d.ImageDigest = deref(digest)
+		d.ConfigHash = deref(cfg)
+		d.RollbackOf = deref(rollback)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// LookupBuild returns a resource's build for a dedup key, if one exists — the
+// retry short-circuit: a 'built' row means the image is already present.
+func (s *Store) LookupBuild(ctx context.Context, resourceID, dedupKey string) (Build, error) {
+	var b Build
+	var srv, sha, ref, digest *string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT id, org_id, resource_id, server_id, dedup_key, git_sha, image_ref, image_digest, status, created_at, updated_at
+		  FROM builds WHERE resource_id = $1 AND dedup_key = $2`, resourceID, dedupKey).Scan(
+		&b.ID, &b.OrgID, &b.ResourceID, &srv, &b.DedupKey, &sha, &ref, &digest, &b.Status, &b.CreatedAt, &b.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Build{}, ErrNotFound
+	}
+	if err != nil {
+		return Build{}, err
+	}
+	b.ServerID, b.GitSHA, b.ImageRef, b.ImageDigest = deref(srv), deref(sha), deref(ref), deref(digest)
+	return b, nil
+}
+
+// RecordBuildResult upserts a build's outcome (dedup-keyed). Used by the agent's
+// build status report to persist the image digest a future deploy reuses.
+func (s *Store) RecordBuildResult(ctx context.Context, orgID, resourceID, serverID, dedupKey, gitSHA, imageRef, imageDigest, status string) error {
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO builds (id, org_id, resource_id, server_id, dedup_key, git_sha, image_ref, image_digest, status)
+		VALUES ($1,$2,$3,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),$9)
+		ON CONFLICT (resource_id, dedup_key) DO UPDATE SET
+			image_ref = COALESCE(NULLIF(EXCLUDED.image_ref,''), builds.image_ref),
+			image_digest = COALESCE(NULLIF(EXCLUDED.image_digest,''), builds.image_digest),
+			status = EXCLUDED.status,
+			updated_at = now()`,
+		newID("bld"), orgID, resourceID, serverID, dedupKey, gitSHA, imageRef, imageDigest, status)
+	return err
+}
+
+// AppendDeployLog appends one build/orchestration log line for streaming to the UI.
+func (s *Store) AppendDeployLog(ctx context.Context, deploymentID, stream, line string) error {
+	if stream == "" {
+		stream = "build"
+	}
+	_, err := s.Pool.Exec(ctx,
+		`INSERT INTO deploy_logs (deployment_id, stream, line) VALUES ($1,$2,$3)`, deploymentID, stream, line)
+	return err
+}
+
+// DeployLog is one streamed build/orchestration log line.
+type DeployLog struct {
+	ID     int64     `json:"id"`
+	Stream string    `json:"stream"`
+	Line   string    `json:"line"`
+	At     time.Time `json:"at"`
+}
+
+// DeployLogsSince returns log lines with id > afterID (SSE cursor), oldest first.
+func (s *Store) DeployLogsSince(ctx context.Context, deploymentID string, afterID int64, limit int) ([]DeployLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, stream, line, at FROM deploy_logs
+		 WHERE deployment_id = $1 AND id > $2 ORDER BY id LIMIT $3`, deploymentID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DeployLog{}
+	for rows.Next() {
+		var l DeployLog
+		if err := rows.Scan(&l.ID, &l.Stream, &l.Line, &l.At); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
