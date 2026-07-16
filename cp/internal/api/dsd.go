@@ -153,6 +153,14 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 	// Route "res:<id>" op statuses into resources.status, and mark applied
 	// "volrm:<pendingId>" destructive ops so they drop out of future DSDs.
 	byResource := map[string]json.RawMessage{}
+	// composeAgg collects a Compose app's per-service rollout statuses so a
+	// synthetic per-resource status still lands in resources.status (the agent
+	// reports a full version's ops in one POST, so the aggregate is coherent).
+	type opStatus struct {
+		State string `json:"state"`
+		Error string `json:"error,omitempty"`
+	}
+	composeAgg := map[string][]opStatus{}
 	for opID, st := range req.Ops {
 		var os struct {
 			State string `json:"state"`
@@ -165,9 +173,13 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(opID, "res:"):
 			// A Compose service op (res:<res>:<svc>) is not a resource id — only a
-			// bare res:<res> routes to resources.status.
+			// bare res:<res> routes to resources.status directly; service ops are
+			// aggregated into a synthetic per-resource status below.
 			if key := strings.TrimPrefix(opID, "res:"); !strings.Contains(key, ":") {
 				byResource[key] = st
+			} else {
+				resID := key[:strings.Index(key, ":")]
+				composeAgg[resID] = append(composeAgg[resID], opStatus{State: os.State, Error: os.Error})
 			}
 		case strings.HasPrefix(opID, "volrm:"):
 			var os struct {
@@ -195,6 +207,24 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		// success only when every service succeeds (failed the moment one does).
 		if err := s.store.AdvanceDeploymentService(r.Context(), srv.ID, a.resID, a.service, a.phase, a.ok, a.errText); err != nil {
 			s.log.Error("advance deployment service", "err", err, "phase", a.phase, "resource", a.resID, "service", a.service)
+		}
+	}
+	// Synthesize a per-resource status for Compose apps from their service ops:
+	// failed if any service failed (first error carried), applied only when every
+	// reported service applied. Never overrides a direct bare res:<id> status.
+	for resID, sts := range composeAgg {
+		if _, ok := byResource[resID]; ok {
+			continue
+		}
+		agg := opStatus{State: "applied"}
+		for _, st := range sts {
+			if st.State != "applied" {
+				agg = opStatus{State: st.State, Error: st.Error}
+				break
+			}
+		}
+		if b, err := json.Marshal(agg); err == nil {
+			byResource[resID] = b
 		}
 	}
 	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource)

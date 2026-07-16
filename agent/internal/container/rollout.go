@@ -56,8 +56,13 @@ func olderGenerations(list []ContainerState, resourceID, service, keepName strin
 }
 
 // defaultProbe is the real health probe: an HTTP GET expecting a 2xx, or a bare
-// TCP dial. A single attempt — gateHealthy retries it until the deadline.
+// TCP dial. A single attempt — gateHealthy retries it until the deadline. Type
+// "none" (a portless service, e.g. a Compose worker) has nothing to probe —
+// running is the readiness signal.
 func defaultProbe(ctx context.Context, ip string, p HealthProbe) error {
+	if p.Type == "none" {
+		return nil
+	}
 	port := p.Port
 	if port == 0 {
 		port = 80
@@ -114,6 +119,8 @@ func gateHealthy(ctx context.Context, dk rolloutDocker, probe Prober, name strin
 		}
 		if !ok || !cur.Running {
 			lastErr = fmt.Errorf("container exited before becoming healthy")
+		} else if p.Type == "none" {
+			return nil // portless service: running IS the readiness signal
 		} else if cur.IP == "" {
 			lastErr = fmt.Errorf("container has no address yet")
 		} else if err := probe(ctx, cur.IP, p); err != nil {
@@ -165,20 +172,23 @@ type imageRetainer interface {
 // disk use.
 const defaultImageRetention = 10
 
-// retainImages keeps the newest `keep` images tagged sigmahub/<resourceID>:* and
-// removes older tags, never removing one in `inUse` (a running generation — the
-// image currently serving must survive). An in-use tag does not consume a keep
-// slot, so `keep` historical images are retained BEYOND the running one.
-// Best-effort: a removal failure is logged, never fatal — a deploy must not fail
-// because an old image couldn't be pruned.
-func retainImages(ctx context.Context, ir imageRetainer, resourceID string, keep int, inUse map[string]bool, log logf) {
+// retainImages keeps the newest `keep` images under a repo prefix (e.g.
+// "sigmahub/<res>:" or a Compose service's "sigmahub/<res>-<svc>:") and removes
+// older tags, never removing one in `inUse` (a running generation — the image
+// currently serving must survive). An in-use tag does not consume a keep slot, so
+// `keep` historical images are retained BEYOND the running one. Best-effort: a
+// removal failure is logged, never fatal — a deploy must not fail because an old
+// image couldn't be pruned.
+func retainImages(ctx context.Context, ir imageRetainer, prefix string, keep int, inUse map[string]bool, log logf) {
 	if keep <= 0 {
 		keep = defaultImageRetention
 	}
-	prefix := imageTagPrefix(resourceID)
+	if prefix == "" {
+		return
+	}
 	imgs, err := ir.ImageList(ctx, prefix+"*")
 	if err != nil {
-		log("retain: list images", "resource", resourceID, "err", err)
+		log("retain: list images", "prefix", prefix, "err", err)
 		return
 	}
 	// Collect this resource's tags newest-first (ImageList sorts by Created desc).
@@ -207,10 +217,21 @@ func retainImages(ctx context.Context, ir imageRetainer, resourceID string, keep
 	}
 }
 
-// imageTagPrefix is the "sigmahub/<resourceID>:" tag prefix — mirrors the CP's
-// dsd.DeployImageTag so retention scopes to exactly one resource's images.
-func imageTagPrefix(resourceID string) string {
-	return "sigmahub/" + resourceID + ":"
+// imageRepoPrefix derives the retention scope from the deployed image reference:
+// "sigmahub/<res>:<sha>" → "sigmahub/<res>:", and a Compose service's
+// "sigmahub/<res>-<svc>:<sha>" → "sigmahub/<res>-<svc>:" — so each service's
+// image line is retained/pruned independently. Returns "" (retention no-op) for a
+// ref without a tag or one not under the sigmahub/ namespace (a prebuilt Compose
+// service image like postgres:16 is never pruned by us).
+func imageRepoPrefix(image string) string {
+	if !strings.HasPrefix(image, "sigmahub/") {
+		return ""
+	}
+	i := strings.LastIndex(image, ":")
+	if i <= 0 {
+		return ""
+	}
+	return image[:i+1]
 }
 
 // inUseImages returns the image tags a resource's running managed containers use,
@@ -382,7 +403,7 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 	}
 	// Keep the last-N built images so a rebuild-free rollback always has a target;
 	// prune older ones. Best-effort — never fails the deploy.
-	retainImages(ctx, d.docker, spec.Container.ResourceID, defaultImageRetention,
+	retainImages(ctx, d.docker, imageRepoPrefix(spec.Container.Image), defaultImageRetention,
 		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)
 	return nil
 }
@@ -424,7 +445,7 @@ func (d *Driver) opRecreate(ctx context.Context, op dsd.Op) error {
 	if err := performRecreate(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
 		return err
 	}
-	retainImages(ctx, d.docker, spec.Container.ResourceID, defaultImageRetention,
+	retainImages(ctx, d.docker, imageRepoPrefix(spec.Container.Image), defaultImageRetention,
 		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)
 	return nil
 }

@@ -92,13 +92,16 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		}
 	}
 
-	// Resources managed by a deploy.rollout op own their own container lifecycle:
-	// the rollout creates the new generation and drains the old ONLY after the new
-	// one is healthy, and a health-gate failure deliberately keeps the old
-	// generation serving. GC must not touch ANY generation of such a resource — a
-	// blind reap here (the old generation is never in `want`) would defeat the
-	// never-cut invariant and take a live app down.
-	rolloutManaged := rolloutManagedResources(doc)
+	// (resource, service) groups managed by a deploy.rollout/recreate op own their
+	// own container lifecycle: the swap creates the new generation and drains the
+	// old ONLY after the new one is healthy, and a health-gate failure deliberately
+	// keeps the old generation serving. GC must not touch any generation of such a
+	// group — a blind reap here (the old generation is never in `want`) would
+	// defeat the never-cut invariant and take a live app down. Scoping to the
+	// (resource, service) PAIR (not the whole resource) means a Compose service
+	// REMOVED from the compose file — whose op disappears from the document — is
+	// still correctly garbage-collected.
+	rolloutGroups := rolloutManagedGroups(doc)
 
 	managed, err := d.docker.ContainerList(ctx)
 	if err != nil {
@@ -109,8 +112,8 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		if want[c.Name] {
 			continue
 		}
-		if rid := c.Labels[LabelResourceID]; rid != "" && rolloutManaged[rid] {
-			continue // a rollout-owned generation — never GC-reaped
+		if rid := c.Labels[LabelResourceID]; rid != "" && rolloutGroups[rolloutGroupKey(rid, c.Labels[LabelService])] {
+			continue // a live rollout-owned generation — never GC-reaped
 		}
 		d.log.Info("gc: removing orphaned container", "container", c.Name)
 		if err := d.docker.ContainerRemove(ctx, c.ID, true); err != nil {
@@ -119,9 +122,16 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 	}
 }
 
-// rolloutManagedResources is the set of resource ids the document deploys via a
-// deploy.rollout op — the resources GC must leave entirely to the rollout op.
-func rolloutManagedResources(doc dsd.Document) map[string]bool {
+// rolloutGroupKey identifies a (resource, service) rollout group; service is ""
+// for a single-container app.
+func rolloutGroupKey(resourceID, service string) string {
+	return resourceID + "\x00" + service
+}
+
+// rolloutManagedGroups is the set of (resource, service) groups the document
+// deploys via a deploy.rollout/deploy.recreate op — the groups GC must leave
+// entirely to the swap ops.
+func rolloutManagedGroups(doc dsd.Document) map[string]bool {
 	out := map[string]bool{}
 	for _, op := range doc.Ops {
 		var container ContainerSpec
@@ -142,7 +152,7 @@ func rolloutManagedResources(doc dsd.Document) map[string]bool {
 			continue
 		}
 		if container.ResourceID != "" {
-			out[container.ResourceID] = true
+			out[rolloutGroupKey(container.ResourceID, container.Service)] = true
 		}
 	}
 	return out

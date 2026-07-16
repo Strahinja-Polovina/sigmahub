@@ -255,8 +255,8 @@ func (f *fakeImages) ImageRemove(_ context.Context, ref string, _ bool) error {
 // are pruned, and a tag in use (the running generation) is never removed even
 // when it's old.
 func TestRetainImages(t *testing.T) {
-	res := "res_a"
-	tag := func(n int) string { return imageTagPrefix(res) + fmt.Sprintf("sha%02d", n) }
+	prefix := "sigmahub/res_a:"
+	tag := func(n int) string { return prefix + fmt.Sprintf("sha%02d", n) }
 	// 12 images newest-first (sha11 … sha00).
 	fi := &fakeImages{}
 	for n := 11; n >= 0; n-- {
@@ -265,7 +265,7 @@ func TestRetainImages(t *testing.T) {
 	// Keep 10; the running image is the oldest (sha00) — it must survive despite
 	// being past the window, and it must not consume a keep slot.
 	inUse := map[string]bool{tag(0): true}
-	retainImages(context.Background(), fi, res, 10, inUse, func(string, ...any) {})
+	retainImages(context.Background(), fi, prefix, 10, inUse, func(string, ...any) {})
 
 	// Newest 10 (sha11…sha02) kept by window; sha00 kept by in-use; sha01 pruned.
 	if len(fi.removed) != 1 || fi.removed[0] != tag(1) {
@@ -276,16 +276,31 @@ func TestRetainImages(t *testing.T) {
 // TestRetainImagesNeverTouchesInUse guards the serving image even under a tiny
 // keep budget.
 func TestRetainImagesNeverTouchesInUse(t *testing.T) {
-	res := "res_b"
-	tag := func(s string) string { return imageTagPrefix(res) + s }
+	prefix := "sigmahub/res_b:"
+	tag := func(s string) string { return prefix + s }
 	fi := &fakeImages{imgs: []ImageSummary{
 		{ID: "i2", RepoTags: []string{tag("new")}, Created: 2},
 		{ID: "i1", RepoTags: []string{tag("old")}, Created: 1},
 	}}
-	retainImages(context.Background(), fi, res, 1, map[string]bool{tag("old"): true}, func(string, ...any) {})
+	retainImages(context.Background(), fi, prefix, 1, map[string]bool{tag("old"): true}, func(string, ...any) {})
 	for _, r := range fi.removed {
 		if r == tag("old") {
 			t.Fatalf("retention removed the in-use image %s", r)
+		}
+	}
+}
+
+// TestImageRepoPrefix pins retention scoping for single-container and Compose
+// per-service tags, and the no-op for prebuilt (non-sigmahub) images.
+func TestImageRepoPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"sigmahub/res_a:abc1234":     "sigmahub/res_a:",
+		"sigmahub/res_a-web:abc1234": "sigmahub/res_a-web:",
+		"postgres:16":                "",
+		"redis":                      "",
+	} {
+		if got := imageRepoPrefix(in); got != want {
+			t.Errorf("imageRepoPrefix(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -333,21 +348,34 @@ func TestPerformRolloutReplacesStoppedLeftover(t *testing.T) {
 	}
 }
 
-// TestRolloutManagedResources proves a resource with a deploy.rollout op is
-// recognised as rollout-owned so GC never reaps its (old) generations.
-func TestRolloutManagedResources(t *testing.T) {
-	spec, _ := rolloutSpec("res_a", "gen2", "h")
+// TestRolloutManagedGroups proves a (resource, service) group with a
+// deploy.rollout/recreate op is recognised as rollout-owned (GC never reaps its
+// generations), while a service REMOVED from the compose file — no op in the doc
+// — is NOT protected, so its orphaned container is garbage-collected.
+func TestRolloutManagedGroups(t *testing.T) {
+	spec, _ := rolloutSpec("res_a", "gen2", "h") // single-container (service "")
 	rb, _ := json.Marshal(spec)
+	svcSpec, _ := recreateSpec("res_c", "db", "g1", "h")
+	rc, _ := json.Marshal(svcSpec)
 	appSpec, _ := json.Marshal(ContainerSpec{Name: "sigmahub-res_b"})
 	doc := dsd.Document{Ops: []dsd.Op{
 		{ID: "res:res_a", Kind: KindDeployRollout, Spec: rb},
+		{ID: "res:res_c:db", Kind: KindDeployRecreate, Spec: rc},
 		{ID: "res:res_b", Kind: KindContainerApply, Spec: appSpec},
 	}}
-	m := rolloutManagedResources(doc)
-	if !m["res_a"] {
-		t.Fatal("res_a (deploy.rollout) must be rollout-managed")
+	m := rolloutManagedGroups(doc)
+	if !m[rolloutGroupKey("res_a", "")] {
+		t.Fatal("res_a (deploy.rollout, single-container) must be rollout-managed")
 	}
-	if m["res_b"] {
+	if !m[rolloutGroupKey("res_c", "db")] {
+		t.Fatal("res_c/db (deploy.recreate) must be rollout-managed")
+	}
+	// A service dropped from the compose file has no op → its containers are
+	// GC-able even though the resource still has other rollout ops.
+	if m[rolloutGroupKey("res_c", "worker")] {
+		t.Fatal("a removed compose service must NOT be protected from GC")
+	}
+	if m[rolloutGroupKey("res_b", "")] {
 		t.Fatal("res_b (plain container.apply) must NOT be rollout-managed")
 	}
 }

@@ -192,13 +192,25 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 // pipeline: one shared git.clone (the whole repo), then for each service a build
 // (its `build:` context subdir) or image.pull (prebuilt), and a deploy.rollout
 // (stateless, blue-green) or deploy.recreate (holds an exclusive resource). Each
-// service container joins the shared project network under its service name so
-// siblings resolve each other; depends_on becomes op ordering. Op ids carry the
-// service (`build:<res>:<svc>`, `res:<res>:<svc>`) so status routes per service.
+// service container joins the app's per-resource network under its service name
+// so siblings resolve each other; depends_on becomes op ordering. Op ids carry
+// the service (`build:<res>:<svc>`, `res:<res>:<svc>`) so status routes per service.
 func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget) (ops []dsd.Op, networkID string, ok bool) {
-	networkName := dsd.NetworkName(rs.ProjectID)
-	networkID = "net:" + rs.ProjectID
+	// Compose services share a PER-RESOURCE network (docker-compose semantics):
+	// bare service-name aliases ("db") stay scoped to this app instead of
+	// colliding across apps on the shared project network. Traefik reaches the
+	// web-facing service regardless — the proxy attaches to every managed network.
+	networkName := dsd.ResourceNetworkName(rs.ResourceID)
+	networkID = "net:res:" + rs.ResourceID
 	gen := deployGeneration(target.SHA, target.DeploymentID)
+
+	// A service with neither a build context nor a prebuilt image cannot run;
+	// filter them here AND in the store's composeServiceCount (same rule), so the
+	// per-service success denominator matches what is actually rendered.
+	services := validComposeServices(spec.Compose.Services)
+	if len(services) == 0 {
+		return nil, "", false
+	}
 
 	// Resource-scoped secret refs, applied to every service container.
 	var refsSpec []secretRef
@@ -218,17 +230,33 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 	})
 	ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
 
-	// The web-facing service (first that exposes a port) carries the Traefik router
-	// labels when a domain is attached to the resource.
+	// The web-facing service carries the Traefik router labels when a domain is
+	// attached: prefer the first source-built blue-green service with a port (the
+	// app, not an infra dependency like a ported db image), falling back to the
+	// first service with a port.
 	webSvc := ""
-	for _, s := range spec.Compose.Services {
-		if len(s.Ports) > 0 {
+	for _, s := range services {
+		if len(s.Ports) > 0 && s.Build != "" && s.Rollout != gitRolloutRecreate {
 			webSvc = s.Name
 			break
 		}
 	}
+	if webSvc == "" {
+		for _, s := range services {
+			if len(s.Ports) > 0 {
+				webSvc = s.Name
+				break
+			}
+		}
+	}
 
-	for _, s := range spec.Compose.Services {
+	// The rendered-service set backs depends_on validation below.
+	rendered := map[string]bool{}
+	for _, s := range services {
+		rendered[s.Name] = true
+	}
+
+	for _, s := range services {
 		svcKey := rs.ResourceID + ":" + s.Name
 		cs := containerOpSpec{
 			ResourceID:     rs.ResourceID,
@@ -291,8 +319,13 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		if imageDep != "" {
 			deps = append(deps, imageDep)
 		}
+		// depends_on ordering — only for services that are actually rendered, so a
+		// typo'd or filtered-out dependency can't produce a dangling op reference
+		// (which would wedge the whole apply).
 		for _, d := range s.DependsOn {
-			deps = append(deps, "res:"+rs.ResourceID+":"+d)
+			if rendered[d] {
+				deps = append(deps, "res:"+rs.ResourceID+":"+d)
+			}
 		}
 		ops = append(ops, dsd.Op{ID: "res:" + svcKey, Kind: kind, DependsOn: deps, Spec: swap})
 	}
@@ -302,15 +335,28 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 // gitRolloutRecreate mirrors gitdetect.RolloutRecreate without importing it.
 const gitRolloutRecreate = "recreate"
 
-// composeServiceHealth is a service's readiness probe: a TCP probe on its first
-// declared container port (the never-cut/gate always needs a probe). A service
-// with no ports gets a probe on port 0, which the agent treats as "port 80".
-func composeServiceHealth(s composeServiceSpec) healthProbe {
-	port := 0
-	if len(s.Ports) > 0 {
-		port = s.Ports[0]
+// validComposeServices filters to services that can actually run: a build context
+// or a prebuilt image. MUST match the store's composeServiceCount rule so the
+// per-service success denominator equals the number of rendered services.
+func validComposeServices(in []composeServiceSpec) []composeServiceSpec {
+	out := make([]composeServiceSpec, 0, len(in))
+	for _, s := range in {
+		if s.Name != "" && (s.Build != "" || s.Image != "") {
+			out = append(out, s)
+		}
 	}
-	return healthProbe{Type: "tcp", Port: port, IntervalSec: 3, TimeoutSec: 120}
+	return out
+}
+
+// composeServiceHealth is a service's readiness probe: a TCP probe on its first
+// declared container port. A portless service (a worker) has nothing to probe —
+// type "none" makes the agent's gate treat "running" as ready instead of probing
+// port 80 and failing forever.
+func composeServiceHealth(s composeServiceSpec) healthProbe {
+	if len(s.Ports) == 0 {
+		return healthProbe{Type: "none", IntervalSec: 3, TimeoutSec: 120}
+	}
+	return healthProbe{Type: "tcp", Port: s.Ports[0], IntervalSec: 3, TimeoutSec: 120}
 }
 
 // deployHealth resolves the rollout's health probe: the gitdetect-detected probe

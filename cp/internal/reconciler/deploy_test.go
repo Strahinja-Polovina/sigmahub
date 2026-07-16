@@ -82,6 +82,52 @@ func TestRenderComposeDeployOps(t *testing.T) {
 	if cs.Container.Image != dsd.DeployServiceImageTag("res_a", "web", "abcdef1234") {
 		t.Fatalf("web image = %q", cs.Container.Image)
 	}
+
+	// Compose apps deploy onto a per-resource network (bare service aliases can't
+	// collide across apps in the same project).
+	if networkID != "net:res:res_a" {
+		t.Fatalf("compose network id = %q, want per-resource", networkID)
+	}
+}
+
+// TestRenderComposePortlessAndInvalid pins two edge rules: a portless worker gets
+// a "none" health probe (running = ready, no bogus port-80 gate), and a service
+// with neither build nor image is filtered out (matching composeServiceCount).
+func TestRenderComposePortlessAndInvalid(t *testing.T) {
+	spec := appResourceSpec{
+		Compose: &composeDeploySpec{Services: []composeServiceSpec{
+			{Name: "worker", Build: "."}, // no ports
+			{Name: "ghost"},              // neither build nor image → filtered
+		}},
+	}
+	raw, _ := json.Marshal(spec)
+	rs := store.ResourceSpec{ResourceID: "res_p", ProjectID: "proj_p", Kind: "app", Spec: raw}
+	target := store.DeployTarget{DeploymentID: "dep_2", Provider: "github", RepoFullName: "acme/w", SHA: "beef1234", Trigger: "git"}
+
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+	if !ok {
+		t.Fatal("render should succeed")
+	}
+	byID := map[string]dsd.Op{}
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	if _, exists := byID["res:res_p:ghost"]; exists {
+		t.Fatal("a service with neither build nor image must be filtered out")
+	}
+	worker, exists := byID["res:res_p:worker"]
+	if !exists {
+		t.Fatalf("worker rollout missing; ops=%v", opIDs(ops))
+	}
+	var ws struct {
+		Health struct {
+			Type string `json:"type"`
+		} `json:"health"`
+	}
+	_ = json.Unmarshal(worker.Spec, &ws)
+	if ws.Health.Type != "none" {
+		t.Fatalf("portless worker health = %q, want none", ws.Health.Type)
+	}
 }
 
 func opIDs(ops []dsd.Op) []string {
