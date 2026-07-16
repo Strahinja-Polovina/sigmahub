@@ -24,6 +24,7 @@ type Store interface {
 	SecretRefsForServer(ctx context.Context, serverID string) (map[string][]store.SecretRefMeta, error)
 	HostHardeningForServer(ctx context.Context, serverID string) (store.HostHardening, error)
 	DomainsForServer(ctx context.Context, serverID string) (map[string][]store.Domain, error)
+	DeployTargetsForServer(ctx context.Context, serverID string) (map[string]store.DeployTarget, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 }
@@ -52,12 +53,21 @@ func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
 // container ops (network.ensure → image.pull → volume.ensure → container.apply);
 // other kinds keep the P1-2 no-op "resource.sync" stub until they are
 // containerised. Confirmed destructive ops are appended as volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, acme ACMEConfig) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, acme ACMEConfig) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
 	for _, rs := range specs {
 		if rs.Kind == "app" {
+			// A git-deployed app (has a deploy target) renders the build pipeline;
+			// a registry-image app keeps the direct container.apply path.
+			if target, isGit := deployTargets[rs.ResourceID]; isGit {
+				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target); ok {
+					resourceOps = append(resourceOps, depOps...)
+					networks[netID] = dsd.NetworkName(rs.ProjectID)
+					continue
+				}
+			}
 			if appOps, netID, ok := renderAppOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID]); ok {
 				resourceOps = append(resourceOps, appOps...)
 				networks[netID] = dsd.NetworkName(rs.ProjectID)
@@ -126,7 +136,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, r.acme)
+	deployTargets, err := r.st.DeployTargetsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, r.acme)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

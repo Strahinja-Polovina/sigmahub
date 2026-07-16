@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -279,6 +281,161 @@ func (s *Store) RecordBuildResult(ctx context.Context, orgID, resourceID, server
 			updated_at = now()`,
 		newID("bld"), orgID, resourceID, serverID, dedupKey, gitSHA, imageRef, imageDigest, status)
 	return err
+}
+
+// ServerRef identifies a server to reconcile after a mutation.
+type ServerRef struct{ ServerID, OrgID string }
+
+// DrainDeployRequests turns queued git deploy_requests (P1-7) into queued
+// deployment rows: each request resolves to the app resources in its target
+// environment, and one deployment is created per resource. Returns the distinct
+// servers to re-render. Idempotent: a drained request is marked so a second pass
+// skips it. Runs as a short background worker.
+func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id
+		  FROM deploy_requests dr
+		  JOIN git_connections c ON c.id = dr.connection_id
+		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
+		 ORDER BY dr.created_at
+		 FOR UPDATE OF dr SKIP LOCKED`)
+	if err != nil {
+		return nil, err
+	}
+	type req struct{ id, orgID, connID, envID, ref, sha, projectID string }
+	var reqs []req
+	for rows.Next() {
+		var r req
+		var env *string
+		if err := rows.Scan(&r.id, &r.orgID, &r.connID, &env, &r.ref, &r.sha, &r.projectID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		r.envID = deref(env)
+		reqs = append(reqs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]ServerRef{}
+	for _, r := range reqs {
+		// App resources in the request's target environment (of the connection's
+		// project). Each gets a queued deployment.
+		res, err := tx.Query(ctx, `
+			SELECT id, server_id, spec FROM resources
+			 WHERE org_id = $1 AND project_id = $2 AND environment_id = $3 AND kind = 'app'`,
+			r.orgID, r.projectID, r.envID)
+		if err != nil {
+			return nil, err
+		}
+		type appRes struct {
+			id, serverID string
+			spec         []byte
+		}
+		var apps []appRes
+		for res.Next() {
+			var a appRes
+			if err := res.Scan(&a.id, &a.serverID, &a.spec); err != nil {
+				res.Close()
+				return nil, err
+			}
+			apps = append(apps, a)
+		}
+		res.Close()
+		if err := res.Err(); err != nil {
+			return nil, err
+		}
+
+		for _, a := range apps {
+			cfgHash := configHash(a.spec)
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
+				                         trigger, git_ref, git_sha, config_hash, status, created_by)
+				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,'queued','github-webhook')`,
+				newID("dep"), r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, cfgHash); err != nil {
+				return nil, err
+			}
+			if a.serverID != "" {
+				seen[a.serverID] = ServerRef{ServerID: a.serverID, OrgID: r.orgID}
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE deploy_requests SET status = 'drained' WHERE id = $1`, r.id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	out := make([]ServerRef, 0, len(seen))
+	for _, sr := range seen {
+		out = append(out, sr)
+	}
+	return out, nil
+}
+
+// configHash is a stable fingerprint of a resource's spec, part of the build
+// dedup key (config_hash + git_sha).
+func configHash(spec []byte) string {
+	sum := sha256.Sum256(spec)
+	return hex.EncodeToString(sum[:8])
+}
+
+// DeployTarget is the release a git-deployed app resource should be running: the
+// clone source + the deployment driving it. The reconciler renders the
+// clone→build→rollout chain (or, for a rollback with a retained image, just the
+// rollout) from it.
+type DeployTarget struct {
+	DeploymentID string
+	ResourceID   string
+	ProjectID    string
+	ConnectionID string
+	Provider     string
+	RepoFullName string
+	Ref          string
+	SHA          string
+	ConfigHash   string
+	ImageDigest  string // set for a rollback (reuse a retained image; skip clone/build)
+	Trigger      string
+}
+
+// DeployTargetsForServer returns the current deploy target per app resource on a
+// server — the latest deployment that is not failed/superseded/rolled_back. The
+// reconciler renders the deploy pipeline from these instead of a bare
+// container.apply.
+func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (map[string]DeployTarget, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT ON (d.resource_id)
+		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger
+		  FROM deployments d
+		  JOIN resources r ON r.id = d.resource_id
+		  JOIN git_connections c ON c.id = d.connection_id
+		 WHERE d.server_id = $1 AND d.status IN ('queued','building','deploying','success')
+		 ORDER BY d.resource_id, d.created_at DESC`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]DeployTarget{}
+	for rows.Next() {
+		var t DeployTarget
+		var ref, sha, cfg, digest *string
+		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger); err != nil {
+			return nil, err
+		}
+		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)
+		out[t.ResourceID] = t
+	}
+	return out, rows.Err()
 }
 
 // AppendDeployLog appends one build/orchestration log line for streaming to the UI.
