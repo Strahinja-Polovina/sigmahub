@@ -172,6 +172,32 @@ func (c *Client) PostDomainStatus(ctx context.Context, agentToken string, domain
 	return c.post(ctx, "/v1/agent/domains/status", agentToken, map[string]any{"domains": domains}, nil)
 }
 
+// CloneCredentialResponse is the short-lived clone credential the CP mints for a
+// deployment (P1-9). The token is for in-memory use by git.clone only.
+type CloneCredentialResponse struct {
+	Token        string `json:"token"`
+	RepoFullName string `json:"repoFullName"`
+	Provider     string `json:"provider"`
+}
+
+// FetchCloneCredential resolves the clone credential for a deployment. Scope is
+// derived server-side from the agent token (an agent can only fetch a credential
+// for a deployment targeting its own host).
+func (c *Client) FetchCloneCredential(ctx context.Context, agentToken, deploymentID string) (CloneCredentialResponse, error) {
+	var res CloneCredentialResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/git-credential?deploymentId="+url.QueryEscape(deploymentID), agentToken, nil, &res)
+	return res, err
+}
+
+// PostBuildLog streams build/orchestration log lines for a deployment (P1-9).
+func (c *Client) PostBuildLog(ctx context.Context, agentToken, deploymentID, stream string, lines []string) error {
+	return c.post(ctx, "/v1/agent/build-logs", agentToken, map[string]any{
+		"deploymentId": deploymentID,
+		"stream":       stream,
+		"lines":        lines,
+	}, nil)
+}
+
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, bearer, body, out)
 }
