@@ -359,17 +359,20 @@ func TestDockerE2ESecretsTmpfsInjection(t *testing.T) {
 	}
 
 	// Disk-scan (acceptance): docker diff reports only the on-disk graphdriver
-	// layer — tmpfs writes never appear. The seeded secret path must therefore be
+	// layer — tmpfs writes never appear. A seeded secret FILE must therefore be
 	// ABSENT, proving it lives in RAM and never landed on host disk. (Had the
 	// agent seeded before start, the file would sit in the rw layer and show up
-	// here as an added path.)
+	// here as an added path.) The tmpfs mount-point DIRECTORY (/run/secrets)
+	// itself can legitimately appear in the diff — Docker creates the mount point
+	// in the rw layer regardless of what the tmpfs shadows — so scan for files
+	// strictly under it, not the directory node.
 	changes, err := docker.ContainerChanges(ctx, e2eContainer)
 	if err != nil {
 		t.Fatalf("container changes: %v", err)
 	}
 	for _, c := range changes {
-		if strings.HasPrefix(c.Path, SecretsMountDir) {
-			t.Errorf("secret path %q leaked to the on-disk layer (docker diff): %+v", c.Path, changes)
+		if strings.HasPrefix(c.Path, SecretsMountDir+"/") {
+			t.Errorf("secret file %q leaked to the on-disk layer (docker diff): %+v", c.Path, changes)
 		}
 	}
 
