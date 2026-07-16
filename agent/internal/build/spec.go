@@ -33,7 +33,10 @@ type BuildImageSpec struct {
 	SHA        string `json:"sha"`
 	DedupKey   string `json:"dedupKey"`
 	Dockerfile string `json:"dockerfile,omitempty"`
-	ImageTag   string `json:"imageTag"` // e.g. sigmahub/<resourceId>:<sha>
+	// ContextSubdir is a Compose service's build context relative to the cloned
+	// repo root (empty ⇒ repo root). Validated to stay within the clone.
+	ContextSubdir string `json:"contextSubdir,omitempty"`
+	ImageTag      string `json:"imageTag"` // e.g. sigmahub/<resourceId>:<sha>
 	// DeploymentID scopes the streamed build logs on the control plane.
 	DeploymentID string `json:"deploymentId,omitempty"`
 	// Force skips the ImageExists dedup short-circuit so a manual redeploy rebuilds
