@@ -144,14 +144,18 @@ var (
 	exposeRe   = regexp.MustCompile(`(?i)^\s*EXPOSE\s+(.+)$`)
 	envRe      = regexp.MustCompile(`(?i)^\s*ENV\s+(.+)$`)
 	argRe      = regexp.MustCompile(`(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	healthRe    = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s`)
-	portNumRe   = regexp.MustCompile(`(\d{1,5})`)
-	envNameRe   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	quoteTrim   = "\"'"
-	composePad  = regexp.MustCompile(`^\s*`)
-	urlRe       = regexp.MustCompile(`https?://[^/\s"']+(?::(\d+))?(/[^\s"'\],)]*)?`)
-	intervalRe  = regexp.MustCompile(`(?i)--interval[= ](\d+)(ms|s|m)?`)
-	cIntervalRe = regexp.MustCompile(`(?i)^\s*interval:\s*(\d+)(ms|s|m)?`)
+	healthRe     = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s`)
+	healthNoneRe = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s+NONE\s*$`)
+	portNumRe    = regexp.MustCompile(`(\d{1,5})`)
+	envNameRe    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	quoteTrim    = "\"'"
+	composePad   = regexp.MustCompile(`^\s*`)
+	// Host class excludes ':' so an explicit "host:port" surfaces the port in the
+	// capture group instead of being swallowed by the host match.
+	urlRe        = regexp.MustCompile(`https?://[^/:\s"']+(?::(\d+))?(/[^\s"'\],)]*)?`)
+	intervalRe   = regexp.MustCompile(`(?i)--interval[= ](\d+)(ms|s|m)?`)
+	cIntervalRe  = regexp.MustCompile(`(?i)^\s*interval:\s*(\d+)(ms|s|m)?`)
+	cPublishedRe = regexp.MustCompile(`^published:\s*"?(\d{1,5})`)
 )
 
 // httpProbeFromLine extracts an HTTP path (and optional port) from a health-check
@@ -187,15 +191,17 @@ func durationSec(n int, unit string) int {
 }
 
 func parseDockerfile(b []byte, ports map[int]bool, env map[string]bool, hc *healthAccum) {
-	for _, raw := range strings.Split(string(b), "\n") {
-		line := strings.TrimRight(raw, "\r")
+	for _, line := range joinContinuations(strings.Split(string(b), "\n")) {
 		if m := exposeRe.FindStringSubmatch(line); m != nil {
 			for _, tok := range portNumRe.FindAllString(m[1], -1) {
 				addPort(ports, tok)
 			}
 			continue
 		}
-		if healthRe.MatchString(line) && !strings.Contains(strings.ToUpper(line), "NONE") {
+		if healthNoneRe.MatchString(line) {
+			continue // HEALTHCHECK NONE explicitly disables the probe.
+		}
+		if healthRe.MatchString(line) {
 			hc.found = true
 			hc.source = "dockerfile"
 			if p, port, ok := httpProbeFromLine(line); ok {
@@ -220,30 +226,62 @@ func parseDockerfile(b []byte, ports map[int]bool, env map[string]bool, hc *heal
 }
 
 // dockerEnvNames extracts the variable name(s) from an ENV instruction, which
-// comes in two forms: `ENV KEY value` (single) and `ENV K1=v1 K2=v2` (multi).
+// comes in two forms distinguished by the FIRST token: `ENV KEY value` (single —
+// the value may itself contain '=') and `ENV K1=v1 K2=v2` (multi). Keying off
+// the first token (not "does the line contain '='") is what Docker itself does.
 func dockerEnvNames(rest string) []string {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
 		return nil
 	}
-	if strings.Contains(rest, "=") {
+	fields := strings.Fields(rest)
+	if strings.Contains(fields[0], "=") {
+		// Multi-form: KEY=val KEY2=val2 …
 		var names []string
-		for _, tok := range strings.Fields(rest) {
+		for _, tok := range fields {
 			if i := strings.Index(tok, "="); i > 0 {
-				name := tok[:i]
-				if envNameRe.MatchString(name) {
+				if name := tok[:i]; envNameRe.MatchString(name) {
 					names = append(names, name)
 				}
 			}
 		}
 		return names
 	}
-	// `ENV KEY the rest is the value` — first field is the name.
-	name := strings.Fields(rest)[0]
-	if envNameRe.MatchString(name) {
-		return []string{name}
+	// Single-form: the first token is the key; the rest (which may contain '=')
+	// is the value.
+	if envNameRe.MatchString(fields[0]) {
+		return []string{fields[0]}
 	}
 	return nil
+}
+
+// joinContinuations merges Dockerfile backslash line-continuations so a
+// multi-line ENV/EXPOSE/HEALTHCHECK is parsed as one logical instruction.
+func joinContinuations(lines []string) []string {
+	var out []string
+	var buf strings.Builder
+	cont := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		if strings.HasSuffix(strings.TrimRight(line, " \t"), `\`) {
+			buf.WriteString(strings.TrimSuffix(strings.TrimRight(line, " \t"), `\`))
+			buf.WriteString(" ")
+			cont = true
+			continue
+		}
+		if cont {
+			buf.WriteString(line)
+			out = append(out, buf.String())
+			buf.Reset()
+			cont = false
+		} else {
+			out = append(out, line)
+		}
+	}
+	if cont {
+		out = append(out, strings.TrimRight(buf.String(), " "))
+	}
+	return out
 }
 
 func addPort(ports map[int]bool, tok string) {
@@ -273,8 +311,11 @@ func parseCompose(b []byte, ports map[int]bool, env map[string]bool, hc *healthA
 		indent := len(composePad.FindString(line))
 		trimmed := strings.TrimSpace(line)
 
-		// Leaving the current block once indentation returns to its header level.
-		if mode != "" && indent <= blockIndent {
+		// Leaving the current block once indentation returns to its header level —
+		// EXCEPT a sequence item ("- …") at the header's own column, which YAML
+		// allows and which still belongs to the block (a sibling key would be
+		// "name:" at that column, not a dash).
+		if mode != "" && indent <= blockIndent && !strings.HasPrefix(trimmed, "-") {
 			mode = ""
 		}
 
@@ -305,6 +346,9 @@ func parseCompose(b []byte, ports map[int]bool, env map[string]bool, hc *healthA
 		case "ports":
 			if strings.HasPrefix(trimmed, "-") {
 				composePortItem(strings.TrimSpace(trimmed[1:]), ports)
+			} else if m := cPublishedRe.FindStringSubmatch(strings.TrimPrefix(trimmed, "- ")); m != nil {
+				// Long syntax: `- target: 80 / published: 8080 / protocol: tcp`.
+				addPort(ports, m[1])
 			}
 		case "env":
 			composeEnvItem(trimmed, env)
@@ -360,14 +404,17 @@ func composeEnvItem(item string, env map[string]bool) {
 		item = strings.TrimSpace(item[1:])
 	}
 	item = strings.Trim(item, quoteTrim)
-	// list form "- KEY=value" or "- KEY"; map form "KEY: value".
-	var name string
-	if i := strings.Index(item, "="); i > 0 {
-		name = item[:i]
-	} else if i := strings.Index(item, ":"); i > 0 {
-		name = item[:i]
-	} else {
-		name = item
+	// list form "KEY=value" | "KEY"; map form "KEY: value". Split on whichever
+	// delimiter appears FIRST, so a value that itself contains '=' (e.g.
+	// "KEY: a=b") or ':' (e.g. "KEY=postgres://…") doesn't truncate the key.
+	eq := strings.Index(item, "=")
+	colon := strings.Index(item, ":")
+	name := item
+	switch {
+	case eq > 0 && (colon < 0 || eq < colon):
+		name = item[:eq]
+	case colon > 0:
+		name = item[:colon]
 	}
 	name = strings.TrimSpace(name)
 	if envNameRe.MatchString(name) {

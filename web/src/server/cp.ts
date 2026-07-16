@@ -680,13 +680,25 @@ export async function cpPromoteBranch(orgId: string, mapId: string, actor: CpAct
 }
 
 /** List a connection together with its branch routes in one hop per connection —
- *  the project view renders repo → branch→env tables. */
+ *  the project view renders repo → branch→env tables. Resilient per connection:
+ *  one failing detail fetch (e.g. a concurrent delete → 404) drops that repo,
+ *  not the whole panel. */
 export async function cpListGitConnectionsWithMaps(
   orgId: string,
   projectId: string
 ): Promise<{ connection: CpGitConnection; branchMaps: CpBranchMap[] }[]> {
   const connections = await cpListGitConnections(orgId, projectId);
-  return Promise.all(connections.map((c) => cpGetGitConnection(orgId, c.id)));
+  const settled = await Promise.all(
+    connections.map(async (c) => {
+      try {
+        return await cpGetGitConnection(orgId, c.id);
+      } catch {
+        // Fall back to the list row with no branch maps rather than dropping it.
+        return { connection: c, branchMaps: [] as CpBranchMap[] };
+      }
+    })
+  );
+  return settled;
 }
 
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */

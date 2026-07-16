@@ -134,6 +134,96 @@ func TestDetectEmpty(t *testing.T) {
 	}
 }
 
+// TestDetectComposeSameIndentList covers the common YAML style where a sequence
+// dash sits at the same column as its key — items must not be dropped.
+func TestDetectComposeSameIndentList(t *testing.T) {
+	compose := []byte("services:\n  web:\n    image: nginx\n    ports:\n    - \"8080:80\"\n    environment:\n    - API_KEY=secret\n")
+	d := Detect(map[string][]byte{"compose.yaml": compose})
+	if len(d.Ports) != 1 || d.Ports[0] != 8080 {
+		t.Errorf("same-indent ports = %v, want [8080]", d.Ports)
+	}
+	if len(d.Env) != 1 || d.Env[0] != "API_KEY" {
+		t.Errorf("same-indent env = %v, want [API_KEY]", d.Env)
+	}
+}
+
+func TestDetectDockerfileEnvValueWithEquals(t *testing.T) {
+	// Single-form ENV whose value contains '=' must keep the real key.
+	d := Detect(map[string][]byte{"Dockerfile": []byte(
+		"FROM x\nENV GREETING hello=world\nENV DATABASE_URL postgres://u:p@h/db?sslmode=require\n")})
+	envs := map[string]bool{}
+	for _, e := range d.Env {
+		envs[e] = true
+	}
+	if !envs["GREETING"] || !envs["DATABASE_URL"] {
+		t.Errorf("env = %v, want GREETING and DATABASE_URL", d.Env)
+	}
+	if envs["hello"] {
+		t.Errorf("must not emit bogus key 'hello' from the value: %v", d.Env)
+	}
+}
+
+func TestDetectDockerfileEnvContinuation(t *testing.T) {
+	d := Detect(map[string][]byte{"Dockerfile": []byte("FROM x\nENV FOO=1 \\\n    BAR=2 \\\n    BAZ=3\n")})
+	for _, want := range []string{"FOO", "BAR", "BAZ"} {
+		found := false
+		for _, e := range d.Env {
+			if e == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("continuation env missing %q; got %v", want, d.Env)
+		}
+	}
+}
+
+func TestDetectComposeMapEnvValueWithEquals(t *testing.T) {
+	compose := []byte("services:\n  a:\n    environment:\n      APP_MODE: cluster=on\n      DATABASE_URL: postgres://u:p@h/db?x=1\n")
+	d := Detect(map[string][]byte{"compose.yml": compose})
+	envs := map[string]bool{}
+	for _, e := range d.Env {
+		envs[e] = true
+	}
+	if !envs["APP_MODE"] || !envs["DATABASE_URL"] {
+		t.Errorf("map-form env = %v, want APP_MODE and DATABASE_URL", d.Env)
+	}
+}
+
+func TestDetectHealthURLPort(t *testing.T) {
+	d := Detect(map[string][]byte{"Dockerfile": []byte(
+		"FROM x\nEXPOSE 3000\nHEALTHCHECK CMD curl -f http://localhost:8080/health\n")})
+	if d.HealthCheck.Type != "http" || d.HealthCheck.Path != "/health" || d.HealthCheck.Port != 8080 {
+		t.Errorf("health probe = %+v, want http /health:8080 (explicit URL port)", d.HealthCheck)
+	}
+}
+
+func TestDetectHealthNoneSubstringNotDisabled(t *testing.T) {
+	// A probe path containing 'none' must not be mistaken for HEALTHCHECK NONE.
+	d := Detect(map[string][]byte{"Dockerfile": []byte(
+		"FROM x\nEXPOSE 8080\nHEALTHCHECK CMD curl -f http://localhost:8080/nonexistent-guard || exit 1\n")})
+	if d.HealthCheck.Source == "default" {
+		t.Errorf("declared probe with 'none' substring was wrongly disabled: %+v", d.HealthCheck)
+	}
+	if d.HealthCheck.Type != "http" || d.HealthCheck.Path != "/nonexistent-guard" {
+		t.Errorf("health probe = %+v, want http /nonexistent-guard", d.HealthCheck)
+	}
+}
+
+func TestDetectComposeLongFormPorts(t *testing.T) {
+	compose := []byte("services:\n  web:\n    ports:\n      - target: 80\n        published: 8080\n        protocol: tcp\n")
+	d := Detect(map[string][]byte{"compose.yaml": compose})
+	found := false
+	for _, p := range d.Ports {
+		if p == 8080 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("long-form ports = %v, want to include published 8080", d.Ports)
+	}
+}
+
 func TestDetectBothPrecedence(t *testing.T) {
 	// A repo with both: Dockerfile chosen for name, and ports merge across both.
 	d := Detect(map[string][]byte{
