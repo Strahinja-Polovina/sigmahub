@@ -56,7 +56,31 @@ type Server struct {
 	Pubkey       *string         `json:"pubkey"`
 	LastSeenAt   *time.Time      `json:"lastSeenAt"`
 	CreatedAt    time.Time       `json:"createdAt"`
+	// P1-5 dashboard fields. Ready is DERIVED on read (running + mesh applied +
+	// a formable same-org peer); the rest are the reported hardening posture and
+	// declared distro. Populated by ListServers/GetServer only.
+	Distro         *string `json:"distro"`
+	Ready          bool    `json:"ready"`
+	MeshPeerCount  int     `json:"meshPeerCount"`
+	HardeningScore *int    `json:"hardeningScore"`
+	DiskEncrypted  *bool   `json:"diskEncrypted"`
+	SSHLocked      *bool   `json:"sshLocked"`
 }
+
+// readinessExpr is the derived Ready predicate: the server is live (running),
+// has applied its mesh config, and a same-org peer is dialable (has a pubkey +
+// mesh IP + endpoint) so a tunnel can form. Computed on read against current peer
+// rows, so it drops promptly when peers leave — no stale persisted flag.
+const readinessExpr = `(
+	s.status = 'running'
+	AND s.mesh_synced_at IS NOT NULL
+	AND s.pubkey IS NOT NULL AND s.mesh_ip IS NOT NULL
+	AND EXISTS (
+		SELECT 1 FROM servers p
+		 WHERE p.org_id = s.org_id AND p.id <> s.id AND p.deleted_at IS NULL
+		   AND p.pubkey IS NOT NULL AND p.mesh_ip IS NOT NULL AND p.endpoint IS NOT NULL
+	)
+)`
 
 func newID(prefix string) string {
 	b := make([]byte, 8)
@@ -365,11 +389,23 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 	return srv, nil
 }
 
+// serverSelect is the dashboard-facing projection: the base columns plus the
+// declared distro, the reported hardening posture, mesh peer count, and the
+// derived Ready flag. Aliased `s` so readinessExpr's correlated subquery binds.
+const serverSelect = `
+	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
+	       s.agent_version, s.facts, s.mesh_ip, s.pubkey, s.last_seen_at, s.created_at,
+	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked, ` + readinessExpr + ` AS ready
+	  FROM servers s`
+
+func scanServerRow(row pgx.Row, srv *Server) error {
+	return row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
+		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
+		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked, &srv.Ready)
+}
+
 func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error) {
-	rows, err := s.Pool.Query(ctx, `
-		SELECT id, org_id, name, type, source, proxy_role, provider, region, status,
-		       agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at
-		  FROM servers WHERE org_id = $1 AND deleted_at IS NULL ORDER BY created_at`, orgID)
+	rows, err := s.Pool.Query(ctx, serverSelect+` WHERE s.org_id = $1 AND s.deleted_at IS NULL ORDER BY s.created_at`, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -378,8 +414,7 @@ func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error)
 	var out []Server
 	for rows.Next() {
 		var srv Server
-		if err := rows.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
-			&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt); err != nil {
+		if err := scanServerRow(rows, &srv); err != nil {
 			return nil, err
 		}
 		out = append(out, srv)
@@ -389,12 +424,9 @@ func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error)
 
 func (s *Store) GetServer(ctx context.Context, orgID, serverID string) (Server, error) {
 	var srv Server
-	err := s.Pool.QueryRow(ctx, `
-		SELECT id, org_id, name, type, source, proxy_role, provider, region, status,
-		       agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at
-		  FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`, orgID, serverID,
-	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
-		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
+	err := scanServerRow(
+		s.Pool.QueryRow(ctx, serverSelect+` WHERE s.org_id = $1 AND s.id = $2 AND s.deleted_at IS NULL`, orgID, serverID),
+		&srv)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Server{}, ErrNotFound
 	}

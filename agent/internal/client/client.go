@@ -64,6 +64,10 @@ type HeartbeatRequest struct {
 	Endpoint     string           `json:"endpoint,omitempty"`
 	Metrics      *MetricSample    `json:"metrics,omitempty"`
 	Hardening    *HardeningReport `json:"hardening,omitempty"`
+	// MeshApplied reports the WireGuard peer config is written for the current
+	// peer set; MeshPeerCount is how many peers it covers. Drives Ready.
+	MeshApplied   bool `json:"meshApplied"`
+	MeshPeerCount int  `json:"meshPeerCount"`
 }
 
 // MeshSelf is this server's own mesh identity as the control plane sees it.

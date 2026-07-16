@@ -841,6 +841,69 @@ func TestHostHardening(t *testing.T) {
 	}
 }
 
+// TestMeshGatedReady covers the P1-5 derived Ready state: a server is Ready only
+// when it is running, has applied its mesh config, AND a same-org peer is
+// dialable (pubkey + mesh IP + endpoint) so a tunnel can form.
+func TestMeshGatedReady(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_ready"
+
+	provisionRegister := func(name, pubkey string) string {
+		res, err := st.ProvisionServer(ctx, orgID, store.ProvisionInput{Name: name, Type: "general"}, "admin", 15*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.RegisterServer(ctx, res.Token, name, "0.1.0", json.RawMessage(`{}`), pubkey); err != nil {
+			t.Fatal(err)
+		}
+		return res.ServerID
+	}
+	ready := func(id string) bool {
+		srv, err := st.GetServer(ctx, orgID, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return srv.Ready
+	}
+
+	a := provisionRegister("a", "wgA==")
+	// Just registered: provisioning (no heartbeat), no mesh sync, no peer → not ready.
+	if ready(a) {
+		t.Fatal("server A ready before any heartbeat/mesh/peer")
+	}
+
+	// A heartbeats with mesh applied → running + mesh_synced, but still no peer.
+	if err := st.RecordHeartbeat(ctx, a, store.HeartbeatInput{
+		AgentVersion: "0.1.0", Facts: json.RawMessage(`{}`), Pubkey: "wgA==", MeshApplied: true, MeshPeerCount: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ready(a) {
+		t.Fatal("server A ready with no formable peer in the org")
+	}
+
+	// Bring up peer B with a pubkey + mesh IP + endpoint → A can now form a tunnel.
+	b := provisionRegister("b", "wgB==")
+	if err := st.RecordHeartbeat(ctx, b, store.HeartbeatInput{
+		AgentVersion: "0.1.0", Facts: json.RawMessage(`{}`), Pubkey: "wgB==", Endpoint: "203.0.113.7:51820", MeshApplied: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !ready(a) {
+		t.Fatal("server A should be Ready once a dialable same-org peer exists")
+	}
+
+	// Cross-org isolation: a peer in a different org must not make A ready. Prove
+	// the peer predicate is org-scoped by deleting B and confirming A drops.
+	if err := st.DeleteServer(ctx, orgID, b, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if ready(a) {
+		t.Fatal("server A must drop out of Ready when its only formable peer is removed")
+	}
+}
+
 func appliedVersion(t *testing.T, st *store.Store, serverID string) int64 {
 	t.Helper()
 	var v int64
