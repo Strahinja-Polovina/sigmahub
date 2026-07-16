@@ -11,6 +11,8 @@ node_modules/
 .next/
 dist/
 build/
+# The agent's Go build-pipeline package is source, not a build-output dir.
+!agent/internal/build/
 .turbo/
 out/
 
