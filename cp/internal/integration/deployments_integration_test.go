@@ -154,6 +154,73 @@ func TestDeploymentsLifecycle(t *testing.T) {
 	}
 }
 
+// TestComposeDeploymentPerServiceStatus pins the multi-service rollup: a
+// deployment with 2 services flips to success only once BOTH service rollouts
+// report, and to failed the moment one service fails.
+func TestComposeDeploymentPerServiceStatus(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_compose"
+
+	proj, _ := st.CreateProject(ctx, orgID, "p", "", "test")
+	env, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	bootTok, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	reg, _ := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	serverID := reg.Server.ID
+	_ = st.AttachServer(ctx, orgID, env.ID, serverID, "test")
+	// A compose resource spec with two services.
+	composeSpec, _ := json.Marshal(map[string]any{
+		"compose": map[string]any{"services": []map[string]any{{"name": "web"}, {"name": "db"}}},
+	})
+	res, _ := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "app", Kind: "app", Spec: composeSpec,
+	}, "test")
+
+	// A git deploy of the compose app records service_count = 2 (via the drain
+	// path's composeServiceCount; here we create it directly with a matching spec).
+	dep, _ := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: serverID, Trigger: "git", GitSHA: "sha1",
+	}, "test")
+	// CreateDeployment doesn't parse compose; set service_count as the drain path would.
+	if _, err := st.Pool.Exec(ctx, `UPDATE deployments SET service_count = 2 WHERE id = $1`, dep.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// web's rollout succeeds — the deployment is still deploying (db pending).
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := st.GetDeployment(ctx, orgID, dep.ID)
+	if d.Status != "deploying" {
+		t.Fatalf("one-of-two services done should still be deploying, got %s", d.Status)
+	}
+
+	// db's rollout succeeds — now ALL services are done → success.
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = st.GetDeployment(ctx, orgID, dep.ID)
+	if d.Status != "success" {
+		t.Fatalf("all services done should be success, got %s", d.Status)
+	}
+
+	// A second compose deploy where one service fails → the deployment fails.
+	dep2, _ := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: serverID, Trigger: "git", GitSHA: "sha2",
+	}, "test")
+	_, _ = st.Pool.Exec(ctx, `UPDATE deployments SET service_count = 2 WHERE id = $1`, dep2.ID)
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", false, "db image build failed"); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := st.GetDeployment(ctx, orgID, dep2.ID)
+	if d2.Status != "failed" {
+		t.Fatalf("a failed service must fail the deployment, got %s", d2.Status)
+	}
+}
+
 // TestDeploymentSupersedeAndAdvance pins the review fixes: a newer deployment
 // supersedes the in-flight one (single-in-flight invariant), status advances
 // monotonically with started_at stamped on the first move, a rollout success

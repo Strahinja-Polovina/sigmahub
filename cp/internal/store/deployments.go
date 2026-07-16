@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -192,10 +193,20 @@ func (s *Store) SetDeploymentStatus(ctx context.Context, deploymentID string, up
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setDeploymentStatusTx(ctx, tx, deploymentID, up); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// setDeploymentStatusTx applies a status transition within an existing tx (a
+// terminal row returns ErrConflict, unchanged). Callers already inside a tx —
+// AdvanceDeploymentService — reuse it so the per-service and overall updates
+// commit atomically.
+func setDeploymentStatusTx(ctx context.Context, tx pgx.Tx, deploymentID string, up DeploymentStatusUpdate) error {
 	var cur string
 	var startedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT status, started_at FROM deployments WHERE id = $1 FOR UPDATE`, deploymentID).Scan(&cur, &startedAt)
+	err := tx.QueryRow(ctx, `SELECT status, started_at FROM deployments WHERE id = $1 FOR UPDATE`, deploymentID).Scan(&cur, &startedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -205,7 +216,6 @@ func (s *Store) SetDeploymentStatus(ctx context.Context, deploymentID string, up
 	if terminalDeployStatus(cur) {
 		return ErrConflict
 	}
-
 	_, err = tx.Exec(ctx, `
 		UPDATE deployments SET
 			status = $2,
@@ -219,10 +229,7 @@ func (s *Store) SetDeploymentStatus(ctx context.Context, deploymentID string, up
 				ELSE duration_seconds END
 		WHERE id = $1`,
 		deploymentID, up.Status, up.Detail, up.ImageDigest, up.BuildSeconds, up.MarkStarted, up.MarkFinished)
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return err
 }
 
 // ListDeployments returns a resource's release history newest-first (org-scoped).
@@ -330,10 +337,11 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 
 	var t Deployment
 	var env, srv, conn, ref, sha, digest, cfg *string
+	var svcCount int
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, status
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, service_count, status
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
-		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &t.Status)
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &svcCount, &t.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrNotFound
 	}
@@ -356,11 +364,11 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, config_hash, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),NULLIF($10,''),$11,'queued',$12)
+		                         git_ref, git_sha, image_digest, config_hash, service_count, rollback_of, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),NULLIF($10,''),$11,$12,'queued',$13)
 		RETURNING created_at`,
 		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID,
-		d.GitRef, d.GitSHA, d.ImageDigest, d.ConfigHash, targetDeploymentID, actor).Scan(&d.CreatedAt)
+		d.GitRef, d.GitSHA, d.ImageDigest, d.ConfigHash, svcCount, targetDeploymentID, actor).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -387,10 +395,11 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var env, srv, conn, ref, sha, cfg *string
+	var svcCount int
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash, service_count
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2
-		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg)
+		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg, &svcCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
 	}
@@ -409,10 +418,10 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, config_hash, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),'queued',$10)
+		                         git_ref, git_sha, config_hash, service_count, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,'queued',$11)
 		RETURNING created_at`,
-		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, d.ConfigHash, actor).Scan(&d.CreatedAt)
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, d.ConfigHash, svcCount, actor).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -532,6 +541,7 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 
 		for _, a := range apps {
 			cfgHash := configHash(a.spec)
+			svcCount := composeServiceCount(a.spec)
 			// A newer push supersedes any still-in-flight deploy for this resource,
 			// so only one deployment per (server,resource) is ever in flight.
 			if err := supersedeInFlightTx(ctx, tx, r.orgID, a.serverID, a.id); err != nil {
@@ -539,9 +549,9 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
-				                         trigger, git_ref, git_sha, config_hash, status, created_by)
-				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,'queued','github-webhook')`,
-				newID("dep"), r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, cfgHash); err != nil {
+				                         trigger, git_ref, git_sha, config_hash, service_count, status, created_by)
+				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,$10,'queued','github-webhook')`,
+				newID("dep"), r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, cfgHash, svcCount); err != nil {
 				return nil, err
 			}
 			if a.serverID != "" {
@@ -698,6 +708,114 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 		return nil // already terminal — a concurrent report won
 	}
 	return err
+}
+
+// AdvanceDeploymentService tracks one Compose service's status on the in-flight
+// deployment and rolls the OVERALL status up from the per-service map: the
+// deployment is 'failed' the moment any service fails, 'success' once every
+// service (service_count of them) succeeds, otherwise 'deploying'. Isolated from
+// the single-container AdvanceDeploymentForResource path. A no-op when there is no
+// in-flight deployment.
+func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string) error {
+	svcStatus := ""
+	if !ok {
+		svcStatus = "failed"
+	} else {
+		switch phase {
+		case "build":
+			svcStatus = "deploying"
+		case "rollout":
+			svcStatus = "success"
+		default:
+			return nil // clone/other phases don't carry a per-service status
+		}
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var depID, gitSHA string
+	var serviceCount int
+	err = tx.QueryRow(ctx, `
+		SELECT id, COALESCE(git_sha,''), service_count FROM deployments
+		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &gitSHA, &serviceCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// Record this service's status, but never regress a service already 'success'
+	// (a re-report on a later DSD version must not undo a completed service).
+	var raw []byte
+	err = tx.QueryRow(ctx, `
+		UPDATE deployments
+		   SET service_status = jsonb_set(COALESCE(service_status,'{}'::jsonb), ARRAY[$2::text], to_jsonb($3::text), true)
+		 WHERE id = $1 AND COALESCE(service_status->>$2, '') <> 'success'
+		RETURNING service_status`, depID, service, svcStatus).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The service was already 'success' (no update) — recompute from the current
+		// map so a straggler still completes the deployment.
+		if err := tx.QueryRow(ctx, `SELECT service_status FROM deployments WHERE id = $1`, depID).Scan(&raw); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	statuses := map[string]string{}
+	_ = json.Unmarshal(raw, &statuses)
+	failed := false
+	success := 0
+	for _, st := range statuses {
+		switch st {
+		case "failed":
+			failed = true
+		case "success":
+			success++
+		}
+	}
+
+	up := DeploymentStatusUpdate{}
+	switch {
+	case failed:
+		up.Status, up.Detail, up.MarkFinished = "failed", detail, true
+	case serviceCount > 0 && success >= serviceCount:
+		up.Status, up.MarkStarted, up.MarkFinished = "success", true, true
+		if gitSHA != "" {
+			up.ImageDigest = deployImageTag(resourceID, gitSHA) // rollback-target marker
+		}
+	default:
+		up.Status, up.MarkStarted = "deploying", true
+	}
+
+	// Apply the overall transition within the same tx (terminal-freeze respected).
+	if err := setDeploymentStatusTx(ctx, tx, depID, up); errors.Is(err, ErrConflict) {
+		return tx.Commit(ctx) // already terminal — keep the per-service update
+	} else if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// composeServiceCount returns how many Compose services a resource spec declares
+// (0 for a single-container app), so a deployment knows how many service rollouts
+// must succeed before it is done.
+func composeServiceCount(spec []byte) int {
+	var s struct {
+		Compose *struct {
+			Services []json.RawMessage `json:"services"`
+		} `json:"compose"`
+	}
+	if json.Unmarshal(spec, &s) != nil || s.Compose == nil {
+		return 0
+	}
+	return len(s.Compose.Services)
 }
 
 // AppendDeployLog appends one build/orchestration log line, scoped to the

@@ -19,15 +19,28 @@ const (
 	KindProxyTraefik = "proxy.traefik"
 	// Git deploy pipeline (P1-9): clone at SHA → build on target → zero-downtime
 	// rollout. Names must match the agent's build/container packages byte-for-byte.
-	KindGitClone      = "git.clone"
-	KindImageBuild    = "image.build"
-	KindDeployRollout = "deploy.rollout"
+	KindGitClone       = "git.clone"
+	KindImageBuild     = "image.build"
+	KindDeployRollout  = "deploy.rollout"
+	KindDeployRecreate = "deploy.recreate"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,
 // so a clone/build/rollout chain and a rollback reference the same image.
 func DeployImageTag(resourceID, sha string) string {
 	return "sigmahub/" + resourceID + ":" + sha
+}
+
+// DeployServiceImageTag is the per-service image tag for a Compose service, so
+// each service in a multi-service resource builds and runs its own image.
+func DeployServiceImageTag(resourceID, service, sha string) string {
+	return "sigmahub/" + resourceID + "-" + service + ":" + sha
+}
+
+// ServiceContainerName is the base container name for a Compose service (the
+// rollout/recreate op suffixes it with the generation).
+func ServiceContainerName(resourceID, service string) string {
+	return "sigmahub-" + resourceID + "-" + service
 }
 
 // TraefikRouterName is the deterministic Traefik router/service name for a
