@@ -80,6 +80,9 @@ func (f *fakeStore) GetServer(context.Context, string, string) (store.Server, er
 func (f *fakeStore) ResolveSecretsForResource(context.Context, string, string, string, string) ([]store.ResolvedSecret, error) {
 	return []store.ResolvedSecret{}, nil
 }
+func (f *fakeStore) SetDomainCertStatus(context.Context, string, string, string, string, *time.Time, string) error {
+	return nil
+}
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -182,6 +185,13 @@ func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error      
 func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)          { return 0, nil }
 func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)       { return "dek_2", nil }
 func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error)      { return 0, nil }
+func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
+	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil
+}
+func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, error) { return "srv_1", nil }
+func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]store.Domain, error) {
+	return []store.Domain{}, nil
+}
 
 const (
 	testServiceToken   = "test-service-token"

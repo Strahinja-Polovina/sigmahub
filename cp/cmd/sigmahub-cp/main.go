@@ -158,6 +158,7 @@ func run() error {
 		return err
 	}
 	rec := reconciler.New(log, st, dsdKey)
+	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
 	go rec.Run(ctx, 60*time.Second)
 
 	// Background maintenance: flip silent servers to unreachable, prune old

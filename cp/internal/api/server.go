@@ -31,6 +31,7 @@ type StoreAPI interface {
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
+	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -148,6 +149,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateResource)))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources", s.requireService(store.RoleDeveloper, s.handleListResources))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteResource))
+
+	// Custom domains (P1-8): attach/detach are Project Admin+, listing is member-visible.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleDeveloper, s.handleListDomains))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/domains/{domainId}", s.requireService(store.RoleProjectAdmin, s.handleDetachDomain))
 	// Audit is member-visible (matches the web settings tab shown to all
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
@@ -181,6 +187,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/agent/dsd", s.requireAgent(s.handleGetDSD))
 	s.mux.HandleFunc("POST /v1/agent/dsd/status", s.requireAgent(s.handleDSDStatus))
 	s.mux.HandleFunc("GET /v1/agent/secrets", s.requireAgent(s.handleAgentSecrets))
+	s.mux.HandleFunc("POST /v1/agent/domains/status", s.requireAgent(s.handleAgentDomainStatus))
 }
 
 func (s *Server) Handler() http.Handler {
