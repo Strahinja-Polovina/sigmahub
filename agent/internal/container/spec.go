@@ -120,6 +120,11 @@ type ContainerSpec struct {
 	// SecretRefs are references (never values) to secrets injected at
 	// container-create; the agent resolves them via the control plane.
 	SecretRefs     []SecretRef       `json:"secretRefs,omitempty"`
+	// Labels are extra Docker labels merged onto the container — the P1-8 Traefik
+	// router labels ride here. Part of the spec hash, so a label change (a domain
+	// attached/detached) triggers a recreate. The sigmahub.* managed labels are
+	// applied separately and win on any key collision.
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// Forbidden by the local policy. The control plane never sets these; they
 	// exist only so the agent can detect and reject a DSD that does.

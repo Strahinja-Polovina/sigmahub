@@ -55,6 +55,7 @@ func (d *Driver) Register(r *apply.Registry) {
 	r.Register(KindImagePull, d.opImagePull)
 	r.Register(KindContainerApply, d.opContainerApply)
 	r.Register(KindVolumeRemove, d.opVolumeRemove)
+	r.Register(KindProxyTraefik, d.opProxyTraefik)
 }
 
 func (d *Driver) throttle() error {
@@ -297,7 +298,15 @@ func (d *Driver) opVolumeRemove(ctx context.Context, op dsd.Op) error {
 // limits, per-project network) plus the SPEC-DRIVEN ones (non-root user,
 // read-only rootfs). specHash is stamped as a label for drift detection.
 func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string]any {
-	labels := managedLabels(spec.ResourceID)
+	// Caller labels first (e.g. P1-8 Traefik routers), then the managed
+	// sigmahub.* labels overwrite so they always win on a key collision.
+	labels := map[string]string{}
+	for k, v := range spec.Labels {
+		labels[k] = v
+	}
+	for k, v := range managedLabels(spec.ResourceID) {
+		labels[k] = v
+	}
 	labels[LabelSpecHash] = specHash
 
 	env := make([]string, 0, len(spec.Env))

@@ -165,6 +165,13 @@ func (c *Client) PostDSDStatus(ctx context.Context, agentToken string, version i
 	}, nil)
 }
 
+// PostDomainStatus reports the ACME certificate state (P1-8) the agent read from
+// Traefik's store. domains is any JSON-marshalable slice of {domain,status,
+// serial,expiresAt,error} entries.
+func (c *Client) PostDomainStatus(ctx context.Context, agentToken string, domains any) error {
+	return c.post(ctx, "/v1/agent/domains/status", agentToken, map[string]any{"domains": domains}, nil)
+}
+
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, bearer, body, out)
 }

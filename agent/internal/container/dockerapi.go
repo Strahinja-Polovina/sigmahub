@@ -171,6 +171,48 @@ func (d *DockerClient) NetworkCreate(ctx context.Context, name string, labels ma
 	return err
 }
 
+// ManagedNetworks lists the names of sigmahub-managed bridge networks (those the
+// agent created for projects). Used to attach the Traefik proxy so it can reach
+// every app it fronts.
+func (d *DockerClient) ManagedNetworks(ctx context.Context) ([]string, error) {
+	q := url.Values{}
+	q.Set("filters", `{"label":["`+LabelManaged+`=true"]}`)
+	var nets []networkInspect
+	if err := d.do(ctx, http.MethodGet, "/networks?"+q.Encode(), nil, &nets); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(nets))
+	for _, n := range nets {
+		out = append(out, n.Name)
+	}
+	return out, nil
+}
+
+// NetworkConnect attaches a container to a network. Connecting an
+// already-connected container is treated as success (idempotent).
+func (d *DockerClient) NetworkConnect(ctx context.Context, network, container string) error {
+	body := map[string]any{"Container": container}
+	err := d.do(ctx, http.MethodPost, "/networks/"+url.PathEscape(network)+"/connect", body, nil)
+	var ae *apiError
+	if asAPIError(err, &ae) && (ae.Status == http.StatusForbidden || ae.Status == http.StatusConflict) {
+		return nil // already connected
+	}
+	return err
+}
+
+// VolumeMountpoint returns a managed volume's host filesystem path (the
+// _data dir), so the agent (running as root) can read files Traefik persists
+// there — namely the ACME store, to report certificate status.
+func (d *DockerClient) VolumeMountpoint(ctx context.Context, name string) (string, error) {
+	var v struct {
+		Mountpoint string `json:"Mountpoint"`
+	}
+	if err := d.do(ctx, http.MethodGet, "/volumes/"+url.PathEscape(name), nil, &v); err != nil {
+		return "", err
+	}
+	return v.Mountpoint, nil
+}
+
 // --- Volumes ---
 
 func (d *DockerClient) VolumeExists(ctx context.Context, name string) (bool, error) {
