@@ -61,6 +61,14 @@ func TestDomainsLifecycle(t *testing.T) {
 		t.Fatal("attaching to a missing resource must fail")
 	}
 
+	// Strict hostname validation: Traefik-rule / wildcard injection is rejected
+	// before it can reach a signed DSD's Host(`…`) label.
+	for _, bad := range []string{"a`.b", "app.example.com || Host(`evil.com`)", "*.example.com", "no-dot", "has space.com", "under_score.com"} {
+		if _, _, err := st.AttachDomain(ctx, orgID, res.ID, bad, "http", "test"); err == nil {
+			t.Fatalf("invalid domain %q was accepted", bad)
+		}
+	}
+
 	dom, srvID, err := st.AttachDomain(ctx, orgID, res.ID, "App.Example.COM", "http", "test")
 	if err != nil {
 		t.Fatalf("attach: %v", err)

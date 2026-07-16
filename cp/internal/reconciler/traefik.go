@@ -37,13 +37,29 @@ type traefikOpSpec struct {
 	ACMECADirURL  string `json:"acmeCaDirUrl,omitempty"`
 }
 
-// renderTraefikOp emits the proxy.traefik op for a proxy-role server. Challenge
-// type defaults to HTTP-01; a server-level DNS-01 override is out of P1-8 scope.
-func renderTraefikOp(serverID string, cfg ACMEConfig) dsd.Op {
+// renderTraefikOp emits the proxy.traefik op for a proxy-role server. A server
+// runs ONE ACME resolver, so the challenge type is a per-server property derived
+// from its domains: TLS-ALPN-01 only when EVERY attached domain requests it (so
+// an HTTP-01 domain is never silently broken by a resolver it can't use);
+// otherwise HTTP-01, the safe default. DNS-01 remains a P1-12 hook.
+func renderTraefikOp(serverID string, cfg ACMEConfig, domains []store.Domain) dsd.Op {
+	challenge := "http"
+	if len(domains) > 0 {
+		allTLSALPN := true
+		for _, d := range domains {
+			if d.ChallengeType != "tls-alpn" {
+				allTLSALPN = false
+				break
+			}
+		}
+		if allTLSALPN {
+			challenge = "tls-alpn"
+		}
+	}
 	spec, _ := json.Marshal(traefikOpSpec{
 		ServerID:      serverID,
 		CertResolver:  traefikCertResolver,
-		ChallengeType: "http",
+		ChallengeType: challenge,
 		ACMEEmail:     cfg.Email,
 		ACMECADirURL:  cfg.CADirURL,
 	})
@@ -65,16 +81,18 @@ func traefikLabels(resourceID string, domains []store.Domain, port int) map[stri
 	}
 	sort.Strings(hosts) // deterministic rule → deterministic doc hash
 	router := dsd.TraefikRouterName(resourceID)
-	if port == 0 {
-		port = 80
-	}
 	labels := map[string]string{
 		"traefik.enable": "true",
-		"traefik.http.routers." + router + ".rule":                      strings.Join(hosts, " || "),
-		"traefik.http.routers." + router + ".entrypoints":               "websecure",
-		"traefik.http.routers." + router + ".tls":                       "true",
-		"traefik.http.routers." + router + ".tls.certresolver":          traefikCertResolver,
-		"traefik.http.services." + router + ".loadbalancer.server.port": strconv.Itoa(port),
+		"traefik.http.routers." + router + ".rule":             strings.Join(hosts, " || "),
+		"traefik.http.routers." + router + ".entrypoints":      "websecure",
+		"traefik.http.routers." + router + ".tls":              "true",
+		"traefik.http.routers." + router + ".tls.certresolver": traefikCertResolver,
+	}
+	// Only pin the upstream port when the app declares one; otherwise let
+	// Traefik auto-detect the container's single exposed port rather than
+	// silently defaulting to 80 (which would misroute an app on another port).
+	if port > 0 {
+		labels["traefik.http.services."+router+".loadbalancer.server.port"] = strconv.Itoa(port)
 	}
 	return labels
 }
