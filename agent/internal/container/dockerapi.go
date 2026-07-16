@@ -329,6 +329,40 @@ func (d *DockerClient) ImageDigest(ctx context.Context, ref string) (string, err
 	return out.ID, nil
 }
 
+// ImageSummary is the subset of GET /images/json each entry carries that image
+// retention needs.
+type ImageSummary struct {
+	ID       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Created  int64    `json:"Created"`
+}
+
+// ImageList returns images whose repo tag matches the reference filter (e.g.
+// "sigmahub/res_x:*"), newest first — the input to keep-last-N retention.
+func (d *DockerClient) ImageList(ctx context.Context, reference string) ([]ImageSummary, error) {
+	filters := `{"reference":["` + reference + `"]}`
+	var out []ImageSummary
+	if err := d.do(ctx, http.MethodGet, "/images/json?filters="+url.QueryEscape(filters), nil, &out); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created > out[j].Created })
+	return out, nil
+}
+
+// ImageRemove deletes an image by reference (a tag or id). A not-found removal is
+// treated as success (already gone), so retention is idempotent.
+func (d *DockerClient) ImageRemove(ctx context.Context, ref string, force bool) error {
+	path := "/images/" + url.PathEscape(ref)
+	if force {
+		path += "?force=true"
+	}
+	err := d.do(ctx, http.MethodDelete, path, nil, nil)
+	if isNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 // ImageBuild builds an image from a local context directory via the daemon's
 // /build endpoint (BuildKit-backed when the daemon defaults to it). It tars the
 // context, streams the build output to logs line-by-line, and fails if the build
