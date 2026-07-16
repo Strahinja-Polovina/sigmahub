@@ -71,4 +71,8 @@ export const DEPLOY_STATUS_META: Record<
   success: { label: "Success", text: "text-emerald-700", dot: "bg-emerald-500" },
   failed: { label: "Failed", text: "text-red-700", dot: "bg-red-500" },
   building: { label: "Building", text: "text-amber-700", dot: "bg-amber-500" },
+  // CP deploy-pipeline statuses (P1-9).
+  deploying: { label: "Deploying", text: "text-blue-700", dot: "bg-blue-500" },
+  superseded: { label: "Superseded", text: "text-muted-foreground", dot: "bg-muted-foreground" },
+  rolled_back: { label: "Rolled back", text: "text-muted-foreground", dot: "bg-muted-foreground" },
 };

@@ -59,6 +59,22 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, dep)
 }
 
+// handleRedeploy queues a manual redeploy of a git-deployed resource, reusing its
+// last deployment's git coordinates (a fresh clone→build→rollout of the same
+// commit). Project Admin+.
+func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	dep, serverID, err := s.domain.CreateManualRedeploy(r.Context(), orgID, r.PathValue("resourceId"), principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "redeploy")
+		return
+	}
+	if s.reconcile != nil && serverID != "" {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
+	writeJSON(w, http.StatusCreated, dep)
+}
+
 // deployLogStreamTimeout bounds an SSE log stream so a stuck deployment can't
 // hold the connection forever. A var so tests can shorten it.
 var deployLogStreamTimeout = 10 * time.Minute

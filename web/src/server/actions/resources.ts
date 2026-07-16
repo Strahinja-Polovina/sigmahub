@@ -13,6 +13,7 @@ import {
   cpDeleteResource,
   cpKind,
   cpMirrorServer,
+  cpRedeploy,
   cpRequestConfirmToken,
   cpConfirmDestructive,
 } from "../cp";
@@ -124,6 +125,16 @@ export async function createResource(input: {
 /** Kick off a redeploy: a new deployment enters the pipeline as `queued`. */
 export async function deployResource(input: { resourceId: string }) {
   const { resource, orgId, actor } = await assertResourceMembership(input.resourceId);
+  // CP mode: queue a real manual redeploy (fresh clone→build→rollout). The CP
+  // drives the pipeline status, so there's no client-side simulation to advance.
+  if (cpEnabled() && orgId && actor) {
+    const { role } = await requireProjectAdmin(orgId);
+    const dep = await cpRedeploy(orgId, input.resourceId, { name: actor.name, role });
+    await writeAudit({ orgId, actor: actor.name, action: "Redeployed resource", target: resource.name });
+    revalidatePath("/dashboard", "layout");
+    revalidatePath(`/dashboard/resources/${input.resourceId}`);
+    return { deploymentId: dep.id, cp: true as const };
+  }
   const id = rid("dep");
   const now = new Date();
   await db.insert(s.deployments).values({

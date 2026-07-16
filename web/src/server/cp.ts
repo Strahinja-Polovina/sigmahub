@@ -742,6 +742,85 @@ export async function cpDetachDomain(orgId: string, domainId: string, actor: CpA
   }, { orgId, actor });
 }
 
+// ── Deployments (P1-9) ───────────────────────────────────────────────────────
+
+export type CpDeployment = {
+  id: string;
+  orgId: string;
+  resourceId: string;
+  environmentId?: string;
+  serverId?: string;
+  connectionId?: string;
+  trigger: string; // git | manual | rollback
+  gitRef?: string;
+  gitSha?: string;
+  imageDigest?: string;
+  configHash?: string;
+  status: string; // queued | building | deploying | success | failed | superseded | rolled_back
+  detail?: string;
+  rollbackOf?: string;
+  buildSeconds?: number;
+  durationSeconds?: number;
+  createdBy?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+};
+
+export type CpDeployLog = {
+  id: number;
+  stream: string;
+  line: string;
+  at: string;
+};
+
+export async function cpListDeployments(orgId: string, resourceId: string, limit = 25): Promise<CpDeployment[]> {
+  const { deployments } = await cpFetch<{ deployments: CpDeployment[] }>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/deployments?limit=${limit}`, undefined, { orgId });
+  return deployments;
+}
+
+export async function cpRollbackTargets(orgId: string, resourceId: string): Promise<CpDeployment[]> {
+  const { targets } = await cpFetch<{ targets: CpDeployment[] }>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/rollback-targets`, undefined, { orgId });
+  return targets;
+}
+
+export async function cpCreateRollback(
+  orgId: string,
+  resourceId: string,
+  targetDeploymentId: string,
+  actor: CpActor
+): Promise<CpDeployment> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/rollback`, {
+    method: "POST",
+    body: JSON.stringify({ targetDeploymentId }),
+  }, { orgId, actor });
+}
+
+/** Queue a manual redeploy (fresh clone→build→rollout of the last commit). */
+export async function cpRedeploy(
+  orgId: string,
+  resourceId: string,
+  actor: CpActor
+): Promise<CpDeployment> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/deploy`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { orgId, actor });
+}
+
+/** One page of a deployment's build/orchestration logs past a cursor (id). */
+export async function cpDeployLogs(
+  orgId: string,
+  deploymentId: string,
+  after = 0
+): Promise<{ deployment: CpDeployment; logs: CpDeployLog[]; nextCursor: number; done: boolean }> {
+  return cpFetch(
+    `${org(orgId)}/deployments/${encodeURIComponent(deploymentId)}/logs?after=${after}`,
+    undefined, { orgId });
+}
+
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
 export function cpKind(localKind: string): string {
   return localKind === "mongo" ? "mongodb" : localKind;

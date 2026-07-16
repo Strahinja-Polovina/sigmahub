@@ -212,6 +212,9 @@ func (f *fakeDomain) RollbackTargets(_ context.Context, _, _ string, _ int) ([]s
 func (f *fakeDomain) CreateRollback(_ context.Context, orgID, resourceID, targetDeploymentID, _ string) (store.Deployment, string, error) {
 	return store.Deployment{ID: "dep_rb", OrgID: orgID, ResourceID: resourceID, Trigger: "rollback", RollbackOf: targetDeploymentID, Status: "queued"}, "srv_1", nil
 }
+func (f *fakeDomain) CreateManualRedeploy(_ context.Context, orgID, resourceID, _ string) (store.Deployment, string, error) {
+	return store.Deployment{ID: "dep_md", OrgID: orgID, ResourceID: resourceID, Trigger: "manual", Status: "queued"}, "srv_1", nil
+}
 func (f *fakeDomain) GetDeployment(_ context.Context, orgID, deploymentID string) (store.Deployment, error) {
 	return store.Deployment{ID: deploymentID, OrgID: orgID, Status: "success"}, nil
 }
