@@ -539,6 +539,146 @@ export async function cpListAudit(orgId: string, limit = 50): Promise<CpAuditEnt
   return entries;
 }
 
+// ── Git integration (P1-7) ───────────────────────────────────────────────────
+
+/** Deploy config detected from a repo's root files — a wizard pre-fill. */
+export type CpDetected = {
+  hasDockerfile: boolean;
+  hasCompose: boolean;
+  dockerfilePath?: string;
+  composePath?: string;
+  ports: number[];
+  env: string[];
+  healthCheck?: string;
+  deployable: boolean;
+  reason?: string;
+};
+
+export type CpGitConnection = {
+  id: string;
+  orgId: string;
+  projectId: string;
+  provider: string;
+  installationId: string;
+  repoFullName: string;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CpBranchMap = {
+  id: string;
+  connectionId: string;
+  branch: string;
+  environmentId: string;
+  policy: "auto" | "manual";
+  lastRef?: string;
+  lastSha?: string;
+  lastPushedAt?: string;
+  createdAt: string;
+};
+
+export type CpDeployRequest = {
+  id: string;
+  orgId: string;
+  connectionId: string;
+  environmentId?: string;
+  kind: "deploy" | "pr_hook";
+  ref: string;
+  sha: string;
+  branch?: string;
+  status: string;
+  createdAt: string;
+};
+
+/** Preview the deploy config sigmahub detects for a repo (persists nothing). */
+export async function cpDetectRepo(
+  orgId: string,
+  input: { repoFullName: string; installationId?: string; token?: string },
+  actor: CpActor
+): Promise<CpDetected> {
+  return cpFetch(`${org(orgId)}/git/detect`, {
+    method: "POST",
+    body: JSON.stringify({
+      repoFullName: input.repoFullName,
+      installationId: input.installationId ?? "",
+      token: input.token ?? "",
+    }),
+  }, { orgId, actor });
+}
+
+/** Connect a repo to a project. The CP refuses (422) a repo that ships neither a
+ *  Dockerfile nor a Compose file, surfaced here as a thrown error. */
+export async function cpConnectRepo(
+  orgId: string,
+  input: { projectId: string; provider?: string; installationId?: string; repoFullName: string; token?: string },
+  actor: CpActor
+): Promise<CpGitConnection> {
+  return cpFetch(`${org(orgId)}/git/connections`, {
+    method: "POST",
+    body: JSON.stringify({
+      projectId: input.projectId,
+      provider: input.provider ?? "github",
+      installationId: input.installationId ?? "",
+      repoFullName: input.repoFullName,
+      token: input.token ?? "",
+    }),
+  }, { orgId, actor });
+}
+
+export async function cpListGitConnections(orgId: string, projectId?: string): Promise<CpGitConnection[]> {
+  const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+  const { connections } = await cpFetch<{ connections: CpGitConnection[] }>(
+    `${org(orgId)}/git/connections${qs}`, undefined, { orgId });
+  return connections;
+}
+
+export async function cpGetGitConnection(
+  orgId: string,
+  connId: string
+): Promise<{ connection: CpGitConnection; branchMaps: CpBranchMap[] }> {
+  return cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}`, undefined, { orgId });
+}
+
+export async function cpDisconnectRepo(orgId: string, connId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpSetBranchMap(
+  orgId: string,
+  connId: string,
+  input: { branch: string; environmentId: string; policy: "auto" | "manual" },
+  actor: CpActor
+): Promise<CpBranchMap> {
+  return cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}/branches`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteBranchMap(orgId: string, mapId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/git/branch-maps/${encodeURIComponent(mapId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpPromoteBranch(orgId: string, mapId: string, actor: CpActor): Promise<CpDeployRequest> {
+  return cpFetch(`${org(orgId)}/git/branch-maps/${encodeURIComponent(mapId)}/promote`, {
+    method: "POST",
+  }, { orgId, actor });
+}
+
+/** List a connection together with its branch routes in one hop per connection —
+ *  the project view renders repo → branch→env tables. */
+export async function cpListGitConnectionsWithMaps(
+  orgId: string,
+  projectId: string
+): Promise<{ connection: CpGitConnection; branchMaps: CpBranchMap[] }[]> {
+  const connections = await cpListGitConnections(orgId, projectId);
+  return Promise.all(connections.map((c) => cpGetGitConnection(orgId, c.id)));
+}
+
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
 export function cpKind(localKind: string): string {
   return localKind === "mongo" ? "mongodb" : localKind;

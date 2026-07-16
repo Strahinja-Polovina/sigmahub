@@ -1,0 +1,143 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { requireMembership, requireProjectAdmin } from "../active-org";
+import { writeAudit } from "../audit";
+import {
+  cpEnabled,
+  cpDetectRepo,
+  cpConnectRepo,
+  cpSetBranchMap,
+  cpDeleteBranchMap,
+  cpPromoteBranch,
+  cpDisconnectRepo,
+  type CpDetected,
+  type CpGitConnection,
+  type CpBranchMap,
+} from "../cp";
+
+/** Git integration is a control-plane feature; the demo path has no webhook
+ *  receiver or provider connection to back it. */
+function ensureCp() {
+  if (!cpEnabled()) {
+    throw new Error("Git integration requires the control plane (set SIGMAHUB_CP_URL).");
+  }
+}
+
+/** Preview the deploy config sigmahub detects for a repo. Read-only; any member
+ *  can run it to see whether a repo is deployable before connecting. */
+export async function detectRepo(input: {
+  orgId: string;
+  repoFullName: string;
+  installationId?: string;
+  token?: string;
+}): Promise<CpDetected> {
+  ensureCp();
+  const { user, role } = await requireMembership(input.orgId);
+  return cpDetectRepo(
+    input.orgId,
+    { repoFullName: input.repoFullName.trim(), installationId: input.installationId, token: input.token },
+    { name: user.name, role }
+  );
+}
+
+/** Connect a repo to a project. Project Admin+ — it stores a provider token and
+ *  wires push-to-deploy. The CP rejects an undeployable repo (thrown here). */
+export async function connectRepo(input: {
+  orgId: string;
+  projectId: string;
+  repoFullName: string;
+  installationId?: string;
+  token?: string;
+}): Promise<CpGitConnection> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  const repo = input.repoFullName.trim();
+  if (!repo.includes("/")) throw new Error("Enter the repository as owner/name.");
+  const conn = await cpConnectRepo(
+    input.orgId,
+    { projectId: input.projectId, repoFullName: repo, installationId: input.installationId, token: input.token },
+    { name: user.name, role }
+  );
+  await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected Git repo", target: repo });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+  return conn;
+}
+
+/** Map a branch to an environment with a deploy policy (auto | manual). */
+export async function setBranchMapping(input: {
+  orgId: string;
+  projectId: string;
+  connectionId: string;
+  branch: string;
+  environmentId: string;
+  policy: "auto" | "manual";
+}): Promise<CpBranchMap> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  const branch = input.branch.trim();
+  if (!branch) throw new Error("Branch is required.");
+  const m = await cpSetBranchMap(
+    input.orgId,
+    input.connectionId,
+    { branch, environmentId: input.environmentId, policy: input.policy },
+    { name: user.name, role }
+  );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: `Mapped branch ${branch} (${input.policy})`,
+    target: input.environmentId,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+  return m;
+}
+
+/** Promote a manual branch's last-seen commit to a deploy. */
+export async function promoteBranch(input: {
+  orgId: string;
+  projectId: string;
+  mapId: string;
+  branch: string;
+}): Promise<void> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  await cpPromoteBranch(input.orgId, input.mapId, { name: user.name, role });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: `Promoted branch ${input.branch}`,
+    target: input.mapId,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+export async function removeBranchMapping(input: {
+  orgId: string;
+  projectId: string;
+  mapId: string;
+}): Promise<void> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  await cpDeleteBranchMap(input.orgId, input.mapId, { name: user.name, role });
+  await writeAudit({ orgId: input.orgId, actor: user.name, action: "Removed branch mapping", target: input.mapId });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+export async function disconnectRepo(input: {
+  orgId: string;
+  projectId: string;
+  connectionId: string;
+  repoFullName: string;
+}): Promise<void> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  await cpDisconnectRepo(input.orgId, input.connectionId, { name: user.name, role });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Disconnected Git repo",
+    target: input.repoFullName,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
