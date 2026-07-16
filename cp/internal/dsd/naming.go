@@ -9,6 +9,11 @@ const (
 	KindImagePull      = "image.pull"
 	KindContainerApply = "container.apply"
 	KindVolumeRemove   = "volume.remove"
+	// Host-hardening ops (P1-5) — the ONLY channel for post-enrollment host
+	// changes. Names must match the agent's host package byte-for-byte.
+	KindHostNftables = "host.nftables"
+	KindHostSSHD     = "host.sshd"
+	KindHostCIS      = "host.cis"
 )
 
 // Docker object naming. The control plane is the sole authority for these

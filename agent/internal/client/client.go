@@ -48,12 +48,22 @@ type MetricSample struct {
 	Load1   float64 `json:"load1"`
 }
 
+// HardeningReport is the agent's self-assessed host hardening posture (P1-5),
+// reported over the heartbeat so the dashboard can show a score + disk-encryption
+// status. A daily drift re-check keeps it current.
+type HardeningReport struct {
+	Score         int  `json:"score"`
+	DiskEncrypted bool `json:"diskEncrypted"`
+	SSHLocked     bool `json:"sshLocked"`
+}
+
 type HeartbeatRequest struct {
-	AgentVersion string          `json:"agentVersion"`
-	Facts        json.RawMessage `json:"facts"`
-	Pubkey       string          `json:"pubkey"`
-	Endpoint     string          `json:"endpoint,omitempty"`
-	Metrics      *MetricSample   `json:"metrics,omitempty"`
+	AgentVersion string           `json:"agentVersion"`
+	Facts        json.RawMessage  `json:"facts"`
+	Pubkey       string           `json:"pubkey"`
+	Endpoint     string           `json:"endpoint,omitempty"`
+	Metrics      *MetricSample    `json:"metrics,omitempty"`
+	Hardening    *HardeningReport `json:"hardening,omitempty"`
 }
 
 // MeshSelf is this server's own mesh identity as the control plane sees it.

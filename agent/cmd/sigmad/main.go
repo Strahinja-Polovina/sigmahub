@@ -20,6 +20,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/container"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/host"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
@@ -140,6 +141,12 @@ func run() error {
 	}
 	driver := container.NewDriver(docker, cstore, log, secretFetcher)
 	driver.Register(registry)
+	// Host-hardening ops (P1-5): nftables / sshd / CIS. These mutate the host
+	// itself and require root; the handlers fail cleanly (reported as a failed op)
+	// when sigmad is not root. Registered behind the same apply registry, so an
+	// unregistered host op kind is still rejected.
+	hostDriver := host.NewDriver()
+	hostDriver.Register(registry)
 	if avail, ver := container.Probe(ctx, docker); avail {
 		log.Info("docker runtime available", "version", ver)
 	} else {
@@ -168,6 +175,15 @@ func run() error {
 	// gone — exit so the operator re-bootstraps.
 	backoff := *interval
 	hb := 0
+	// Hardening posture is a daily drift re-check, not a per-heartbeat probe:
+	// compute it at startup and roughly every 6h, and report the cached value on
+	// every heartbeat so the dashboard's score stays fresh without hammering the
+	// host with lsblk/sshd/sysctl/nft calls each tick.
+	var posture host.Posture
+	postureEvery := int((6 * time.Hour) / *interval)
+	if postureEvery < 1 {
+		postureEvery = 1
+	}
 	for {
 		hb++
 		// Re-probe the endpoint roughly every 10 minutes to track IP changes.
@@ -175,6 +191,9 @@ func run() error {
 			if ep, err := mesh.DiscoverEndpoint(ctx); err == nil && ep != "" {
 				meshEndpoint = ep
 			}
+		}
+		if hb == 1 || hb%postureEvery == 0 {
+			posture = hostDriver.Posture(ctx)
 		}
 		hostFacts := facts.Collect()
 		if avail, ver := container.Probe(ctx, docker); avail {
@@ -193,6 +212,11 @@ func run() error {
 				MemPct:  sample.MemPct,
 				DiskPct: sample.DiskPct,
 				Load1:   sample.Load1,
+			},
+			Hardening: &client.HardeningReport{
+				Score:         posture.Score,
+				DiskEncrypted: posture.DiskEncrypted,
+				SSHLocked:     posture.SSHLocked,
 			},
 		})
 		var apiErr *client.APIError

@@ -24,6 +24,14 @@ type MetricPoint struct {
 	RecordedAt time.Time `json:"recordedAt"`
 }
 
+// HardeningReport is the agent's self-assessed hardening posture (P1-5), carried
+// on the heartbeat from its daily drift re-check.
+type HardeningReport struct {
+	Score         int
+	DiskEncrypted bool
+	SSHLocked     bool
+}
+
 // HeartbeatInput is one agent check-in.
 type HeartbeatInput struct {
 	AgentVersion string
@@ -31,6 +39,7 @@ type HeartbeatInput struct {
 	Pubkey       string
 	Endpoint     string
 	Metrics      *MetricSample
+	Hardening    *HardeningReport
 }
 
 // RecordHeartbeat updates a server's liveness and appends a metrics sample.
@@ -82,6 +91,15 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 			VALUES ($1, $2, $3, $4, $5)`,
 			serverID, m.CPUPct, m.MemPct, m.DiskPct, m.Load1); err != nil {
 			return fmt.Errorf("insert metric: %w", err)
+		}
+	}
+	if h := in.Hardening; h != nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servers
+			   SET hardening_score = $2, disk_encrypted = $3, ssh_locked = $4, hardening_checked_at = now()
+			 WHERE id = $1`,
+			serverID, h.Score, h.DiskEncrypted, h.SSHLocked); err != nil {
+			return fmt.Errorf("record hardening posture: %w", err)
 		}
 	}
 	return tx.Commit(ctx)
