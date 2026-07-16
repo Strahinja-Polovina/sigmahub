@@ -128,6 +128,16 @@ func desiredNames(doc dsd.Document) map[string]bool {
 			if spec.Name != "" {
 				names[spec.Name] = true
 			}
+		case KindDeployRollout:
+			// A rollout's live container carries a generation-suffixed name; keep
+			// it so GC doesn't reap the freshly-deployed version.
+			var rs RolloutSpec
+			if err := json.Unmarshal(op.Spec, &rs); err != nil {
+				continue
+			}
+			if rs.Container.Name != "" {
+				names[rolloutName(rs.Container.Name, rs.Generation)] = true
+			}
 		}
 	}
 	return names

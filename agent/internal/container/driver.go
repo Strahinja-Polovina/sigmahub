@@ -56,6 +56,7 @@ func (d *Driver) Register(r *apply.Registry) {
 	r.Register(KindContainerApply, d.opContainerApply)
 	r.Register(KindVolumeRemove, d.opVolumeRemove)
 	r.Register(KindProxyTraefik, d.opProxyTraefik)
+	r.Register(KindDeployRollout, d.opRollout)
 }
 
 func (d *Driver) throttle() error {

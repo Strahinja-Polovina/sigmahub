@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -443,7 +444,10 @@ type ContainerState struct {
 	// Pid is the container's main-process host PID (0 when not running). Used to
 	// seed secret files through the container's live mount namespace via
 	// /proc/<pid>/root, which lands in the tmpfs and never on the host disk layer.
-	Pid    int
+	Pid int
+	// IP is the container's address on its (first) bridge network, so the agent
+	// can health-probe a new container directly during a zero-downtime rollout.
+	IP     string
 	Labels map[string]string
 }
 
@@ -458,6 +462,27 @@ type containerInspect struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+// firstIP returns a deterministic non-empty container IP (networks sorted by
+// name) so the health probe targets a stable address.
+func (ci containerInspect) firstIP() string {
+	names := make([]string, 0, len(ci.NetworkSettings.Networks))
+	for n := range ci.NetworkSettings.Networks {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if ip := ci.NetworkSettings.Networks[n].IPAddress; ip != "" {
+			return ip
+		}
+	}
+	return ""
 }
 
 // ContainerInspect returns (state, true, nil) when the named container exists,
@@ -477,6 +502,7 @@ func (d *DockerClient) ContainerInspect(ctx context.Context, name string) (Conta
 		Image:   ci.Config.Image,
 		Running: ci.State.Running,
 		Pid:     ci.State.Pid,
+		IP:      ci.firstIP(),
 		Labels:  ci.Config.Labels,
 	}, true, nil
 }
