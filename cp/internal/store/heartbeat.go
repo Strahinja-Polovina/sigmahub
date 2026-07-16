@@ -40,6 +40,10 @@ type HeartbeatInput struct {
 	Endpoint     string
 	Metrics      *MetricSample
 	Hardening    *HardeningReport
+	// MeshApplied marks the agent has written its WG peer config; MeshPeerCount
+	// is how many peers it covers. Drive the mesh-gated Ready state.
+	MeshApplied   bool
+	MeshPeerCount int
 }
 
 // RecordHeartbeat updates a server's liveness and appends a metrics sample.
@@ -100,6 +104,13 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 			 WHERE id = $1`,
 			serverID, h.Score, h.DiskEncrypted, h.SSHLocked); err != nil {
 			return fmt.Errorf("record hardening posture: %w", err)
+		}
+	}
+	if in.MeshApplied {
+		if _, err := tx.Exec(ctx, `
+			UPDATE servers SET mesh_synced_at = now(), mesh_peer_count = $2 WHERE id = $1`,
+			serverID, in.MeshPeerCount); err != nil {
+			return fmt.Errorf("record mesh sync: %w", err)
 		}
 	}
 	return tx.Commit(ctx)

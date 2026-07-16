@@ -53,8 +53,10 @@ type heartbeatRequest struct {
 	Facts        json.RawMessage     `json:"facts"`
 	Pubkey       string              `json:"pubkey"`
 	Endpoint     string              `json:"endpoint"`
-	Metrics      *store.MetricSample `json:"metrics"`
-	Hardening    *hardeningReport    `json:"hardening"`
+	Metrics       *store.MetricSample `json:"metrics"`
+	Hardening     *hardeningReport    `json:"hardening"`
+	MeshApplied   bool                `json:"meshApplied"`
+	MeshPeerCount int                 `json:"meshPeerCount"`
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -77,8 +79,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Facts:        req.Facts,
 		Pubkey:       req.Pubkey,
 		Endpoint:     req.Endpoint,
-		Metrics:      req.Metrics,
-		Hardening:    hardening,
+		Metrics:       req.Metrics,
+		Hardening:     hardening,
+		MeshApplied:   req.MeshApplied,
+		MeshPeerCount: req.MeshPeerCount,
 	}); err != nil {
 		s.log.Error("heartbeat", "err", err, "server", srv.ID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})

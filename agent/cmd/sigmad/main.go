@@ -184,6 +184,10 @@ func run() error {
 	if postureEvery < 1 {
 		postureEvery = 1
 	}
+	// Mesh application state, refreshed by syncMesh after each heartbeat and
+	// reported on the next one to drive the CP's mesh-gated Ready state.
+	var meshApplied bool
+	var meshPeers int
 	for {
 		hb++
 		// Re-probe the endpoint roughly every 10 minutes to track IP changes.
@@ -218,13 +222,15 @@ func run() error {
 				DiskEncrypted: posture.DiskEncrypted,
 				SSHLocked:     posture.SSHLocked,
 			},
+			MeshApplied:   meshApplied,
+			MeshPeerCount: meshPeers,
 		})
 		var apiErr *client.APIError
 		switch {
 		case err == nil:
 			backoff = *interval
 			log.Info("heartbeat ok", "server_id", st.ServerID)
-			syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp)
+			meshApplied, meshPeers = syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp)
 		case errors.As(err, &apiErr) && apiErr.Permanent():
 			return err
 		case ctx.Err() != nil:
@@ -332,20 +338,25 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 // syncMesh refreshes the WireGuard peer config after a successful heartbeat.
 // Mesh trouble never fails the heartbeat loop — the coordination plane is
 // best-effort in v0.
-func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToken, dataDir, meshPriv string, wgUp bool) {
+// syncMesh renders + writes the WireGuard peer config and reports whether the
+// mesh config is applied and how many peers it covers, so the next heartbeat can
+// drive the CP's mesh-gated Ready state. "applied" here means the peer config for
+// the current peer set is rendered/written (the CP is outbound-only and never on
+// the WG data plane, so it cannot observe a real handshake in v1).
+func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToken, dataDir, meshPriv string, wgUp bool) (applied bool, peerCount int) {
 	res, err := c.MeshPeers(ctx, agentToken)
 	if err != nil {
 		log.Warn("mesh: peer fetch failed", "err", err)
-		return
+		return false, 0
 	}
 	if res.Self.MeshIP == nil || *res.Self.MeshIP == "" {
 		log.Warn("mesh: no mesh IP allocated yet")
-		return
+		return false, 0
 	}
 	path, changed, err := mesh.WriteConfig(dataDir, mesh.RenderConfig(meshPriv, *res.Self.MeshIP, res.Peers))
 	if err != nil {
 		log.Warn("mesh: config write failed", "err", err)
-		return
+		return false, len(res.Peers)
 	}
 	if changed {
 		log.Info("mesh: peer config updated", "config", path, "peers", len(res.Peers), "mesh_ip", *res.Self.MeshIP)
@@ -353,6 +364,7 @@ func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToke
 			mesh.Apply(ctx, log, path)
 		}
 	}
+	return true, len(res.Peers)
 }
 
 func envOr(key, fallback string) string {
