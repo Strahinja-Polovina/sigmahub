@@ -42,12 +42,19 @@ func serverFrom(r *http.Request) store.Server {
 	return srv
 }
 
+type hardeningReport struct {
+	Score         int  `json:"score"`
+	DiskEncrypted bool `json:"diskEncrypted"`
+	SSHLocked     bool `json:"sshLocked"`
+}
+
 type heartbeatRequest struct {
 	AgentVersion string              `json:"agentVersion"`
 	Facts        json.RawMessage     `json:"facts"`
 	Pubkey       string              `json:"pubkey"`
 	Endpoint     string              `json:"endpoint"`
 	Metrics      *store.MetricSample `json:"metrics"`
+	Hardening    *hardeningReport    `json:"hardening"`
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -57,12 +64,21 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	srv := serverFrom(r)
+	var hardening *store.HardeningReport
+	if req.Hardening != nil {
+		hardening = &store.HardeningReport{
+			Score:         req.Hardening.Score,
+			DiskEncrypted: req.Hardening.DiskEncrypted,
+			SSHLocked:     req.Hardening.SSHLocked,
+		}
+	}
 	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, store.HeartbeatInput{
 		AgentVersion: req.AgentVersion,
 		Facts:        req.Facts,
 		Pubkey:       req.Pubkey,
 		Endpoint:     req.Endpoint,
 		Metrics:      req.Metrics,
+		Hardening:    hardening,
 	}); err != nil {
 		s.log.Error("heartbeat", "err", err, "server", srv.ID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})

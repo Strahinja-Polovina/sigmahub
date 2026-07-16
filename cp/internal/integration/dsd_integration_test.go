@@ -50,7 +50,7 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 	}
 	// Fresh, isolated state per run. cp_secrets is cleared too so the pepper
 	// and DSD key are re-wrapped under this run's throwaway KMS key.
-	for _, tbl := range []string{"server_dsd", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "servers", "cp_audit_log", "cp_secrets"} {
+	for _, tbl := range []string{"server_dsd", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
 		if _, err := st.Pool.Exec(ctx, "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
@@ -157,8 +157,19 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	if err := dsd.Verify(dsdKey.Public().(ed25519.PublicKey), signed); err != nil {
 		t.Fatalf("agent could not verify delivered DSD: %v", err)
 	}
-	if len(signed.Document.Ops) != 1 || signed.Document.Ops[0].ID != "res:"+res {
-		t.Fatalf("unexpected ops: %+v", signed.Document.Ops)
+	// The document carries the resource op plus the always-present P1-5 host
+	// hardening ops (nftables/sshd/cis).
+	opIDs := map[string]bool{}
+	for _, op := range signed.Document.Ops {
+		opIDs[op.ID] = true
+	}
+	if !opIDs["res:"+res] {
+		t.Fatalf("resource op missing: %+v", signed.Document.Ops)
+	}
+	for _, want := range []string{"host:nftables:" + serverID, "host:sshd:" + serverID, "host:cis:" + serverID} {
+		if !opIDs[want] {
+			t.Fatalf("host hardening op %q missing: %+v", want, signed.Document.Ops)
+		}
 	}
 	_ = pubB64
 
@@ -192,7 +203,8 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 
 	// Resync convergence: delete the resource directly in the store (bypassing
 	// the API's event-driven reconcile), then run a reconcile tick (what the
-	// 60s resync loop does) — the DSD must bump to v2 with zero ops.
+	// 60s resync loop does) — the DSD must bump to v2 with no resource ops left
+	// (only the always-present host hardening ops remain).
 	if _, err := st.DeleteResource(ctx, orgID, res, "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -200,8 +212,13 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 		t.Fatal(err)
 	}
 	signed2, code := agentGetDSD(t, ts.URL, agentTok, 1)
-	if code != http.StatusOK || signed2.Document.Version != 2 || len(signed2.Document.Ops) != 0 {
-		t.Fatalf("resync: code=%d version=%d ops=%d, want 200 v2 0-ops", code, signed2.Document.Version, len(signed2.Document.Ops))
+	if code != http.StatusOK || signed2.Document.Version != 2 {
+		t.Fatalf("resync: code=%d version=%d, want 200 v2", code, signed2.Document.Version)
+	}
+	for _, op := range signed2.Document.Ops {
+		if !strings.HasPrefix(op.ID, "host:") {
+			t.Fatalf("resync left a non-host op after resource delete: %+v", signed2.Document.Ops)
+		}
 	}
 
 	// Idempotent resync: a second tick with unchanged specs must NOT bump.
@@ -764,6 +781,63 @@ func TestBootstrapProvisioning(t *testing.T) {
 	// Single redemption: the token cannot be used a second time.
 	if _, err := st.RegisterServer(ctx, res.Token, "web1", "0.1.0", json.RawMessage(`{}`), "x"); !errors.Is(err, store.ErrTokenInvalid) {
 		t.Fatalf("second register = %v, want ErrTokenInvalid (single-use)", err)
+	}
+}
+
+// TestHostHardening covers the P1-5 hardening store flow: defaults, the
+// keep-public-SSH opt-out toggle, and posture persistence from a heartbeat.
+func TestHostHardening(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_hard"
+
+	res, err := st.ProvisionServer(ctx, orgID, store.ProvisionInput{
+		Name: "web1", Type: "general", ProxyRole: true, Distro: "debian-12",
+	}, "admin", 15*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterServer(ctx, res.Token, "web1", "0.1.0", json.RawMessage(`{}`), "wg=="); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default posture: SSH locked down, CIS on, proxy role carried, mesh iface set.
+	hh, err := st.HostHardeningForServer(ctx, res.ServerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hh.KeepPublicSSH || !hh.CISEnabled || !hh.ProxyRole || hh.MeshInterface != "sigma0" || hh.MeshIP == "" {
+		t.Fatalf("default hardening = %+v", hh)
+	}
+
+	// Opt out of SSH lockdown + add an exception; the render input reflects it.
+	if err := st.SetHardeningConfig(ctx, orgID, res.ServerID, true, true,
+		[]store.PortException{{Port: 8443, Proto: "tcp"}}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	hh, _ = st.HostHardeningForServer(ctx, res.ServerID)
+	if !hh.KeepPublicSSH || len(hh.ExtraPorts) != 1 || hh.ExtraPorts[0].Port != 8443 {
+		t.Fatalf("after opt-out = %+v", hh)
+	}
+
+	// Cross-tenant guard: another org cannot change this server's hardening.
+	if err := st.SetHardeningConfig(ctx, "org_other", res.ServerID, false, true, nil, "attacker"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-tenant hardening write = %v, want ErrNotFound", err)
+	}
+
+	// Posture from a heartbeat is persisted on the server.
+	if err := st.RecordHeartbeat(ctx, res.ServerID, store.HeartbeatInput{
+		AgentVersion: "0.1.0", Facts: json.RawMessage(`{}`),
+		Hardening: &store.HardeningReport{Score: 80, DiskEncrypted: true, SSHLocked: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var score int
+	var disk, locked bool
+	st.Pool.QueryRow(ctx, `SELECT hardening_score, disk_encrypted, ssh_locked FROM servers WHERE id=$1`, res.ServerID).
+		Scan(&score, &disk, &locked)
+	if score != 80 || !disk || !locked {
+		t.Fatalf("posture not persisted: score=%d disk=%v locked=%v", score, disk, locked)
 	}
 }
 

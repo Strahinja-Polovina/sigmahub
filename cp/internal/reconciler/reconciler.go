@@ -22,6 +22,7 @@ type Store interface {
 	ResourceSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
 	PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]store.PendingDestructiveOp, error)
 	SecretRefsForServer(ctx context.Context, serverID string) (map[string][]store.SecretRefMeta, error)
+	HostHardeningForServer(ctx context.Context, serverID string) (store.HostHardening, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 }
@@ -44,7 +45,7 @@ func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 // container ops (network.ensure → image.pull → volume.ensure → container.apply);
 // other kinds keep the P1-2 no-op "resource.sync" stub until they are
 // containerised. Confirmed destructive ops are appended as volume.remove.
-func renderOps(specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
@@ -75,6 +76,10 @@ func renderOps(specs []store.ResourceSpec, pending []store.PendingDestructiveOp,
 		ops = append(ops, dsd.Op{ID: id, Kind: dsd.KindNetworkEnsure, Spec: ns})
 	}
 	ops = append(ops, resourceOps...)
+	// Host-hardening ops (P1-5) are appended in a fixed order so the document
+	// hash stays deterministic. They have no dependencies (host-level, independent
+	// of the container graph).
+	ops = append(ops, renderHostOps(serverID, hardening)...)
 	for _, p := range pending {
 		ops = append(ops, renderVolumeRemoveOp(p))
 	}
@@ -96,7 +101,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(specs, pending, secretRefs)
+	hardening, err := r.st.HostHardeningForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err
