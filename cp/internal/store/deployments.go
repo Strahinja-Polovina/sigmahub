@@ -438,6 +438,69 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	return out, rows.Err()
 }
 
+// DeploymentCloneCredential returns the short-lived clone credential + repo for a
+// deployment, resolved from the connection's KMS-wrapped provider token (P1-6
+// envelope). Scoped to the REQUESTING server: an agent token can only fetch the
+// credential for a deployment targeting its own host (BOLA). The plaintext token
+// is returned to the agent for in-memory use and never persisted.
+func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error) {
+	var orgID, connID string
+	err = s.Pool.QueryRow(ctx, `
+		SELECT d.org_id, d.connection_id, c.repo_full_name, c.provider
+		  FROM deployments d JOIN git_connections c ON c.id = d.connection_id
+		 WHERE d.id = $1 AND d.server_id = $2`, deploymentID, serverID).Scan(&orgID, &connID, &repo, &provider)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", "", err
+	}
+	token, err = s.gitProviderToken(ctx, orgID, connID)
+	if err != nil {
+		return "", "", "", err
+	}
+	return token, repo, provider, nil
+}
+
+// AdvanceDeploymentForResource transitions the in-flight deployment for a
+// (server, resource) as its pipeline ops report in. phase is "clone" | "build" |
+// "rollout"; a failure fails the deployment. No-op (ErrNotFound) when there is no
+// in-flight deployment — so it is safe to call for every res:<id> op status,
+// including non-git container.apply resources.
+func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error {
+	var depID, curStatus string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT id, status FROM deployments
+		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // no in-flight deployment
+	}
+	if err != nil {
+		return err
+	}
+	up := DeploymentStatusUpdate{}
+	if !ok {
+		up.Status, up.Detail, up.MarkFinished = "failed", detail, true
+	} else {
+		switch phase {
+		case "clone":
+			up.Status, up.MarkStarted = "building", true
+		case "build":
+			up.Status = "deploying"
+		case "rollout":
+			up.Status, up.MarkFinished = "success", true
+		default:
+			return nil
+		}
+	}
+	err = s.SetDeploymentStatus(ctx, depID, up)
+	if errors.Is(err, ErrConflict) {
+		return nil // already terminal — a concurrent report won
+	}
+	return err
+}
+
 // AppendDeployLog appends one build/orchestration log line for streaming to the UI.
 func (s *Store) AppendDeployLog(ctx context.Context, deploymentID, stream, line string) error {
 	if stream == "" {

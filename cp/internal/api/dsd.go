@@ -87,6 +87,20 @@ func (s *Server) handleGetDSD(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// deployPhase maps a deploy-pipeline op id to its (phase, resourceID). The
+// rollout op keeps the res:<id> id (so its status also routes to resources.status).
+func deployPhase(opID string) (phase, resourceID string, ok bool) {
+	switch {
+	case strings.HasPrefix(opID, "clone:"):
+		return "clone", strings.TrimPrefix(opID, "clone:"), true
+	case strings.HasPrefix(opID, "build:"):
+		return "build", strings.TrimPrefix(opID, "build:"), true
+	case strings.HasPrefix(opID, "res:"):
+		return "rollout", strings.TrimPrefix(opID, "res:"), true
+	}
+	return "", "", false
+}
+
 type dsdStatusRequest struct {
 	Version int64 `json:"version"`
 	// Ops maps op id -> reported status object; resource.sync ops carry the
@@ -106,6 +120,18 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 	// "volrm:<pendingId>" destructive ops so they drop out of future DSDs.
 	byResource := map[string]json.RawMessage{}
 	for opID, st := range req.Ops {
+		// Advance the in-flight deployment (P1-9) as its pipeline ops report. A
+		// no-op for non-git resources (no in-flight deployment).
+		var os struct {
+			State string `json:"state"`
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(st, &os)
+		if phase, resID, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
+			if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, resID, phase, os.State == "applied", os.Error); err != nil {
+				s.log.Error("advance deployment", "err", err, "op", opID)
+			}
+		}
 		switch {
 		case strings.HasPrefix(opID, "res:"):
 			byResource[strings.TrimPrefix(opID, "res:")] = st

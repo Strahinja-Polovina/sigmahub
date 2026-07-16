@@ -113,6 +113,54 @@ func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAgentGitCredential mints the short-lived clone credential for a
+// deployment (P1-9). Scoped to the requesting server: an agent can only fetch the
+// credential for a deployment targeting its own host. The plaintext is returned
+// for in-memory use by git.clone and never lands on disk.
+func (s *Server) handleAgentGitCredential(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	depID := r.URL.Query().Get("deploymentId")
+	if depID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "deploymentId is required"})
+		return
+	}
+	token, repo, provider, err := s.store.DeploymentCloneCredential(r.Context(), srv.ID, depID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deployment for this server"})
+		return
+	}
+	if err != nil {
+		s.log.Error("git credential", "err", err, "server", srv.ID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": token, "repoFullName": repo, "provider": provider})
+}
+
+// handleAgentBuildLog ingests build/orchestration log lines for the deploy SSE
+// stream. Bounded per request.
+func (s *Server) handleAgentBuildLog(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeploymentID string   `json:"deploymentId"`
+		Stream       string   `json:"stream"`
+		Lines        []string `json:"lines"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.DeploymentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "deploymentId and lines required"})
+		return
+	}
+	if len(req.Lines) > 500 {
+		req.Lines = req.Lines[:500]
+	}
+	for _, line := range req.Lines {
+		if err := s.store.AppendDeployLog(r.Context(), req.DeploymentID, req.Stream, line); err != nil {
+			s.log.Error("append deploy log", "err", err)
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // validCertStatus bounds the cert-status values an agent may report, so a buggy
 // or compromised agent can't persist an arbitrary status string.
 var validCertStatus = map[string]bool{"pending": true, "issuing": true, "issued": true, "failed": true}

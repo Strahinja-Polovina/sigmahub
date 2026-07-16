@@ -129,6 +129,29 @@ func loadDSDKey(ctx context.Context, st *store.Store) (ed25519.PrivateKey, error
 	return st.LoadDSDSigningKey(ctx, custody)
 }
 
+// runDeployDrain periodically drains queued deploy_requests into deployments and
+// nudges the reconciler for each affected server, so a git push produces a
+// rendered clone→build→rollout pipeline within a few seconds.
+func runDeployDrain(ctx context.Context, log *slog.Logger, st *store.Store, rec *reconciler.Reconciler) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refs, err := st.DrainDeployRequests(ctx)
+			if err != nil {
+				log.Error("deploy drain", "err", err)
+				continue
+			}
+			for _, r := range refs {
+				rec.ReconcileAsync(r.OrgID, r.ServerID)
+			}
+		}
+	}
+}
+
 func run() error {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -160,6 +183,10 @@ func run() error {
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
 	go rec.Run(ctx, 60*time.Second)
+
+	// Deploy-request drain (P1-9): turn queued git deploy_requests into
+	// deployments and re-render the affected servers so the pipeline runs.
+	go runDeployDrain(ctx, log, st, rec)
 
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
