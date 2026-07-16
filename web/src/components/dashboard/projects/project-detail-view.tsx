@@ -65,6 +65,7 @@ import {
 } from "@/server/actions/projects";
 import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared";
 import { NewEnvironmentDialog } from "./new-environment-dialog";
+import { ProjectGitPanel, type GitConnectionPanel } from "./project-git-panel";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
 export type OrgServer = {
@@ -427,12 +428,19 @@ export function ProjectDetailView({
   project,
   panels,
   orgServers,
+  orgId,
+  gitConnections,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
   orgServers: OrgServer[];
+  orgId?: string;
+  gitConnections?: GitConnectionPanel[];
 }) {
   if (!project) return <NotFound />;
+
+  const environments = panels.map((p) => ({ id: p.env.id, name: p.env.name }));
+  const showGit = Boolean(orgId && gitConnections);
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -508,6 +516,15 @@ export function ProjectDetailView({
             </TabsContent>
           ))}
         </Tabs>
+      )}
+
+      {showGit && (
+        <ProjectGitPanel
+          orgId={orgId!}
+          projectId={project.id}
+          connections={gitConnections!}
+          environments={environments}
+        />
       )}
     </div>
   );
