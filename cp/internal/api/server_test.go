@@ -203,6 +203,21 @@ func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, er
 func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]store.Domain, error) {
 	return []store.Domain{}, nil
 }
+func (f *fakeDomain) ListDeployments(_ context.Context, _, resourceID string, _ int) ([]store.Deployment, error) {
+	return []store.Deployment{}, nil
+}
+func (f *fakeDomain) RollbackTargets(_ context.Context, _, _ string, _ int) ([]store.Deployment, error) {
+	return []store.Deployment{}, nil
+}
+func (f *fakeDomain) CreateRollback(_ context.Context, orgID, resourceID, targetDeploymentID, _ string) (store.Deployment, string, error) {
+	return store.Deployment{ID: "dep_rb", OrgID: orgID, ResourceID: resourceID, Trigger: "rollback", RollbackOf: targetDeploymentID, Status: "queued"}, "srv_1", nil
+}
+func (f *fakeDomain) GetDeployment(_ context.Context, orgID, deploymentID string) (store.Deployment, error) {
+	return store.Deployment{ID: deploymentID, OrgID: orgID, Status: "success"}, nil
+}
+func (f *fakeDomain) DeployLogsSince(_ context.Context, _ string, _ int64, _ int) ([]store.DeployLog, error) {
+	return []store.DeployLog{}, nil
+}
 
 const (
 	testServiceToken   = "test-service-token"

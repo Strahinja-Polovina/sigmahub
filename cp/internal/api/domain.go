@@ -59,6 +59,15 @@ type DomainAPI interface {
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)
 	DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error)
 	ListDomainsForResource(ctx context.Context, orgID, resourceID string) ([]store.Domain, error)
+	// Deployments (P1-9). List is the release history; RollbackTargets are the
+	// retained-image candidates; CreateRollback queues a rebuild-free rollback and
+	// returns the server to re-render; GetDeployment + DeployLogsSince back the
+	// build-log stream.
+	ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
+	RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
+	CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (store.Deployment, string, error)
+	GetDeployment(ctx context.Context, orgID, deploymentID string) (store.Deployment, error)
+	DeployLogsSince(ctx context.Context, deploymentID string, afterID int64, limit int) ([]store.DeployLog, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,
@@ -421,10 +430,10 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"orgId":     req.OrgID,
-		"token":     tok,
-		"tokenId":   p.ID,
-		"role":      string(p.Role),
-		"issuedAt":  time.Now().UTC(),
+		"orgId":    req.OrgID,
+		"token":    tok,
+		"tokenId":  p.ID,
+		"role":     string(p.Role),
+		"issuedAt": time.Now().UTC(),
 	})
 }
