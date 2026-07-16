@@ -20,12 +20,37 @@ import (
 // Op kinds registered on both the control plane (reconciler render) and the
 // agent (apply registry). Kept in one place so the two sides cannot drift.
 const (
-	KindNetworkEnsure = "network.ensure"
-	KindVolumeEnsure  = "volume.ensure"
-	KindImagePull     = "image.pull"
+	KindNetworkEnsure  = "network.ensure"
+	KindVolumeEnsure   = "volume.ensure"
+	KindImagePull      = "image.pull"
 	KindContainerApply = "container.apply"
-	KindVolumeRemove  = "volume.remove"
+	KindVolumeRemove   = "volume.remove"
+	// KindDeployRollout is the P1-9 zero-downtime blue-green rollout: a new
+	// generation of a resource's container is started alongside the old, health-
+	// gated, and only after it passes is the old drained. Name matches the CP.
+	KindDeployRollout = "deploy.rollout"
 )
+
+// HealthProbe is how the agent decides a new container is ready before draining
+// the old (the never-cut invariant). Type "http" GETs Path on Port expecting a
+// 2xx; "tcp" just dials Port. Derived from the resource's health spec (P1-7/P1-8).
+type HealthProbe struct {
+	Type        string `json:"type"` // http | tcp
+	Path        string `json:"path,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	IntervalSec int    `json:"intervalSec,omitempty"`
+	TimeoutSec  int    `json:"timeoutSec,omitempty"` // overall gate deadline
+}
+
+// RolloutSpec is the payload of a deploy.rollout op: the desired container plus
+// the generation tag that names its instance and the health probe that gates the
+// swap.
+type RolloutSpec struct {
+	Container    ContainerSpec `json:"container"`
+	Generation   string        `json:"generation"` // e.g. the 8-char git SHA
+	Health       HealthProbe   `json:"health"`
+	DeploymentID string        `json:"deploymentId,omitempty"`
+}
 
 // Managed-object labels. Every container/volume/network the agent creates
 // carries these so the reconcile loop can enumerate and garbage-collect them
@@ -113,13 +138,13 @@ type ContainerSpec struct {
 	ReadOnlyRootfs bool              `json:"readOnlyRootfs,omitempty"`
 	// Tmpfs mount points (e.g. /tmp, /var/cache/nginx). Required to run a
 	// read-only-rootfs image that still needs scratch space.
-	Tmpfs          []string          `json:"tmpfs,omitempty"`
-	CPUs           float64           `json:"cpus,omitempty"`
-	MemoryMB       int64             `json:"memoryMb,omitempty"`
-	Restart        string            `json:"restart,omitempty"` // no|on-failure|always|unless-stopped
+	Tmpfs    []string `json:"tmpfs,omitempty"`
+	CPUs     float64  `json:"cpus,omitempty"`
+	MemoryMB int64    `json:"memoryMb,omitempty"`
+	Restart  string   `json:"restart,omitempty"` // no|on-failure|always|unless-stopped
 	// SecretRefs are references (never values) to secrets injected at
 	// container-create; the agent resolves them via the control plane.
-	SecretRefs     []SecretRef       `json:"secretRefs,omitempty"`
+	SecretRefs []SecretRef `json:"secretRefs,omitempty"`
 	// Labels are extra Docker labels merged onto the container — the P1-8 Traefik
 	// router labels ride here. Part of the spec hash, so a label change (a domain
 	// attached/detached) triggers a recreate. The sigmahub.* managed labels are
