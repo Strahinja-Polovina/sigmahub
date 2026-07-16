@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -151,6 +152,87 @@ func drainOld(ctx context.Context, dk rolloutDocker, resourceID, keepName string
 
 type logf func(msg string, args ...any)
 
+// imageRetainer is the image slice keep-last-N retention needs. Extracted so the
+// retention policy is unit-testable with a fake.
+type imageRetainer interface {
+	ImageList(ctx context.Context, reference string) ([]ImageSummary, error)
+	ImageRemove(ctx context.Context, ref string, force bool) error
+}
+
+// defaultImageRetention is how many built images per resource are kept so a
+// rebuild-free rollback always has a target; older images are pruned to bound
+// disk use.
+const defaultImageRetention = 10
+
+// retainImages keeps the newest `keep` images tagged sigmahub/<resourceID>:* and
+// removes older tags, never removing one in `inUse` (a running generation — the
+// image currently serving must survive). An in-use tag does not consume a keep
+// slot, so `keep` historical images are retained BEYOND the running one.
+// Best-effort: a removal failure is logged, never fatal — a deploy must not fail
+// because an old image couldn't be pruned.
+func retainImages(ctx context.Context, ir imageRetainer, resourceID string, keep int, inUse map[string]bool, log logf) {
+	if keep <= 0 {
+		keep = defaultImageRetention
+	}
+	prefix := imageTagPrefix(resourceID)
+	imgs, err := ir.ImageList(ctx, prefix+"*")
+	if err != nil {
+		log("retain: list images", "resource", resourceID, "err", err)
+		return
+	}
+	// Collect this resource's tags newest-first (ImageList sorts by Created desc).
+	var tags []string
+	seen := map[string]bool{}
+	for _, im := range imgs {
+		for _, t := range im.RepoTags {
+			if strings.HasPrefix(t, prefix) && !seen[t] {
+				seen[t] = true
+				tags = append(tags, t)
+			}
+		}
+	}
+	kept := 0
+	for _, t := range tags {
+		if inUse[t] {
+			continue // always keep the serving image; doesn't use a slot
+		}
+		if kept < keep {
+			kept++
+			continue
+		}
+		if err := ir.ImageRemove(ctx, t, false); err != nil {
+			log("retain: remove image", "image", t, "err", err)
+		}
+	}
+}
+
+// imageTagPrefix is the "sigmahub/<resourceID>:" tag prefix — mirrors the CP's
+// dsd.DeployImageTag so retention scopes to exactly one resource's images.
+func imageTagPrefix(resourceID string) string {
+	return "sigmahub/" + resourceID + ":"
+}
+
+// inUseImages returns the image tags a resource's running managed containers use,
+// plus the just-deployed tag — the set retention must never remove.
+func inUseImages(ctx context.Context, dk interface {
+	ContainerList(ctx context.Context) ([]ContainerState, error)
+}, resourceID, deployedTag string) map[string]bool {
+	inUse := map[string]bool{}
+	if deployedTag != "" {
+		inUse[deployedTag] = true
+	}
+	list, err := dk.ContainerList(ctx)
+	if err != nil {
+		return inUse
+	}
+	for _, c := range list {
+		if c.Labels[LabelResourceID] == resourceID && c.Image != "" {
+			inUse[c.Image] = true
+		}
+	}
+	return inUse
+}
+
 // performRollout is the blue-green swap, factored from the Docker specifics for
 // testing. body is the create body for the new generation; postStart runs after
 // the new container starts (secret seeding) and aborts the rollout on error.
@@ -240,7 +322,14 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 		return writeFileSecrets(cur.Pid, fileSecrets)
 	}
 
-	return performRollout(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn)
+	if err := performRollout(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
+		return err
+	}
+	// Keep the last-N built images so a rebuild-free rollback always has a target;
+	// prune older ones. Best-effort — never fails the deploy.
+	retainImages(ctx, d.docker, spec.Container.ResourceID, defaultImageRetention,
+		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)
+	return nil
 }
 
 // resolveSecrets resolves a container's secret references into an effective spec

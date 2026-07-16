@@ -209,3 +209,57 @@ func indexOf(events []string, e string) int {
 	}
 	return -1
 }
+
+// fakeImages is an in-memory imageRetainer recording removals.
+type fakeImages struct {
+	imgs    []ImageSummary
+	removed []string
+}
+
+func (f *fakeImages) ImageList(_ context.Context, _ string) ([]ImageSummary, error) {
+	// Already sorted newest-first by the caller's contract; return as seeded.
+	return f.imgs, nil
+}
+func (f *fakeImages) ImageRemove(_ context.Context, ref string, _ bool) error {
+	f.removed = append(f.removed, ref)
+	return nil
+}
+
+// TestRetainImages pins keep-last-N: the newest `keep` tags survive, older ones
+// are pruned, and a tag in use (the running generation) is never removed even
+// when it's old.
+func TestRetainImages(t *testing.T) {
+	res := "res_a"
+	tag := func(n int) string { return imageTagPrefix(res) + fmt.Sprintf("sha%02d", n) }
+	// 12 images newest-first (sha11 … sha00).
+	fi := &fakeImages{}
+	for n := 11; n >= 0; n-- {
+		fi.imgs = append(fi.imgs, ImageSummary{ID: fmt.Sprintf("id%d", n), RepoTags: []string{tag(n)}, Created: int64(n)})
+	}
+	// Keep 10; the running image is the oldest (sha00) — it must survive despite
+	// being past the window, and it must not consume a keep slot.
+	inUse := map[string]bool{tag(0): true}
+	retainImages(context.Background(), fi, res, 10, inUse, func(string, ...any) {})
+
+	// Newest 10 (sha11…sha02) kept by window; sha00 kept by in-use; sha01 pruned.
+	if len(fi.removed) != 1 || fi.removed[0] != tag(1) {
+		t.Fatalf("retention removed = %v, want only %s", fi.removed, tag(1))
+	}
+}
+
+// TestRetainImagesNeverTouchesInUse guards the serving image even under a tiny
+// keep budget.
+func TestRetainImagesNeverTouchesInUse(t *testing.T) {
+	res := "res_b"
+	tag := func(s string) string { return imageTagPrefix(res) + s }
+	fi := &fakeImages{imgs: []ImageSummary{
+		{ID: "i2", RepoTags: []string{tag("new")}, Created: 2},
+		{ID: "i1", RepoTags: []string{tag("old")}, Created: 1},
+	}}
+	retainImages(context.Background(), fi, res, 1, map[string]bool{tag("old"): true}, func(string, ...any) {})
+	for _, r := range fi.removed {
+		if r == tag("old") {
+			t.Fatalf("retention removed the in-use image %s", r)
+		}
+	}
+}
