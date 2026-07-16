@@ -56,6 +56,14 @@ func TraefikRouterName(resourceID string) string { return "sigmahub-" + resource
 // share it (no cross-project layer-2 adjacency).
 func NetworkName(projectID string) string { return "sigmahub-" + projectID }
 
+// ResourceNetworkName is the per-resource Docker network a Compose app's services
+// share. Compose service discovery uses bare service names as network aliases
+// ("db", "web") — a dedicated network per compose app (docker-compose semantics)
+// keeps those aliases from colliding across apps in the same project. Traefik
+// still reaches the web-facing service: the proxy attaches to every managed
+// network.
+func ResourceNetworkName(resourceID string) string { return "sigmahub-app-" + resourceID }
+
 // ContainerName is the managed container for a resource.
 func ContainerName(resourceID string) string { return "sigmahub-" + resourceID }
 

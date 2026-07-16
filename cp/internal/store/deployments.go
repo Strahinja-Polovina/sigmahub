@@ -349,11 +349,10 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 
 	var t Deployment
 	var env, srv, conn, ref, sha, digest, cfg *string
-	var svcCount int
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, service_count, status
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, status
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
-		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &svcCount, &t.Status)
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &t.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrNotFound
 	}
@@ -362,6 +361,12 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	}
 	if t.Status != "success" || digest == nil || *digest == "" {
 		return Deployment{}, "", ErrInvalid{Msg: "rollback target must be a successful release with a built image"}
+	}
+	// The per-service denominator comes from the CURRENT resource spec (what the
+	// reconciler will render), not the prior deployment's stale copy.
+	svcCount, err := resourceServiceCountTx(ctx, tx, orgID, resourceID)
+	if err != nil {
+		return Deployment{}, "", err
 	}
 
 	d := Deployment{
@@ -407,14 +412,18 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var env, srv, conn, ref, sha, cfg *string
-	var svcCount int
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash, service_count
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2
-		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg, &svcCount)
+		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
 	}
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	// Fresh denominator from the current resource spec (see CreateRollback).
+	svcCount, err := resourceServiceCountTx(ctx, tx, orgID, resourceID)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -815,19 +824,46 @@ func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resource
 	return tx.Commit(ctx)
 }
 
-// composeServiceCount returns how many Compose services a resource spec declares
-// (0 for a single-container app), so a deployment knows how many service rollouts
-// must succeed before it is done.
+// composeServiceCount returns how many RUNNABLE Compose services a resource spec
+// declares (0 for a single-container app), so a deployment knows how many service
+// rollouts must succeed before it is done. The runnable rule (a name plus a build
+// context or a prebuilt image) MUST match the reconciler's validComposeServices
+// filter, or the success denominator would diverge from the rendered ops.
 func composeServiceCount(spec []byte) int {
 	var s struct {
 		Compose *struct {
-			Services []json.RawMessage `json:"services"`
+			Services []struct {
+				Name  string `json:"name"`
+				Build string `json:"build"`
+				Image string `json:"image"`
+			} `json:"services"`
 		} `json:"compose"`
 	}
 	if json.Unmarshal(spec, &s) != nil || s.Compose == nil {
 		return 0
 	}
-	return len(s.Compose.Services)
+	n := 0
+	for _, svc := range s.Compose.Services {
+		if svc.Name != "" && (svc.Build != "" || svc.Image != "") {
+			n++
+		}
+	}
+	return n
+}
+
+// resourceServiceCountTx computes the CURRENT compose service count for a
+// resource — used by rollback/redeploy so the per-service denominator reflects
+// the spec that will actually be rendered, not a stale copy from a prior row.
+func resourceServiceCountTx(ctx context.Context, tx pgx.Tx, orgID, resourceID string) (int, error) {
+	var spec []byte
+	err := tx.QueryRow(ctx, `SELECT spec FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&spec)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return composeServiceCount(spec), nil
 }
 
 // AppendDeployLog appends one build/orchestration log line, scoped to the

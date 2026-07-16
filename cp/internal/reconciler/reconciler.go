@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,7 +65,13 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 			if target, isGit := deployTargets[rs.ResourceID]; isGit {
 				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target); ok {
 					resourceOps = append(resourceOps, depOps...)
-					networks[netID] = dsd.NetworkName(rs.ProjectID)
+					// A Compose app deploys onto its own per-resource network
+					// ("net:res:<id>"); a single-container app shares the project network.
+					if strings.HasPrefix(netID, "net:res:") {
+						networks[netID] = dsd.ResourceNetworkName(rs.ResourceID)
+					} else {
+						networks[netID] = dsd.NetworkName(rs.ProjectID)
+					}
 					continue
 				}
 			}
