@@ -24,6 +24,21 @@ SIGMAHUB_WG_UP="${SIGMAHUB_WG_UP:-1}"
 die() { echo "sigmahub-install: $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || die "must run as root"
 
+# Strip the one-time bootstrap key on EXIT — success OR abort. Even if a later
+# step fails, the CP-held bootstrap key must never linger in authorized_keys
+# (Phase-0 invariant: never reused). Wired as an EXIT trap below so it always
+# runs, not as a happy-path tail that a `set -e` abort would skip.
+remove_bootstrap_key() {
+  for ak in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$ak" ] || continue
+    if grep -q 'sigmahub-bootstrap' "$ak" 2>/dev/null; then
+      tmp="$(mktemp)"; grep -v 'sigmahub-bootstrap' "$ak" > "$tmp" || true
+      cat "$tmp" > "$ak"; rm -f "$tmp"
+      echo "removed bootstrap key from $ak"
+    fi
+  done
+}
+
 # --- Distro gate: only the hardened-onboarding targets are supported ----------
 . /etc/os-release 2>/dev/null || die "cannot read /etc/os-release"
 distro="${ID:-}-${VERSION_ID:-}"
@@ -44,6 +59,10 @@ ensure_tool() { need "$1" || { echo "installing $2..."; apt-get update -qq && ap
 
 ensure_tool curl curl
 ensure_tool tar tar
+# The firewall backend (nftables) and the CIS auditd control are not on the
+# stock base images; the host.cis / host.nftables DSD ops need them present.
+need nft || { echo "installing nftables..."; apt-get update -qq && apt-get install -y -qq nftables; }
+apt-get install -y -qq auditd >/dev/null 2>&1 || echo "warning: could not install auditd; the CIS auditd control will score as unmet"
 # cosign is required to verify the release before we run it.
 if ! need cosign; then
   echo "installing cosign..."
@@ -59,7 +78,7 @@ if ! need docker; then
 fi
 
 # --- Download + verify --------------------------------------------------------
-work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+work="$(mktemp -d)"; trap 'rm -rf "$work"; remove_bootstrap_key' EXIT
 archive="sigmad_${ver_noV}_linux_${arch}.tar.gz"
 echo "downloading ${archive}..."
 curl -fsSL "${SIGMAHUB_DOWNLOAD_BASE}/${archive}"        -o "${work}/${archive}"
@@ -112,20 +131,28 @@ if [ "${SIGMAHUB_WG_UP}" != "1" ]; then
   sed -i 's| -wg-up||' /etc/systemd/system/sigmad.service
 fi
 
+# Persist the firewall across reboots: a oneshot unit loads the ruleset the
+# agent writes on its first host.nftables op (ConditionPathExists guards the
+# pre-first-apply boot). Without this the DSD apply is version-gated and would
+# never re-run `nft -f` after a reboot, leaving the host firewall failing open.
+install -m 0644 /dev/stdin /etc/systemd/system/sigmahub-nftables.service <<'NFTUNIT'
+[Unit]
+Description=Load sigmahub nftables ruleset
+Before=network-pre.target
+Wants=network-pre.target
+ConditionPathExists=/etc/sigmahub/nftables.conf
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/sigmahub/nftables.conf
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+NFTUNIT
+
 systemctl daemon-reload
+systemctl enable sigmahub-nftables.service
 systemctl enable --now sigmad.service
 
-# --- Remove the one-time bootstrap SSH key ------------------------------------
-# The provisioner added the CP's ed25519 public key (comment sigmahub-bootstrap)
-# to authorized_keys for a single login. Now that the agent is up and talks
-# outbound-only, the key must never be reused.
-for ak in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
-  [ -f "$ak" ] || continue
-  if grep -q 'sigmahub-bootstrap' "$ak"; then
-    tmp="$(mktemp)"; grep -v 'sigmahub-bootstrap' "$ak" > "$tmp" || true
-    cat "$tmp" > "$ak"; rm -f "$tmp"
-    echo "removed bootstrap key from $ak"
-  fi
-done
-
+# The one-time bootstrap key is stripped by the EXIT trap (remove_bootstrap_key),
+# so it is removed even if any step above aborted.
 echo "sigmahub agent installed and started. It will register and join the mesh; the dashboard will show it as Ready once a peer is reachable."

@@ -156,14 +156,17 @@ func (d *Driver) opCIS(ctx context.Context, op dsd.Op) error {
 	if err := d.writeFile(cisSysctlPath, []byte(RenderCISSysctl()), 0o644); err != nil {
 		return fmt.Errorf("write cis sysctl: %w", err)
 	}
-	if out, err := d.runner(ctx, "sysctl", "--system"); err != nil {
-		return fmt.Errorf("sysctl --system: %w: %s", err, strings.TrimSpace(string(out)))
+	// Apply ONLY our file with -e (ignore errors about unknown keys): on hosts
+	// with IPv6 disabled the net.ipv6.* keys don't exist under /proc, and
+	// `sysctl --system` would exit non-zero and (wrongly) fail the whole op.
+	if out, err := d.runner(ctx, "sysctl", "-e", "-p", cisSysctlPath); err != nil {
+		return fmt.Errorf("sysctl -p %s: %w: %s", cisSysctlPath, err, strings.TrimSpace(string(out)))
 	}
-	// auditd is a CIS L1 control; enable + start idempotently (already-enabled is
-	// a no-op that returns 0).
-	if out, err := d.runner(ctx, "systemctl", "enable", "--now", "auditd"); err != nil {
-		return fmt.Errorf("enable auditd: %w: %s", err, strings.TrimSpace(string(out)))
-	}
+	// auditd is a CIS L1 control, but the package isn't on the stock base images.
+	// Enable it best-effort: if it isn't installed the op still converges (the
+	// installer apt-installs it, and the posture score reflects whether auditd
+	// ended up active). Never block convergence on it.
+	_, _ = d.runner(ctx, "systemctl", "enable", "--now", "auditd")
 	return nil
 }
 
@@ -183,8 +186,16 @@ func RenderNftables(spec NftablesSpec) string {
 	var b strings.Builder
 	b.WriteString("#!/usr/sbin/nft -f\n")
 	b.WriteString("# Managed by sigmahub (host.nftables). Do not edit by hand.\n")
-	b.WriteString("flush ruleset\n\n")
+	// Replace ONLY our own table, atomically — never `flush ruleset`, which would
+	// wipe Docker's ip/ip6 NAT + filter chains and break container networking. The
+	// ensure-then-delete-then-define idiom leaves every other table untouched.
+	b.WriteString("table inet sigmahub {}\n")
+	b.WriteString("delete table inet sigmahub\n\n")
 	b.WriteString("table inet sigmahub {\n")
+	// Only an INPUT chain (host protection). We deliberately do NOT manage the
+	// forward hook — that is Docker's domain; a drop here would be traversed
+	// alongside Docker's forward chain and kill bridge forwarding. Output is left
+	// unfiltered (default accept) so the agent's outbound channel always survives.
 	b.WriteString("\tchain input {\n")
 	b.WriteString("\t\ttype filter hook input priority 0; policy drop;\n")
 	b.WriteString("\t\tct state established,related accept\n")
@@ -193,7 +204,7 @@ func RenderNftables(spec NftablesSpec) string {
 	b.WriteString("\t\tip protocol icmp accept\n")
 	b.WriteString("\t\tip6 nexthdr ipv6-icmp accept\n")
 	fmt.Fprintf(&b, "\t\tudp dport %d accept\n", wg) // WireGuard mesh — always
-	fmt.Fprintf(&b, "\t\tiifname \"%s\" accept\n", mesh) // intra-fleet over the mesh
+	fmt.Fprintf(&b, "\t\tiifname \"%s\" accept\n", mesh) // intra-fleet + mesh SSH
 	if spec.AllowPublicSSH {
 		b.WriteString("\t\ttcp dport 22 accept\n")
 	}
@@ -208,8 +219,6 @@ func RenderNftables(spec NftablesSpec) string {
 		fmt.Fprintf(&b, "\t\t%s dport %d accept\n", proto, p.Port)
 	}
 	b.WriteString("\t}\n")
-	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy drop;\n\t}\n")
-	b.WriteString("\tchain output {\n\t\ttype filter hook output priority 0; policy accept;\n\t}\n")
 	b.WriteString("}\n")
 	return b.String()
 }
@@ -226,19 +235,20 @@ func sortedPorts(ports []PortException) []PortException {
 }
 
 // RenderSSHDConfig produces the sshd drop-in. Password + root login are always
-// off (SIGMA-A-5); binding to the mesh IP is the default, and keeping public SSH
-// (ListenMeshOnly false) is the explicit opt-out.
+// off (SIGMA-A-5). We deliberately do NOT pin ListenAddress to the mesh IP:
+// sshd would fail to start after any reboot where the WireGuard interface has
+// not yet come up (the mesh IP is unassigned), and `sshd -t` cannot detect an
+// unbindable address — a full remote-SSH lockout with no rollback. Instead sshd
+// keeps its default wildcard bind (so it always starts) and mesh-only access is
+// enforced at the firewall (host.nftables drops public tcp/22 unless
+// AllowPublicSSH, and accepts 22 arriving on the mesh interface).
 func RenderSSHDConfig(spec SSHDSpec) string {
 	var b strings.Builder
 	b.WriteString("# Managed by sigmahub (host.sshd). Do not edit by hand.\n")
 	b.WriteString("PasswordAuthentication no\n")
 	b.WriteString("KbdInteractiveAuthentication no\n")
 	b.WriteString("PermitRootLogin no\n")
-	if spec.ListenMeshOnly && spec.MeshIP != "" {
-		// Bind sshd to the mesh IP only — public SSH is closed; access is over the
-		// WireGuard tunnel. (ListenAddress is additive, so we pin exactly one.)
-		fmt.Fprintf(&b, "ListenAddress %s\n", spec.MeshIP)
-	}
+	_ = spec // MeshIP/ListenMeshOnly retained on the wire; access is firewall-enforced.
 	return b.String()
 }
 

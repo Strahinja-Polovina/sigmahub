@@ -18,17 +18,24 @@ func TestRenderNftables(t *testing.T) {
 	})
 	// Invariants that keep the agent + mesh alive regardless of config.
 	for _, must := range []string{
-		"policy drop;",                          // default-drop inbound
-		"ct state established,related accept",   // outbound control channel survives
-		"udp dport 51820 accept",                // WireGuard always open
-		"iifname \"sigma0\" accept",             // intra-fleet mesh
-		"chain output {\n\t\ttype filter hook output priority 0; policy accept;", // outbound accept
-		"tcp dport { 80, 443 } accept",          // proxy role
-		"tcp dport 9000 accept",                 // customer exception
+		"delete table inet sigmahub",          // single-table atomic replace (never flush ruleset)
+		"policy drop;",                        // default-drop inbound
+		"ct state established,related accept", // outbound control channel survives
+		"udp dport 51820 accept",              // WireGuard always open
+		"iifname \"sigma0\" accept",           // intra-fleet + mesh SSH
+		"tcp dport { 80, 443 } accept",        // proxy role
+		"tcp dport 9000 accept",               // customer exception
 	} {
 		if !strings.Contains(got, must) {
 			t.Errorf("nft ruleset missing %q\n%s", must, got)
 		}
+	}
+	// Must NOT wipe other tables (Docker) or filter the forward hook.
+	if strings.Contains(got, "flush ruleset") {
+		t.Error("must not flush the whole ruleset (would wipe Docker's chains)")
+	}
+	if strings.Contains(got, "chain forward") {
+		t.Error("must not manage the forward hook (breaks Docker bridge forwarding)")
 	}
 	// Public SSH is closed by default (opt-out only).
 	if strings.Contains(got, "tcp dport 22 accept") {
@@ -45,16 +52,17 @@ func TestRenderNftablesPublicSSHOptOut(t *testing.T) {
 
 func TestRenderSSHDConfig(t *testing.T) {
 	locked := RenderSSHDConfig(SSHDSpec{MeshIP: "10.77.0.5", ListenMeshOnly: true})
-	for _, must := range []string{"PasswordAuthentication no", "PermitRootLogin no", "ListenAddress 10.77.0.5"} {
+	for _, must := range []string{"PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin no"} {
 		if !strings.Contains(locked, must) {
 			t.Errorf("sshd config missing %q\n%s", must, locked)
 		}
 	}
-	// Opt-out: public SSH kept → no mesh-only ListenAddress, but auth still hardened.
-	open := RenderSSHDConfig(SSHDSpec{MeshIP: "10.77.0.5", ListenMeshOnly: false})
-	if strings.Contains(open, "ListenAddress") {
-		t.Error("keep-public-SSH must not pin ListenAddress to the mesh IP")
+	// Must NOT pin ListenAddress to the mesh IP — that bricks SSH after a reboot
+	// where the WG interface hasn't come up. Mesh-only is firewall-enforced.
+	if strings.Contains(locked, "ListenAddress") {
+		t.Error("sshd config must not pin ListenAddress (reboot lockout risk)")
 	}
+	open := RenderSSHDConfig(SSHDSpec{MeshIP: "10.77.0.5", ListenMeshOnly: false})
 	if !strings.Contains(open, "PasswordAuthentication no") {
 		t.Error("password auth must be off even when keeping public SSH")
 	}
