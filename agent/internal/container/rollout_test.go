@@ -33,6 +33,15 @@ func (f *fakeRollout) seed(name, resourceID, hash string, running bool) {
 	}
 }
 
+// seedSvc seeds a container tagged with a Compose service label.
+func (f *fakeRollout) seedSvc(name, resourceID, service, hash string, running bool) {
+	f.nextID++
+	f.byName[name] = &ContainerState{
+		ID: fmt.Sprintf("id%d", f.nextID), Name: name, Running: running, IP: "10.0.0.1",
+		Labels: map[string]string{LabelManaged: "true", LabelResourceID: resourceID, LabelService: service, LabelSpecHash: hash},
+	}
+}
+
 func (f *fakeRollout) ContainerList(context.Context) ([]ContainerState, error) {
 	out := []ContainerState{}
 	for _, c := range f.byName {
@@ -189,9 +198,23 @@ func TestOlderGenerationsSelection(t *testing.T) {
 		{Name: "sigmahub-res_a-gen2", Labels: map[string]string{LabelResourceID: "res_a"}},
 		{Name: "sigmahub-res_b", Labels: map[string]string{LabelResourceID: "res_b"}},
 	}
-	old := olderGenerations(list, "res_a", "sigmahub-res_a-gen2")
+	old := olderGenerations(list, "res_a", "", "sigmahub-res_a-gen2")
 	if len(old) != 1 || old[0].Name != "sigmahub-res_a" {
 		t.Fatalf("olderGenerations = %+v", old)
+	}
+}
+
+// TestOlderGenerationsServiceScoped proves a Compose service's generations are
+// isolated: draining service "web" never selects service "db"'s container.
+func TestOlderGenerationsServiceScoped(t *testing.T) {
+	list := []ContainerState{
+		{Name: "sigmahub-res_a-web-g1", Labels: map[string]string{LabelResourceID: "res_a", LabelService: "web"}},
+		{Name: "sigmahub-res_a-web-g2", Labels: map[string]string{LabelResourceID: "res_a", LabelService: "web"}},
+		{Name: "sigmahub-res_a-db-g1", Labels: map[string]string{LabelResourceID: "res_a", LabelService: "db"}},
+	}
+	old := olderGenerations(list, "res_a", "web", "sigmahub-res_a-web-g2")
+	if len(old) != 1 || old[0].Name != "sigmahub-res_a-web-g1" {
+		t.Fatalf("service-scoped olderGenerations = %+v", old)
 	}
 }
 
@@ -326,5 +349,47 @@ func TestRolloutManagedResources(t *testing.T) {
 	}
 	if m["res_b"] {
 		t.Fatal("res_b (plain container.apply) must NOT be rollout-managed")
+	}
+}
+
+// recreateSpec builds a RecreateSpec + create body for a Compose service.
+func recreateSpec(res, service, gen, hash string) (RecreateSpec, any) {
+	spec := RecreateSpec{
+		Container: ContainerSpec{
+			ResourceID: res, Service: service, Name: "sigmahub-" + res + "-" + service, Image: "img",
+		},
+		Generation: gen,
+		Health:     HealthProbe{Type: "http", Port: 8080, Path: "/", IntervalSec: 1, TimeoutSec: 1},
+	}
+	body := map[string]any{"Labels": map[string]string{
+		LabelManaged: "true", LabelResourceID: res, LabelService: service, LabelSpecHash: hash,
+	}}
+	return spec, body
+}
+
+// TestPerformRecreateRemovesOldFirst proves the recreate swap removes the old
+// generation BEFORE creating the new one (an exclusive resource can't be held
+// twice), and scopes to the service so a sibling service is untouched.
+func TestPerformRecreateRemovesOldFirst(t *testing.T) {
+	f := newFakeRollout()
+	// db service, old generation running; plus an unrelated web service.
+	f.seedSvc("sigmahub-res_a-db-g1", "res_a", "db", "oldhash", true)
+	f.seedSvc("sigmahub-res_a-web-g1", "res_a", "web", "whash", true)
+
+	spec, body := recreateSpec("res_a", "db", "g2", "newhash")
+	if err := performRecreate(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+		t.Fatal(err)
+	}
+	// The old db generation must be removed before the new db is created.
+	rmOld := indexOf(f.events, "remove:sigmahub-res_a-db-g1")
+	crNew := indexOf(f.events, "create:sigmahub-res_a-db-g2")
+	if rmOld < 0 || crNew < 0 || rmOld > crNew {
+		t.Fatalf("recreate must remove old before creating new; events=%v", f.events)
+	}
+	// The sibling web service must be untouched.
+	for _, e := range f.events {
+		if strings.Contains(e, "web") {
+			t.Fatalf("recreate touched a sibling service: %s", e)
+		}
 	}
 }
