@@ -14,7 +14,14 @@ const (
 	KindHostNftables = "host.nftables"
 	KindHostSSHD     = "host.sshd"
 	KindHostCIS      = "host.cis"
+	// Ingress (P1-8): the Traefik proxy on a proxy-role server. Name must match
+	// the agent's proxy package byte-for-byte.
+	KindProxyTraefik = "proxy.traefik"
 )
+
+// TraefikRouterName is the deterministic Traefik router/service name for a
+// resource, so a resync renders byte-identical labels.
+func TraefikRouterName(resourceID string) string { return "sigmahub-" + resourceID }
 
 // Docker object naming. The control plane is the sole authority for these
 // names; it renders them into DSD ops and the agent uses them verbatim, so the

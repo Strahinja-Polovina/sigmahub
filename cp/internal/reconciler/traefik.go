@@ -1,0 +1,80 @@
+package reconciler
+
+import (
+	"encoding/json"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+// ACMEConfig is the control-plane's ACME issuance configuration, rendered into
+// every proxy.traefik op. CADirURL empty means Let's Encrypt production; the
+// staging/Pebble URL is injected for the e2e environment. Email is the ACME
+// account contact.
+type ACMEConfig struct {
+	Email    string
+	CADirURL string
+}
+
+// traefikCertResolver is the fixed resolver name both the static config (agent)
+// and the router labels (here) reference.
+const traefikCertResolver = "le"
+
+// traefikOpSpec is the wire contract for the proxy.traefik op. The agent renders
+// Traefik's static config from it: the web/websecure entrypoints, an ACME
+// resolver (challenge type + CA directory + account email), and a persistent
+// acme store. ChallengeType is 'http' or 'tls-alpn' in P1-8 ('dns' is a P1-12
+// hook). The op is idempotent: the agent reuses the persisted acme store, so a
+// re-apply issues no new ACME order.
+type traefikOpSpec struct {
+	ServerID      string `json:"serverId"`
+	CertResolver  string `json:"certResolver"`
+	ChallengeType string `json:"challengeType"`
+	ACMEEmail     string `json:"acmeEmail,omitempty"`
+	ACMECADirURL  string `json:"acmeCaDirUrl,omitempty"`
+}
+
+// renderTraefikOp emits the proxy.traefik op for a proxy-role server. Challenge
+// type defaults to HTTP-01; a server-level DNS-01 override is out of P1-8 scope.
+func renderTraefikOp(serverID string, cfg ACMEConfig) dsd.Op {
+	spec, _ := json.Marshal(traefikOpSpec{
+		ServerID:      serverID,
+		CertResolver:  traefikCertResolver,
+		ChallengeType: "http",
+		ACMEEmail:     cfg.Email,
+		ACMECADirURL:  cfg.CADirURL,
+	})
+	return dsd.Op{ID: "proxy:traefik:" + serverID, Kind: dsd.KindProxyTraefik, Spec: spec}
+}
+
+// traefikLabels renders the Docker labels that make Traefik route the resource's
+// domains to it over HTTPS with an auto-issued certificate. port is the
+// container port Traefik connects to on the shared project network. Returns nil
+// when the resource has no domains (no router labels — the container is still
+// reachable internally, and gains labels only once a domain is attached).
+func traefikLabels(resourceID string, domains []store.Domain, port int) map[string]string {
+	if len(domains) == 0 {
+		return nil
+	}
+	hosts := make([]string, 0, len(domains))
+	for _, d := range domains {
+		hosts = append(hosts, "Host(`"+d.Domain+"`)")
+	}
+	sort.Strings(hosts) // deterministic rule → deterministic doc hash
+	router := dsd.TraefikRouterName(resourceID)
+	if port == 0 {
+		port = 80
+	}
+	labels := map[string]string{
+		"traefik.enable": "true",
+		"traefik.http.routers." + router + ".rule":                      strings.Join(hosts, " || "),
+		"traefik.http.routers." + router + ".entrypoints":               "websecure",
+		"traefik.http.routers." + router + ".tls":                       "true",
+		"traefik.http.routers." + router + ".tls.certresolver":          traefikCertResolver,
+		"traefik.http.services." + router + ".loadbalancer.server.port": strconv.Itoa(port),
+	}
+	return labels
+}

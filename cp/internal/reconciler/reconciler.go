@@ -23,6 +23,7 @@ type Store interface {
 	PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]store.PendingDestructiveOp, error)
 	SecretRefsForServer(ctx context.Context, serverID string) (map[string][]store.SecretRefMeta, error)
 	HostHardeningForServer(ctx context.Context, serverID string) (store.HostHardening, error)
+	DomainsForServer(ctx context.Context, serverID string) (map[string][]store.Domain, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 }
@@ -32,6 +33,7 @@ type Reconciler struct {
 	log  *slog.Logger
 	st   Store
 	priv ed25519.PrivateKey
+	acme ACMEConfig
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
@@ -41,17 +43,22 @@ func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
 }
 
+// SetACMEConfig installs the ACME issuance config rendered into proxy.traefik
+// ops (Let's Encrypt account email + CA directory; the staging/Pebble URL is
+// injected for e2e). Called at boot before serving.
+func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
+
 // renderOps builds the ordered op list for a server. "app" resources fan into
 // container ops (network.ensure → image.pull → volume.ensure → container.apply);
 // other kinds keep the P1-2 no-op "resource.sync" stub until they are
 // containerised. Confirmed destructive ops are appended as volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, acme ACMEConfig) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
 	for _, rs := range specs {
 		if rs.Kind == "app" {
-			if appOps, netID, ok := renderAppOps(rs, secretRefs[rs.ResourceID]); ok {
+			if appOps, netID, ok := renderAppOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID]); ok {
 				resourceOps = append(resourceOps, appOps...)
 				networks[netID] = dsd.NetworkName(rs.ProjectID)
 				continue
@@ -80,6 +87,12 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	// hash stays deterministic. They have no dependencies (host-level, independent
 	// of the container graph).
 	ops = append(ops, renderHostOps(serverID, hardening)...)
+	// Ingress (P1-8): a proxy-role server runs Traefik. P1-5's nftables op has
+	// already opened 80/443 (proxyRole feeds renderHostOps), so this only stands
+	// up the proxy + ACME resolver; the router labels ride on the app containers.
+	if hardening.ProxyRole {
+		ops = append(ops, renderTraefikOp(serverID, acme))
+	}
 	for _, p := range pending {
 		ops = append(ops, renderVolumeRemoveOp(p))
 	}
@@ -105,7 +118,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening)
+	domains, err := r.st.DomainsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, r.acme)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

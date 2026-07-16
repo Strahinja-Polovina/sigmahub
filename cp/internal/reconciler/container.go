@@ -73,6 +73,9 @@ type containerOpSpec struct {
 	MemoryMB       int64             `json:"memoryMb,omitempty"`
 	Restart        string            `json:"restart,omitempty"`
 	SecretRefs     []secretRef       `json:"secretRefs,omitempty"`
+	// Labels are Docker container labels — the P1-8 Traefik ingress path renders
+	// router labels here when the resource has an attached domain.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // renderAppOps expands one "app" resource into its ordered container ops:
@@ -80,7 +83,7 @@ type containerOpSpec struct {
 // on its image, its volumes, and its project network (whose op is emitted once
 // per project by the caller). Returns ok=false when the resource is not yet
 // deployable (no image), so the caller falls back to a no-op resource.sync.
-func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta) (ops []dsd.Op, networkID string, ok bool) {
+func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []store.Domain) (ops []dsd.Op, networkID string, ok bool) {
 	var spec appResourceSpec
 	if err := json.Unmarshal(rs.Spec, &spec); err != nil || spec.Image == "" {
 		return nil, "", false
@@ -148,6 +151,15 @@ func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta) (ops []dsd.
 		if !has {
 			cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
 		}
+	}
+	// Traefik router labels for any attached domain. The port is the container
+	// port Traefik dials on the shared project network (first declared port).
+	if len(domains) > 0 {
+		lbPort := 0
+		if len(spec.Ports) > 0 {
+			lbPort = spec.Ports[0].Container
+		}
+		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
 	}
 	csBytes, _ := json.Marshal(cs)
 	ops = append(ops, dsd.Op{ID: containerID, Kind: dsd.KindContainerApply, DependsOn: deps, Spec: csBytes})
