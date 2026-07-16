@@ -1,6 +1,7 @@
 package container
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -297,6 +300,124 @@ func (d *DockerClient) ImagePull(ctx context.Context, image string) error {
 	}
 }
 
+// ImageExists reports whether an image reference is present locally.
+func (d *DockerClient) ImageExists(ctx context.Context, ref string) (bool, error) {
+	err := d.do(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, &struct{}{})
+	if err == nil {
+		return true, nil
+	}
+	if isNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// ImageDigest returns an image's content digest (RepoDigests[0] when present,
+// else the image Id), used to pin a deploy to an immutable image.
+func (d *DockerClient) ImageDigest(ctx context.Context, ref string) (string, error) {
+	var out struct {
+		ID          string   `json:"Id"`
+		RepoDigests []string `json:"RepoDigests"`
+	}
+	if err := d.do(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, &out); err != nil {
+		return "", err
+	}
+	if len(out.RepoDigests) > 0 {
+		return out.RepoDigests[0], nil
+	}
+	return out.ID, nil
+}
+
+// ImageBuild builds an image from a local context directory via the daemon's
+// /build endpoint (BuildKit-backed when the daemon defaults to it). It tars the
+// context, streams the build output to logs line-by-line, and fails if the build
+// stream reports an error.
+func (d *DockerClient) ImageBuild(ctx context.Context, contextDir, dockerfile, tag string, logs io.Writer) error {
+	pr, pw := io.Pipe()
+	go func() { pw.CloseWithError(tarDir(contextDir, pw)) }()
+
+	q := url.Values{}
+	q.Set("t", tag)
+	q.Set("dockerfile", dockerfile)
+	q.Set("rm", "1")
+	q.Set("forcerm", "1")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.url("/build?"+q.Encode()), pr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	// Ask the daemon to use BuildKit for the build.
+	req.Header.Set("X-Registry-Config", "")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Stream string `json:"stream"`
+			Error  string `json:"error"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("image build: %s", msg.Error)
+		}
+		if msg.Stream != "" && logs != nil {
+			_, _ = io.WriteString(logs, msg.Stream)
+		}
+	}
+}
+
+// tarDir writes a tar of a directory tree (regular files + dirs) to w. It is the
+// Docker build context; symlinks and special files are skipped.
+func tarDir(root string, w io.Writer) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if !info.Mode().IsRegular() && !info.IsDir() {
+			return nil // skip symlinks/devices
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+}
+
 // splitImageRef separates a reference into (fromImage, tag) for /images/create.
 // A digest reference stays whole (fromImage carries the @sha256:… and tag is
 // empty); a tagged reference is split on the tag colon (guarding against a
@@ -315,9 +436,9 @@ func splitImageRef(image string) (string, string) {
 
 // ContainerState is the subset of a container inspect the driver needs.
 type ContainerState struct {
-	ID     string
-	Name   string
-	Image  string
+	ID      string
+	Name    string
+	Image   string
 	Running bool
 	// Pid is the container's main-process host PID (0 when not running). Used to
 	// seed secret files through the container's live mount namespace via
