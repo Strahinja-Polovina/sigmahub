@@ -62,6 +62,10 @@ import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
+import { DBConnectionPanel, type BackupPolicyRow } from "./db-connection-panel";
+
+/** Resource kinds that are P1-10 managed databases (web vocabulary). */
+const DB_KINDS = new Set(["postgres", "mysql", "mongo", "redis"]);
 
 type Deployment = {
   id: string;
@@ -193,6 +197,8 @@ export function ResourceDetail({
   cpDeployments,
   rollbackTargetIds = [],
   deploymentsEnabled = false,
+  backupPolicy = null,
+  databasesEnabled = false,
 }: {
   detail: Detail;
   orgId?: string;
@@ -207,10 +213,15 @@ export function ResourceDetail({
   /** True when the control plane backs deployments; swaps the demo timeline for
    *  the real release history + build logs + rollback. */
   deploymentsEnabled?: boolean;
+  /** Backup policy for a DB resource (CP mode; null when absent). */
+  backupPolicy?: BackupPolicyRow;
+  /** True when the control plane backs database resources (P1-10). */
+  databasesEnabled?: boolean;
 }) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
+  const showDBConnection = Boolean(databasesEnabled && orgId && DB_KINDS.has(resource.kind));
 
   const metrics = React.useMemo(() => getMetrics(resource.id), [resource.id]);
   const logs = React.useMemo(() => getLogs(resource.id), [resource.id]);
@@ -367,6 +378,16 @@ export function ResourceDetail({
               </CardContent>
             </Card>
           </div>
+          {showDBConnection && (
+            <div className="pt-4">
+              <DBConnectionPanel
+                orgId={orgId!}
+                resourceId={resource.id}
+                canManage={canManage}
+                backupPolicy={backupPolicy}
+              />
+            </div>
+          )}
         </TabsContent>
 
         <TabsContent value="logs" className="pt-4">

@@ -2,7 +2,7 @@ import { notFound, redirect } from "next/navigation";
 import { getActiveOrgId, requireMembership } from "@/server/active-org";
 import { getResourceDetail } from "@/server/queries";
 import { effectiveSecrets } from "@/server/secrets-data";
-import { cpEnabled, cpListDomains, cpListDeployments, cpRollbackTargets } from "@/server/cp";
+import { cpEnabled, cpListDomains, cpListDeployments, cpRollbackTargets, cpBackupPolicy } from "@/server/cp";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -89,6 +89,18 @@ export default async function ResourceDetailPage({
     detail.resource.kind
   );
 
+  // Backup policy for DB kinds (CP mode). A CP failure degrades to no panel row.
+  const dbKinds = new Set(["postgres", "mysql", "mongo", "redis"]);
+  let backupPolicy = null;
+  if (cpEnabled() && dbKinds.has(detail.resource.kind)) {
+    try {
+      const p = await cpBackupPolicy(orgId, resourceId);
+      backupPolicy = { schedule: p.schedule, retentionDays: p.retentionDays, enabled: p.enabled };
+    } catch {
+      backupPolicy = null;
+    }
+  }
+
   return (
     <ResourceDetail
       detail={{ ...detail, secrets, canManage }}
@@ -98,6 +110,8 @@ export default async function ResourceDetailPage({
       cpDeployments={deployments}
       rollbackTargetIds={rollbackTargetIds}
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
+      backupPolicy={backupPolicy}
+      databasesEnabled={cpEnabled()}
     />
   );
 }

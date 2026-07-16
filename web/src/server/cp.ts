@@ -824,6 +824,32 @@ export async function cpDeployLogs(
     undefined, { orgId });
 }
 
+// ── Databases (P1-10) ────────────────────────────────────────────────────────
+
+export type CpBackupPolicy = {
+  id: string;
+  resourceId: string;
+  schedule: string;
+  retentionDays: number;
+  enabled: boolean;
+};
+
+/** Reveal a database's connection string (mesh-internal). Project Admin+ on the
+ *  CP side; every reveal is audited there. */
+export async function cpRevealDBConnection(
+  orgId: string,
+  resourceId: string,
+  actor: CpActor
+): Promise<{ connectionString: string; scope: string }> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/connection`,
+    undefined, { orgId, actor });
+}
+
+export async function cpBackupPolicy(orgId: string, resourceId: string): Promise<CpBackupPolicy> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-policy`,
+    undefined, { orgId });
+}
+
 /** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
 export function cpKind(localKind: string): string {
   return localKind === "mongo" ? "mongodb" : localKind;
