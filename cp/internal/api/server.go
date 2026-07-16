@@ -39,17 +39,20 @@ type ReconcileTrigger interface {
 }
 
 type Server struct {
-	log             *slog.Logger
-	db              Pinger
-	store           StoreAPI
-	domain          DomainAPI
-	dsdStore        DSDStore
-	dsdWaiter       DSDWaiter
-	reconcile       ReconcileTrigger
-	dsdPub          ed25519.PublicKey
-	devServiceToken string
-	provisionToken  string
-	mux             *http.ServeMux
+	log                 *slog.Logger
+	db                  Pinger
+	store               StoreAPI
+	domain              DomainAPI
+	git                 GitAPI
+	inspector           RepoInspector
+	dsdStore            DSDStore
+	dsdWaiter           DSDWaiter
+	reconcile           ReconcileTrigger
+	dsdPub              ed25519.PublicKey
+	devServiceToken     string
+	provisionToken      string
+	githubWebhookSecret string
+	mux                 *http.ServeMux
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -59,23 +62,34 @@ type Server struct {
 type Options struct {
 	DevServiceToken string
 	ProvisionToken  string
-	DSDStore        DSDStore
-	DSDWaiter       DSDWaiter
-	Reconcile       ReconcileTrigger
-	DSDPublicKey    ed25519.PublicKey
+	// Git is the git-integration store slice (P1-7). Nil in handler unit tests
+	// that don't exercise the git routes.
+	Git GitAPI
+	// Inspector reads a connected repo's files to derive the deploy config. Nil
+	// disables detection (the detect endpoint 503s and connect skips its gate).
+	Inspector RepoInspector
+	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
+	GitHubWebhookSecret string
+	DSDStore            DSDStore
+	DSDWaiter           DSDWaiter
+	Reconcile           ReconcileTrigger
+	DSDPublicKey        ed25519.PublicKey
 }
 
 // New builds the HTTP surface.
 func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) *Server {
 	s := &Server{
 		log: log, db: db, store: st, domain: dom,
-		dsdStore:        opts.DSDStore,
-		dsdWaiter:       opts.DSDWaiter,
-		reconcile:       opts.Reconcile,
-		dsdPub:          opts.DSDPublicKey,
-		devServiceToken: opts.DevServiceToken,
-		provisionToken:  opts.ProvisionToken,
-		mux:             http.NewServeMux(),
+		git:                 opts.Git,
+		inspector:           opts.Inspector,
+		dsdStore:            opts.DSDStore,
+		dsdWaiter:           opts.DSDWaiter,
+		reconcile:           opts.Reconcile,
+		dsdPub:              opts.DSDPublicKey,
+		devServiceToken:     opts.DevServiceToken,
+		provisionToken:      opts.ProvisionToken,
+		githubWebhookSecret: opts.GitHubWebhookSecret,
+		mux:                 http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -87,6 +101,10 @@ func (s *Server) routes() {
 
 	// Org provisioning (dedicated token; mints the org's web credential).
 	s.mux.HandleFunc("POST /v1/orgs", s.requireProvision(s.handleProvisionOrg))
+
+	// Git provider webhook (P1-7). Public: unauthenticated but HMAC-verified
+	// against the configured secret; a forged signature is rejected 401.
+	s.mux.HandleFunc("POST /v1/webhooks/github", s.handleGitHubWebhook)
 
 	// Dashboard-facing (org-scoped service tokens): reads need any role,
 	// mutations need at least Project Admin — mirroring the v1 web RBAC.
@@ -133,6 +151,18 @@ func (s *Server) routes() {
 	// Audit is member-visible (matches the web settings tab shown to all
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
+
+	// Git integration (P1-7). Detection is a read-only preview (Developer+);
+	// connecting a repo and editing branch routes/policies are Project Admin+.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/detect", s.requireService(store.RoleDeveloper, s.handleGitDetect))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/connections", s.requireService(store.RoleProjectAdmin, s.handleGitConnect))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/connections", s.requireService(store.RoleDeveloper, s.handleListGitConnections))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/connections/{connId}", s.requireService(store.RoleDeveloper, s.handleGetGitConnection))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/connections/{connId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteGitConnection))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/branches", s.requireService(store.RoleProjectAdmin, s.handleSetBranchMap))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/branch-maps/{mapId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBranchMap))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/branch-maps/{mapId}/promote", s.requireService(store.RoleProjectAdmin, s.handlePromoteBranch))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/deploy-requests", s.requireService(store.RoleDeveloper, s.handleListDeployRequests))
 
 	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
 	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);
