@@ -231,6 +231,9 @@ func run() error {
 			backoff = *interval
 			log.Info("heartbeat ok", "server_id", st.ServerID)
 			meshApplied, meshPeers = syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp)
+			// Report Traefik-issued certificate state (P1-8). A no-op on non-proxy
+			// servers (no ACME store); never fails the loop.
+			reportCertStatus(ctx, log, c, st.AgentToken, driver)
 		case errors.As(err, &apiErr) && apiErr.Permanent():
 			return err
 		case ctx.Err() != nil:
@@ -332,6 +335,26 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 		if err := c.PostDSDStatus(ctx, st.AgentToken, signed.Document.Version, apply.StatusPayload(results)); err != nil {
 			log.Warn("dsd: status report failed", "err", err)
 		}
+	}
+}
+
+// reportCertStatus reads Traefik's ACME store and reports issued certificates to
+// the control plane (P1-8). Best-effort: a non-proxy server (no ACME store) or a
+// proxy with nothing issued yet reports nothing; errors never fail the loop.
+func reportCertStatus(ctx context.Context, log *slog.Logger, c *client.Client, agentToken string, driver *container.Driver) {
+	if driver == nil {
+		return
+	}
+	reports, err := driver.TraefikCertStatus(ctx)
+	if err != nil {
+		log.Warn("cert status: read failed", "err", err)
+		return
+	}
+	if len(reports) == 0 {
+		return
+	}
+	if err := c.PostDomainStatus(ctx, agentToken, reports); err != nil {
+		log.Warn("cert status: report failed", "err", err)
 	}
 }
 
