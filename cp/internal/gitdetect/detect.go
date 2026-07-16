@@ -21,6 +21,9 @@ type Detected struct {
 	ComposePath   string   `json:"composePath,omitempty"`
 	Ports         []int    `json:"ports"`
 	Env           []string `json:"env"`
+	// Services is the Compose service graph (empty for a plain Dockerfile app) —
+	// the input to a per-service multi-service deploy.
+	Services []ComposeService `json:"services,omitempty"`
 	// HealthCheck is always populated: a probe detected from the repo, or — when
 	// nothing is declared — a default TCP probe on the primary declared port. It
 	// is the spec field the P1-9 zero-downtime gate consumes.
@@ -92,6 +95,7 @@ func Detect(files map[string][]byte) Detected {
 	}
 	if d.HasCompose {
 		parseCompose(compose, portSet, envSet, &hc)
+		d.Services = ParseComposeServices(compose)
 	}
 
 	for p := range portSet {
@@ -141,9 +145,9 @@ func finalizeHealth(hc healthAccum, ports []int) HealthCheck {
 }
 
 var (
-	exposeRe   = regexp.MustCompile(`(?i)^\s*EXPOSE\s+(.+)$`)
-	envRe      = regexp.MustCompile(`(?i)^\s*ENV\s+(.+)$`)
-	argRe      = regexp.MustCompile(`(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	exposeRe     = regexp.MustCompile(`(?i)^\s*EXPOSE\s+(.+)$`)
+	envRe        = regexp.MustCompile(`(?i)^\s*ENV\s+(.+)$`)
+	argRe        = regexp.MustCompile(`(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	healthRe     = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s`)
 	healthNoneRe = regexp.MustCompile(`(?i)^\s*HEALTHCHECK\s+NONE\s*$`)
 	portNumRe    = regexp.MustCompile(`(\d{1,5})`)

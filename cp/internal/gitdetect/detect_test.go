@@ -100,6 +100,20 @@ func TestDetectCompose(t *testing.T) {
 	if d.HealthCheck.Type != "http" || d.HealthCheck.Path != "/" {
 		t.Errorf("compose health probe = %+v, want http /", d.HealthCheck)
 	}
+	// The service graph is surfaced for a multi-service deploy: web builds from
+	// source (fixed host port → recreate), worker runs a prebuilt image (stateless
+	// → blue-green).
+	if len(d.Services) != 2 {
+		t.Fatalf("expected 2 services, got %d: %+v", len(d.Services), d.Services)
+	}
+	web := svcByName(d.Services, "web")
+	if web == nil || web.Build != "." || web.Rollout != RolloutRecreate {
+		t.Errorf("web service = %+v", web)
+	}
+	worker := svcByName(d.Services, "worker")
+	if worker == nil || worker.Image != "worker" || worker.Rollout != RolloutBlueGreen {
+		t.Errorf("worker service = %+v", worker)
+	}
 }
 
 func TestDetectInlineCompose(t *testing.T) {
