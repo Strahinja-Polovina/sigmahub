@@ -34,6 +34,11 @@ type Deployment struct {
 	CreatedAt       time.Time  `json:"createdAt"`
 	StartedAt       *time.Time `json:"startedAt,omitempty"`
 	FinishedAt      *time.Time `json:"finishedAt,omitempty"`
+	// ServiceCount + ServiceStatus describe a Compose multi-service deploy (0/empty
+	// for a single-container app): how many services the deploy spans and each
+	// service's current state (deploying|success|failed).
+	ServiceCount  int               `json:"serviceCount,omitempty"`
+	ServiceStatus map[string]string `json:"serviceStatus,omitempty"`
 }
 
 // Build tracks a dedup-keyed image build so a retry of the same inputs reuses the
@@ -240,7 +245,7 @@ func (s *Store) ListDeployments(ctx context.Context, orgID, resourceID string, l
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
 		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
-		       created_by, created_at, started_at, finished_at
+		       created_by, created_at, started_at, finished_at, service_count, service_status
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2
 		 ORDER BY created_at DESC LIMIT $3`, orgID, resourceID, limit)
 	if err != nil {
@@ -260,7 +265,7 @@ func (s *Store) RollbackTargets(ctx context.Context, orgID, resourceID string, l
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
 		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
-		       created_by, created_at, started_at, finished_at
+		       created_by, created_at, started_at, finished_at, service_count, service_status
 		  FROM deployments
 		 WHERE org_id = $1 AND resource_id = $2 AND status = 'success' AND image_digest IS NOT NULL
 		 ORDER BY created_at DESC LIMIT $3`, orgID, resourceID, limit)
@@ -276,9 +281,10 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	for rows.Next() {
 		var d Deployment
 		var env, srv, conn, ref, sha, digest, cfg, rollback *string
+		var svcStatus []byte
 		if err := rows.Scan(&d.ID, &d.OrgID, &d.ResourceID, &env, &srv, &conn, &d.Trigger, &ref, &sha,
 			&digest, &cfg, &d.Status, &d.Detail, &rollback, &d.BuildSeconds, &d.DurationSeconds,
-			&d.CreatedBy, &d.CreatedAt, &d.StartedAt, &d.FinishedAt); err != nil {
+			&d.CreatedBy, &d.CreatedAt, &d.StartedAt, &d.FinishedAt, &d.ServiceCount, &svcStatus); err != nil {
 			return nil, err
 		}
 		d.EnvironmentID = deref(env)
@@ -289,6 +295,12 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		d.ImageDigest = deref(digest)
 		d.ConfigHash = deref(cfg)
 		d.RollbackOf = deref(rollback)
+		if len(svcStatus) > 0 {
+			m := map[string]string{}
+			if json.Unmarshal(svcStatus, &m) == nil && len(m) > 0 {
+				d.ServiceStatus = m
+			}
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
@@ -307,7 +319,7 @@ func (s *Store) GetDeployment(ctx context.Context, orgID, deploymentID string) (
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
 		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
-		       created_by, created_at, started_at, finished_at
+		       created_by, created_at, started_at, finished_at, service_count, service_status
 		  FROM deployments WHERE org_id = $1 AND id = $2`, orgID, deploymentID)
 	if err != nil {
 		return Deployment{}, err

@@ -765,6 +765,9 @@ export type CpDeployment = {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  // Compose multi-service deploy: how many services and each service's state.
+  serviceCount?: number;
+  serviceStatus?: Record<string, string>;
 };
 
 export type CpDeployLog = {
