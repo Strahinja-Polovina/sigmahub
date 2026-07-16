@@ -152,8 +152,11 @@ func (s *Server) handleAgentBuildLog(w http.ResponseWriter, r *http.Request) {
 	if len(req.Lines) > 500 {
 		req.Lines = req.Lines[:500]
 	}
+	srv := serverFrom(r)
 	for _, line := range req.Lines {
-		if err := s.store.AppendDeployLog(r.Context(), req.DeploymentID, req.Stream, line); err != nil {
+		// Server-scoped: the store drops lines for a deployment not on this host, so
+		// a compromised agent can't forge into another server's deploy log.
+		if err := s.store.AppendDeployLog(r.Context(), srv.ID, req.DeploymentID, req.Stream, line); err != nil {
 			s.log.Error("append deploy log", "err", err)
 			break
 		}

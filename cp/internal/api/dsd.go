@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +88,20 @@ func (s *Server) handleGetDSD(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// deployPhaseRank orders the deploy pipeline phases so a batch of op statuses is
+// applied clone→build→rollout regardless of map-iteration order.
+func deployPhaseRank(phase string) int {
+	switch phase {
+	case "clone":
+		return 0
+	case "build":
+		return 1
+	case "rollout":
+		return 2
+	}
+	return 3
+}
+
 // deployPhase maps a deploy-pipeline op id to its (phase, resourceID). The
 // rollout op keeps the res:<id> id (so its status also routes to resources.status).
 func deployPhase(opID string) (phase, resourceID string, ok bool) {
@@ -116,21 +131,27 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
+	// Advance the in-flight deployment (P1-9) as its pipeline ops report, in
+	// deterministic phase order (clone→build→rollout) so a single status POST
+	// carrying several ops in arbitrary map order yields a stable outcome. The
+	// store transition is independently monotonic; ordering here just fixes the
+	// recorded detail/timing. A no-op for non-git resources (no in-flight deploy).
+	type deployAdvance struct {
+		phase, resID, errText string
+		ok                    bool
+	}
+	var advances []deployAdvance
 	// Route "res:<id>" op statuses into resources.status, and mark applied
 	// "volrm:<pendingId>" destructive ops so they drop out of future DSDs.
 	byResource := map[string]json.RawMessage{}
 	for opID, st := range req.Ops {
-		// Advance the in-flight deployment (P1-9) as its pipeline ops report. A
-		// no-op for non-git resources (no in-flight deployment).
 		var os struct {
 			State string `json:"state"`
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(st, &os)
 		if phase, resID, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
-			if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, resID, phase, os.State == "applied", os.Error); err != nil {
-				s.log.Error("advance deployment", "err", err, "op", opID)
-			}
+			advances = append(advances, deployAdvance{phase: phase, resID: resID, ok: os.State == "applied", errText: os.Error})
 		}
 		switch {
 		case strings.HasPrefix(opID, "res:"):
@@ -144,6 +165,14 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 					s.log.Error("mark destructive op applied", "err", err, "op", opID)
 				}
 			}
+		}
+	}
+	sort.SliceStable(advances, func(i, j int) bool {
+		return deployPhaseRank(advances[i].phase) < deployPhaseRank(advances[j].phase)
+	})
+	for _, a := range advances {
+		if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, a.resID, a.phase, a.ok, a.errText); err != nil {
+			s.log.Error("advance deployment", "err", err, "phase", a.phase, "resource", a.resID)
 		}
 	}
 	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource)

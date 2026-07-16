@@ -92,6 +92,14 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		}
 	}
 
+	// Resources managed by a deploy.rollout op own their own container lifecycle:
+	// the rollout creates the new generation and drains the old ONLY after the new
+	// one is healthy, and a health-gate failure deliberately keeps the old
+	// generation serving. GC must not touch ANY generation of such a resource — a
+	// blind reap here (the old generation is never in `want`) would defeat the
+	// never-cut invariant and take a live app down.
+	rolloutManaged := rolloutManagedResources(doc)
+
 	managed, err := d.docker.ContainerList(ctx)
 	if err != nil {
 		d.log.Warn("gc: list managed containers", "err", err)
@@ -101,11 +109,33 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		if want[c.Name] {
 			continue
 		}
+		if rid := c.Labels[LabelResourceID]; rid != "" && rolloutManaged[rid] {
+			continue // a rollout-owned generation — never GC-reaped
+		}
 		d.log.Info("gc: removing orphaned container", "container", c.Name)
 		if err := d.docker.ContainerRemove(ctx, c.ID, true); err != nil {
 			d.log.Warn("gc: remove", "container", c.Name, "err", err)
 		}
 	}
+}
+
+// rolloutManagedResources is the set of resource ids the document deploys via a
+// deploy.rollout op — the resources GC must leave entirely to the rollout op.
+func rolloutManagedResources(doc dsd.Document) map[string]bool {
+	out := map[string]bool{}
+	for _, op := range doc.Ops {
+		if op.Kind != KindDeployRollout {
+			continue
+		}
+		var rs RolloutSpec
+		if err := json.Unmarshal(op.Spec, &rs); err != nil {
+			continue
+		}
+		if rs.Container.ResourceID != "" {
+			out[rs.Container.ResourceID] = true
+		}
+	}
+	return out
 }
 
 // desiredNames is the set of container names the document wants running — the

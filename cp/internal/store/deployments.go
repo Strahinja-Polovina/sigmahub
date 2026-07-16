@@ -61,6 +61,51 @@ func terminalDeployStatus(s string) bool {
 	return false
 }
 
+// deployStatusRank orders the non-terminal → success progression so a status
+// advance is monotonic: a single agent status POST reports clone+build+rollout in
+// arbitrary map order, and only forward moves may apply (no regression).
+func deployStatusRank(s string) int {
+	switch s {
+	case "queued":
+		return 0
+	case "building":
+		return 1
+	case "deploying":
+		return 2
+	case "success":
+		return 3
+	}
+	return -1
+}
+
+// supersedeInFlightTx freezes any still-in-flight deployment for a (server,
+// resource) as 'superseded' — called in the same tx that creates a newer
+// deployment, so there is at most ONE in-flight deployment per (server,resource).
+// That single-in-flight invariant is what lets the op-status path advance "the
+// in-flight deployment" unambiguously, and it makes the promised "superseded when
+// a newer deploy wins the race" state actually hold (no lingering orphan rows).
+func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resourceID string) error {
+	if serverID == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE deployments SET
+			status = 'superseded',
+			finished_at = now(),
+			duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int)
+		 WHERE org_id = $1 AND server_id = $2 AND resource_id = $3
+		   AND status IN ('queued','building','deploying')`,
+		orgID, serverID, resourceID)
+	return err
+}
+
+// deployImageTag mirrors dsd.DeployImageTag — the deterministic image reference a
+// git-deployed resource's build produces and its rollout runs. Kept inline (not
+// an import) to avoid a store→dsd dependency; the two MUST stay in sync.
+func deployImageTag(resourceID, sha string) string {
+	return "sigmahub/" + resourceID + ":" + sha
+}
+
 // CreateDeploymentInput queues a new deploy.
 type CreateDeploymentInput struct {
 	ResourceID    string
@@ -305,6 +350,10 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 		GitSHA: deref(sha), ImageDigest: deref(digest), ConfigHash: deref(cfg),
 		RollbackOf: targetDeploymentID, Status: "queued", CreatedBy: actor,
 	}
+	// The rollback supersedes any in-flight deploy for this resource.
+	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
+		return Deployment{}, "", err
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
 		                         git_ref, git_sha, image_digest, config_hash, rollback_of, status, created_by)
@@ -353,6 +402,10 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 		ID: newID("dep"), OrgID: orgID, ResourceID: resourceID, EnvironmentID: deref(env),
 		ServerID: deref(srv), ConnectionID: deref(conn), Trigger: "manual", GitRef: deref(ref),
 		GitSHA: deref(sha), ConfigHash: deref(cfg), Status: "queued", CreatedBy: actor,
+	}
+	// The manual redeploy supersedes any in-flight deploy for this resource.
+	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
+		return Deployment{}, "", err
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
@@ -479,6 +532,11 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 
 		for _, a := range apps {
 			cfgHash := configHash(a.spec)
+			// A newer push supersedes any still-in-flight deploy for this resource,
+			// so only one deployment per (server,resource) is ever in flight.
+			if err := supersedeInFlightTx(ctx, tx, r.orgID, a.serverID, a.id); err != nil {
+				return nil, err
+			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
 				                         trigger, git_ref, git_sha, config_hash, status, created_by)
@@ -591,13 +649,13 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 // in-flight deployment — so it is safe to call for every res:<id> op status,
 // including non-git container.apply resources.
 func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error {
-	var depID, curStatus string
+	var depID, curStatus, gitSHA string
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, status FROM deployments
+		SELECT id, status, COALESCE(git_sha,'') FROM deployments
 		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus)
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil // no in-flight deployment
+		return nil // no in-flight deployment (supersede keeps this to at most one)
 	}
 	if err != nil {
 		return err
@@ -606,15 +664,33 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 	if !ok {
 		up.Status, up.Detail, up.MarkFinished = "failed", detail, true
 	} else {
+		var target string
 		switch phase {
 		case "clone":
-			up.Status, up.MarkStarted = "building", true
+			target = "building"
 		case "build":
-			up.Status = "deploying"
+			target = "deploying"
 		case "rollout":
-			up.Status, up.MarkFinished = "success", true
+			target = "success"
 		default:
 			return nil
+		}
+		// Monotonic: a single status POST reports clone/build/rollout in arbitrary
+		// map order — only a forward move applies, never a regression.
+		if deployStatusRank(target) <= deployStatusRank(curStatus) {
+			return nil
+		}
+		up.Status = target
+		// Stamp started_at on the first move off 'queued', whichever phase reports
+		// first (SetDeploymentStatus sets it only when currently NULL).
+		up.MarkStarted = true
+		if target == "success" {
+			up.MarkFinished = true
+			// Record the deployable image reference so the release becomes a
+			// rebuild-free rollback target (RollbackTargets requires image_digest).
+			if gitSHA != "" {
+				up.ImageDigest = deployImageTag(resourceID, gitSHA)
+			}
 		}
 	}
 	err = s.SetDeploymentStatus(ctx, depID, up)
@@ -624,13 +700,19 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 	return err
 }
 
-// AppendDeployLog appends one build/orchestration log line for streaming to the UI.
-func (s *Store) AppendDeployLog(ctx context.Context, deploymentID, stream, line string) error {
+// AppendDeployLog appends one build/orchestration log line, scoped to the
+// reporting server: the row is written only when the deployment targets that
+// server (BOLA guard — an agent can't forge or read into another host's deploy
+// logs). A line for a deployment not on this server is silently dropped.
+func (s *Store) AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error {
 	if stream == "" {
 		stream = "build"
 	}
-	_, err := s.Pool.Exec(ctx,
-		`INSERT INTO deploy_logs (deployment_id, stream, line) VALUES ($1,$2,$3)`, deploymentID, stream, line)
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO deploy_logs (deployment_id, stream, line)
+		SELECT $1, $2, $3
+		 WHERE EXISTS (SELECT 1 FROM deployments WHERE id = $1 AND server_id = $4)`,
+		deploymentID, stream, line, serverID)
 	return err
 }
 

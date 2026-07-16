@@ -66,26 +66,42 @@ function DeployLogs({
   React.useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+    const MAX_FAILURES = 5;
+    // The CP caps each page at 1000 lines; a full page means more may remain.
+    const PAGE = 1000;
 
     async function poll() {
       try {
         const snap = await fetchDeployLogs({ orgId, deploymentId, after: cursorRef.current });
         if (cancelled) return;
+        failures = 0;
         if (snap.logs.length > 0) {
           cursorRef.current = snap.nextCursor;
           setLines((prev) => [...prev, ...snap.logs]);
         }
         setLoading(false);
-        if (snap.done) {
+        // Even when the deployment is terminal, keep draining while a full page
+        // came back — otherwise the failing tail past 1000 lines is dropped. Only
+        // stop once terminal AND the last page was not full.
+        if (snap.done && snap.logs.length < PAGE) {
           setDone(true);
           return;
         }
-        timer = setTimeout(poll, 1500);
+        // Drain a backlog immediately; poll live tails on an interval.
+        timer = setTimeout(poll, snap.logs.length >= PAGE ? 0 : 1500);
       } catch {
-        if (!cancelled) {
-          setLoading(false);
+        if (cancelled) return;
+        setLoading(false);
+        // A transient fetch error must not permanently kill live streaming or
+        // falsely mark the deploy finished — retry with backoff, give up only
+        // after several consecutive failures.
+        failures += 1;
+        if (failures >= MAX_FAILURES) {
           setDone(true);
+          return;
         }
+        timer = setTimeout(poll, 1500 * failures);
       }
     }
     poll();

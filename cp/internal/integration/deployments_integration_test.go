@@ -116,8 +116,8 @@ func TestDeploymentsLifecycle(t *testing.T) {
 	}
 
 	// Deploy-log streaming cursor.
-	_ = st.AppendDeployLog(ctx, dep.ID, "build", "step 1/5 : FROM nginx")
-	_ = st.AppendDeployLog(ctx, dep.ID, "build", "step 2/5 : COPY . .")
+	_ = st.AppendDeployLog(ctx, serverID, dep.ID, "build", "step 1/5 : FROM nginx")
+	_ = st.AppendDeployLog(ctx, serverID, dep.ID, "build", "step 2/5 : COPY . .")
 	logs, err := st.DeployLogsSince(ctx, dep.ID, 0, 100)
 	if err != nil || len(logs) != 2 {
 		t.Fatalf("deploy logs = %+v (err %v)", logs, err)
@@ -151,5 +151,84 @@ func TestDeploymentsLifecycle(t *testing.T) {
 	// A failed deployment is not a valid rollback target.
 	if _, _, err := st.CreateRollback(ctx, orgID, res.ID, failDep.ID, "operator"); err == nil {
 		t.Fatal("rollback to a failed release must be rejected")
+	}
+}
+
+// TestDeploymentSupersedeAndAdvance pins the review fixes: a newer deployment
+// supersedes the in-flight one (single-in-flight invariant), status advances
+// monotonically with started_at stamped on the first move, a rollout success
+// records the image_digest that makes it a rollback target, and a stale report
+// after terminal is a no-op.
+func TestDeploymentSupersedeAndAdvance(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_sup"
+
+	proj, _ := st.CreateProject(ctx, orgID, "p", "", "test")
+	env, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	bootTok, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	reg, _ := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	serverID := reg.Server.ID
+	_ = st.AttachServer(ctx, orgID, env.ID, serverID, "test")
+	appSpec, _ := json.Marshal(map[string]any{"image": "nginx"})
+	res, _ := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "web", Kind: "app", Spec: appSpec,
+	}, "test")
+
+	// First deploy, advance one step so it is in flight with started_at stamped.
+	dep1, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: serverID, Trigger: "git", GitSHA: "abcdef1", ConfigHash: "cfg",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := st.GetDeployment(ctx, orgID, dep1.ID)
+	if d1.Status != "building" || d1.StartedAt == nil {
+		t.Fatalf("clone advance = %s started=%v", d1.Status, d1.StartedAt)
+	}
+
+	// A manual redeploy supersedes the in-flight dep1 and becomes the sole in-flight.
+	dep2, srv, err := st.CreateManualRedeploy(ctx, orgID, res.ID, "operator")
+	if err != nil {
+		t.Fatalf("manual redeploy: %v", err)
+	}
+	if srv != serverID {
+		t.Fatalf("redeploy server = %q", srv)
+	}
+	d1, _ = st.GetDeployment(ctx, orgID, dep1.ID)
+	if d1.Status != "superseded" {
+		t.Fatalf("dep1 should be superseded, got %s", d1.Status)
+	}
+
+	// Out-of-order status report (rollout before clone/build) still advances the
+	// single in-flight deployment monotonically to success and records the image.
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "rollout", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A late 'clone' report must NOT regress a terminal success.
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := st.GetDeployment(ctx, orgID, dep2.ID)
+	if d2.Status != "success" {
+		t.Fatalf("dep2 status = %s, want success", d2.Status)
+	}
+	if d2.ImageDigest == "" {
+		t.Fatal("a successful git deployment must record image_digest (rollback target)")
+	}
+
+	// It is now a rebuild-free rollback target.
+	targets, _ := st.RollbackTargets(ctx, orgID, res.ID, 10)
+	found := false
+	for _, tgt := range targets {
+		if tgt.ID == dep2.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the successful deployment should be a rollback target")
 	}
 }

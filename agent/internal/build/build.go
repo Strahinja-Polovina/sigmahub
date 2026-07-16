@@ -183,12 +183,15 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 	}
 
 	// Dedup: a retry of the same inputs finds the image already built and skips —
-	// the idempotency invariant (and what keeps a rollback rebuild-free).
-	if exists, err := b.docker.ImageExists(ctx, spec.ImageTag); err != nil {
-		return err
-	} else if exists {
-		b.stream(ctx, spec.DeploymentID, "build", "image "+spec.ImageTag+" already built — reusing")
-		return nil
+	// the idempotency invariant (and what keeps a rollback rebuild-free). A forced
+	// build (manual redeploy) bypasses the short-circuit to rebuild the same commit.
+	if !spec.Force {
+		if exists, err := b.docker.ImageExists(ctx, spec.ImageTag); err != nil {
+			return err
+		} else if exists {
+			b.stream(ctx, spec.DeploymentID, "build", "image "+spec.ImageTag+" already built — reusing")
+			return nil
+		}
 	}
 
 	dockerfile := spec.Dockerfile

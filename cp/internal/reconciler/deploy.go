@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -26,6 +27,9 @@ type buildImageOpSpec struct {
 	Dockerfile   string `json:"dockerfile,omitempty"`
 	ImageTag     string `json:"imageTag"`
 	DeploymentID string `json:"deploymentId,omitempty"`
+	// Force skips the build-dedup short-circuit so a manual redeploy rebuilds the
+	// same commit (e.g. to pick up base-image changes) instead of reusing the cached image.
+	Force bool `json:"force,omitempty"`
 }
 
 type healthProbe struct {
@@ -51,12 +55,32 @@ type detectedHealth struct {
 	IntervalSec int    `json:"intervalSec"`
 }
 
-// shortSHA is the 8-char generation tag; git SHAs are validated upstream.
+// shortSHA is the 8-char SHA prefix; git SHAs are validated upstream.
 func shortSHA(sha string) string {
 	if len(sha) > 8 {
 		return sha[:8]
 	}
 	return sha
+}
+
+// deployGeneration is the per-deployment rollout generation: the short SHA plus a
+// slice of the deployment id. Making it unique PER DEPLOYMENT (not just per SHA)
+// means every deploy — including a manual redeploy or a config-only change on the
+// same commit — rolls out under a distinct container name, so the agent always
+// creates-and-health-gates the new generation BEFORE draining the old (never a
+// hard cut), and a rollout re-apply stays idempotent on that name.
+func deployGeneration(sha, deploymentID string) string {
+	suffix := deploymentID
+	if i := strings.LastIndex(suffix, "_"); i >= 0 {
+		suffix = suffix[i+1:]
+	}
+	if len(suffix) > 6 {
+		suffix = suffix[len(suffix)-6:]
+	}
+	if suffix == "" {
+		return shortSHA(sha)
+	}
+	return shortSHA(sha) + "-" + suffix
 }
 
 // renderDeployOps expands a git-deployed app resource into its deploy pipeline:
@@ -103,18 +127,27 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	if fileMode {
 		cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
 	}
+	health := deployHealth(spec, rs.Spec)
 	if len(domains) > 0 {
 		lbPort := 0
 		if len(spec.Ports) > 0 {
 			lbPort = spec.Ports[0].Container
 		}
 		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
+		// Gated attach: two generations of a git-deployed app share the same
+		// Traefik router labels, so the LB must withhold traffic from the new
+		// generation until it is healthy. A service-level health check makes Traefik
+		// probe each backend and route only to ready ones — closing the window
+		// between "new container started" and "agent health gate passed".
+		for k, v := range traefikHealthLabels(rs.ResourceID, health) {
+			cs.Labels[k] = v
+		}
 	}
 
 	rollout := rolloutOpSpec{
 		Container:    cs,
-		Generation:   shortSHA(target.SHA),
-		Health:       deployHealth(spec, rs.Spec),
+		Generation:   deployGeneration(target.SHA, target.DeploymentID),
+		Health:       health,
 		DeploymentID: target.DeploymentID,
 	}
 	rolloutBytes, _ := json.Marshal(rollout)
@@ -135,6 +168,9 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	build, _ := json.Marshal(buildImageOpSpec{
 		ResourceID: rs.ResourceID, SHA: target.SHA, DedupKey: target.ConfigHash + ":" + target.SHA,
 		ImageTag: imageTag, DeploymentID: target.DeploymentID,
+		// A manual redeploy forces a rebuild of the same commit; git-triggered
+		// deploys keep the warm-cache dedup.
+		Force: target.Trigger == "manual",
 	})
 	ops = append(ops,
 		dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},

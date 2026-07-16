@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -176,5 +178,42 @@ func TestBuildImageRequiresTag(t *testing.T) {
 	b, _ := newTestBuilder(t, &fakeImageBuilder{}, nil)
 	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{ResourceID: "r"})); err == nil {
 		t.Error("empty image tag must be rejected")
+	}
+}
+
+// TestBuildForceRebuildsDespiteExistingImage proves a forced build (manual
+// redeploy) bypasses the ImageExists dedup and rebuilds, while a normal build of
+// an existing image is skipped.
+func TestBuildForceRebuildsDespiteExistingImage(t *testing.T) {
+	// Without Force: an existing image short-circuits (no rebuild).
+	fb := &fakeImageBuilder{exists: true}
+	b, _ := newTestBuilder(t, fb, nil)
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_a", ImageTag: "sigmahub/res_a:sha", DedupKey: "k",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if fb.built {
+		t.Fatal("an existing image without Force must be reused, not rebuilt")
+	}
+
+	// With Force: the same existing image is rebuilt.
+	fb2 := &fakeImageBuilder{exists: true}
+	b2, _ := newTestBuilder(t, fb2, nil)
+	// Seed a Dockerfile in the context so the build path proceeds.
+	dir := b2.ContextDir("res_a")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_a", ImageTag: "sigmahub/res_a:sha", DedupKey: "k", Force: true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if !fb2.built {
+		t.Fatal("Force must rebuild even when the image already exists")
 	}
 }
