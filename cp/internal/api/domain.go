@@ -66,6 +66,7 @@ type DomainAPI interface {
 	ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (store.Deployment, string, error)
+	CreateManualRedeploy(ctx context.Context, orgID, resourceID, actor string) (store.Deployment, string, error)
 	GetDeployment(ctx context.Context, orgID, deploymentID string) (store.Deployment, error)
 	DeployLogsSince(ctx context.Context, deploymentID string, afterID int64, limit int) ([]store.DeployLog, error)
 }

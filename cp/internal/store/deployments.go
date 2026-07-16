@@ -324,6 +324,54 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	return d, d.ServerID, nil
 }
 
+// CreateManualRedeploy queues a manual redeploy of a git-deployed resource: it
+// copies the git coordinates (connection/ref/sha/config) of the resource's most
+// recent deployment into a new deployment (trigger=manual) with NO image digest,
+// so the reconciler renders a fresh clone→build→rollout — a rebuild of the same
+// commit that picks up base-image changes. Errors when the resource has never
+// been deployed (nothing to redeploy). Returns the server to re-render. Audited.
+func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, actor string) (Deployment, string, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var env, srv, conn, ref, sha, cfg *string
+	err = tx.QueryRow(ctx, `
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash
+		  FROM deployments WHERE org_id = $1 AND resource_id = $2
+		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Deployment{}, "", ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
+	}
+	if err != nil {
+		return Deployment{}, "", err
+	}
+
+	d := Deployment{
+		ID: newID("dep"), OrgID: orgID, ResourceID: resourceID, EnvironmentID: deref(env),
+		ServerID: deref(srv), ConnectionID: deref(conn), Trigger: "manual", GitRef: deref(ref),
+		GitSHA: deref(sha), ConfigHash: deref(cfg), Status: "queued", CreatedBy: actor,
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
+		                         git_ref, git_sha, config_hash, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),'queued',$10)
+		RETURNING created_at`,
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, d.ConfigHash, actor).Scan(&d.CreatedAt)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Manual redeploy queued", resourceID); err != nil {
+		return Deployment{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, "", err
+	}
+	return d, d.ServerID, nil
+}
+
 // LookupBuild returns a resource's build for a dedup key, if one exists — the
 // retry short-circuit: a 'built' row means the image is already present.
 func (s *Store) LookupBuild(ctx context.Context, resourceID, dedupKey string) (Build, error) {

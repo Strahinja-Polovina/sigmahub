@@ -163,6 +163,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/deployments", s.requireService(store.RoleDeveloper, s.handleListDeployments))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/rollback-targets", s.requireService(store.RoleDeveloper, s.handleRollbackTargets))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/rollback", s.requireService(store.RoleProjectAdmin, s.handleRollback))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/deploy", s.requireService(store.RoleProjectAdmin, s.handleRedeploy))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/deployments/{deploymentId}/logs", s.requireService(store.RoleDeveloper, s.handleDeployLogs))
 	// Audit is member-visible (matches the web settings tab shown to all
 	// members); mutations above stay Project Admin+.

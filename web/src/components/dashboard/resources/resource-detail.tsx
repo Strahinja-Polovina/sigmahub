@@ -61,6 +61,7 @@ import { VolumeDeleteDialog } from "./volume-delete-dialog";
 import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
+import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 
 type Deployment = {
   id: string;
@@ -120,14 +121,23 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
   async function redeploy() {
     setBusy(true);
     try {
-      const { deploymentId } = await deployResource({ resourceId });
+      const res = await deployResource({ resourceId });
       router.refresh();
+      // CP mode: the control plane drives the real clone→build→rollout pipeline;
+      // its progress shows live in the Deployments tab, so there's nothing to
+      // simulate here.
+      if ("cp" in res && res.cp) {
+        toast.info("Deployment queued", {
+          description: "Building & rolling out — watch the Deployments tab.",
+        });
+        return;
+      }
       toast.info("Deployment queued", { description: "Building the image…" });
       await sleep(1100);
-      await advanceDeployment({ deploymentId }); // → building
+      await advanceDeployment({ deploymentId: res.deploymentId }); // → building
       router.refresh();
       await sleep(1100);
-      await advanceDeployment({ deploymentId }); // → running
+      await advanceDeployment({ deploymentId: res.deploymentId }); // → running
       router.refresh();
       toast.success("Deployed", { description: "Health checks passed · now serving traffic." });
     } catch (err) {
@@ -180,6 +190,9 @@ export function ResourceDetail({
   orgId,
   domains = [],
   domainsEnabled = false,
+  cpDeployments,
+  rollbackTargetIds = [],
+  deploymentsEnabled = false,
 }: {
   detail: Detail;
   orgId?: string;
@@ -187,9 +200,17 @@ export function ResourceDetail({
   /** True only when the control plane backs custom domains; the panel is hidden
    *  in demo mode where the attach/detach actions would error. */
   domainsEnabled?: boolean;
+  /** CP-backed release history (P1-9). Present only when deploymentsEnabled. */
+  cpDeployments?: DeploymentRow[];
+  /** Deployment ids that are rebuild-free rollback candidates. */
+  rollbackTargetIds?: string[];
+  /** True when the control plane backs deployments; swaps the demo timeline for
+   *  the real release history + build logs + rollback. */
+  deploymentsEnabled?: boolean;
 }) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
+  const showCpDeployments = Boolean(deploymentsEnabled && orgId);
 
   const metrics = React.useMemo(() => getMetrics(resource.id), [resource.id]);
   const logs = React.useMemo(() => getLogs(resource.id), [resource.id]);
@@ -412,44 +433,54 @@ export function ResourceDetail({
         </TabsContent>
 
         <TabsContent value="deployments" className="pt-4">
-          <Card>
-            <CardHeader className="border-b">
-              <CardTitle>Deployments</CardTitle>
-              <CardDescription>Recent builds for {resource.name}</CardDescription>
-            </CardHeader>
-            <CardContent className="px-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="pl-4">Commit</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Author</TableHead>
-                    <TableHead>Duration</TableHead>
-                    <TableHead className="pr-4">Started</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {deployments.map((d) => (
-                    <TableRow key={d.id}>
-                      <TableCell className="pl-4">
-                        <span className="font-mono text-sm text-foreground">{d.sha}</span>
-                      </TableCell>
-                      <TableCell>
-                        <DeployStatusBadge status={d.status} />
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">{d.author}</TableCell>
-                      <TableCell className="tabular-nums text-muted-foreground">
-                        {formatDuration(d.durationSec)}
-                      </TableCell>
-                      <TableCell className="pr-4 tabular-nums text-muted-foreground">
-                        {formatDateTime(d.startedAt)}
-                      </TableCell>
+          {showCpDeployments ? (
+            <DeploymentsPanel
+              orgId={orgId!}
+              resourceId={resource.id}
+              deployments={cpDeployments ?? []}
+              rollbackTargetIds={rollbackTargetIds}
+              canManage={canManage}
+            />
+          ) : (
+            <Card>
+              <CardHeader className="border-b">
+                <CardTitle>Deployments</CardTitle>
+                <CardDescription>Recent builds for {resource.name}</CardDescription>
+              </CardHeader>
+              <CardContent className="px-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="pl-4">Commit</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Author</TableHead>
+                      <TableHead>Duration</TableHead>
+                      <TableHead className="pr-4">Started</TableHead>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
+                  </TableHeader>
+                  <TableBody>
+                    {deployments.map((d) => (
+                      <TableRow key={d.id}>
+                        <TableCell className="pl-4">
+                          <span className="font-mono text-sm text-foreground">{d.sha}</span>
+                        </TableCell>
+                        <TableCell>
+                          <DeployStatusBadge status={d.status} />
+                        </TableCell>
+                        <TableCell className="text-muted-foreground">{d.author}</TableCell>
+                        <TableCell className="tabular-nums text-muted-foreground">
+                          {formatDuration(d.durationSec)}
+                        </TableCell>
+                        <TableCell className="pr-4 tabular-nums text-muted-foreground">
+                          {formatDateTime(d.startedAt)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
+          )}
         </TabsContent>
 
         <TabsContent value="settings" className="pt-4">
