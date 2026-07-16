@@ -52,6 +52,7 @@ async function loadDeployments(
         createdBy: d.createdBy,
         createdAt: d.createdAt,
         startedAt: d.startedAt,
+        serviceStatus: d.serviceStatus,
       })),
       rollbackTargetIds: targets.map((t) => t.id),
     };

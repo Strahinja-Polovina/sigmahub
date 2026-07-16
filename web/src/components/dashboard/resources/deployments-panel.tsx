@@ -39,6 +39,7 @@ export type DeploymentRow = {
   createdBy?: string;
   createdAt: string;
   startedAt?: string;
+  serviceStatus?: Record<string, string>;
 };
 
 type LogLine = { id: number; stream: string; line: string; at: string };
@@ -288,6 +289,24 @@ export function DeploymentsPanel({
                     >
                       {d.detail}
                     </p>
+                  )}
+                  {d.serviceStatus && Object.keys(d.serviceStatus).length > 0 && (
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-xs font-medium text-muted-foreground">Services</span>
+                      <div className="flex flex-wrap gap-2">
+                        {Object.entries(d.serviceStatus)
+                          .sort(([a], [b]) => a.localeCompare(b))
+                          .map(([svc, st]) => (
+                            <span
+                              key={svc}
+                              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs"
+                            >
+                              <span className="font-mono text-foreground">{svc}</span>
+                              <DeployStatusBadge status={st} />
+                            </span>
+                          ))}
+                      </div>
+                    </div>
                   )}
                   <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                     <ScrollText className="size-3.5" />
