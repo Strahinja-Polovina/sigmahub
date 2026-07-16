@@ -36,4 +36,7 @@ type BuildImageSpec struct {
 	ImageTag   string `json:"imageTag"` // e.g. sigmahub/<resourceId>:<sha>
 	// DeploymentID scopes the streamed build logs on the control plane.
 	DeploymentID string `json:"deploymentId,omitempty"`
+	// Force skips the ImageExists dedup short-circuit so a manual redeploy rebuilds
+	// the same commit (picking up base-image changes) instead of reusing the cache.
+	Force bool `json:"force,omitempty"`
 }

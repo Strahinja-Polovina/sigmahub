@@ -34,7 +34,7 @@ type StoreAPI interface {
 	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error
 	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error
-	AppendDeployLog(ctx context.Context, deploymentID, stream, line string) error
+	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.

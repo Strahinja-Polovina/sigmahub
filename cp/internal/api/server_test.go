@@ -89,7 +89,9 @@ func (f *fakeStore) DeploymentCloneCredential(context.Context, string, string) (
 func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string, string, bool, string) error {
 	return nil
 }
-func (f *fakeStore) AppendDeployLog(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
+	return nil
+}
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {

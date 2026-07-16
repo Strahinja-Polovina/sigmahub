@@ -252,7 +252,15 @@ func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec Ro
 		if cur.Running && cur.Labels[LabelSpecHash] == hash {
 			return drainOld(ctx, dk, resourceID, newName, log)
 		}
-		// A stale/leftover same-name container: remove before recreating.
+		if cur.Running {
+			// A live container already holds this generation's name but with a
+			// different spec. Generation names are per-deployment, so this should
+			// not occur; refuse rather than force-remove a SERVING container before
+			// its replacement is health-gated (that would be a hard cut).
+			return fmt.Errorf("generation %q already held by a running container with a different spec — refusing to cut", newName)
+		}
+		// A stopped leftover of this generation (e.g. a crashed prior attempt):
+		// safe to remove before recreating — it is not serving traffic.
 		if err := dk.ContainerRemove(ctx, cur.ID, true); err != nil {
 			return fmt.Errorf("remove stale generation: %w", err)
 		}

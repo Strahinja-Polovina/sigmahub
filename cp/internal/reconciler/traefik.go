@@ -71,6 +71,32 @@ func renderTraefikOp(serverID string, cfg ACMEConfig, domains []store.Domain) ds
 // container port Traefik connects to on the shared project network. Returns nil
 // when the resource has no domains (no router labels — the container is still
 // reachable internally, and gains labels only once a domain is attached).
+// traefikHealthLabels makes Traefik health-check each backend so it withholds
+// traffic from a new, not-yet-healthy generation — the load-balancer-level gate
+// for a git-deployed app whose two generations share the same router labels
+// during a blue-green swap. Only emitted for an HTTP probe: Traefik's health check
+// is an HTTP GET, so a TCP-only probe has no LB equivalent and the agent's own
+// health gate remains the guard.
+func traefikHealthLabels(resourceID string, h healthProbe) map[string]string {
+	if h.Type != "http" || h.Path == "" {
+		return nil
+	}
+	svc := dsd.TraefikRouterName(resourceID)
+	prefix := "traefik.http.services." + svc + ".loadbalancer.healthcheck."
+	interval := h.IntervalSec
+	if interval <= 0 {
+		interval = 3
+	}
+	labels := map[string]string{
+		prefix + "path":     h.Path,
+		prefix + "interval": strconv.Itoa(interval) + "s",
+	}
+	if h.Port > 0 {
+		labels[prefix+"port"] = strconv.Itoa(h.Port)
+	}
+	return labels
+}
+
 func traefikLabels(resourceID string, domains []store.Domain, port int) map[string]string {
 	if len(domains) == 0 {
 		return nil

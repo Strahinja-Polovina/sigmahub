@@ -2,10 +2,13 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
 
 // fakeRollout is an in-memory rolloutDocker that records the ordered sequence of
@@ -261,5 +264,67 @@ func TestRetainImagesNeverTouchesInUse(t *testing.T) {
 		if r == tag("old") {
 			t.Fatalf("retention removed the in-use image %s", r)
 		}
+	}
+}
+
+// TestPerformRolloutRefusesHardCut proves a live container already holding the new
+// generation's name with a DIFFERENT spec is NOT force-removed (never cut): the
+// rollout refuses rather than tear down a serving container before a replacement
+// is health-gated.
+func TestPerformRolloutRefusesHardCut(t *testing.T) {
+	f := newFakeRollout()
+	// A running container occupies the target generation name but with a stale hash.
+	f.seed("sigmahub-res_a-gen2", "res_a", "stalehash", true)
+
+	spec, body := rolloutSpec("res_a", "gen2", "newhash")
+	err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog)
+	if err == nil {
+		t.Fatal("expected performRollout to refuse cutting a running same-name container")
+	}
+	if _, ok := f.byName["sigmahub-res_a-gen2"]; !ok {
+		t.Fatal("the serving container must NOT have been removed (never cut)")
+	}
+	for _, e := range f.events {
+		if e == "remove:sigmahub-res_a-gen2" {
+			t.Fatal("hard cut: the serving container was removed")
+		}
+	}
+}
+
+// TestPerformRolloutReplacesStoppedLeftover proves a STOPPED same-name leftover
+// (e.g. a crashed prior attempt) is safely removed and recreated — it is not
+// serving, so create-before-destroy does not apply.
+func TestPerformRolloutReplacesStoppedLeftover(t *testing.T) {
+	f := newFakeRollout()
+	f.seed("sigmahub-res_a-gen2", "res_a", "stalehash", false) // stopped leftover
+
+	spec, body := rolloutSpec("res_a", "gen2", "newhash")
+	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+		t.Fatalf("stopped leftover should be replaceable: %v", err)
+	}
+	if indexOf(f.events, "remove:sigmahub-res_a-gen2") < 0 {
+		t.Fatal("the stopped leftover should have been removed")
+	}
+	if indexOf(f.events, "create:sigmahub-res_a-gen2") < 0 {
+		t.Fatal("a fresh generation should have been created")
+	}
+}
+
+// TestRolloutManagedResources proves a resource with a deploy.rollout op is
+// recognised as rollout-owned so GC never reaps its (old) generations.
+func TestRolloutManagedResources(t *testing.T) {
+	spec, _ := rolloutSpec("res_a", "gen2", "h")
+	rb, _ := json.Marshal(spec)
+	appSpec, _ := json.Marshal(ContainerSpec{Name: "sigmahub-res_b"})
+	doc := dsd.Document{Ops: []dsd.Op{
+		{ID: "res:res_a", Kind: KindDeployRollout, Spec: rb},
+		{ID: "res:res_b", Kind: KindContainerApply, Spec: appSpec},
+	}}
+	m := rolloutManagedResources(doc)
+	if !m["res_a"] {
+		t.Fatal("res_a (deploy.rollout) must be rollout-managed")
+	}
+	if m["res_b"] {
+		t.Fatal("res_b (plain container.apply) must NOT be rollout-managed")
 	}
 }
