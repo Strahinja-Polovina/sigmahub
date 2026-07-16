@@ -54,6 +54,11 @@ type DomainAPI interface {
 	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
 	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
+	// Custom domains (P1-8). Attach/Detach return the host server id so the
+	// handler can re-render its DSD.
+	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)
+	DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error)
+	ListDomainsForResource(ctx context.Context, orgID, resourceID string) ([]store.Domain, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,
@@ -278,12 +283,65 @@ func (s *Server) handleProxyRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	err := s.domain.SetProxyRole(r.Context(), r.PathValue("orgId"), r.PathValue("serverId"), req.Proxy, principalFrom(r).Name)
+	orgID, serverID := r.PathValue("orgId"), r.PathValue("serverId")
+	err := s.domain.SetProxyRole(r.Context(), orgID, serverID, req.Proxy, principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "proxy role")
 		return
 	}
+	// The proxy role gates the Traefik op AND (via P1-5) the 80/443 firewall
+	// rules — both live in the server's DSD, so re-render it.
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "proxy": req.Proxy})
+}
+
+// ── Custom domains (P1-8) ───────────────────────────────────────────────────
+
+func (s *Server) handleAttachDomain(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Domain        string `json:"domain"`
+		ChallengeType string `json:"challengeType"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || strings.TrimSpace(req.Domain) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "domain is required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	d, serverID, err := s.domain.AttachDomain(r.Context(), orgID, r.PathValue("resourceId"),
+		req.Domain, req.ChallengeType, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "attach domain")
+		return
+	}
+	// A new domain adds Traefik router labels to the resource's container — re-render.
+	if s.reconcile != nil && serverID != "" {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
+	writeJSON(w, http.StatusCreated, d)
+}
+
+func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
+	domains, err := s.domain.ListDomainsForResource(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"))
+	if err != nil {
+		s.writeStoreErr(w, err, "list domains")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"domains": domains})
+}
+
+func (s *Server) handleDetachDomain(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	serverID, err := s.domain.DetachDomain(r.Context(), orgID, r.PathValue("domainId"), principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "detach domain")
+		return
+	}
+	if s.reconcile != nil && serverID != "" {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "detached"})
 }
 
 // handleSetHardening updates a server's desired hardening config (the

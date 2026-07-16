@@ -33,36 +33,37 @@ var validChallengeTypes = map[string]bool{"http": true, "tls-alpn": true, "dns":
 
 // AttachDomain attaches a custom domain to an app resource. The resource must
 // belong to the org and be an "app" (only apps front HTTP). A domain routes to at
-// most one resource (unique). Audited.
-func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (Domain, error) {
+// most one resource (unique). Audited. Returns the host server id so the caller
+// can re-render its DSD.
+func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (Domain, string, error) {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if domain == "" || !strings.Contains(domain, ".") || strings.ContainsAny(domain, " /") {
-		return Domain{}, ErrInvalid{Msg: "domain must be a valid fully-qualified hostname"}
+		return Domain{}, "", ErrInvalid{Msg: "domain must be a valid fully-qualified hostname"}
 	}
 	if challengeType == "" {
 		challengeType = "http"
 	}
 	if !validChallengeTypes[challengeType] {
-		return Domain{}, ErrInvalid{Msg: `challengeType must be "http", "tls-alpn", or "dns"`}
+		return Domain{}, "", ErrInvalid{Msg: `challengeType must be "http", "tls-alpn", or "dns"`}
 	}
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return Domain{}, err
+		return Domain{}, "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var kind string
+	var kind, serverID string
 	err = tx.QueryRow(ctx,
-		`SELECT kind FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&kind)
+		`SELECT kind, server_id FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&kind, &serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Domain{}, ErrNotFound
+		return Domain{}, "", ErrNotFound
 	}
 	if err != nil {
-		return Domain{}, err
+		return Domain{}, "", err
 	}
 	if kind != "app" {
-		return Domain{}, ErrInvalid{Msg: "a custom domain can only be attached to an app resource"}
+		return Domain{}, "", ErrInvalid{Msg: "a custom domain can only be attached to an app resource"}
 	}
 
 	d := Domain{
@@ -75,40 +76,50 @@ func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, cha
 		RETURNING created_at, updated_at`,
 		d.ID, orgID, resourceID, domain, challengeType, actor).Scan(&d.CreatedAt, &d.UpdatedAt)
 	if isUniqueViolation(err) {
-		return Domain{}, fmt.Errorf("%w: domain %q is already attached", ErrConflict, domain)
+		return Domain{}, "", fmt.Errorf("%w: domain %q is already attached", ErrConflict, domain)
 	}
 	if err != nil {
-		return Domain{}, err
+		return Domain{}, "", err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Domain attached ("+domain+")", resourceID); err != nil {
-		return Domain{}, err
+		return Domain{}, "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Domain{}, err
+		return Domain{}, "", err
 	}
-	return d, nil
+	return d, serverID, nil
 }
 
-// DetachDomain removes a domain (org-scoped). Audited.
-func (s *Store) DetachDomain(ctx context.Context, orgID, domainID, actor string) error {
+// DetachDomain removes a domain (org-scoped). Audited. Returns the host server id
+// so the caller can re-render its DSD.
+func (s *Store) DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var domain string
-	err = tx.QueryRow(ctx,
-		`DELETE FROM domains WHERE org_id = $1 AND id = $2 RETURNING domain`, orgID, domainID).Scan(&domain)
+
+	var domain, serverID string
+	err = tx.QueryRow(ctx, `
+		SELECT d.domain, r.server_id
+		  FROM domains d JOIN resources r ON r.id = d.resource_id
+		 WHERE d.org_id = $1 AND d.id = $2`, orgID, domainID).Scan(&domain, &serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return err
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM domains WHERE org_id = $1 AND id = $2`, orgID, domainID); err != nil {
+		return "", err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Domain detached ("+domain+")", domainID); err != nil {
-		return err
+		return "", err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return serverID, nil
 }
 
 // ListDomainsForResource returns an app resource's domains (org-scoped).
@@ -147,19 +158,27 @@ func (s *Store) DomainsForServer(ctx context.Context, serverID string) (map[stri
 	return out, nil
 }
 
-// SetDomainCertStatus records the ACME certificate state reported by the agent.
+// SetDomainCertStatus records the ACME certificate state reported by an agent.
 // Idempotent: re-reporting the same issued serial is a no-op change. status is
 // one of pending|issuing|issued|failed.
-func (s *Store) SetDomainCertStatus(ctx context.Context, domain, status, serial string, expiresAt *time.Time, certErr string) error {
+//
+// Scoped to the REPORTING server (server_id), not merely the domain name: an
+// agent token authenticates one specific host, so a stolen/compromised token
+// must not be able to write cert state for a domain hosted on a different server
+// (BOLA). The join to resources enforces that the domain routes to a resource
+// scheduled on this server.
+func (s *Store) SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	tag, err := s.Pool.Exec(ctx, `
-		UPDATE domains
-		   SET cert_status = $2,
-		       cert_serial = COALESCE(NULLIF($3, ''), cert_serial),
-		       cert_expires_at = COALESCE($4, cert_expires_at),
-		       last_error = $5,
+		UPDATE domains d
+		   SET cert_status = $3,
+		       cert_serial = COALESCE(NULLIF($4, ''), cert_serial),
+		       cert_expires_at = COALESCE($5, cert_expires_at),
+		       last_error = $6,
 		       updated_at = now()
-		 WHERE lower(domain) = $1`, domain, status, serial, expiresAt, certErr)
+		  FROM resources r
+		 WHERE r.id = d.resource_id AND r.server_id = $1 AND lower(d.domain) = $2`,
+		serverID, domain, status, serial, expiresAt, certErr)
 	if err != nil {
 		return err
 	}

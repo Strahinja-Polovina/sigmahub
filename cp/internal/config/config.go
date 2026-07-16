@@ -25,6 +25,11 @@ type Config struct {
 	// (X-Hub-Signature-256 HMAC-SHA256). Empty disables the webhook receiver
 	// (returns 503) rather than accepting unverifiable deliveries.
 	GitHubWebhookSecret string
+	// ACMEEmail is the Let's Encrypt account contact rendered into proxy.traefik
+	// ops (P1-8). ACMECADirURL overrides the CA directory — set to the Pebble /
+	// LE-staging URL for e2e; empty means Let's Encrypt production.
+	ACMEEmail    string
+	ACMECADirURL string
 }
 
 func FromEnv() (Config, error) {
@@ -35,6 +40,8 @@ func FromEnv() (Config, error) {
 		ServiceToken:        os.Getenv("CP_SERVICE_TOKEN"),
 		ProvisionToken:      os.Getenv("CP_PROVISION_TOKEN"),
 		GitHubWebhookSecret: os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
+		ACMEEmail:           os.Getenv("CP_ACME_EMAIL"),
+		ACMECADirURL:        os.Getenv("CP_ACME_CA_DIR_URL"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")

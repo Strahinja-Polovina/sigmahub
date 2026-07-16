@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -110,4 +111,41 @@ func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
 		},
 		"peers": peers,
 	})
+}
+
+// handleAgentDomainStatus ingests the ACME certificate state the agent reads
+// from Traefik's acme store. Each entry is scoped to the reporting server, so an
+// agent can only update cert state for domains routed to a resource it hosts.
+func (s *Server) handleAgentDomainStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Domains []struct {
+			Domain    string     `json:"domain"`
+			Status    string     `json:"status"`
+			Serial    string     `json:"serial"`
+			ExpiresAt *time.Time `json:"expiresAt"`
+			Error     string     `json:"error"`
+		} `json:"domains"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	srv := serverFrom(r)
+	applied := 0
+	for _, d := range req.Domains {
+		if strings.TrimSpace(d.Domain) == "" {
+			continue
+		}
+		err := s.store.SetDomainCertStatus(r.Context(), srv.ID, d.Domain, d.Status, d.Serial, d.ExpiresAt, d.Error)
+		if errors.Is(err, store.ErrNotFound) {
+			continue // domain not on this server (or detached) — ignore, don't fail the batch
+		}
+		if err != nil {
+			s.log.Error("domain status", "err", err, "server", srv.ID, "domain", d.Domain)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		applied++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "applied": applied})
 }
