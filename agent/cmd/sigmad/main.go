@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/build"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/container"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -46,10 +47,10 @@ func defaultDataDir() string {
 
 func run() error {
 	var (
-		endpoint  = flag.String("endpoint", envOr("SIGMAD_ENDPOINT", "http://localhost:8080"), "control plane base URL")
-		bootstrap = flag.String("bootstrap-token", os.Getenv("SIGMAD_BOOTSTRAP_TOKEN"), "one-time bootstrap token (first run only)")
-		dataDir   = flag.String("data-dir", envOr("SIGMAD_DATA_DIR", defaultDataDir()), "directory for persisted identity")
-		interval  = flag.Duration("interval", 30*time.Second, "heartbeat interval")
+		endpoint   = flag.String("endpoint", envOr("SIGMAD_ENDPOINT", "http://localhost:8080"), "control plane base URL")
+		bootstrap  = flag.String("bootstrap-token", os.Getenv("SIGMAD_BOOTSTRAP_TOKEN"), "one-time bootstrap token (first run only)")
+		dataDir    = flag.String("data-dir", envOr("SIGMAD_DATA_DIR", defaultDataDir()), "directory for persisted identity")
+		interval   = flag.Duration("interval", 30*time.Second, "heartbeat interval")
 		name       = flag.String("name", "", "server display name (defaults to hostname)")
 		wgUp       = flag.Bool("wg-up", false, "apply the rendered WireGuard config via wg-quick (Linux only; default renders config only)")
 		dockerSock = flag.String("docker-socket", envOr("SIGMAD_DOCKER_SOCKET", "/var/run/docker.sock"), "Docker Engine unix socket")
@@ -141,6 +142,34 @@ func run() error {
 	}
 	driver := container.NewDriver(docker, cstore, log, secretFetcher)
 	driver.Register(registry)
+	// Git deploy build path (P1-9): git.clone + image.build behind the same
+	// registry (the no-shell enforcement point). The clone credential is fetched
+	// into memory per deployment (never persisted); build/orchestration logs stream
+	// to the CP for the deploy view. workRoot holds per-resource build contexts.
+	buildRoot := filepath.Join(*dataDir, "build")
+	builder := build.NewBuilder(
+		docker,
+		func(ctx context.Context, credentialRef string) (string, error) {
+			// credentialRef is the deployment id; the CP scopes the credential to
+			// this server. A public repo carries no ref and never reaches here.
+			res, err := c.FetchCloneCredential(ctx, st.AgentToken, credentialRef)
+			if err != nil {
+				return "", err
+			}
+			return res.Token, nil
+		},
+		buildRoot,
+		log,
+		func(ctx context.Context, deploymentID, stream, line string) {
+			if deploymentID == "" {
+				return
+			}
+			if err := c.PostBuildLog(ctx, st.AgentToken, deploymentID, stream, []string{line}); err != nil {
+				log.Warn("build log post failed", "err", err)
+			}
+		},
+	)
+	builder.Register(registry)
 	// Host-hardening ops (P1-5): nftables / sshd / CIS. These mutate the host
 	// itself and require root; the handlers fail cleanly (reported as a failed op)
 	// when sigmad is not root. Registered behind the same apply registry, so an
