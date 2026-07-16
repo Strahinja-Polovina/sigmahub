@@ -199,6 +199,16 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 		dockerfile = "Dockerfile"
 	}
 	dir := b.ContextDir(spec.ResourceID)
+	// A Compose service builds from a subdir of the clone. Confine it to the clone
+	// so a crafted spec can't escape the build root (path traversal).
+	if spec.ContextSubdir != "" {
+		sub := filepath.Clean("/" + spec.ContextSubdir)[1:] // strip leading .. / abs
+		dir = filepath.Join(dir, sub)
+		root := b.ContextDir(spec.ResourceID)
+		if rel, err := filepath.Rel(root, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("build context %q escapes the clone root", spec.ContextSubdir)
+		}
+	}
 	if _, err := os.Stat(filepath.Join(dir, dockerfile)); err != nil {
 		return fmt.Errorf("build context missing %s (clone did not run?): %w", dockerfile, err)
 	}
