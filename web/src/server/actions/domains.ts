@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireProjectAdmin } from "../active-org";
+import { requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
 import { cpEnabled, cpAttachDomain, cpDetachDomain, type CpDomain } from "../cp";
 
@@ -20,7 +20,7 @@ export async function attachDomain(input: {
   challengeType?: string;
 }): Promise<CpDomain> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const domain = input.domain.trim().toLowerCase();
   if (!domain.includes(".")) throw new Error("Enter a valid domain (e.g. app.example.com).");
   const d = await cpAttachDomain(
@@ -41,7 +41,7 @@ export async function detachDomain(input: {
   domain: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   await cpDetachDomain(input.orgId, input.domainId, { name: user.name, role });
   await writeAudit({ orgId: input.orgId, actor: user.name, action: `Detached domain ${input.domain}`, target: input.resourceId });
   revalidatePath(`/dashboard/resources/${input.resourceId}`);

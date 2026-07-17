@@ -1,6 +1,6 @@
 "use server";
 
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -36,7 +36,7 @@ export async function revealDatabaseConnection(input: {
   resourceId: string;
 }): Promise<CpDatabaseConnection> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const conn = await cpRevealDatabaseConnection(input.orgId, input.resourceId, {
     name: user.name,
     role,

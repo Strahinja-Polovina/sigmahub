@@ -3,6 +3,7 @@ import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { and, eq } from "drizzle-orm";
 import { auth } from "../lib/auth";
+import { effectiveProjectRole, roleAtLeast } from "../lib/rbac";
 import { db } from "./db";
 import * as s from "./db/schema";
 
@@ -85,11 +86,81 @@ export async function requireOrgAdmin(orgId: string) {
 
 /** Assert the session user can mutate the domain model (create/delete
  *  projects, environments, resources; attach servers). Matches the CP's
- *  Project Admin+ gate so both modes agree; returns the user and role. */
+ *  Project Admin+ gate so both modes agree; returns the user and role.
+ *  ORG-scoped — for actions addressed to a specific project use
+ *  requireProjectRole so per-project grants (P2-7) apply. */
 export async function requireProjectAdmin(orgId: string) {
   const { user, role } = await requireMembership(orgId);
   if (role !== "Org Admin" && role !== "Project Admin") {
     throw new Error("Only project admins can perform this action.");
   }
   return { user, role };
+}
+
+// ── Per-project RBAC (P2-7) ─────────────────────────────────────────────────
+// Grants live web-side (the CP has no user concept — it sees the acting user
+// only as the signed {name, role} header, which can only NARROW the token's
+// role). The effective per-project role computed here is what rides that
+// header, so CP enforcement follows automatically with zero CP changes.
+
+/** The user's project grants inside one org: projectId → granted role. */
+export async function projectGrants(
+  userId: string,
+  orgId: string
+): Promise<Map<string, string>> {
+  const rows = await db
+    .select({ projectId: s.projectMemberships.projectId, role: s.projectMemberships.role })
+    .from(s.projectMemberships)
+    .innerJoin(s.projects, eq(s.projectMemberships.projectId, s.projects.id))
+    .where(and(eq(s.projectMemberships.userId, userId), eq(s.projects.orgId, orgId)));
+  return new Map(rows.map((r) => [r.projectId, r.role]));
+}
+
+/** Projects the user may see in this org, or null for "all" (org admins and
+ *  legacy users with zero grants). Read paths filter lists with this. */
+export async function visibleProjects(
+  userId: string,
+  orgId: string,
+  orgRole: string
+): Promise<Set<string> | null> {
+  if (orgRole === "Org Admin") return null;
+  const grants = await projectGrants(userId, orgId);
+  if (grants.size === 0) return null;
+  return new Set(grants.keys());
+}
+
+/** Assert the session user holds at least `min` on THIS project (effective
+ *  role = org ceiling narrowed by their grant; see lib/rbac.ts for the exact
+ *  rules). Returns the user and the effective role — forward THAT role to the
+ *  CP actor header, never the bare org role. */
+export async function requireProjectRole(
+  orgId: string,
+  projectId: string,
+  min: "Project Admin" | "Developer"
+) {
+  const { user, role: orgRole } = await requireMembership(orgId);
+  const grants = await projectGrants(user.id, orgId);
+  const effective = effectiveProjectRole(orgRole, grants.get(projectId), grants.size > 0);
+  if (!effective) {
+    throw new Error("You do not have access to this project.");
+  }
+  if (!roleAtLeast(effective, min)) {
+    throw new Error("This action requires the Project Admin role for this project.");
+  }
+  return { user, role: effective };
+}
+
+/** Project Admin gate for actions addressed by resource id: the project is
+ *  resolved through the local mirror. A missing mirror row falls back to the
+ *  org-level gate rather than breaking the action — the mirror self-heals via
+ *  the SIGMA-56 sync, and the CP still enforces its own org+role checks. */
+export async function requireProjectAdminForResource(orgId: string, resourceId: string) {
+  const [res] = await db
+    .select({ projectId: s.resources.projectId })
+    .from(s.resources)
+    .where(eq(s.resources.id, resourceId));
+  if (res) {
+    return requireProjectRole(orgId, res.projectId, "Project Admin");
+  }
+  return requireProjectAdmin(orgId);
 }

@@ -16,8 +16,11 @@ export async function getOrgs() {
 export async function getOrg(id: string) {
   return (await db.select().from(s.orgs).where(eq(s.orgs.id, id)))[0];
 }
-export async function getProjects(orgId: string) {
-  return db.select().from(s.projects).where(eq(s.projects.orgId, orgId));
+export async function getProjects(orgId: string, visible?: Set<string> | null) {
+  const rows = await db.select().from(s.projects).where(eq(s.projects.orgId, orgId));
+  // P2-7 visibility: a project-scoped user sees only granted projects; null
+  // (org admins / users with zero grants) means everything.
+  return visible ? rows.filter((p) => visible.has(p.id)) : rows;
 }
 export async function getProject(id: string) {
   return (await db.select().from(s.projects).where(eq(s.projects.id, id)))[0];
@@ -111,8 +114,12 @@ export type CommandIndex = {
   resources: { id: string; name: string; kind: string; projectName: string }[];
 };
 
-/** Flat, org-scoped search index that powers the ⌘K command menu. */
-export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
+/** Flat, org-scoped search index that powers the ⌘K command menu. `visible`
+ *  applies the P2-7 project scoping (null = everything). */
+export async function getCommandIndex(
+  orgId: string,
+  visible?: Set<string> | null
+): Promise<CommandIndex> {
   const [projects, environments, serverRows, resources] = await Promise.all([
     db
       .select({ id: s.projects.id, name: s.projects.name, slug: s.projects.slug })
@@ -136,6 +143,7 @@ export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
         id: s.resources.id,
         name: s.resources.name,
         kind: s.resources.kind,
+        projectId: s.resources.projectId,
         projectName: s.projects.name,
       })
       .from(s.resources)
@@ -148,7 +156,15 @@ export async function getCommandIndex(orgId: string): Promise<CommandIndex> {
     type: sv.type,
     region: sv.region,
   }));
-  return { projects, environments, servers, resources };
+  const visibleResources = (visible ? resources.filter((r) => visible.has(r.projectId)) : resources)
+    .map(({ id, name, kind, projectName }) => ({ id, name, kind, projectName }));
+  if (!visible) return { projects, environments, servers, resources: visibleResources };
+  return {
+    projects: projects.filter((p) => visible.has(p.id)),
+    environments: environments.filter((e) => visible.has(e.projectId)),
+    servers,
+    resources: visibleResources,
+  };
 }
 
 export async function getDeployments(resourceId: string) {
@@ -182,8 +198,11 @@ export type ProjectSummary = {
 };
 
 /** One card per project: env/server/resource counts + resource-status breakdown. */
-export async function getProjectSummaries(orgId: string): Promise<ProjectSummary[]> {
-  const projs = await getProjects(orgId);
+export async function getProjectSummaries(
+  orgId: string,
+  visible?: Set<string> | null
+): Promise<ProjectSummary[]> {
+  const projs = await getProjects(orgId, visible);
   return Promise.all(
     projs.map(async (project) => {
       const envs = await db
@@ -215,8 +234,8 @@ export async function getProjectSummaries(orgId: string): Promise<ProjectSummary
 }
 
 /** Sidebar nav: each project with its environments (id + name). */
-export async function getProjectsWithEnvs(orgId: string) {
-  const projs = await getProjects(orgId);
+export async function getProjectsWithEnvs(orgId: string, visible?: Set<string> | null) {
+  const projs = await getProjects(orgId, visible);
   return Promise.all(
     projs.map(async (p) => ({
       id: p.id,

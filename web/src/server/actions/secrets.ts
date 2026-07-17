@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectRole } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import { putSecret, readSecretValue, removeSecret, secretName } from "../secrets-data";
@@ -32,9 +32,9 @@ export async function createSecretAction(input: {
   envVar: boolean;
 }) {
   const { orgId, projectId, environmentId, resourceName } = await resourceScope(input.resourceId);
-  // Create is Project Admin+ (matches the CP route); a Developer is refused here
-  // before any value reaches the control plane.
-  const { user, role } = await requireProjectAdmin(orgId);
+  // Create is Project Admin+ on THIS project (P2-7); a Developer is refused
+  // here before any value reaches the control plane.
+  const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
 
   const name = input.name.trim();
   if (!name) throw new Error("Secret name is required.");
@@ -63,10 +63,10 @@ export async function createSecretAction(input: {
 }
 
 export async function revealSecretAction(input: { resourceId: string; secretId: string }) {
-  const { orgId } = await resourceScope(input.resourceId);
-  // Reveal is Project Admin+; a Developer 403s here (and again at the CP, which
-  // caps the effective role by the forwarded actor and audits the read).
-  const { user, role } = await requireProjectAdmin(orgId);
+  const { orgId, projectId } = await resourceScope(input.resourceId);
+  // Reveal is Project Admin+ on THIS project (P2-7); a Developer 403s here (and
+  // again at the CP, which caps the effective role by the forwarded actor).
+  const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
   const value = await readSecretValue(orgId, input.secretId, { name: user.name, role });
   // In demo mode the CP isn't the one auditing, so record the read locally.
   const name = await secretName(orgId, input.secretId);
@@ -80,8 +80,8 @@ export async function revealSecretAction(input: { resourceId: string; secretId: 
 }
 
 export async function deleteSecretAction(input: { resourceId: string; secretId: string }) {
-  const { orgId, resourceName } = await resourceScope(input.resourceId);
-  const { user, role } = await requireProjectAdmin(orgId);
+  const { orgId, projectId, resourceName } = await resourceScope(input.resourceId);
+  const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
   const name = await secretName(orgId, input.secretId);
   await removeSecret(orgId, input.secretId, { name: user.name, role });
   await writeAudit({

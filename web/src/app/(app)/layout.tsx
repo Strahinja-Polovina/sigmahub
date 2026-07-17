@@ -4,6 +4,7 @@ import {
   getActiveOrgId,
   getMyOrgs,
   getSessionUser,
+  visibleProjects,
 } from "@/server/active-org";
 import {
   getProjectsWithEnvs,
@@ -36,11 +37,14 @@ export default async function AppLayout({
   // mode); the returned health drives the "control plane unreachable" banner.
   const cpStatus = await maybeSyncOrgMirror(orgId);
 
-  const [myOrgs, sessionUser, projects, commandIndex] = await Promise.all([
-    getMyOrgs(),
-    getSessionUser(),
-    getProjectsWithEnvs(orgId),
-    getCommandIndex(orgId),
+  const [myOrgs, sessionUser] = await Promise.all([getMyOrgs(), getSessionUser()]);
+  // P2-7 project scoping: a user with project grants sees only those projects
+  // in the sidebar and ⌘K index; null = org-wide (admins, ungranted users).
+  const orgRole = myOrgs.find((o) => o.id === orgId)?.role ?? "Developer";
+  const visible = await visibleProjects(sessionUser.id, orgId, orgRole);
+  const [projects, commandIndex] = await Promise.all([
+    getProjectsWithEnvs(orgId, visible),
+    getCommandIndex(orgId, visible),
   ]);
   const counts = await getServerCounts(myOrgs.map((o) => o.id));
   const orgs = myOrgs.map((o) => ({

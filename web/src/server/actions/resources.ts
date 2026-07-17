@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { and, eq, ne } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdminForResource, requireProjectRole } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import {
@@ -45,7 +45,7 @@ export async function createResource(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireProjectAdmin(project.orgId);
+  const { user, role } = await requireProjectRole(project.orgId, input.projectId, "Project Admin");
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
 
@@ -135,7 +135,7 @@ export async function deployResource(input: { resourceId: string }) {
   // CP mode: queue a real manual redeploy (fresh clone→build→rollout). The CP
   // drives the pipeline status, so there's no client-side simulation to advance.
   if (cpEnabled() && orgId && actor) {
-    const { role } = await requireProjectAdmin(orgId);
+    const { role } = await requireProjectAdminForResource(orgId, input.resourceId);
     const dep = await cpRedeploy(orgId, input.resourceId, { name: actor.name, role });
     await writeAudit({ orgId, actor: actor.name, action: "Redeployed resource", target: resource.name });
     revalidatePath("/dashboard", "layout");
@@ -212,7 +212,7 @@ export async function deleteResource(input: { resourceId: string }) {
   const resource = await getResource(input.resourceId);
   if (!resource) return;
   const project = await getProject(resource.projectId);
-  const membership = project ? await requireProjectAdmin(project.orgId) : null;
+  const membership = project ? await requireProjectRole(project.orgId, project.id, "Project Admin") : null;
   if (project && membership && cpEnabled()) {
     await cpDeleteResource(project.orgId, input.resourceId, {
       name: membership.user.name,
@@ -240,7 +240,7 @@ async function volumeDeleteContext(resourceId: string) {
   if (!resource) throw new Error("Resource not found.");
   const project = await getProject(resource.projectId);
   if (!project) throw new Error("Resource not found.");
-  const membership = await requireProjectAdmin(project.orgId);
+  const membership = await requireProjectRole(project.orgId, project.id, "Project Admin");
   if (!resource.serverId) throw new Error("Resource is not bound to a server.");
   return { resource, orgId: project.orgId, serverId: resource.serverId, membership };
 }

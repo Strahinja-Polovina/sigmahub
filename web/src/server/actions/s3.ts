@@ -3,7 +3,7 @@
 // S3 storage (P2-1): the info/reveal split mirrors databases — metadata for
 // every member, the audited credential reveal for Project Admin+.
 
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -33,7 +33,7 @@ export async function revealS3Connection(input: {
   resourceId: string;
 }): Promise<CpS3Connection> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const conn = await cpRevealS3Connection(input.orgId, input.resourceId, {
     name: user.name,
     role,

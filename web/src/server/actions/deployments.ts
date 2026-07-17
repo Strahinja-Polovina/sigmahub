@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -25,7 +25,7 @@ export async function rollbackDeployment(input: {
   targetDeploymentId: string;
 }): Promise<CpDeployment> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const dep = await cpCreateRollback(input.orgId, input.resourceId, input.targetDeploymentId, {
     name: user.name,
     role,
