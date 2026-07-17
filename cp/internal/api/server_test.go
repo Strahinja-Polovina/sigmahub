@@ -260,6 +260,19 @@ func (f *fakeDomain) GetDeployment(_ context.Context, orgID, deploymentID string
 func (f *fakeDomain) DeployLogsSince(_ context.Context, _ string, _ int64, _ int) ([]store.DeployLog, error) {
 	return []store.DeployLog{}, nil
 }
+func (f *fakeDomain) CreateAlertChannel(_ context.Context, _, actor string, in store.CreateAlertChannelInput) (store.AlertChannel, error) {
+	return store.AlertChannel{ID: "alch_1", Kind: in.Kind, Name: in.Name, Enabled: true, Events: store.AlertEvents, CreatedBy: actor}, nil
+}
+func (f *fakeDomain) ListAlertChannels(context.Context, string) ([]store.AlertChannel, error) {
+	return []store.AlertChannel{}, nil
+}
+func (f *fakeDomain) DeleteAlertChannel(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) SetAlertRules(_ context.Context, _, _ string, events []string, _ string) error {
+	return nil
+}
+func (f *fakeDomain) AlertChannelForSend(_ context.Context, orgID, channelID string) (store.AlertChannelSend, error) {
+	return store.AlertChannelSend{ID: channelID, OrgID: orgID, Kind: "webhook", Config: []byte(`{"url":"http://example.invalid"}`)}, nil
+}
 
 const (
 	testServiceToken   = "test-service-token"

@@ -962,6 +962,69 @@ export async function cpConnectRepo(
   }, { orgId, actor });
 }
 
+// ── Alerting (P2-6) ─────────────────────────────────────────────────────────
+
+export type CpAlertChannel = {
+  id: string;
+  kind: string; // email | slack | telegram | webhook
+  name: string;
+  config: Record<string, unknown>;
+  enabled: boolean;
+  events: string[];
+  lastOkAt?: string | null;
+  lastError?: string;
+  createdBy: string;
+  createdAt: string;
+};
+
+export async function cpListAlertChannels(
+  orgId: string
+): Promise<{ channels: CpAlertChannel[]; events: string[] }> {
+  return cpFetch(`${org(orgId)}/alert-channels`, undefined, { orgId });
+}
+
+export async function cpCreateAlertChannel(
+  orgId: string,
+  input: { kind: string; name: string; config?: Record<string, unknown>; secret?: string },
+  actor: CpActor
+): Promise<CpAlertChannel> {
+  return cpFetch(`${org(orgId)}/alert-channels`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: input.kind,
+      name: input.name,
+      config: input.config ?? {},
+      secret: input.secret ?? "",
+    }),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteAlertChannel(orgId: string, channelId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/alert-channels/${encodeURIComponent(channelId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpSetAlertRules(
+  orgId: string,
+  channelId: string,
+  events: string[],
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`${org(orgId)}/alert-channels/${encodeURIComponent(channelId)}/rules`, {
+    method: "PUT",
+    body: JSON.stringify({ events }),
+  }, { orgId, actor });
+}
+
+/** Fires a synchronous test notification; throws with the transport error. */
+export async function cpTestAlertChannel(orgId: string, channelId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/alert-channels/${encodeURIComponent(channelId)}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { orgId, actor });
+}
+
 /** GitHub App metadata (SIGMA-55): whether the CP can mint installation
  *  tokens, and the App slug for the installations/new link. */
 export type CpGitAppInfo = { enabled: boolean; slug: string };

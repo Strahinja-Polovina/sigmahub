@@ -176,7 +176,14 @@ func (s *Store) DomainsForServer(ctx context.Context, serverID string) (map[stri
 // scheduled on this server.
 func (s *Store) SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error {
 	domain = strings.ToLower(strings.TrimSpace(domain))
-	tag, err := s.Pool.Exec(ctx, `
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var orgID string
+	err = tx.QueryRow(ctx, `
 		UPDATE domains d
 		   SET cert_status = $3,
 		       cert_serial = COALESCE(NULLIF($4, ''), cert_serial),
@@ -184,15 +191,29 @@ func (s *Store) SetDomainCertStatus(ctx context.Context, serverID, domain, statu
 		       last_error = $6,
 		       updated_at = now()
 		  FROM resources r
-		 WHERE r.id = d.resource_id AND r.server_id = $1 AND lower(d.domain) = $2`,
-		serverID, domain, status, serial, expiresAt, certErr)
+		 WHERE r.id = d.resource_id AND r.server_id = $1 AND lower(d.domain) = $2
+		 RETURNING d.org_id`,
+		serverID, domain, status, serial, expiresAt, certErr).Scan(&orgID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	// P2-6: issuance failures alert with a 6h cooldown per domain — ACME
+	// retries are expected, a wall of identical alerts is not.
+	if status == "failed" {
+		body := certErr
+		if body == "" {
+			body = "certificate issuance failed with no error detail"
+		}
+		if err := enqueueAlertTx(ctx, tx, orgID, AlertCertFailed,
+			"dom:"+domain+":failed", 6*time.Hour,
+			"Certificate issuance failed for "+domain, body); err != nil {
+			return err
+		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func scanDomains(rows pgx.Rows) ([]Domain, error) {

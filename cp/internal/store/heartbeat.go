@@ -86,6 +86,16 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 			VALUES ($1, 'sigmad', 'Server running', $2)`, orgID, name); err != nil {
 			return fmt.Errorf("audit: %w", err)
 		}
+		// Resolve notification (P2-6): pairs with the sweeper's unreachable
+		// alert. Same cooldown so a flapping agent produces one pair per window.
+		if prevStatus == "unreachable" {
+			if err := enqueueAlertTx(ctx, tx, orgID, AlertServerRecovered,
+				"srv:"+serverID+":recovered", 30*time.Minute,
+				"Server "+name+" recovered",
+				"Server "+name+" is heartbeating again and is back to running."); err != nil {
+				return err
+			}
+		}
 	}
 
 	if in.Metrics != nil {
@@ -143,26 +153,46 @@ func (s *Store) MetricsSince(ctx context.Context, orgID, serverID string, since 
 }
 
 // MarkStaleUnreachable flips running servers with no heartbeat within the
-// threshold to unreachable, writing one audit row per flipped server. Returns
-// how many changed. The cutoff is computed in SQL (now() - interval) so it
-// stays in the DB clock domain that wrote last_seen_at — CP↔DB clock skew
-// must not make live servers flap.
+// threshold to unreachable, writing one audit row per flipped server and
+// enqueueing a server_unreachable alert (P2-6) per subscribed channel, with a
+// 30-minute flap cooldown per server. Returns how many changed. The cutoff is
+// computed in SQL (now() - interval) so it stays in the DB clock domain that
+// wrote last_seen_at — CP↔DB clock skew must not make live servers flap.
 func (s *Store) MarkStaleUnreachable(ctx context.Context, threshold time.Duration) (int64, error) {
-	tag, err := s.Pool.Exec(ctx, `
+	var flipped int64
+	err := s.Pool.QueryRow(ctx, `
 		WITH flipped AS (
 			UPDATE servers
 			   SET status = 'unreachable'
 			 WHERE status = 'running'
 			   AND (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $1))
-			 RETURNING org_id, name
+			 RETURNING id, org_id, name
+		),
+		audited AS (
+			INSERT INTO cp_audit_log (org_id, actor, action, target)
+			SELECT org_id, 'sweeper', 'Server unreachable', name FROM flipped
+		),
+		enqueued AS (
+			INSERT INTO alert_outbox (org_id, channel_id, event, dedup_key, title, body)
+			SELECT f.org_id, r.channel_id, 'server_unreachable', 'srv:' || f.id || ':unreachable',
+			       'Server ' || f.name || ' is unreachable',
+			       'Server ' || f.name || ' missed heartbeats for over ' || $1::int || 's and was marked unreachable. Workloads on it keep running; the control plane just cannot manage it until the agent reconnects.'
+			  FROM flipped f
+			  JOIN alert_rules r ON r.org_id = f.org_id AND r.event = 'server_unreachable'
+			  JOIN alert_channels c ON c.id = r.channel_id AND c.enabled
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM alert_outbox o
+				 WHERE o.channel_id = r.channel_id
+				   AND o.dedup_key = 'srv:' || f.id || ':unreachable'
+				   AND o.created_at > now() - interval '30 minutes'
+			 )
 		)
-		INSERT INTO cp_audit_log (org_id, actor, action, target)
-		SELECT org_id, 'sweeper', 'Server unreachable', name FROM flipped`,
-		threshold.Seconds())
+		SELECT count(*) FROM flipped`,
+		threshold.Seconds()).Scan(&flipped)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return flipped, nil
 }
 
 // PruneMetrics deletes samples older than the retention window. Same DB-clock

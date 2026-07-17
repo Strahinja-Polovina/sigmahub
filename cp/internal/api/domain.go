@@ -82,6 +82,13 @@ type DomainAPI interface {
 	CreateManualRedeploy(ctx context.Context, orgID, resourceID, actor string) (store.Deployment, string, error)
 	GetDeployment(ctx context.Context, orgID, deploymentID string) (store.Deployment, error)
 	DeployLogsSince(ctx context.Context, deploymentID string, afterID int64, limit int) ([]store.DeployLog, error)
+	// Alerting (P2-6): channels + per-event rules; ForSend resolves a
+	// channel's transport config (incl. the unwrapped secret) for test-fires.
+	CreateAlertChannel(ctx context.Context, orgID, actor string, in store.CreateAlertChannelInput) (store.AlertChannel, error)
+	ListAlertChannels(ctx context.Context, orgID string) ([]store.AlertChannel, error)
+	DeleteAlertChannel(ctx context.Context, orgID, channelID, actor string) error
+	SetAlertRules(ctx context.Context, orgID, channelID string, events []string, actor string) error
+	AlertChannelForSend(ctx context.Context, orgID, channelID string) (store.AlertChannelSend, error)
 }
 
 // writeStoreErr maps store errors onto the HTTP surface: unknown ids are 404,

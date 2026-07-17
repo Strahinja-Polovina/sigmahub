@@ -234,7 +234,37 @@ func setDeploymentStatusTx(ctx context.Context, tx pgx.Tx, deploymentID string, 
 				ELSE duration_seconds END
 		WHERE id = $1`,
 		deploymentID, up.Status, up.Detail, up.ImageDigest, up.BuildSeconds, up.MarkStarted, up.MarkFinished)
-	return err
+	if err != nil {
+		return err
+	}
+	// P2-6: a deployment reaching failed alerts once (dedup key = deployment
+	// id, no window). This is the single choke point every failure path —
+	// single-container, per-service compose, timeout — funnels through.
+	if up.Status == "failed" {
+		var orgID, resName, sha string
+		if err := tx.QueryRow(ctx, `
+			SELECT d.org_id, r.name, COALESCE(d.git_sha, '')
+			  FROM deployments d JOIN resources r ON r.id = d.resource_id
+			 WHERE d.id = $1`, deploymentID).Scan(&orgID, &resName, &sha); err != nil {
+			return err
+		}
+		detail := up.Detail
+		if detail == "" {
+			detail = "no failure detail reported"
+		}
+		if len(sha) > 7 {
+			sha = sha[:7]
+		}
+		title := "Deploy of " + resName + " failed"
+		if sha != "" {
+			title += " (" + sha + ")"
+		}
+		if err := enqueueAlertTx(ctx, tx, orgID, AlertDeployFailed,
+			"dep:"+deploymentID, 0, title, detail); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ListDeployments returns a resource's release history newest-first (org-scoped).
