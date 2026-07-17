@@ -1,6 +1,9 @@
 import Link from "next/link";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
 import { RotateCcw, Server, ShieldCheck } from "lucide-react";
 
+import { auth } from "@/lib/auth";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 
@@ -28,9 +31,12 @@ const TRUST_STATS = [
   { value: "0", label: "servers resold" },
 ];
 
-export default function AuthLayout({
+export default async function AuthLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
+  // Already signed in → login/signup make no sense; go straight to the app.
+  const session = await auth.api.getSession({ headers: await headers() });
+  if (session) redirect("/dashboard");
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-2">
       {/* Left: form column */}
