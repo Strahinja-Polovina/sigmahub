@@ -236,6 +236,47 @@ func run() error {
 	)
 	go shipper.Run(ctx)
 
+	// WAL shipper (P2-5): drains PITR-enabled postgres resources' spool volumes
+	// into their restic repos every minute (continuous archiving), separate
+	// from the daily scheduled snapshot/base runs. Credentials fetched per
+	// cycle over the audited channel; segments deleted only after restic
+	// confirms the bundle.
+	walShipper := backup.NewWALShipper(
+		docker,
+		func(ctx context.Context) ([]string, error) {
+			targets, err := c.FetchWALTargets(ctx, st.AgentToken)
+			if err != nil {
+				return nil, err
+			}
+			ids := make([]string, len(targets))
+			for i, t := range targets {
+				ids[i] = t.ResourceID
+			}
+			return ids, nil
+		},
+		func(ctx context.Context, resourceID string) (backup.Credential, error) {
+			res, err := c.FetchWALCredential(ctx, st.AgentToken, resourceID)
+			if err != nil {
+				return backup.Credential{}, err
+			}
+			return backup.Credential{
+				Repository: res.Repository,
+				RepoKey:    res.RepoKey,
+				AccessKey:  res.AccessKey,
+				SecretKey:  res.SecretKey,
+				Region:     res.Region,
+			}, nil
+		},
+		func(ctx context.Context, resourceID, lastSegment string) {
+			if err := c.PostWALStatus(ctx, st.AgentToken, resourceID, lastSegment); err != nil {
+				log.Warn("wal status post failed", "err", err, "resource", resourceID)
+			}
+		},
+		log,
+		time.Minute,
+	)
+	go walShipper.Run(ctx)
+
 	// The DSD loop runs alongside the heartbeat loop, outbound-only. After each
 	// applied DSD it garbage-collects containers the document no longer describes.
 	go runDSDLoop(ctx, log, c, st, journal, registry, driver)

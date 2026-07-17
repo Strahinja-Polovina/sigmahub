@@ -68,13 +68,14 @@ export async function setBackupPolicy(input: {
   resourceId: string;
   targetId?: string | null;
   enabled?: boolean;
+  pitrEnabled?: boolean;
 }): Promise<CpBackupPolicy> {
   ensureCp();
   const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const bp = await cpUpdateBackupPolicy(
     input.orgId,
     input.resourceId,
-    { targetId: input.targetId, enabled: input.enabled },
+    { targetId: input.targetId, enabled: input.enabled, pitrEnabled: input.pitrEnabled },
     { name: user.name, role }
   );
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Backup policy updated", target: input.resourceId });

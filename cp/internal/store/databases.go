@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -173,15 +174,19 @@ type DBTarget struct {
 	Database   string
 	Port       int
 	ServerType string // drives the tuning profile (database vs general)
+	// PITR (P2-5): render WAL archiving (spool volume + archive flags).
+	PITR bool
 }
 
 // DBTargetsForServer returns the database render inputs for every database
 // resource on a server, keyed by resource id. Mirrors DeployTargetsForServer.
 func (s *Store) DBTargetsForServer(ctx context.Context, serverID string) (map[string]DBTarget, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT dc.resource_id, dc.engine, dc.username, dc.dbname, dc.port, sv.type
+		SELECT dc.resource_id, dc.engine, dc.username, dc.dbname, dc.port, sv.type,
+		       COALESCE(bp.pitr_enabled, FALSE)
 		  FROM db_credentials dc
 		  JOIN servers sv ON sv.id = dc.server_id
+		  LEFT JOIN backup_policies bp ON bp.resource_id = dc.resource_id
 		 WHERE dc.server_id = $1`, serverID)
 	if err != nil {
 		return nil, err
@@ -191,7 +196,7 @@ func (s *Store) DBTargetsForServer(ctx context.Context, serverID string) (map[st
 	for rows.Next() {
 		var id string
 		var t DBTarget
-		if err := rows.Scan(&id, &t.Engine, &t.Username, &t.Database, &t.Port, &t.ServerType); err != nil {
+		if err := rows.Scan(&id, &t.Engine, &t.Username, &t.Database, &t.Port, &t.ServerType, &t.PITR); err != nil {
 			return nil, err
 		}
 		out[id] = t
@@ -210,6 +215,9 @@ type BackupPolicy struct {
 	KeepMonthly int     `json:"keepMonthly"`
 	TargetID    *string `json:"targetId"`
 	Enabled     bool    `json:"enabled"`
+	// PitrEnabled (P2-5, postgres only): continuous WAL archiving + a daily
+	// physical base backup, the ingredients of a point-in-time restore.
+	PitrEnabled bool `json:"pitrEnabled"`
 }
 
 // DatabaseInfo is a database resource's NON-secret connection metadata plus its
@@ -224,6 +232,10 @@ type DatabaseInfo struct {
 	Username   string        `json:"username"`
 	MeshOnly   bool          `json:"meshOnly"` // always true in v1
 	Backup     *BackupPolicy `json:"backupPolicy,omitempty"`
+	// P2-5 WAL archiving health: the PITR window honestly reaches only as far
+	// as the last shipped segment. Nil = never shipped (or PITR off).
+	LastWalAt      *time.Time `json:"lastWalAt,omitempty"`
+	LastWalSegment string     `json:"lastWalSegment,omitempty"`
 }
 
 // DatabaseConnection is the audited reveal: DatabaseInfo plus the decrypted
@@ -280,13 +292,26 @@ func (s *Store) GetDatabaseInfo(ctx context.Context, orgID, resourceID string) (
 	}
 	var bp BackupPolicy
 	err = s.Pool.QueryRow(ctx, `
-		SELECT id, resource_id, schedule, keep_daily, keep_weekly, keep_monthly, target_id, enabled
+		SELECT id, resource_id, schedule, keep_daily, keep_weekly, keep_monthly, target_id, enabled, pitr_enabled
 		  FROM backup_policies WHERE org_id = $1 AND resource_id = $2`,
-		orgID, resourceID).Scan(&bp.ID, &bp.ResourceID, &bp.Schedule, &bp.KeepDaily, &bp.KeepWeekly, &bp.KeepMonthly, &bp.TargetID, &bp.Enabled)
+		orgID, resourceID).Scan(&bp.ID, &bp.ResourceID, &bp.Schedule, &bp.KeepDaily, &bp.KeepWeekly, &bp.KeepMonthly, &bp.TargetID, &bp.Enabled, &bp.PitrEnabled)
 	if err == nil {
 		info.Backup = &bp
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return DatabaseInfo{}, err
+	}
+	if bp.PitrEnabled {
+		var lastAt *time.Time
+		var lastSeg string
+		err := s.Pool.QueryRow(ctx, `
+			SELECT last_shipped_at, last_segment FROM wal_archive_status
+			 WHERE org_id = $1 AND resource_id = $2`, orgID, resourceID).Scan(&lastAt, &lastSeg)
+		if err == nil {
+			info.LastWalAt = lastAt
+			info.LastWalSegment = lastSeg
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return DatabaseInfo{}, err
+		}
 	}
 	return info, nil
 }

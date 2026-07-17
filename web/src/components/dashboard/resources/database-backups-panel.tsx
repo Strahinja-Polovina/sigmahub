@@ -251,6 +251,8 @@ export function DatabaseBackupsPanel({
   targets: initialTargets,
   runs: initialRuns,
   canManage,
+  engine,
+  pitrWindow,
 }: {
   orgId: string;
   resourceId: string;
@@ -261,13 +263,21 @@ export function DatabaseBackupsPanel({
   targets: CpBackupTarget[];
   runs: CpBackupRun[];
   canManage: boolean;
+  /** Engine kind — PITR is offered for postgres only (P2-5). */
+  engine?: string;
+  /** WAL high-water mark: the newest point a PITR restore can currently reach. */
+  pitrWindow?: { lastWalAt?: string | null; lastWalSegment?: string } | null;
 }) {
   const router = useRouter();
   const [targets, setTargets] = React.useState(initialTargets);
   const [runs, setRuns] = React.useState(initialRuns);
   const [pending, startTransition] = React.useTransition();
 
-  function updatePolicy(input: { targetId?: string | null; enabled?: boolean }) {
+  function updatePolicy(input: {
+    targetId?: string | null;
+    enabled?: boolean;
+    pitrEnabled?: boolean;
+  }) {
     startTransition(async () => {
       try {
         await setBackupPolicy({ orgId, resourceId, ...input });
@@ -370,6 +380,41 @@ export function DatabaseBackupsPanel({
             {policy.keepWeekly > 0 && ` / ${policy.keepWeekly} weekly`}
             {policy.keepMonthly > 0 && ` / ${policy.keepMonthly} monthly`} snapshots (GFS).
           </p>
+        )}
+
+        {policy && engine === "postgres" && (
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/30 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-col">
+                <span className="text-sm font-medium text-foreground">
+                  Point-in-time recovery
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  Continuous WAL archiving + a daily base backup, so you can restore to any
+                  moment — not just the last daily snapshot.
+                </span>
+              </div>
+              {canManage ? (
+                <Switch
+                  checked={Boolean(policy.pitrEnabled)}
+                  onCheckedChange={(v) => updatePolicy({ pitrEnabled: v })}
+                  disabled={pending || !hasTarget}
+                  aria-label="Point-in-time recovery"
+                />
+              ) : (
+                <span className="text-xs text-muted-foreground">
+                  {policy.pitrEnabled ? "On" : "Off"}
+                </span>
+              )}
+            </div>
+            {policy.pitrEnabled && (
+              <p className="text-xs text-muted-foreground">
+                {pitrWindow?.lastWalAt
+                  ? `Recoverable up to ${new Date(pitrWindow.lastWalAt).toLocaleString("en-GB")} (last archived segment ${pitrWindow.lastWalSegment ?? "—"}).`
+                  : "Waiting for the first WAL segment to ship — the recovery window opens once archiving reports in."}
+              </p>
+            )}
+          </div>
         )}
 
         {runs.length === 0 ? (

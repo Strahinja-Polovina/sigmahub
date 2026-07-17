@@ -89,9 +89,19 @@ func resticInit(ctx context.Context, cred Credential) error {
 // resticBackupStdin streams a dump into the repository and returns the new
 // snapshot id parsed from restic's JSON summary line.
 func resticBackupStdin(ctx context.Context, cred Credential, dump io.Reader, filename string) (string, error) {
+	return resticBackupStdinTagged(ctx, cred, dump, filename, "")
+}
+
+// resticBackupStdinTagged is resticBackupStdin with an optional restic tag, so
+// base backups and WAL bundles (P2-5) land under distinguishable tags in the
+// per-resource repo.
+func resticBackupStdinTagged(ctx context.Context, cred Credential, dump io.Reader, filename, tag string) (string, error) {
+	args := []string{"backup", "--stdin", "--stdin-filename", filename, "--json"}
+	if tag != "" {
+		args = append(args, "--tag", tag)
+	}
 	var out bytes.Buffer
-	if err := restic(ctx, cred, dump, &out,
-		"backup", "--stdin", "--stdin-filename", filename, "--json"); err != nil {
+	if err := restic(ctx, cred, dump, &out, args...); err != nil {
 		return "", err
 	}
 	// The last JSON line with message_type "summary" carries snapshot_id.

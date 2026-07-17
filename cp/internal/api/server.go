@@ -40,6 +40,10 @@ type StoreAPI interface {
 	// Backups (P1-11): the audited per-run credential release and the agent's
 	// terminal result report, plus the op-status failure fallback.
 	BackupCredentialForRun(ctx context.Context, serverID, runID string) (store.BackupCredential, error)
+	// WAL shipping (P2-5).
+	WALTargetsForServer(ctx context.Context, serverID string) ([]store.WALTarget, error)
+	WALCredentialForResource(ctx context.Context, serverID, resourceID string) (store.BackupCredential, error)
+	SetWALStatus(ctx context.Context, serverID, resourceID, lastSegment string, at time.Time) error
 	SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error
 	FailBackupRunFromOpStatus(ctx context.Context, serverID, runID, errText string) error
 }
@@ -280,6 +284,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
 	s.mux.HandleFunc("GET /v1/agent/backup-credential", s.requireAgent(s.handleAgentBackupCredential))
 	s.mux.HandleFunc("POST /v1/agent/backup-status", s.requireAgent(s.handleAgentBackupStatus))
+	// WAL shipping (P2-5).
+	s.mux.HandleFunc("GET /v1/agent/wal-targets", s.requireAgent(s.handleAgentWALTargets))
+	s.mux.HandleFunc("GET /v1/agent/wal-credential", s.requireAgent(s.handleAgentWALCredential))
+	s.mux.HandleFunc("POST /v1/agent/wal-status", s.requireAgent(s.handleAgentWALStatus))
 	s.mux.HandleFunc("POST /v1/agent/telemetry/metrics", s.requireAgent(s.handleAgentTelemetryMetrics))
 	s.mux.HandleFunc("POST /v1/agent/telemetry/logs", s.requireAgent(s.handleAgentTelemetryLogs))
 }

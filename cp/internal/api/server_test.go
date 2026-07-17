@@ -98,6 +98,15 @@ func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, str
 func (f *fakeStore) BackupCredentialForRun(context.Context, string, string) (store.BackupCredential, error) {
 	return store.BackupCredential{}, store.ErrNotFound
 }
+func (f *fakeStore) WALTargetsForServer(context.Context, string) ([]store.WALTarget, error) {
+	return []store.WALTarget{}, nil
+}
+func (f *fakeStore) WALCredentialForResource(context.Context, string, string) (store.BackupCredential, error) {
+	return store.BackupCredential{}, store.ErrNotFound
+}
+func (f *fakeStore) SetWALStatus(context.Context, string, string, string, time.Time) error {
+	return nil
+}
 func (f *fakeStore) SetBackupRunResult(context.Context, string, string, bool, string, string, string) error {
 	return nil
 }

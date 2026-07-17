@@ -74,6 +74,14 @@ func renderBackupOps(runs []store.BackupRunSpec, rendered map[string]bool) []dsd
 			if rendered["res:"+r.ResourceID] {
 				deps = append(deps, "res:"+r.ResourceID)
 			}
+		case "basebackup":
+			// P2-5: physical base backup (pg_basebackup → restic), the PITR
+			// starting point. Needs the live container, like a dump backup.
+			kind = dsd.KindBackupBase
+			spec.KeepDaily, spec.KeepWeekly, spec.KeepMonthly = r.KeepDaily, r.KeepWeekly, r.KeepMonthly
+			if rendered["res:"+r.ResourceID] {
+				deps = append(deps, "res:"+r.ResourceID)
+			}
 		case "verify":
 			kind = dsd.KindBackupVerify
 			spec.ExpectedSha = r.ExpectedSha
