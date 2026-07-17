@@ -94,14 +94,111 @@ const INCLUDED_FEATURES: { label: string; icon: React.ElementType }[] = [
   { label: "Automated backups", icon: History },
 ];
 
+/** Paddle subscription state (P2-4); present only in CP mode. */
+type Subscription = {
+  configured: boolean;
+  status: string; // none | active | past_due | canceled
+  billableServers: number;
+  serverHoursThisMonth: number;
+  orgId: string;
+};
+
+/** CP-mode subscription state + Paddle checkout/portal actions. Renders the
+ *  honest not-configured banner when Paddle isn't wired. */
+function SubscriptionCard({ sub }: { sub: Subscription }) {
+  const [pending, startTransition] = React.useTransition();
+
+  function go(kind: "checkout" | "portal") {
+    startTransition(async () => {
+      try {
+        const { startCheckout, openBillingPortal } = await import("@/server/actions/billing");
+        const res =
+          kind === "checkout"
+            ? await startCheckout(sub.orgId)
+            : await openBillingPortal(sub.orgId);
+        const url = "checkoutUrl" in res ? res.checkoutUrl : res.portalUrl;
+        window.location.href = url;
+      } catch (err) {
+        toast.error("Couldn’t open billing", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
+
+  if (!sub.configured) {
+    return (
+      <Card>
+        <CardContent className="flex items-start gap-2 py-4">
+          <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          <p className="text-sm text-muted-foreground">
+            Payments are not configured on this control plane, so the figures below are a
+            usage preview only — no charges are made. An operator can wire Paddle
+            (<span className="font-mono text-xs">CP_PADDLE_*</span>) to enable checkout and
+            invoicing.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const statusLabel: Record<string, { text: string; cls: string }> = {
+    none: { text: "No subscription", cls: "text-muted-foreground" },
+    active: { text: "Active", cls: "text-emerald-700 dark:text-emerald-400" },
+    past_due: { text: "Payment past due", cls: "text-destructive" },
+    canceled: { text: "Canceled", cls: "text-amber-700 dark:text-amber-400" },
+  };
+  const st = statusLabel[sub.status] ?? statusLabel.none;
+
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium text-foreground">
+            Subscription: <span className={st.cls}>{st.text}</span>
+          </span>
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {sub.billableServers} billable {sub.billableServers === 1 ? "server" : "servers"} ·{" "}
+            {sub.serverHoursThisMonth} connected server-hours this month
+          </span>
+          {sub.status === "past_due" && (
+            <span className="text-xs text-destructive">
+              Your servers keep running during the grace period — update your payment method to
+              avoid interruption.
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {sub.status === "active" || sub.status === "past_due" ? (
+            <Button variant="outline" size="sm" onClick={() => go("portal")} disabled={pending}>
+              Manage subscription
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              onClick={() => go("checkout")}
+              disabled={pending || sub.billableServers < 1}
+            >
+              {sub.billableServers < 1 ? "Within free tier" : "Subscribe"}
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function BillingView({
   orgName,
   billing,
   servers,
+  subscription,
 }: {
   orgName: string;
   billing: Billing;
   servers: ServerItem[];
+  /** CP-mode Paddle state; omitted in demo mode. */
+  subscription?: Subscription;
 }) {
   const { unitPrice, freeTier, currency } = billing;
   const fc = (a: number, cents = false) => money(a, currency, cents);
@@ -121,6 +218,8 @@ export function BillingView({
           One simple meter for {orgName}: you pay only for connected servers.
         </p>
       </div>
+
+      {subscription && <SubscriptionCard sub={subscription} />}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-1">

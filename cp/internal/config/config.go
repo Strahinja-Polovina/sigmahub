@@ -54,6 +54,15 @@ type Config struct {
 	VMWriteURL string
 	VMReadURL  string
 	LokiURL    string
+	// Paddle billing (P2-4). PaddleAPIKey empty = billing off (no checkout /
+	// no subscription sync); PaddleWebhookSecret empty = the webhook receiver
+	// 503s rather than accept unverifiable deliveries (mirrors the GitHub
+	// receiver). PaddleEnv selects sandbox vs production API base. PaddlePriceID
+	// is the connected-server price the checkout/subscription bill against.
+	PaddleAPIKey        string
+	PaddleWebhookSecret string
+	PaddleEnv           string
+	PaddlePriceID       string
 }
 
 func FromEnv() (Config, error) {
@@ -72,6 +81,10 @@ func FromEnv() (Config, error) {
 		VMWriteURL:              os.Getenv("CP_VM_WRITE_URL"),
 		VMReadURL:               os.Getenv("CP_VM_READ_URL"),
 		LokiURL:                 os.Getenv("CP_LOKI_URL"),
+		PaddleAPIKey:            os.Getenv("CP_PADDLE_API_KEY"),
+		PaddleWebhookSecret:     os.Getenv("CP_PADDLE_WEBHOOK_SECRET"),
+		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
+		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
@@ -94,6 +107,14 @@ func FromEnv() (Config, error) {
 	if cfg.Env == "dev" && cfg.ProvisionToken == "" {
 		cfg.ProvisionToken = "dev-provision-token"
 	}
+	// Paddle env must be sandbox|production; a typo must not silently point
+	// live billing at the wrong API base.
+	switch cfg.PaddleEnv {
+	case "sandbox", "production":
+	default:
+		return Config{}, fmt.Errorf(`CP_PADDLE_ENV must be "sandbox" or "production", got %q`, cfg.PaddleEnv)
+	}
+
 	// P1-10 engine allowlist. Empty = all engines enabled.
 	raw := getenv("CP_DB_ENGINES", "postgres,mysql,redis,mongodb")
 	for _, e := range strings.Split(raw, ",") {

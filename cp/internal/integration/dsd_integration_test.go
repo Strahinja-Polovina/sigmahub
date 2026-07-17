@@ -50,7 +50,7 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 	}
 	// Fresh, isolated state per run. cp_secrets is cleared too so the pepper
 	// and DSD key are re-wrapped under this run's throwaway KMS key.
-	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_targets", "db_credentials", "s3_credentials", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
+	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "server_hours", "org_billing", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_targets", "db_credentials", "s3_credentials", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
 		if _, err := st.Pool.Exec(ctx, "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}

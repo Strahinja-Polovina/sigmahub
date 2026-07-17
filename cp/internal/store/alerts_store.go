@@ -27,12 +27,14 @@ const (
 	AlertVerifyFailed      = "verify_failed"
 	AlertCertFailed        = "cert_failed"
 	AlertCertExpiring      = "cert_expiring"
+	AlertPaymentFailed     = "payment_failed"
 )
 
 // AlertEvents is the full vocabulary, in display order.
 var AlertEvents = []string{
 	AlertServerUnreachable, AlertServerRecovered, AlertDeployFailed,
 	AlertBackupFailed, AlertVerifyFailed, AlertCertFailed, AlertCertExpiring,
+	AlertPaymentFailed,
 }
 
 func validAlertEvent(e string) bool {

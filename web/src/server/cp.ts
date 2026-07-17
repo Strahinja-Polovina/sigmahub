@@ -966,6 +966,44 @@ export async function cpConnectRepo(
   }, { orgId, actor });
 }
 
+// ── Billing (P2-4, Paddle) ──────────────────────────────────────────────────
+
+export type CpBillingSummary = {
+  configured: boolean;
+  connected: number;
+  billableServers: number;
+  freeTier: number;
+  unitPrice: number;
+  currency: string;
+  amount: number;
+  serverHoursThisMonth: number;
+  month: string;
+  subscription: {
+    status: string; // none | active | past_due | canceled
+    quantity: number;
+    customerId?: string;
+    subscriptionId?: string;
+  };
+};
+
+export async function cpGetBilling(orgId: string): Promise<CpBillingSummary> {
+  return cpFetch(`${org(orgId)}/billing`, undefined, { orgId });
+}
+
+export async function cpBillingCheckout(orgId: string, actor: CpActor): Promise<{ checkoutUrl: string }> {
+  return cpFetch(`${org(orgId)}/billing/checkout`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { orgId, actor });
+}
+
+export async function cpBillingPortal(orgId: string, actor: CpActor): Promise<{ portalUrl: string }> {
+  return cpFetch(`${org(orgId)}/billing/portal`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { orgId, actor });
+}
+
 // ── S3 storage (P2-1) ───────────────────────────────────────────────────────
 
 export type CpS3Info = {
