@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -73,6 +74,7 @@ func (s *Server) handleUpdateBackupPolicy(w http.ResponseWriter, r *http.Request
 		KeepWeekly  *int    `json:"keepWeekly"`
 		KeepMonthly *int    `json:"keepMonthly"`
 		Enabled     *bool   `json:"enabled"`
+		PitrEnabled *bool   `json:"pitrEnabled"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -85,6 +87,7 @@ func (s *Server) handleUpdateBackupPolicy(w http.ResponseWriter, r *http.Request
 		KeepWeekly:  req.KeepWeekly,
 		KeepMonthly: req.KeepMonthly,
 		Enabled:     req.Enabled,
+		PitrEnabled: req.PitrEnabled,
 	})
 	if err != nil {
 		s.writeDBErr(w, err, "update backup policy")
@@ -208,6 +211,55 @@ func (s *Server) handleAgentBackupStatus(w http.ResponseWriter, r *http.Request)
 	// The run left the open set — re-render so its op drops out of the DSD.
 	if s.reconcile != nil {
 		s.reconcile.ReconcileAsync(srv.OrgID, srv.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
+}
+
+// ── WAL shipping (P2-5) ─────────────────────────────────────────────────────
+
+// handleAgentWALTargets lists the PITR-enabled resources whose spool the
+// calling agent should be draining.
+func (s *Server) handleAgentWALTargets(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	targets, err := s.store.WALTargetsForServer(r.Context(), srv.ID)
+	if err != nil {
+		s.writeStoreErr(w, err, "wal targets")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"targets": targets})
+}
+
+// handleAgentWALCredential releases the restic credential for one resource's
+// WAL shipping. Audited per release; the agent caches it for ~50 minutes.
+func (s *Server) handleAgentWALCredential(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	resourceID := r.URL.Query().Get("resourceId")
+	if resourceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "resourceId is required"})
+		return
+	}
+	cred, err := s.store.WALCredentialForResource(r.Context(), srv.ID, resourceID)
+	if err != nil {
+		s.writeStoreErr(w, err, "wal credential")
+		return
+	}
+	writeJSON(w, http.StatusOK, cred)
+}
+
+// handleAgentWALStatus records a shipping cycle's high-water mark.
+func (s *Server) handleAgentWALStatus(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	var req struct {
+		ResourceID  string `json:"resourceId"`
+		LastSegment string `json:"lastSegment"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.ResourceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "resourceId is required"})
+		return
+	}
+	if err := s.store.SetWALStatus(r.Context(), srv.ID, req.ResourceID, req.LastSegment, time.Now()); err != nil {
+		s.writeStoreErr(w, err, "wal status")
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }

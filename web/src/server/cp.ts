@@ -412,6 +412,7 @@ export type CpBackupPolicy = {
   keepMonthly: number;
   targetId: string | null;
   enabled: boolean;
+  pitrEnabled?: boolean;
 };
 
 export type CpDatabaseInfo = {
@@ -424,6 +425,9 @@ export type CpDatabaseInfo = {
   username: string;
   meshOnly: boolean;
   backupPolicy?: CpBackupPolicy;
+  // P2-5 PITR window: how far back a point-in-time restore can reach.
+  lastWalAt?: string | null;
+  lastWalSegment?: string;
 };
 
 export type CpDatabaseConnection = CpDatabaseInfo & {
@@ -522,7 +526,7 @@ export async function cpDeleteBackupTarget(orgId: string, targetId: string, acto
 export async function cpUpdateBackupPolicy(
   orgId: string,
   resourceId: string,
-  input: { targetId?: string | null; enabled?: boolean; keepDaily?: number; keepWeekly?: number; keepMonthly?: number },
+  input: { targetId?: string | null; enabled?: boolean; keepDaily?: number; keepWeekly?: number; keepMonthly?: number; pitrEnabled?: boolean },
   actor: CpActor
 ): Promise<CpBackupPolicy> {
   return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-policy`, {

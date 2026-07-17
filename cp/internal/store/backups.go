@@ -156,6 +156,9 @@ type UpdateBackupPolicyInput struct {
 	KeepWeekly  *int
 	KeepMonthly *int
 	Enabled     *bool
+	// PitrEnabled (P2-5): postgres only — enabling on another engine is a
+	// typed error, never a silent no-op.
+	PitrEnabled *bool
 }
 
 // UpdateBackupPolicy updates a database resource's backup policy. Audited.
@@ -169,9 +172,9 @@ func (s *Store) UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor
 	var bp BackupPolicy
 	var target *string
 	err = tx.QueryRow(ctx, `
-		SELECT id, resource_id, schedule, keep_daily, keep_weekly, keep_monthly, target_id, enabled
+		SELECT id, resource_id, schedule, keep_daily, keep_weekly, keep_monthly, target_id, enabled, pitr_enabled
 		  FROM backup_policies WHERE org_id = $1 AND resource_id = $2 FOR UPDATE`,
-		orgID, resourceID).Scan(&bp.ID, &bp.ResourceID, &bp.Schedule, &bp.KeepDaily, &bp.KeepWeekly, &bp.KeepMonthly, &target, &bp.Enabled)
+		orgID, resourceID).Scan(&bp.ID, &bp.ResourceID, &bp.Schedule, &bp.KeepDaily, &bp.KeepWeekly, &bp.KeepMonthly, &target, &bp.Enabled, &bp.PitrEnabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BackupPolicy{}, ErrNotDatabase
 	}
@@ -216,11 +219,25 @@ func (s *Store) UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor
 	if in.Enabled != nil {
 		bp.Enabled = *in.Enabled
 	}
+	if in.PitrEnabled != nil {
+		if *in.PitrEnabled {
+			var engine string
+			if err := tx.QueryRow(ctx,
+				`SELECT engine FROM db_credentials WHERE org_id = $1 AND resource_id = $2`,
+				orgID, resourceID).Scan(&engine); err != nil {
+				return BackupPolicy{}, err
+			}
+			if engine != "postgres" {
+				return BackupPolicy{}, ErrInvalid{Msg: "point-in-time recovery is available for postgres resources only"}
+			}
+		}
+		bp.PitrEnabled = *in.PitrEnabled
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE backup_policies
-		   SET target_id = $3, schedule = $4, keep_daily = $5, keep_weekly = $6, keep_monthly = $7, enabled = $8, updated_at = now()
+		   SET target_id = $3, schedule = $4, keep_daily = $5, keep_weekly = $6, keep_monthly = $7, enabled = $8, pitr_enabled = $9, updated_at = now()
 		 WHERE org_id = $1 AND resource_id = $2`,
-		orgID, resourceID, bp.TargetID, bp.Schedule, bp.KeepDaily, bp.KeepWeekly, bp.KeepMonthly, bp.Enabled); err != nil {
+		orgID, resourceID, bp.TargetID, bp.Schedule, bp.KeepDaily, bp.KeepWeekly, bp.KeepMonthly, bp.Enabled, bp.PitrEnabled); err != nil {
 		return BackupPolicy{}, fmt.Errorf("update backup policy: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Backup policy updated", resourceID); err != nil {
@@ -280,7 +297,10 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'verify'
 		                  AND r.created_at >= $1) AS verified_today,
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'backup'
-		                  AND r.status = 'success') AS has_success
+		                  AND r.status = 'success') AS has_success,
+		       (p.pitr_enabled AND dc.engine = 'postgres' AND NOT EXISTS (
+		            SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'basebackup'
+		               AND r.created_at >= $1)) AS base_due
 		  FROM backup_policies p
 		  JOIN db_credentials dc ON dc.resource_id = p.resource_id
 		 WHERE p.enabled AND p.target_id IS NOT NULL`, day)
@@ -289,19 +309,19 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 	}
 	type due struct {
 		policyID, orgID, resourceID, serverID string
-		backup, verify                        bool
+		backup, verify, base                  bool
 	}
 	var work []due
 	for rows.Next() {
 		var d due
 		var backedToday, verifiedToday, hasSuccess bool
-		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &hasSuccess); err != nil {
+		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &hasSuccess, &d.base); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		d.backup = !backedToday
 		d.verify = !verifiedToday && (hasSuccess || d.backup)
-		if d.backup || d.verify {
+		if d.backup || d.verify || d.base {
 			work = append(work, d)
 		}
 	}
@@ -327,6 +347,15 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
 				VALUES ($1, $2, $3, $4, $5, 'verify')`,
+				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
+				return nil, err
+			}
+		}
+		// P2-5: the daily physical base backup PITR replays from.
+		if d.base {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
+				VALUES ($1, $2, $3, $4, $5, 'basebackup')`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -414,7 +443,7 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 		  LEFT JOIN db_credentials rdc ON rdc.resource_id = r.restore_resource_id
 		 WHERE r.server_id = $1 AND r.status IN ('pending', 'running')
 		 ORDER BY r.created_at,
-		          CASE r.kind WHEN 'backup' THEN 0 WHEN 'verify' THEN 1 ELSE 2 END,
+		          CASE r.kind WHEN 'backup' THEN 0 WHEN 'basebackup' THEN 1 WHEN 'verify' THEN 2 ELSE 3 END,
 		          r.id`, serverID)
 	if err != nil {
 		return nil, err

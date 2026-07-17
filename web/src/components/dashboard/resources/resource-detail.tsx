@@ -429,6 +429,11 @@ export function ResourceDetail({
                   targets={backupTargets}
                   runs={backupRuns}
                   canManage={canManage}
+                  engine={database.engine}
+                  pitrWindow={{
+                    lastWalAt: database.lastWalAt,
+                    lastWalSegment: database.lastWalSegment,
+                  }}
                 />
               )}
               <Card>

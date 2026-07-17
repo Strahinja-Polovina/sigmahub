@@ -13,6 +13,17 @@ import "fmt"
 
 // dumpFilename is the stable in-snapshot filename for an engine's dump stream
 // (restic --stdin-filename); verify addresses the same path via restic dump.
+// baseBackupCommand streams a physical base backup (P2-5, postgres only) as a
+// tar to stdout, fetching the WALs needed for consistency. This is the PITR
+// starting point WAL segments replay from. Local unix-socket trust auth, like
+// the dump path.
+func baseBackupCommand(engine, username string) ([]string, error) {
+	if engine != "postgres" {
+		return nil, fmt.Errorf("base backup is postgres-only, got %q", engine)
+	}
+	return []string{"pg_basebackup", "-U", username, "-D", "-", "-Ft", "-X", "fetch"}, nil
+}
+
 func dumpFilename(engine string) string {
 	switch engine {
 	case "redis":

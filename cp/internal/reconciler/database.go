@@ -48,6 +48,28 @@ func renderDatabaseOps(rs store.ResourceSpec, target store.DBTarget, meshIP stri
 		// Server-type tuning profile: container-level engine knobs only.
 		Command: def.TunedCommand(target.ServerType),
 	}
+	deps := []string{networkID, imageID, volID}
+
+	// P2-5 WAL archiving: postgres archives completed segments into a spool
+	// volume (tmp+rename so a half-written file is never shipped); the agent's
+	// shipper drains it into the resource's restic repo. Config rides the
+	// command, so flipping PITR recreates the container with archiving on.
+	if target.PITR && rs.Kind == "postgres" {
+		walVol := dsd.VolumeName(rs.ResourceID, "wal")
+		walVolID := "vol:" + rs.ResourceID + ":wal"
+		ws, _ := json.Marshal(map[string]string{"name": walVol, "resourceId": rs.ResourceID})
+		ops = append(ops, dsd.Op{ID: walVolID, Kind: dsd.KindVolumeEnsure, Spec: ws})
+		const spool = "/var/lib/postgresql/wal-archive"
+		cs.Volumes = append(cs.Volumes, volumeMount{Name: walVol, MountPath: spool})
+		cs.Command = append(cs.Command,
+			"-c", "wal_level=replica",
+			"-c", "archive_mode=on",
+			"-c", "archive_timeout=300",
+			"-c", "archive_command=test ! -f "+spool+"/%f && cp %p "+spool+"/%f.tmp && mv "+spool+"/%f.tmp "+spool+"/%f",
+		)
+		deps = append(deps, walVolID)
+	}
+
 	for _, name := range def.SecretEnvNames {
 		cs.SecretRefs = append(cs.SecretRefs, secretRef{Name: name, EnvVar: true})
 	}
@@ -55,7 +77,7 @@ func renderDatabaseOps(rs store.ResourceSpec, target store.DBTarget, meshIP stri
 	ops = append(ops, dsd.Op{
 		ID:        containerID,
 		Kind:      dsd.KindContainerApply,
-		DependsOn: []string{networkID, imageID, volID},
+		DependsOn: deps,
 		Spec:      csBytes,
 	})
 	return ops, networkID, true

@@ -25,6 +25,7 @@ import (
 // agent. Kept byte-identical with the CP's dsd package.
 const (
 	KindBackupRun     = "backup.run"
+	KindBackupBase    = "backup.base"
 	KindBackupVerify  = "backup.verify"
 	KindBackupRestore = "backup.restore"
 )
@@ -91,6 +92,7 @@ func NewRunner(docker Docker, creds CredentialFetcher, report Reporter, workDir 
 // enforcement point that keeps unregistered op kinds rejected.
 func (r *Runner) Register(reg *apply.Registry) {
 	reg.Register(KindBackupRun, r.opBackupRun)
+	reg.Register(KindBackupBase, r.opBackupBase)
 	reg.Register(KindBackupVerify, r.opBackupVerify)
 	reg.Register(KindBackupRestore, r.opBackupRestore)
 }
@@ -180,6 +182,67 @@ func (r *Runner) opBackupRun(ctx context.Context, op dsd.Op) error {
 	sha := hex.EncodeToString(hasher.Sum(nil))
 	r.report(ctx, spec.RunID, true, snapshotID, sha, "")
 	r.log.Info("backup complete", "run", spec.RunID, "snapshot", snapshotID)
+	return nil
+}
+
+// opBackupBase: physical base backup (P2-5). pg_basebackup streams a tar to
+// stdout (docker exec inside the DB container), piped straight into restic
+// --stdin under the "base" tag — the PITR starting point WAL segments replay
+// from. The stream never touches host disk, and a broken pg_basebackup fails
+// restic's stdin (CloseWithError) so it can't become a "successful" snapshot.
+func (r *Runner) opBackupBase(ctx context.Context, op dsd.Op) error {
+	spec, err := parseSpec(op)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	cred, err := r.creds(ctx, spec.RunID)
+	if errors.Is(err, ErrRunSettled) {
+		r.log.Info("base backup already settled; skipping", "run", spec.RunID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("fetch backup credential: %w", err)
+	}
+	if err := resticInit(ctx, cred); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("init repository: %w", err))
+	}
+	baseCmd, err := baseBackupCommand(spec.Engine, spec.Username)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+
+	hasher := sha256.New()
+	pr, pw := io.Pipe()
+	execDone := make(chan error, 1)
+	go func() {
+		exitCode, stderrTail, execErr := r.docker.ContainerExec(ctx, spec.Container, baseCmd, io.MultiWriter(pw, hasher))
+		switch {
+		case execErr != nil:
+			execErr = fmt.Errorf("basebackup exec: %w", execErr)
+		case exitCode != 0:
+			execErr = fmt.Errorf("basebackup exited %d: %s", exitCode, stderrTail)
+		}
+		pw.CloseWithError(execErr)
+		execDone <- execErr
+	}()
+
+	snapshotID, backupErr := resticBackupStdinTagged(ctx, cred, pr, "base.tar", "base")
+	baseErr := <-execDone
+	if baseErr != nil {
+		return r.fail(ctx, spec.RunID, baseErr)
+	}
+	if backupErr != nil {
+		return r.fail(ctx, spec.RunID, backupErr)
+	}
+	if err := resticCheck(ctx, cred); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("post-basebackup check: %w", err))
+	}
+	sha := hex.EncodeToString(hasher.Sum(nil))
+	r.report(ctx, spec.RunID, true, snapshotID, sha, "")
+	r.log.Info("base backup complete", "run", spec.RunID, "snapshot", snapshotID)
 	return nil
 }
 

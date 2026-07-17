@@ -30,6 +30,9 @@ const (
 	KindBackupRun     = "backup.run"
 	KindBackupVerify  = "backup.verify"
 	KindBackupRestore = "backup.restore"
+	// P2-5: daily physical base backup (pg_basebackup → restic), the PITR
+	// starting point WAL segments replay from.
+	KindBackupBase = "backup.base"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

@@ -230,6 +230,36 @@ func (c *Client) PostBackupResult(ctx context.Context, agentToken, runID string,
 	}, nil)
 }
 
+// WALTarget is a PITR-enabled resource whose WAL this server ships (P2-5).
+type WALTarget struct {
+	ResourceID string `json:"resourceId"`
+}
+
+// FetchWALTargets lists the resources whose spool the agent should drain.
+func (c *Client) FetchWALTargets(ctx context.Context, agentToken string) ([]WALTarget, error) {
+	var res struct {
+		Targets []WALTarget `json:"targets"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/agent/wal-targets", agentToken, nil, &res)
+	return res.Targets, err
+}
+
+// FetchWALCredential resolves the restic credential for a resource's WAL
+// shipping (audited per release; the caller caches it).
+func (c *Client) FetchWALCredential(ctx context.Context, agentToken, resourceID string) (BackupCredentialResponse, error) {
+	var res BackupCredentialResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/wal-credential?resourceId="+url.QueryEscape(resourceID), agentToken, nil, &res)
+	return res, err
+}
+
+// PostWALStatus records a shipping cycle's high-water mark.
+func (c *Client) PostWALStatus(ctx context.Context, agentToken, resourceID, lastSegment string) error {
+	return c.post(ctx, "/v1/agent/wal-status", agentToken, map[string]any{
+		"resourceId":  resourceID,
+		"lastSegment": lastSegment,
+	}, nil)
+}
+
 // TelemetrySample is one metric point shipped over the outbound channel
 // (P1-13). Labels are restricted to the agent-suppliable allowlist
 // {resource, service}; the CP adds {org, project, env, server} itself.

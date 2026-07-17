@@ -113,6 +113,58 @@ func TestRenderDatabaseDSDCarriesNoSecret(t *testing.T) {
 	}
 }
 
+func TestRenderPostgresPITRAddsWALArchiving(t *testing.T) {
+	target := dbTargets("postgres", "database")
+	t0 := target["res_db"]
+	t0.PITR = true
+	target["res_db"] = t0
+	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, target, nil, nil, ACMEConfig{})
+
+	// A dedicated WAL spool volume is ensured and mounted.
+	if _, ok := opByID(ops, "vol:res_db:wal"); !ok {
+		t.Fatal("PITR postgres must ensure a wal spool volume")
+	}
+	ctr, ok := opByID(ops, "res:res_db")
+	if !ok {
+		t.Fatal("missing container op")
+	}
+	var spec struct {
+		Command []string      `json:"command"`
+		Volumes []struct{ MountPath string `json:"mountPath"` } `json:"volumes"`
+	}
+	if err := json.Unmarshal(ctr.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(spec.Command, " ")
+	if !strings.Contains(joined, "archive_mode=on") || !strings.Contains(joined, "wal_level=replica") {
+		t.Fatalf("WAL archiving flags missing: %q", joined)
+	}
+	// The archive_command writes tmp+rename so a half-written segment never ships.
+	if !strings.Contains(joined, ".tmp && mv") {
+		t.Fatalf("archive_command must be atomic (tmp+rename): %q", joined)
+	}
+	var mounts []string
+	for _, v := range spec.Volumes {
+		mounts = append(mounts, v.MountPath)
+	}
+	if !strings.Contains(strings.Join(mounts, " "), "/var/lib/postgresql/wal-archive") {
+		t.Fatalf("spool mount missing: %v", mounts)
+	}
+}
+
+func TestRenderPostgresWithoutPITRHasNoWAL(t *testing.T) {
+	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, ACMEConfig{})
+	if _, ok := opByID(ops, "vol:res_db:wal"); ok {
+		t.Fatal("PITR-off postgres must not ensure a wal volume")
+	}
+	ctr, _ := opByID(ops, "res:res_db")
+	if strings.Contains(string(ctr.Spec), "archive_mode") {
+		t.Fatalf("PITR-off postgres must not carry archive flags: %s", ctr.Spec)
+	}
+}
+
 func TestRenderMySQLIncludesRootPasswordRef(t *testing.T) {
 	ops, _ := renderOps("srv_t", dbSpecs("mysql"), nil, nil,
 		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("mysql", "database"), nil, nil, ACMEConfig{})

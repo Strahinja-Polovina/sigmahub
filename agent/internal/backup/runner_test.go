@@ -59,7 +59,7 @@ func (f *fakeDocker) ContainerExec(_ context.Context, _ string, cmd []string, ou
 		return 1, "boom", nil
 	}
 	// The dump commands write the payload; ready/load/probe commands just succeed.
-	if cmd[0] == "pg_dump" || strings.Contains(strings.Join(cmd, " "), "mysqldump") {
+	if cmd[0] == "pg_dump" || cmd[0] == "pg_basebackup" || strings.Contains(strings.Join(cmd, " "), "mysqldump") {
 		_, _ = out.Write(f.dumpData)
 	}
 	if strings.Contains(strings.Join(cmd, " "), "information_schema.tables") {
@@ -140,6 +140,38 @@ func TestBackupRunPipesDumpIntoResticAndReportsSha(t *testing.T) {
 	// the DSD (the spec carries no command field at all).
 	if fd.execCalls[0][0] != "pg_dump" {
 		t.Fatalf("dump cmd = %v", fd.execCalls[0])
+	}
+}
+
+func TestBaseBackupPipesIntoResticUnderBaseTag(t *testing.T) {
+	base := []byte("PG_BASEBACKUP_TAR_STREAM")
+	fd := &fakeDocker{dumpData: base}
+	r, rep := testRunner(t, fd)
+
+	op := backupOp(t, KindBackupBase, opSpec{
+		RunID: "run_base", ResourceID: "res_db", Container: "sigmahub-res_db",
+		Engine: "postgres", Database: "shop", Username: "sigma",
+	})
+	if err := r.opBackupBase(context.Background(), op); err != nil {
+		t.Fatalf("base backup: %v", err)
+	}
+	wantSha := sha256.Sum256(base)
+	if !rep.ok || rep.snapshot != "snap123" || rep.sha != hex.EncodeToString(wantSha[:]) {
+		t.Fatalf("reported = %+v", rep)
+	}
+	// Must use pg_basebackup, never a shell from the DSD.
+	if fd.execCalls[0][0] != "pg_basebackup" {
+		t.Fatalf("base cmd = %v", fd.execCalls[0])
+	}
+}
+
+func TestBaseBackupRejectsNonPostgres(t *testing.T) {
+	r, _ := testRunner(t, &fakeDocker{})
+	err := r.opBackupBase(context.Background(), backupOp(t, KindBackupBase, opSpec{
+		RunID: "run_x", ResourceID: "res_db", Container: "c", Engine: "mysql", Database: "d", Username: "u",
+	}))
+	if err == nil {
+		t.Fatal("base backup on mysql must fail")
 	}
 }
 
