@@ -21,6 +21,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
@@ -293,9 +294,22 @@ func run() error {
 				if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
 					log.Error("usage sweep", "err", err)
 				}
+				// P2-4: the time-integrated connected-server meter billing reads.
+				if _, err := st.SweepServerHours(ctx, time.Now()); err != nil {
+					log.Error("server-hours sweep", "err", err)
+				}
 			}
 		}
 	}()
+
+	// Paddle billing (P2-4): nil client when no API key → billing endpoints
+	// answer honest not-configured. The typed-nil guard matters — a nil
+	// *paddle.Client must not become a non-nil interface.
+	var paddleClient api.PaddleClient
+	if pc := paddle.NewClient(cfg.PaddleEnv, cfg.PaddleAPIKey); pc != nil {
+		paddleClient = pc
+		log.Info("paddle billing configured", "env", cfg.PaddleEnv)
+	}
 
 	srv := &http.Server{
 		Addr: cfg.Addr,
@@ -314,6 +328,10 @@ func run() error {
 			Telemetry:           tel,
 			TelemetryStore:      st,
 			AlertSender:         alertSender,
+			Billing:             st,
+			Paddle:              paddleClient,
+			PaddleWebhookSecret: cfg.PaddleWebhookSecret,
+			PaddlePriceID:       cfg.PaddlePriceID,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

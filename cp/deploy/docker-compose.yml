@@ -59,6 +59,11 @@ services:
       CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
       CP_VM_READ_URL: ${CP_VM_READ_URL:-}
       CP_LOKI_URL: ${CP_LOKI_URL:-}
+      # Billing (P2-4, Paddle; optional). Empty = billing off (usage preview).
+      CP_PADDLE_API_KEY: ${CP_PADDLE_API_KEY:-}
+      CP_PADDLE_WEBHOOK_SECRET: ${CP_PADDLE_WEBHOOK_SECRET:-}
+      CP_PADDLE_ENV: ${CP_PADDLE_ENV:-sandbox}
+      CP_PADDLE_PRICE_ID: ${CP_PADDLE_PRICE_ID:-}
     volumes:
       - cp-data:/data
       # GitHub App key import (set CP_GITHUB_APP_PRIVATE_KEY_FILE=/data/github-app.pem):

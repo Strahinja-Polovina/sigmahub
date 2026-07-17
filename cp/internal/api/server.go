@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
@@ -76,7 +77,20 @@ type Server struct {
 	tel       TelemetryAPI
 	// alertSender test-fires alert channels (P2-6); nil → test endpoint 503s.
 	alertSender AlertSender
-	mux         *http.ServeMux
+	// Billing (P2-4). billing is the store slice; paddle is the outbound
+	// client (nil = billing off / honest not-configured); paddleWebhookSecret
+	// empty = the webhook receiver 503s; paddlePriceID is the checkout price.
+	billing             BillingStore
+	paddle              PaddleClient
+	paddleWebhookSecret string
+	paddlePriceID       string
+	mux                 *http.ServeMux
+}
+
+// PaddleClient is the outbound Paddle surface the billing handlers need.
+type PaddleClient interface {
+	CreateCheckout(ctx context.Context, in paddle.CreateTransactionInput) (paddle.Transaction, error)
+	CustomerPortalURL(ctx context.Context, customerID string) (string, error)
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -110,6 +124,13 @@ type Options struct {
 	TelemetryStore TelemetryAPI
 	// AlertSender test-fires alert channels (P2-6); nil in handler unit tests.
 	AlertSender AlertSender
+	// Billing (P2-4). Billing is the store slice; Paddle is the outbound client
+	// (nil = billing off); PaddleWebhookSecret/PaddlePriceID configure the
+	// receiver + checkout.
+	Billing             BillingStore
+	Paddle              PaddleClient
+	PaddleWebhookSecret string
+	PaddlePriceID       string
 }
 
 // New builds the HTTP surface.
@@ -130,6 +151,10 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
 		alertSender:         opts.AlertSender,
+		billing:             opts.Billing,
+		paddle:              opts.Paddle,
+		paddleWebhookSecret: opts.PaddleWebhookSecret,
+		paddlePriceID:       opts.PaddlePriceID,
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()
@@ -146,6 +171,9 @@ func (s *Server) routes() {
 	// Git provider webhook (P1-7). Public: unauthenticated but HMAC-verified
 	// against the configured secret; a forged signature is rejected 401.
 	s.mux.HandleFunc("POST /v1/webhooks/github", s.handleGitHubWebhook)
+	// Paddle billing webhook (P2-4). Public: Paddle-Signature HMAC-verified;
+	// 503 when no secret is configured.
+	s.mux.HandleFunc("POST /v1/webhooks/paddle", s.handlePaddleWebhook)
 
 	// Dashboard-facing (org-scoped service tokens): reads need any role,
 	// mutations need at least Project Admin — mirroring the v1 web RBAC.
@@ -261,6 +289,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/alert-channels/{channelId}", s.requireService(store.RoleOrgAdmin, s.handleDeleteAlertChannel))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/alert-channels/{channelId}/rules", s.requireService(store.RoleOrgAdmin, s.handleSetAlertRules))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/alert-channels/{channelId}/test", s.requireService(store.RoleOrgAdmin, s.handleTestAlertChannel))
+
+	// Billing (P2-4). The usage+charge summary is member-visible; checkout and
+	// the customer portal mutate the subscription so they need Org Admin.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/billing", s.requireService(store.RoleDeveloper, s.handleGetBilling))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/billing/checkout", s.requireService(store.RoleOrgAdmin, s.handleBillingCheckout))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/billing/portal", s.requireService(store.RoleOrgAdmin, s.handleBillingPortal))
 
 	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
 	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);
