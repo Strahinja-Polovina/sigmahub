@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectAdmin, requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -70,7 +70,7 @@ export async function setBackupPolicy(input: {
   enabled?: boolean;
 }): Promise<CpBackupPolicy> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const bp = await cpUpdateBackupPolicy(
     input.orgId,
     input.resourceId,
@@ -98,7 +98,7 @@ export async function restoreDatabase(input: {
   serverId: string;
 }) {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
   const out = await cpRestoreDatabase(
     input.orgId,
     input.resourceId,

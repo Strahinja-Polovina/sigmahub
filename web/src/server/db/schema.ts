@@ -11,6 +11,7 @@ import {
   boolean,
   timestamp,
   primaryKey,
+  unique,
 } from "drizzle-orm/pg-core";
 import { user } from "./auth-schema";
 
@@ -33,6 +34,27 @@ export const memberships = pgTable("memberships", {
   role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
+
+// P2-7: per-project role grants. Semantics (enforced in active-org.ts):
+// the org role is always the ceiling; a user with ZERO rows here keeps
+// org-wide access to every project (backward compatible — nobody loses
+// access when this ships); a user with ANY row becomes project-scoped and
+// sees only the projects they are granted. Org Admins are never scoped.
+export const projectMemberships = pgTable(
+  "project_memberships",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    role: text("role").notNull().default("Developer"), // Project Admin | Developer
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => ({ uniq: unique().on(t.projectId, t.userId) })
+);
 
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),

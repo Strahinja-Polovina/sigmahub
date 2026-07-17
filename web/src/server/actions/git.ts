@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectAdmin } from "../active-org";
+import { requireMembership, requireProjectRole } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -57,7 +57,7 @@ export async function connectRepo(input: {
   token?: string;
 }): Promise<CpGitConnection> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   const repo = input.repoFullName.trim();
   if (!repo.includes("/")) throw new Error("Enter the repository as owner/name.");
   const conn = await cpConnectRepo(
@@ -80,7 +80,7 @@ export async function setBranchMapping(input: {
   policy: "auto" | "manual";
 }): Promise<CpBranchMap> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   const branch = input.branch.trim();
   if (!branch) throw new Error("Branch is required.");
   const m = await cpSetBranchMap(
@@ -107,7 +107,7 @@ export async function promoteBranch(input: {
   branch: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   await cpPromoteBranch(input.orgId, input.mapId, { name: user.name, role });
   await writeAudit({
     orgId: input.orgId,
@@ -124,7 +124,7 @@ export async function removeBranchMapping(input: {
   mapId: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   await cpDeleteBranchMap(input.orgId, input.mapId, { name: user.name, role });
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Removed branch mapping", target: input.mapId });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
@@ -137,7 +137,7 @@ export async function disconnectRepo(input: {
   repoFullName: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   await cpDisconnectRepo(input.orgId, input.connectionId, { name: user.name, role });
   await writeAudit({
     orgId: input.orgId,
@@ -158,7 +158,7 @@ export async function setPreviews(input: {
   serverId?: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   await cpSetPreviews(
     input.orgId,
     input.connectionId,
@@ -200,7 +200,7 @@ export async function linkInstallation(input: {
   installationId: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectAdmin(input.orgId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
   await cpLinkInstallation(input.orgId, input.connectionId, input.installationId, {
     name: user.name,
     role,

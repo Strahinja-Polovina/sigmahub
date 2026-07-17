@@ -1,6 +1,16 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId } from "@/server/active-org";
-import { getEnvironmentPanels, getProject, getServers } from "@/server/queries";
+import { eq } from "drizzle-orm";
+import {
+  getActiveOrgId,
+  getSessionUser,
+  projectGrants,
+  requireMembership,
+} from "@/server/active-org";
+import { effectiveProjectRole, roleAtLeast } from "@/lib/rbac";
+import { db } from "@/server/db";
+import * as dbs from "@/server/db/schema";
+import { getEnvironmentPanels, getMembers, getProject, getServers } from "@/server/queries";
+import type { ProjectMemberRow } from "@/components/dashboard/projects/project-members-panel";
 import {
   cpEnabled,
   cpGitAppInfo,
@@ -68,6 +78,33 @@ export default async function ProjectDetailPage({
     return <ProjectDetailView project={null} panels={[]} orgServers={[]} />;
   }
 
+  // P2-7: project-scoped users only see granted projects; the effective role
+  // decides whether the members panel is editable.
+  const sessionUser = await getSessionUser();
+  const { role: orgRole } = await requireMembership(orgId);
+  const grants = await projectGrants(sessionUser.id, orgId);
+  const myEffectiveRole = effectiveProjectRole(orgRole, grants.get(projectId), grants.size > 0);
+  if (!myEffectiveRole) {
+    return <ProjectDetailView project={null} panels={[]} orgServers={[]} />;
+  }
+  const canManageMembers = roleAtLeast(myEffectiveRole, "Project Admin");
+
+  const [orgMembers, grantRows] = await Promise.all([
+    getMembers(orgId),
+    db
+      .select({ userId: dbs.projectMemberships.userId, role: dbs.projectMemberships.role })
+      .from(dbs.projectMemberships)
+      .where(eq(dbs.projectMemberships.projectId, projectId)),
+  ]);
+  const grantByUser = new Map(grantRows.map((g) => [g.userId, g.role]));
+  const projectMembers: ProjectMemberRow[] = orgMembers.map((m) => ({
+    userId: m.id,
+    name: m.name,
+    email: m.email,
+    orgRole: m.role,
+    grantedRole: grantByUser.get(m.id) ?? null,
+  }));
+
   // Bounced back from the GitHub App install flow (SIGMA-55): the connect
   // dialog opens pre-filled with this installation.
   const rawInstallation = typeof query.installation_id === "string" ? query.installation_id : undefined;
@@ -96,6 +133,8 @@ export default async function ProjectDetailPage({
       gitConnections={gitConnections}
       gitApp={gitApp}
       pendingInstallationId={pendingInstallationId}
+      projectMembers={projectMembers}
+      canManageMembers={canManageMembers}
     />
   );
 }

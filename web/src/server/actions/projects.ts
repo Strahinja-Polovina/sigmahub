@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireProjectAdmin } from "../active-org";
+import { requireProjectAdmin, requireProjectRole } from "../active-org";
 import { getProject } from "../queries";
 import { writeAudit } from "../audit";
 import {
@@ -79,7 +79,7 @@ export async function renameProject(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireProjectAdmin(project.orgId);
+  const { user, role } = await requireProjectRole(project.orgId, project.id, "Project Admin");
   const name = input.name.trim();
   if (!name) throw new Error("Project name is required.");
   if (cpEnabled()) {
@@ -110,7 +110,7 @@ export async function renameProject(input: {
 export async function deleteProject(input: { projectId: string }) {
   const project = await getProject(input.projectId);
   if (!project) return;
-  const { user, role } = await requireProjectAdmin(project.orgId);
+  const { user, role } = await requireProjectRole(project.orgId, project.id, "Project Admin");
   if (cpEnabled()) {
     await cpDeleteProject(project.orgId, input.projectId, { name: user.name, role });
   }
@@ -126,7 +126,7 @@ export async function createEnvironment(input: {
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireProjectAdmin(project.orgId);
+  const { user, role } = await requireProjectRole(project.orgId, project.id, "Project Admin");
   const name = input.name.trim();
   if (!name) throw new Error("Environment name is required.");
   let id = rid("env");
@@ -155,7 +155,7 @@ async function requireEnvMembership(environmentId: string) {
   if (!env) throw new Error("Environment not found.");
   const project = await getProject(env.projectId);
   if (!project) throw new Error("Project not found.");
-  const { user, role } = await requireProjectAdmin(project.orgId);
+  const { user, role } = await requireProjectRole(project.orgId, project.id, "Project Admin");
   return { env, project, user, role };
 }
 
@@ -270,7 +270,7 @@ export async function deleteEnvironment(input: { environmentId: string }) {
     .where(eq(s.environments.id, input.environmentId));
   if (!env) return;
   const project = await getProject(env.projectId);
-  const membership = project ? await requireProjectAdmin(project.orgId) : null;
+  const membership = project ? await requireProjectRole(project.orgId, project.id, "Project Admin") : null;
   if (project && membership && cpEnabled()) {
     await cpDeleteEnvironment(project.orgId, input.environmentId, {
       name: membership.user.name,

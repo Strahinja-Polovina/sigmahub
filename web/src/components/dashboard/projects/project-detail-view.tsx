@@ -66,6 +66,7 @@ import {
 import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared";
 import { NewEnvironmentDialog } from "./new-environment-dialog";
 import { ProjectGitPanel, type GitAppInfo, type GitConnectionPanel } from "./project-git-panel";
+import { ProjectMembersPanel, type ProjectMemberRow } from "./project-members-panel";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
 export type OrgServer = {
@@ -433,6 +434,8 @@ export function ProjectDetailView({
   gitConnections,
   gitApp,
   pendingInstallationId,
+  projectMembers,
+  canManageMembers = false,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
@@ -444,6 +447,9 @@ export function ProjectDetailView({
   gitConnections?: GitConnectionPanel[];
   gitApp?: GitAppInfo;
   pendingInstallationId?: string;
+  /** P2-7 per-project roles; undefined hides the panel (e.g. not-found view). */
+  projectMembers?: ProjectMemberRow[];
+  canManageMembers?: boolean;
 }) {
   if (!project) return <NotFound />;
 
@@ -535,6 +541,15 @@ export function ProjectDetailView({
           servers={orgServers.map((sv) => ({ id: sv.id, name: sv.name }))}
           gitApp={gitApp}
           pendingInstallationId={pendingInstallationId}
+        />
+      )}
+
+      {projectMembers && orgId && (
+        <ProjectMembersPanel
+          orgId={orgId}
+          projectId={project.id}
+          members={projectMembers}
+          canManage={canManageMembers}
         />
       )}
     </div>

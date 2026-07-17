@@ -1,5 +1,10 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId, getMyOrgs } from "@/server/active-org";
+import {
+  getActiveOrgId,
+  getMyOrgs,
+  getSessionUser,
+  visibleProjects,
+} from "@/server/active-org";
 import { getProjectSummaries } from "@/server/queries";
 import { ProjectsView } from "@/components/dashboard/projects/projects-view";
 
@@ -7,10 +12,10 @@ export default async function ProjectsPage() {
   const orgId = await getActiveOrgId();
   if (!orgId) redirect("/login");
 
-  const [summaries, myOrgs] = await Promise.all([
-    getProjectSummaries(orgId),
-    getMyOrgs(),
-  ]);
+  const [myOrgs, sessionUser] = await Promise.all([getMyOrgs(), getSessionUser()]);
+  const orgRole = myOrgs.find((o) => o.id === orgId)?.role ?? "Developer";
+  const visible = await visibleProjects(sessionUser.id, orgId, orgRole);
+  const summaries = await getProjectSummaries(orgId, visible);
   const orgName = myOrgs.find((o) => o.id === orgId)?.name ?? "your organization";
 
   const projects = summaries.map((s) => ({
