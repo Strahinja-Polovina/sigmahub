@@ -50,6 +50,8 @@ services:
       CP_GITHUB_APP_PRIVATE_KEY_FILE: ${CP_GITHUB_APP_PRIVATE_KEY_FILE:-}
       CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
       CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
+      # Object-storage engines (P2-2). MinIO-only build: CP_S3_ENGINES=minio.
+      CP_S3_ENGINES: ${CP_S3_ENGINES:-minio,seaweedfs}
       # Key custody (P0-9): file (dev default) or vault (production).
       CP_KMS_BACKEND: ${CP_KMS_BACKEND:-file}
       CP_VAULT_ADDR: ${CP_VAULT_ADDR:-}

@@ -17,7 +17,13 @@ func s3Specs() []store.ResourceSpec {
 
 func s3Targets() map[string]store.S3Target {
 	return map[string]store.S3Target{
-		"res_s3": {Engine: "s3", AccessKey: "sigma", Port: 15001, ServerType: "storage"},
+		"res_s3": {Engine: "minio", AccessKey: "sigma", Port: 15001, ServerType: "storage"},
+	}
+}
+
+func seaweedTargets() map[string]store.S3Target {
+	return map[string]store.S3Target{
+		"res_s3": {Engine: "seaweedfs", AccessKey: "sigma", Port: 15002, ServerType: "storage"},
 	}
 }
 
@@ -75,6 +81,51 @@ func TestRenderS3FansIntoContainerOps(t *testing.T) {
 		t.Fatalf("secret refs = %+v", spec.SecretRefs)
 	}
 	if strings.Join(spec.Command, " ") != "server /data --address :9000" {
+		t.Fatalf("command = %v", spec.Command)
+	}
+}
+
+// TestRenderS3SeaweedFS is the P2-2 parity contract: the same `s3` kind renders
+// the SeaweedFS engine when the credentials row selects it — pinned digest,
+// S3-gateway port 8333, access key in plain env, secret strictly as a reference.
+func TestRenderS3SeaweedFS(t *testing.T) {
+	ops, _ := renderOps("srv_t", s3Specs(), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, seaweedTargets(), nil, ACMEConfig{})
+
+	ctr, ok := opByID(ops, "res:res_s3")
+	if !ok {
+		t.Fatal("missing container op")
+	}
+	var spec struct {
+		Image string            `json:"image"`
+		Env   map[string]string `json:"env"`
+		Ports []struct {
+			Container int    `json:"container"`
+			Host      int    `json:"host"`
+			HostIP    string `json:"hostIp"`
+		} `json:"ports"`
+		Command    []string `json:"command"`
+		SecretRefs []struct {
+			Name   string `json:"name"`
+			EnvVar bool   `json:"envVar"`
+		} `json:"secretRefs"`
+	}
+	if err := json.Unmarshal(ctr.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(spec.Image, "chrislusf/seaweedfs:") || !strings.Contains(spec.Image, "@sha256:") {
+		t.Fatalf("image = %q, want digest-pinned seaweedfs", spec.Image)
+	}
+	if len(spec.Ports) != 1 || spec.Ports[0].HostIP != "10.8.0.5" || spec.Ports[0].Host != 15002 || spec.Ports[0].Container != 8333 {
+		t.Fatalf("ports = %+v, want mesh-bound 10.8.0.5:15002->8333", spec.Ports)
+	}
+	if spec.Env["AWS_ACCESS_KEY_ID"] != "sigma" || spec.Env["MINIO_ROOT_USER"] != "" {
+		t.Fatalf("plain env = %v, want AWS_ACCESS_KEY_ID only", spec.Env)
+	}
+	if len(spec.SecretRefs) != 1 || spec.SecretRefs[0].Name != "AWS_SECRET_ACCESS_KEY" || !spec.SecretRefs[0].EnvVar {
+		t.Fatalf("secret refs = %+v, want AWS_SECRET_ACCESS_KEY", spec.SecretRefs)
+	}
+	if strings.Join(spec.Command, " ") != "server -dir=/data -s3 -s3.port=8333" {
 		t.Fatalf("command = %v", spec.Command)
 	}
 }

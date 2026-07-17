@@ -16,7 +16,9 @@ import (
 // container.apply. ok=false (pre-mesh, unknown engine) falls back to the
 // resource.sync stub, mirroring renderDatabaseOps.
 func renderS3Ops(rs store.ResourceSpec, target store.S3Target, meshIP string) (ops []dsd.Op, networkID string, ok bool) {
-	def, isEngine := store.S3Engine(rs.Kind)
+	// The engine is authoritative from the credentials row (target.Engine), not
+	// the kind — one `s3` kind can carry either MinIO or SeaweedFS (P2-2).
+	def, isEngine := store.S3EngineByName(target.Engine)
 	if !isEngine || meshIP == "" || target.Port == 0 {
 		return nil, "", false
 	}

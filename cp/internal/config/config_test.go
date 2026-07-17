@@ -1,14 +1,17 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestFromEnv(t *testing.T) {
 	const db = "postgres://x"
 	for _, tc := range []struct {
-		name         string
-		env          map[string]string
-		wantErr      bool
-		wantToken    string
+		name      string
+		env       map[string]string
+		wantErr   bool
+		wantToken string
 	}{
 		{"dev defaults service token", map[string]string{"CP_DATABASE_URL": db}, false, "dev-service-token"},
 		{"missing db", map[string]string{}, true, ""},
@@ -36,6 +39,44 @@ func TestFromEnv(t *testing.T) {
 			}
 			if cfg.ServiceToken != tc.wantToken {
 				t.Fatalf("ServiceToken = %q, want %q", cfg.ServiceToken, tc.wantToken)
+			}
+		})
+	}
+}
+
+// TestS3EnginesFromEnv covers the P2-2 CP_S3_ENGINES allowlist: default enables
+// both engines, a subset narrows, and a typo fails boot rather than silently
+// disabling an engine (mirrors CP_DB_ENGINES).
+func TestS3EnginesFromEnv(t *testing.T) {
+	const db = "postgres://x"
+	for _, tc := range []struct {
+		name    string
+		val     string // "" ⇒ leave unset (fall through to the default)
+		wantErr bool
+		want    string // comma-joined expected engines
+	}{
+		{"default enables both", "", false, "minio,seaweedfs"},
+		{"minio only", "minio", false, "minio"},
+		{"seaweedfs only", "seaweedfs", false, "seaweedfs"},
+		{"whitespace tolerated", " minio , seaweedfs ", false, "minio,seaweedfs"},
+		{"unknown engine rejected", "minio,garbage", true, ""},
+		{"blank list rejected", ",", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CP_DATABASE_URL", db)
+			t.Setenv("CP_S3_ENGINES", tc.val)
+			cfg, err := FromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %+v", cfg.S3Engines)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := strings.Join(cfg.S3Engines, ","); got != tc.want {
+				t.Fatalf("S3Engines = %q, want %q", got, tc.want)
 			}
 		})
 	}
