@@ -41,6 +41,13 @@ services:
       CP_KMS_KEY_FILE: /data/cp-kms.key
       CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN:?set CP_PROVISION_TOKEN in .env}
       CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
+      # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
+      # Drop the downloaded PEM next to this file as github-app.pem and
+      # uncomment the volume below; the key is imported into KMS custody on
+      # first boot, after which the file can be removed.
+      CP_GITHUB_APP_ID: ${CP_GITHUB_APP_ID:-}
+      CP_GITHUB_APP_SLUG: ${CP_GITHUB_APP_SLUG:-}
+      CP_GITHUB_APP_PRIVATE_KEY_FILE: ${CP_GITHUB_APP_PRIVATE_KEY_FILE:-}
       CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
       CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
       # Key custody (P0-9): file (dev default) or vault (production).
@@ -54,6 +61,8 @@ services:
       CP_LOKI_URL: ${CP_LOKI_URL:-}
     volumes:
       - cp-data:/data
+      # GitHub App key import (set CP_GITHUB_APP_PRIVATE_KEY_FILE=/data/github-app.pem):
+      # - ./github-app.pem:/data/github-app.pem:ro
     ports:
       - "8080:8080"
 

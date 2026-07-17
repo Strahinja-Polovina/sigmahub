@@ -23,7 +23,10 @@ type fakeGit struct {
 	lastEvent store.GitWebhookEvent
 	outcome   store.WebhookOutcome
 	err       error
-	// detect result for the inspector-less connect gate tests (unused here).
+	// linkedConn/linkedInstallation record the last SetConnectionInstallation
+	// call (SIGMA-55 handler tests).
+	linkedConn         string
+	linkedInstallation string
 }
 
 func (f *fakeGit) HandleGitWebhook(_ context.Context, ev store.GitWebhookEvent) (store.WebhookOutcome, error) {
@@ -58,6 +61,13 @@ func (f *fakeGit) SetConnectionPreviews(context.Context, string, string, bool, s
 }
 func (f *fakeGit) ListPreviewEnvironments(context.Context, string, string) ([]store.PreviewEnvironment, error) {
 	return []store.PreviewEnvironment{}, nil
+}
+func (f *fakeGit) SetConnectionInstallation(_ context.Context, _, connID, installationID, _ string) error {
+	if installationID == "" {
+		return store.ErrInvalid{Msg: "installationId must be a numeric GitHub installation id"}
+	}
+	f.linkedConn, f.linkedInstallation = connID, installationID
+	return nil
 }
 
 // fakeInspector returns a scripted detection.

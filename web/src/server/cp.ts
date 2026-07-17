@@ -330,6 +330,23 @@ export async function cpListProjects(orgId: string): Promise<CpProject[]> {
   return projects;
 }
 
+export async function cpListEnvironments(
+  orgId: string,
+  projectId: string
+): Promise<CpEnvironment[]> {
+  const { environments } = await cpFetch<{ environments: CpEnvironment[] }>(
+    `${org(orgId)}/projects/${encodeURIComponent(projectId)}/environments`,
+    undefined, { orgId });
+  return environments;
+}
+
+export async function cpEnvServerIds(orgId: string, envId: string): Promise<string[]> {
+  const { serverIds } = await cpFetch<{ serverIds: string[] }>(
+    `${org(orgId)}/environments/${encodeURIComponent(envId)}/servers`,
+    undefined, { orgId });
+  return serverIds ?? [];
+}
+
 export async function cpCreateEnvironment(
   orgId: string,
   projectId: string,
@@ -943,6 +960,29 @@ export async function cpConnectRepo(
       token: input.token ?? "",
     }),
   }, { orgId, actor });
+}
+
+/** GitHub App metadata (SIGMA-55): whether the CP can mint installation
+ *  tokens, and the App slug for the installations/new link. */
+export type CpGitAppInfo = { enabled: boolean; slug: string };
+
+export async function cpGitAppInfo(orgId: string): Promise<CpGitAppInfo> {
+  return cpFetch(`${org(orgId)}/git/app`, undefined, { orgId });
+}
+
+/** Link a GitHub App installation to an existing connection — from then on
+ *  the CP clones and inspects with short-lived installation tokens. */
+export async function cpLinkInstallation(
+  orgId: string,
+  connId: string,
+  installationId: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/git/connections/${encodeURIComponent(connId)}/installation`,
+    { method: "POST", body: JSON.stringify({ installationId }) },
+    { orgId, actor }
+  );
 }
 
 export async function cpListGitConnections(orgId: string, projectId?: string): Promise<CpGitConnection[]> {

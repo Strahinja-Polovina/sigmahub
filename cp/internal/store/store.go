@@ -32,6 +32,21 @@ type Store struct {
 	// enabledDBEngines is the P1-10 engine allowlist (CP_DB_ENGINES). Nil means
 	// all engines; the Postgres-only fallback build is this map with one entry.
 	enabledDBEngines map[string]bool
+	// installTokens mints GitHub App installation tokens (SIGMA-55). Nil when
+	// no App is configured — connections then rely on their stored PAT.
+	installTokens InstallationTokenSource
+}
+
+// InstallationTokenSource mints short-lived GitHub App installation access
+// tokens for connections that carry an installation id.
+type InstallationTokenSource interface {
+	InstallationToken(ctx context.Context, installationID string) (string, error)
+}
+
+// SetInstallationTokens installs the GitHub App token minter. Optional; the
+// PAT path keeps working without it.
+func (s *Store) SetInstallationTokens(src InstallationTokenSource) {
+	s.installTokens = src
 }
 
 // SetCustody installs the key-custody boundary used to wrap/unwrap per-org DEKs.

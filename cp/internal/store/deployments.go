@@ -651,7 +651,8 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 }
 
 // DeploymentCloneCredential returns the short-lived clone credential + repo for a
-// deployment, resolved from the connection's KMS-wrapped provider token (P1-6
+// deployment: a GitHub App installation token when the connection carries an
+// installation (SIGMA-55), else the connection's KMS-wrapped PAT (P1-6
 // envelope). Scoped to the REQUESTING server: an agent token can only fetch the
 // credential for a deployment targeting its own host (BOLA). The plaintext token
 // is returned to the agent for in-memory use and never persisted.
@@ -667,7 +668,7 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 	if err != nil {
 		return "", "", "", err
 	}
-	token, err = s.gitProviderToken(ctx, orgID, connID)
+	token, err = s.gitCloneToken(ctx, orgID, connID)
 	if err != nil {
 		return "", "", "", err
 	}

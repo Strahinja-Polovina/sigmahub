@@ -65,7 +65,7 @@ import {
 } from "@/server/actions/projects";
 import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared";
 import { NewEnvironmentDialog } from "./new-environment-dialog";
-import { ProjectGitPanel, type GitConnectionPanel } from "./project-git-panel";
+import { ProjectGitPanel, type GitAppInfo, type GitConnectionPanel } from "./project-git-panel";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
 export type OrgServer = {
@@ -431,6 +431,8 @@ export function ProjectDetailView({
   orgId,
   gitEnabled = false,
   gitConnections,
+  gitApp,
+  pendingInstallationId,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
@@ -440,6 +442,8 @@ export function ProjectDetailView({
    *  hidden in demo mode where every git action would error. */
   gitEnabled?: boolean;
   gitConnections?: GitConnectionPanel[];
+  gitApp?: GitAppInfo;
+  pendingInstallationId?: string;
 }) {
   if (!project) return <NotFound />;
 
@@ -529,6 +533,8 @@ export function ProjectDetailView({
           connections={gitConnections!}
           environments={environments}
           servers={orgServers.map((sv) => ({ id: sv.id, name: sv.name }))}
+          gitApp={gitApp}
+          pendingInstallationId={pendingInstallationId}
         />
       )}
     </div>

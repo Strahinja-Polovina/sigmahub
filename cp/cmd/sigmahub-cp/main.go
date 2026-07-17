@@ -153,6 +153,32 @@ func loadDSDKey(ctx context.Context, st *store.Store) (ed25519.PrivateKey, error
 	return st.LoadDSDSigningKey(ctx, custody)
 }
 
+// loadGitHubApp wires the SIGMA-55 installation-token minter when a GitHub
+// App is configured: the App private key rides the same KMS custody as the
+// other CP secrets (imported from CP_GITHUB_APP_PRIVATE_KEY_FILE on first
+// boot). Returns nil with no error when the App is simply not set up;
+// half-configuration fails boot rather than silently minting nothing.
+func loadGitHubApp(ctx context.Context, st *store.Store, cfg config.Config) (*githubapp.AppAuth, error) {
+	custody, err := loadCustody(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	key, err := st.LoadGitHubAppKey(ctx, custody, cfg.GitHubAppPrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	if key == nil && cfg.GitHubAppID == "" {
+		return nil, nil
+	}
+	if key == nil {
+		return nil, fmt.Errorf("CP_GITHUB_APP_ID is set but no App private key is available (set CP_GITHUB_APP_PRIVATE_KEY_FILE once to import it)")
+	}
+	if cfg.GitHubAppID == "" {
+		return nil, fmt.Errorf("a GitHub App private key is imported but CP_GITHUB_APP_ID is not set")
+	}
+	return githubapp.NewAppAuth(cfg.GitHubAppID, key), nil
+}
+
 // runDeployDrain periodically drains queued deploy_requests into deployments and
 // nudges the reconciler for each affected server, so a git push produces a
 // rendered clone→build→rollout pipeline within a few seconds.
@@ -206,6 +232,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// GitHub App installation-token minting (SIGMA-55). Optional: nil keeps
+	// the PAT-only path. The typed-nil guard matters — a nil *AppAuth must not
+	// become a non-nil interface.
+	appAuth, err := loadGitHubApp(ctx, st, cfg)
+	if err != nil {
+		return err
+	}
+	var installTokens api.InstallationTokenSource
+	if appAuth != nil {
+		st.SetInstallationTokens(appAuth)
+		installTokens = appAuth
+		log.Info("github app configured", "appId", cfg.GitHubAppID, "slug", cfg.GitHubAppSlug)
+	}
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
 	go rec.Run(ctx, 60*time.Second)
@@ -258,6 +298,8 @@ func run() error {
 			ProvisionToken:      cfg.ProvisionToken,
 			Git:                 st,
 			Inspector:           githubapp.NewInspector(),
+			InstallationTokens:  installTokens,
+			GitHubAppSlug:       cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			DSDStore:            st,
 			DSDWaiter:           rec,

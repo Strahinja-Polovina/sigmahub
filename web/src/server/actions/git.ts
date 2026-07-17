@@ -13,6 +13,9 @@ import {
   cpDisconnectRepo,
   cpSetPreviews,
   cpListPreviews,
+  cpGitAppInfo,
+  cpLinkInstallation,
+  type CpGitAppInfo,
   type CpDetected,
   type CpGitConnection,
   type CpBranchMap,
@@ -179,4 +182,34 @@ export async function listPreviews(input: {
   ensureCp();
   await requireMembership(input.orgId);
   return cpListPreviews(input.orgId, input.connectionId);
+}
+
+/** GitHub App availability (SIGMA-55) — drives the Install/Link buttons. */
+export async function getGitAppInfo(orgId: string): Promise<CpGitAppInfo> {
+  ensureCp();
+  await requireMembership(orgId);
+  return cpGitAppInfo(orgId);
+}
+
+/** Link a GitHub App installation to a connection (the post-install callback
+ *  lands here). Project Admin+ — it changes how the repo is authenticated. */
+export async function linkInstallation(input: {
+  orgId: string;
+  projectId: string;
+  connectionId: string;
+  installationId: string;
+}): Promise<void> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  await cpLinkInstallation(input.orgId, input.connectionId, input.installationId, {
+    name: user.name,
+    role,
+  });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Linked GitHub App installation",
+    target: input.connectionId,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
 }

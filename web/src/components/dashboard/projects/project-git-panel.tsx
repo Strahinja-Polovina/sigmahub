@@ -60,6 +60,7 @@ import {
   listPreviews,
 } from "@/server/actions/git";
 import type { CpPreviewEnvironment } from "@/server/cp";
+import { githubInstallUrl } from "@/lib/github-app";
 
 // Local mirrors of the CP shapes (kept off the server-only cp module).
 type HealthCheck = {
@@ -95,10 +96,13 @@ type BranchMap = {
 type Connection = {
   id: string;
   repoFullName: string;
+  installationId?: string;
   previewsEnabled?: boolean;
   previewServerId?: string;
 };
 export type GitConnectionPanel = { connection: Connection; branchMaps: BranchMap[] };
+/** GitHub App availability, from the CP (SIGMA-55). */
+export type GitAppInfo = { enabled: boolean; slug: string };
 type EnvOption = { id: string; name: string };
 type ServerOption = { id: string; name: string };
 
@@ -143,13 +147,20 @@ function DetectedConfig({ d }: { d: Detected }) {
 function ConnectRepoDialog({
   orgId,
   projectId,
+  gitApp,
+  initialInstallationId,
 }: {
   orgId: string;
   projectId: string;
+  gitApp?: GitAppInfo;
+  initialInstallationId?: string;
 }) {
-  const [open, setOpen] = React.useState(false);
+  // Returning from the GitHub App install flow lands with an installation id
+  // in the URL — open the dialog straight away so the user finishes connecting.
+  const [open, setOpen] = React.useState(Boolean(initialInstallationId));
   const [repo, setRepo] = React.useState("");
   const [token, setToken] = React.useState("");
+  const [installationId, setInstallationId] = React.useState(initialInstallationId ?? "");
   const [detected, setDetected] = React.useState<Detected | null>(null);
   const [detecting, setDetecting] = React.useState(false);
   const [pending, startTransition] = React.useTransition();
@@ -157,6 +168,7 @@ function ConnectRepoDialog({
   function reset() {
     setRepo("");
     setToken("");
+    setInstallationId("");
     setDetected(null);
   }
 
@@ -167,7 +179,12 @@ function ConnectRepoDialog({
     }
     setDetecting(true);
     setDetected(null);
-    detectRepo({ orgId, repoFullName: repo.trim(), token: token.trim() || undefined })
+    detectRepo({
+      orgId,
+      repoFullName: repo.trim(),
+      installationId: installationId || undefined,
+      token: token.trim() || undefined,
+    })
       .then((d) => setDetected(d))
       .catch((err) => toast.error("Couldn’t read repository", { description: errMsg(err) }))
       .finally(() => setDetecting(false));
@@ -180,6 +197,7 @@ function ConnectRepoDialog({
           orgId,
           projectId,
           repoFullName: repo.trim(),
+          installationId: installationId || undefined,
           token: token.trim() || undefined,
         });
         toast.success(`Connected ${repo.trim()}`);
@@ -238,20 +256,44 @@ function ConnectRepoDialog({
             </div>
           </div>
 
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="git-token">Access token (private repos)</Label>
-            <Input
-              id="git-token"
-              type="password"
-              placeholder="ghp_… (optional for public repos)"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              autoComplete="off"
-            />
-            <p className="text-xs text-muted-foreground">
-              Stored encrypted (per-org envelope) — sigmahub uses it to read the repo and deploy.
-            </p>
-          </div>
+          {installationId ? (
+            <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm">
+              <span>
+                GitHub App installation <span className="font-mono">#{installationId}</span>{" "}
+                authenticates this repository — no token needed.
+              </span>
+              <Button type="button" variant="ghost" size="sm" onClick={() => setInstallationId("")}>
+                Use a token instead
+              </Button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="git-token">Access token (private repos)</Label>
+              <Input
+                id="git-token"
+                type="password"
+                placeholder="ghp_… (optional for public repos)"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                autoComplete="off"
+              />
+              <p className="text-xs text-muted-foreground">
+                Stored encrypted (per-org envelope) — sigmahub uses it to read the repo and deploy.
+              </p>
+              {gitApp?.enabled && gitApp.slug && (
+                <p className="text-xs text-muted-foreground">
+                  Prefer short-lived credentials?{" "}
+                  <a
+                    className="underline underline-offset-2 hover:text-foreground"
+                    href={githubInstallUrl(gitApp.slug, { kind: "project", projectId })}
+                  >
+                    Install the GitHub App
+                  </a>{" "}
+                  — no token to paste or rotate.
+                </p>
+              )}
+            </div>
+          )}
 
           {detected && !detected.deployable && (
             <p className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -473,12 +515,14 @@ function ConnectionCard({
   panel,
   environments,
   servers,
+  gitApp,
 }: {
   orgId: string;
   projectId: string;
   panel: GitConnectionPanel;
   environments: EnvOption[];
   servers: ServerOption[];
+  gitApp?: GitAppInfo;
 }) {
   const [pending, startTransition] = React.useTransition();
   const envName = (id: string) => environments.find((e) => e.id === id)?.name ?? id;
@@ -522,17 +566,45 @@ function ConnectionCard({
         <span className="inline-flex items-center gap-2 text-sm font-medium text-foreground">
           <GitFork className="size-4 text-muted-foreground" />
           {panel.connection.repoFullName}
+          {panel.connection.installationId && (
+            <span
+              className="rounded-full border border-emerald-500/30 px-2 py-0.5 text-xs font-medium text-emerald-700"
+              title={`GitHub App installation #${panel.connection.installationId} — short-lived tokens`}
+            >
+              GitHub App
+            </span>
+          )}
         </span>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-muted-foreground hover:text-destructive"
-          onClick={disconnect}
-          disabled={pending}
-        >
-          <Unplug className="size-3.5" />
-          Disconnect
-        </Button>
+        <span className="flex items-center gap-1">
+          {!panel.connection.installationId && gitApp?.enabled && gitApp.slug && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground"
+              render={
+                <a
+                  href={githubInstallUrl(gitApp.slug, {
+                    kind: "connection",
+                    projectId,
+                    connectionId: panel.connection.id,
+                  })}
+                />
+              }
+            >
+              Link GitHub App
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-destructive"
+            onClick={disconnect}
+            disabled={pending}
+          >
+            <Unplug className="size-3.5" />
+            Disconnect
+          </Button>
+        </span>
       </div>
       <div className="px-4 py-3">
         {panel.branchMaps.length === 0 ? (
@@ -624,12 +696,17 @@ export function ProjectGitPanel({
   connections,
   environments,
   servers = [],
+  gitApp,
+  pendingInstallationId,
 }: {
   orgId: string;
   projectId: string;
   connections: GitConnectionPanel[];
   environments: EnvOption[];
   servers?: ServerOption[];
+  gitApp?: GitAppInfo;
+  /** Installation id bounced back from the GitHub App install flow. */
+  pendingInstallationId?: string;
 }) {
   return (
     <Card>
@@ -644,7 +721,12 @@ export function ProjectGitPanel({
             ship on merge; manual branches wait for a promote.
           </CardDescription>
         </div>
-        <ConnectRepoDialog orgId={orgId} projectId={projectId} />
+        <ConnectRepoDialog
+          orgId={orgId}
+          projectId={projectId}
+          gitApp={gitApp}
+          initialInstallationId={pendingInstallationId}
+        />
       </CardHeader>
       <CardContent className="flex flex-col gap-4 pt-4">
         {connections.length === 0 ? (
@@ -660,6 +742,7 @@ export function ProjectGitPanel({
               panel={panel}
               environments={environments}
               servers={servers}
+              gitApp={gitApp}
             />
           ))
         )}

@@ -175,6 +175,45 @@ func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in Create
 	return c, nil
 }
 
+// SetConnectionInstallation links a GitHub App installation to an existing
+// connection (SIGMA-55: the post-install callback lands here). From then on
+// clone credentials and repo inspection prefer short-lived installation
+// tokens over the stored PAT.
+func (s *Store) SetConnectionInstallation(ctx context.Context, orgID, connID, installationID, actor string) error {
+	installationID = strings.TrimSpace(installationID)
+	if installationID == "" || !isDigits(installationID) {
+		return ErrInvalid{Msg: "installationId must be a numeric GitHub installation id"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE git_connections SET installation_id = $3
+		 WHERE org_id = $1 AND id = $2`, orgID, connID, installationID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "GitHub App installation linked", connID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 // ListGitConnections returns the org's connections, optionally filtered to a
 // project (pass "" for all).
 func (s *Store) ListGitConnections(ctx context.Context, orgID, projectID string) ([]GitConnection, error) {
@@ -549,21 +588,36 @@ func (s *Store) ListDeployRequests(ctx context.Context, orgID string, limit int)
 	return out, rows.Err()
 }
 
-// gitProviderToken unwraps the stored provider token for a connection (used by
-// the repo-detection service to read the repo through the GitHub API). Returns
-// "" with no error when the connection carries no stored token.
-func (s *Store) gitProviderToken(ctx context.Context, orgID, connID string) (string, error) {
+// gitCloneToken resolves the credential a clone (or repo read) should use for
+// a connection: a short-lived App installation token when the connection has
+// an installation and a minter is configured, falling back to the stored PAT
+// when minting fails (revoked installation, GitHub outage) or no App is set
+// up. "" with no error means a public, credential-less repo.
+func (s *Store) gitCloneToken(ctx context.Context, orgID, connID string) (string, error) {
+	var installationID string
 	var wrapped []byte
 	err := s.Pool.QueryRow(ctx,
-		`SELECT token_wrapped FROM git_connections WHERE org_id = $1 AND id = $2`,
-		orgID, connID).Scan(&wrapped)
+		`SELECT installation_id, token_wrapped FROM git_connections WHERE org_id = $1 AND id = $2`,
+		orgID, connID).Scan(&installationID, &wrapped)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
+
+	var mintErr error
+	if installationID != "" && s.installTokens != nil {
+		token, err := s.installTokens.InstallationToken(ctx, installationID)
+		if err == nil {
+			return token, nil
+		}
+		mintErr = err
+	}
 	if len(wrapped) == 0 {
+		if mintErr != nil {
+			return "", fmt.Errorf("mint installation token: %w", mintErr)
+		}
 		return "", nil
 	}
 	plain, err := s.custody.Unwrap(ctx, gitTokenPurpose(orgID), wrapped)
