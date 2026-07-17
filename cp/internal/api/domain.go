@@ -54,6 +54,10 @@ type DomainAPI interface {
 	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
 	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
+	// Database resources (P1-10). Info is the Developer-visible metadata;
+	// Reveal decrypts credentials (Project Admin+, audited in the store).
+	GetDatabaseInfo(ctx context.Context, orgID, resourceID string) (store.DatabaseInfo, error)
+	RevealDatabaseConnection(ctx context.Context, orgID, resourceID, actor string) (store.DatabaseConnection, error)
 	// Custom domains (P1-8). Attach/Detach return the host server id so the
 	// handler can re-render its DSD.
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)

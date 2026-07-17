@@ -62,6 +62,8 @@ import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
+import { DatabasePanel } from "./database-panel";
+import type { CpDatabaseInfo } from "@/server/cp";
 
 type Deployment = {
   id: string;
@@ -193,6 +195,7 @@ export function ResourceDetail({
   cpDeployments,
   rollbackTargetIds = [],
   deploymentsEnabled = false,
+  database = null,
 }: {
   detail: Detail;
   orgId?: string;
@@ -207,6 +210,8 @@ export function ResourceDetail({
   /** True when the control plane backs deployments; swaps the demo timeline for
    *  the real release history + build logs + rollback. */
   deploymentsEnabled?: boolean;
+  /** P1-10 database connection metadata (CP mode, database kinds only). */
+  database?: CpDatabaseInfo | null;
 }) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
@@ -341,31 +346,41 @@ export function ResourceDetail({
               </CardContent>
             </Card>
 
-            <Card className="lg:col-span-2">
-              <CardHeader className="border-b">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex flex-col gap-1">
-                    <CardTitle>Resource usage</CardTitle>
-                    <CardDescription>Last 24 hours</CardDescription>
-                  </div>
-                  {latest && (
-                    <div className="flex items-center gap-4 text-sm">
-                      <span className="inline-flex items-center gap-1.5">
-                        <Cpu className="size-4 text-muted-foreground" />
-                        <span className="tabular-nums text-foreground">{latest.cpu}%</span>
-                      </span>
-                      <span className="inline-flex items-center gap-1.5">
-                        <MemoryStick className="size-4 text-muted-foreground" />
-                        <span className="tabular-nums text-foreground">{latest.mem}%</span>
-                      </span>
+            <div className="flex flex-col gap-4 lg:col-span-2">
+              {database && orgId && (
+                <DatabasePanel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  info={database}
+                  canManage={canManage}
+                />
+              )}
+              <Card>
+                <CardHeader className="border-b">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex flex-col gap-1">
+                      <CardTitle>Resource usage</CardTitle>
+                      <CardDescription>Last 24 hours</CardDescription>
                     </div>
-                  )}
-                </div>
-              </CardHeader>
-              <CardContent>
-                <MetricsChart data={metrics} className="aspect-[16/7] w-full" />
-              </CardContent>
-            </Card>
+                    {latest && (
+                      <div className="flex items-center gap-4 text-sm">
+                        <span className="inline-flex items-center gap-1.5">
+                          <Cpu className="size-4 text-muted-foreground" />
+                          <span className="tabular-nums text-foreground">{latest.cpu}%</span>
+                        </span>
+                        <span className="inline-flex items-center gap-1.5">
+                          <MemoryStick className="size-4 text-muted-foreground" />
+                          <span className="tabular-nums text-foreground">{latest.mem}%</span>
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <MetricsChart data={metrics} className="aspect-[16/7] w-full" />
+                </CardContent>
+              </Card>
+            </div>
           </div>
         </TabsContent>
 

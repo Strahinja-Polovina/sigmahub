@@ -29,6 +29,9 @@ type Store struct {
 	// custody-unwrapped (and audited) once per process, not per secret op.
 	dekMu    sync.Mutex
 	dekCache map[string][]byte
+	// enabledDBEngines is the P1-10 engine allowlist (CP_DB_ENGINES). Nil means
+	// all engines; the Postgres-only fallback build is this map with one entry.
+	enabledDBEngines map[string]bool
 }
 
 // SetCustody installs the key-custody boundary used to wrap/unwrap per-org DEKs.

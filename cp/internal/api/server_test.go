@@ -199,6 +199,12 @@ func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error      
 func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)     { return 0, nil }
 func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)  { return "dek_2", nil }
 func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error) { return 0, nil }
+func (f *fakeDomain) GetDatabaseInfo(_ context.Context, _, _ string) (store.DatabaseInfo, error) {
+	return store.DatabaseInfo{}, store.ErrNotDatabase
+}
+func (f *fakeDomain) RevealDatabaseConnection(_ context.Context, _, _, _ string) (store.DatabaseConnection, error) {
+	return store.DatabaseConnection{}, store.ErrNotDatabase
+}
 func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
 	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil
 }

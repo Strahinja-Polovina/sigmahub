@@ -76,9 +76,8 @@ export async function createResource(input: {
   if (cpEnabled()) {
     // CP mode: the control plane owns the resource record and enforces the
     // kind/server-type availability matrix + env attachment server-side. The
-    // local row mirrors it under the same id so the (still simulated, P1-9)
-    // deploy timeline keeps rendering; mirror the CP server first so the local
-    // resources.server_id FK holds.
+    // local row mirrors it under the same id for read models; mirror the CP
+    // server first so the local resources.server_id FK holds.
     if (!input.serverId) throw new Error("A target server is required.");
     await cpMirrorServer(project.orgId, input.serverId);
     const created = await cpCreateResource(
@@ -95,6 +94,10 @@ export async function createResource(input: {
     id = created.id;
   }
   const now = new Date();
+  // CP mode reports honest state: the resource is provisioning until the
+  // agent's status ingest flips it (the read path prefers live CP status).
+  // Demo mode keeps the instant-running simulation.
+  const cp = cpEnabled();
   await db.insert(s.resources).values({
     id,
     projectId: input.projectId,
@@ -102,22 +105,26 @@ export async function createResource(input: {
     serverId: input.serverId ?? null,
     name,
     kind: input.kind,
-    status: "running",
+    status: cp ? "provisioning" : "running",
     repo: input.repo ?? null,
     domain: input.domain ?? null,
     version: "v1",
     lastDeployAt: now,
   });
-  await db.insert(s.deployments).values({
-    id: rid("dep"),
-    resourceId: id,
-    sha: sha7(),
-    status: "running",
-    author: "you",
-    durationSec: 42,
-    startedAt: now,
-  });
-  await writeAudit({ orgId: project.orgId, actor: user.name, action: "Deployed resource", target: `${name} · ${input.kind}` });
+  if (!cp) {
+    // Demo-mode deploy timeline seed. CP mode never fabricates deployments —
+    // the real pipeline rows come from the control plane.
+    await db.insert(s.deployments).values({
+      id: rid("dep"),
+      resourceId: id,
+      sha: sha7(),
+      status: "running",
+      author: "you",
+      durationSec: 42,
+      startedAt: now,
+    });
+  }
+  await writeAudit({ orgId: project.orgId, actor: user.name, action: "Created resource", target: `${name} · ${input.kind}` });
   revalidatePath("/dashboard", "layout");
   return { id };
 }

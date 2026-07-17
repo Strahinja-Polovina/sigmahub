@@ -174,6 +174,8 @@ func run() error {
 		return err
 	}
 	defer st.Close()
+	// P1-10 engine allowlist (the Postgres-only fallback build is CP_DB_ENGINES=postgres).
+	st.SetEnabledDBEngines(cfg.DBEngines)
 
 	// DSD signing key (custody-wrapped, stable across restarts) + reconciler.
 	dsdKey, err := loadDSDKey(ctx, st)

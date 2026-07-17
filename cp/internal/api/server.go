@@ -154,6 +154,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources", s.requireService(store.RoleDeveloper, s.handleListResources))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteResource))
 
+	// Database resources (P1-10). Metadata is member-visible; the credential
+	// reveal is Project Admin+ (a Developer 403s) and audited; the public-
+	// exposure hook returns the typed not-enabled error (mesh-only v1).
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database", s.requireService(store.RoleDeveloper, s.handleGetDatabase))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealDatabaseConnection))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/database/expose", s.requireService(store.RoleProjectAdmin, s.handleExposeDatabase))
+
 	// Custom domains (P1-8): attach/detach are Project Admin+, listing is member-visible.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleDeveloper, s.handleListDomains))

@@ -2,7 +2,15 @@ import { notFound, redirect } from "next/navigation";
 import { getActiveOrgId, requireMembership } from "@/server/active-org";
 import { getResourceDetail } from "@/server/queries";
 import { effectiveSecrets } from "@/server/secrets-data";
-import { cpEnabled, cpListDomains, cpListDeployments, cpRollbackTargets } from "@/server/cp";
+import {
+  cpEnabled,
+  cpListDomains,
+  cpListDeployments,
+  cpRollbackTargets,
+  cpGetDatabase,
+  cpKind,
+  type CpDatabaseInfo,
+} from "@/server/cp";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -61,6 +69,23 @@ async function loadDeployments(
   }
 }
 
+const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongo", "mongodb"]);
+
+/** Load a database resource's connection metadata (P1-10, CP mode only). A CP
+ *  failure degrades to null rather than breaking the page. */
+async function loadDatabase(
+  orgId: string,
+  resourceId: string,
+  kind: string
+): Promise<CpDatabaseInfo | null> {
+  if (!cpEnabled() || !DB_KINDS.has(cpKind(kind))) return null;
+  try {
+    return await cpGetDatabase(orgId, resourceId);
+  } catch {
+    return null;
+  }
+}
+
 export default async function ResourceDetailPage({
   params,
 }: {
@@ -88,6 +113,7 @@ export default async function ResourceDetailPage({
     resourceId,
     detail.resource.kind
   );
+  const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
 
   return (
     <ResourceDetail
@@ -98,6 +124,7 @@ export default async function ResourceDetailPage({
       cpDeployments={deployments}
       rollbackTargetIds={rollbackTargetIds}
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
+      database={database}
     />
   );
 }

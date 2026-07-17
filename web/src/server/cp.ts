@@ -384,6 +384,64 @@ export async function cpDeleteResource(orgId: string, resourceId: string, actor:
   }, { orgId, actor });
 }
 
+// Database resources (P1-10). Databases are mesh-only in v1: the CP publishes
+// the engine port exclusively on the server's WireGuard mesh address.
+export type CpBackupPolicy = {
+  id: string;
+  resourceId: string;
+  schedule: string;
+  keepDaily: number;
+  keepWeekly: number;
+  keepMonthly: number;
+  targetId: string | null;
+  enabled: boolean;
+};
+
+export type CpDatabaseInfo = {
+  resourceId: string;
+  engine: string;
+  image: string;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  meshOnly: boolean;
+  backupPolicy?: CpBackupPolicy;
+};
+
+export type CpDatabaseConnection = CpDatabaseInfo & {
+  password: string;
+  url: string;
+};
+
+/** Non-secret connection metadata + backup policy. Developer-visible. */
+export async function cpGetDatabase(orgId: string, resourceId: string): Promise<CpDatabaseInfo | null> {
+  try {
+    return await cpFetch<CpDatabaseInfo>(
+      `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/database`,
+      undefined, { orgId }
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Control plane 404")) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** Audited credential reveal. The CP gates this at Project Admin+ (Developer
+ *  tokens 403) and writes an audit row per reveal. */
+export async function cpRevealDatabaseConnection(
+  orgId: string,
+  resourceId: string,
+  actor: CpActor
+): Promise<CpDatabaseConnection> {
+  return cpFetch(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/database/connection`,
+    undefined, { orgId, actor }
+  );
+}
+
 // Server + token lifecycle (P1-4). Server delete tombstones the CP record and
 // revokes its agent token; a 409 (with the bound-resource list) surfaces as a
 // thrown "Control plane 409" error the caller can show.
