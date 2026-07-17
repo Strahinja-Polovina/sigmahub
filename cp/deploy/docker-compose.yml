@@ -1,10 +1,12 @@
-# Production self-hosting for the SigmaHub control plane: the CP container +
-# PostgreSQL 16. Copy .env.example to .env and fill in the secrets first.
+# Production self-hosting for the full SigmaHub stack: control plane +
+# dashboard + PostgreSQL 16. Copy .env.example to .env and fill in the
+# secrets first.
 #
 #   docker compose -f cp/deploy/docker-compose.yml up -d
 #
-# The KMS custody key is generated on first boot inside the cp-data volume —
-# BACK IT UP: every wrapped secret (DEKs, DSD signing key, tokens) depends on it.
+# Key custody: default is the file backend — the key is generated on first
+# boot inside the cp-data volume; BACK IT UP (every wrapped secret depends on
+# it). For production set CP_KMS_BACKEND=vault + CP_VAULT_* instead.
 services:
   db:
     image: postgres:16.6-alpine
@@ -15,6 +17,8 @@ services:
       POSTGRES_DB: sigmahub
     volumes:
       - db-data:/var/lib/postgresql/data
+      # Creates the dashboard's own database (sigmahub_web) on first boot.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sigmahub -d sigmahub"]
       interval: 5s
@@ -39,6 +43,11 @@ services:
       CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
       CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
       CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
+      # Key custody (P0-9): file (dev default) or vault (production).
+      CP_KMS_BACKEND: ${CP_KMS_BACKEND:-file}
+      CP_VAULT_ADDR: ${CP_VAULT_ADDR:-}
+      CP_VAULT_TOKEN: ${CP_VAULT_TOKEN:-}
+      CP_VAULT_TRANSIT_KEY: ${CP_VAULT_TRANSIT_KEY:-sigmahub-cp}
       # P1-13 telemetry sinks (optional; empty = pipeline off, UI shows it).
       CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
       CP_VM_READ_URL: ${CP_VM_READ_URL:-}
@@ -47,6 +56,26 @@ services:
       - cp-data:/data
     ports:
       - "8080:8080"
+
+  web:
+    build:
+      context: ../../web
+      dockerfile: Dockerfile
+    image: sigmahub-web:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      cp:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://sigmahub:${CP_DB_PASSWORD}@db:5432/sigmahub_web
+      SIGMAHUB_CP_URL: http://cp:8080
+      SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
+      BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+    ports:
+      - "3000:3000"
 
 volumes:
   db-data:

@@ -84,10 +84,40 @@ func mintServiceToken(args []string) error {
 	return nil
 }
 
+// loadCustody constructs the key-custody boundary from CP_KMS_BACKEND:
+//   - "file" (default): the dev-grade AES-GCM key file at CP_KMS_KEY_FILE —
+//     envelope hygiene + audit trail, NOT a production trust boundary.
+//   - "vault": HashiCorp Vault transit (CP_VAULT_ADDR, CP_VAULT_TOKEN,
+//     CP_VAULT_TRANSIT_KEY, optional CP_VAULT_NAMESPACE) — the production
+//     custody: master key material never touches this host, and Vault's own
+//     audit log is the out-of-band anchor P0-9 calls for.
+//
+// Switching backends does NOT re-wrap existing envelopes: bootstrap a fresh
+// deployment on vault, or re-wrap (KEK rotation covers org DEKs) before
+// flipping an existing one.
+func loadCustody(ctx context.Context, st *store.Store) (kms.KeyCustody, error) {
+	switch backend := os.Getenv("CP_KMS_BACKEND"); backend {
+	case "", "file":
+		keyPath := os.Getenv("CP_KMS_KEY_FILE")
+		if keyPath == "" {
+			keyPath = filepath.Join(".data", "cp-kms.key")
+		}
+		return kms.LoadOrCreateFileCustody(keyPath, st.AuditUnwrapSink())
+	case "vault":
+		return kms.NewVaultCustody(ctx, kms.VaultConfig{
+			Addr:       os.Getenv("CP_VAULT_ADDR"),
+			Token:      os.Getenv("CP_VAULT_TOKEN"),
+			TransitKey: os.Getenv("CP_VAULT_TRANSIT_KEY"),
+			Namespace:  os.Getenv("CP_VAULT_NAMESPACE"),
+		}, st.AuditUnwrapSink())
+	default:
+		return nil, fmt.Errorf(`CP_KMS_BACKEND must be "file" or "vault", got %q`, backend)
+	}
+}
+
 // setupStore opens the DB, applies migrations, and installs the KMS-custodied
-// token pepper so token hashing is keyed (P0-9). The dev custody is a
-// file-anchored AES-GCM key at CP_KMS_KEY_FILE (default ./.data/cp-kms.key);
-// its unwrap of the pepper writes one audit row into cp_audit_log.
+// token pepper so token hashing is keyed (P0-9). Every custody unwrap writes
+// an audit row into cp_audit_log via the sink.
 func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*store.Store, error) {
 	st, err := store.Open(ctx, databaseURL)
 	if err != nil {
@@ -97,11 +127,7 @@ func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*sto
 		st.Close()
 		return nil, err
 	}
-	keyPath := os.Getenv("CP_KMS_KEY_FILE")
-	if keyPath == "" {
-		keyPath = filepath.Join(".data", "cp-kms.key")
-	}
-	custody, err := kms.LoadOrCreateFileCustody(keyPath, st.AuditUnwrapSink())
+	custody, err := loadCustody(ctx, st)
 	if err != nil {
 		st.Close()
 		return nil, err
@@ -120,11 +146,7 @@ func setupStore(ctx context.Context, log *slog.Logger, databaseURL string) (*sto
 // loadDSDKey unwraps (or creates) the Ed25519 DSD-signing key through the same
 // KMS custody used for the token pepper.
 func loadDSDKey(ctx context.Context, st *store.Store) (ed25519.PrivateKey, error) {
-	keyPath := os.Getenv("CP_KMS_KEY_FILE")
-	if keyPath == "" {
-		keyPath = filepath.Join(".data", "cp-kms.key")
-	}
-	custody, err := kms.LoadOrCreateFileCustody(keyPath, st.AuditUnwrapSink())
+	custody, err := loadCustody(ctx, st)
 	if err != nil {
 		return nil, err
 	}
