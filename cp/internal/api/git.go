@@ -21,6 +21,39 @@ type GitAPI interface {
 	DeleteBranchMap(ctx context.Context, orgID, mapID, actor string) error
 	PromoteBranch(ctx context.Context, orgID, mapID, actor string) (store.DeployRequest, error)
 	ListDeployRequests(ctx context.Context, orgID string, limit int) ([]store.DeployRequest, error)
+	// Previews (P1-12): the per-connection toggle + PR environment records.
+	SetConnectionPreviews(ctx context.Context, orgID, connID string, enabled bool, serverID, actor string) error
+	ListPreviewEnvironments(ctx context.Context, orgID, connID string) ([]store.PreviewEnvironment, error)
+}
+
+// handleSetPreviews flips a connection's preview flag and designates the
+// preview server. Project Admin+.
+func (s *Server) handleSetPreviews(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled  bool   `json:"enabled"`
+		ServerID string `json:"serverId"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	err := s.git.SetConnectionPreviews(r.Context(), r.PathValue("orgId"), r.PathValue("connId"),
+		req.Enabled, req.ServerID, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "set previews")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": req.Enabled})
+}
+
+// handleListPreviews lists a connection's preview environments (open first).
+func (s *Server) handleListPreviews(w http.ResponseWriter, r *http.Request) {
+	previews, err := s.git.ListPreviewEnvironments(r.Context(), r.PathValue("orgId"), r.PathValue("connId"))
+	if err != nil {
+		s.writeStoreErr(w, err, "list previews")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"previews": previews})
 }
 
 // RepoInspector derives the deploy config from a connected repo's files.

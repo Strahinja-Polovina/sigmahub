@@ -48,6 +48,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Switch } from "@/components/ui/switch";
 import {
   connectRepo,
   detectRepo,
@@ -55,7 +56,10 @@ import {
   promoteBranch,
   removeBranchMapping,
   setBranchMapping,
+  setPreviews,
+  listPreviews,
 } from "@/server/actions/git";
+import type { CpPreviewEnvironment } from "@/server/cp";
 
 // Local mirrors of the CP shapes (kept off the server-only cp module).
 type HealthCheck = {
@@ -88,9 +92,15 @@ type BranchMap = {
   policy: "auto" | "manual";
   lastSha?: string;
 };
-type Connection = { id: string; repoFullName: string };
+type Connection = {
+  id: string;
+  repoFullName: string;
+  previewsEnabled?: boolean;
+  previewServerId?: string;
+};
 export type GitConnectionPanel = { connection: Connection; branchMaps: BranchMap[] };
 type EnvOption = { id: string; name: string };
+type ServerOption = { id: string; name: string };
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : "Please try again.";
@@ -354,16 +364,121 @@ function AddMappingRow({
   );
 }
 
+/** P1-12: per-connection preview toggle + the open PR environments list. */
+function PreviewsSection({
+  orgId,
+  projectId,
+  connection,
+  servers,
+}: {
+  orgId: string;
+  projectId: string;
+  connection: Connection;
+  servers: ServerOption[];
+}) {
+  const enabled = Boolean(connection.previewsEnabled);
+  const [serverId, setServerId] = React.useState(connection.previewServerId ?? "");
+  const [previews, setPreviewList] = React.useState<CpPreviewEnvironment[] | null>(null);
+  const [pending, startTransition] = React.useTransition();
+
+  React.useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    listPreviews({ orgId, connectionId: connection.id })
+      .then((p) => !cancelled && setPreviewList(p))
+      .catch(() => !cancelled && setPreviewList([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, orgId, connection.id]);
+
+  function toggle(next: boolean) {
+    if (next && !serverId) {
+      toast.error("Pick the server preview environments deploy to first.");
+      return;
+    }
+    startTransition(async () => {
+      try {
+        await setPreviews({
+          orgId,
+          projectId,
+          connectionId: connection.id,
+          enabled: next,
+          serverId: next ? serverId : undefined,
+        });
+        toast.success(next ? "Previews enabled" : "Previews disabled", {
+          description: next
+            ? "Every opened PR gets an ephemeral pr-<n> environment; closing tears it down."
+            : undefined,
+        });
+      } catch (err) {
+        toast.error("Couldn’t update previews", { description: errMsg(err) });
+      }
+    });
+  }
+
+  const open = (previews ?? []).filter((p) => p.status === "open");
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="inline-flex items-center gap-2 text-sm text-foreground">
+          <Switch checked={enabled} onCheckedChange={toggle} disabled={pending} />
+          Preview environments per PR
+        </label>
+        {!enabled && (
+          <Select value={serverId} onValueChange={(v) => setServerId(v ?? "")} disabled={pending}>
+            <SelectTrigger className="w-52" size="sm">
+              <SelectValue placeholder="Preview server…" />
+            </SelectTrigger>
+            <SelectContent>
+              {servers.map((sv) => (
+                <SelectItem key={sv.id} value={sv.id}>
+                  {sv.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+      </div>
+      {enabled && (
+        <div className="pt-2">
+          {open.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No open preview environments — open a pull request to spawn one.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {open.map((p) => (
+                <li key={p.id} className="flex items-center gap-2 text-sm">
+                  <GitBranch className="size-3.5 text-muted-foreground" />
+                  <span className="font-medium">pr-{p.prNumber}</span>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {p.branch}
+                    {p.sha ? ` @ ${p.sha.slice(0, 7)}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ConnectionCard({
   orgId,
   projectId,
   panel,
   environments,
+  servers,
 }: {
   orgId: string;
   projectId: string;
   panel: GitConnectionPanel;
   environments: EnvOption[];
+  servers: ServerOption[];
 }) {
   const [pending, startTransition] = React.useTransition();
   const envName = (id: string) => environments.find((e) => e.id === id)?.name ?? id;
@@ -492,6 +607,12 @@ function ConnectionCard({
           connectionId={panel.connection.id}
           environments={environments}
         />
+        <PreviewsSection
+          orgId={orgId}
+          projectId={projectId}
+          connection={panel.connection}
+          servers={servers}
+        />
       </div>
     </div>
   );
@@ -502,11 +623,13 @@ export function ProjectGitPanel({
   projectId,
   connections,
   environments,
+  servers = [],
 }: {
   orgId: string;
   projectId: string;
   connections: GitConnectionPanel[];
   environments: EnvOption[];
+  servers?: ServerOption[];
 }) {
   return (
     <Card>
@@ -536,6 +659,7 @@ export function ProjectGitPanel({
               projectId={projectId}
               panel={panel}
               environments={environments}
+              servers={servers}
             />
           ))
         )}

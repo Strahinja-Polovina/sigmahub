@@ -847,7 +847,43 @@ export type CpGitConnection = {
   repoFullName: string;
   createdBy: string;
   createdAt: string;
+  previewsEnabled: boolean;
+  previewServerId?: string;
 };
+
+// Previews (P1-12): per-PR ephemeral environments.
+export type CpPreviewEnvironment = {
+  id: string;
+  connectionId: string;
+  prNumber: number;
+  environmentId: string;
+  resourceId: string | null;
+  branch: string;
+  sha: string;
+  status: string; // open | closed
+  createdAt: string;
+  closedAt: string | null;
+};
+
+export async function cpSetPreviews(
+  orgId: string,
+  connId: string,
+  input: { enabled: boolean; serverId?: string },
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}/previews`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: input.enabled, serverId: input.serverId ?? "" }),
+  }, { orgId, actor });
+}
+
+export async function cpListPreviews(orgId: string, connId: string): Promise<CpPreviewEnvironment[]> {
+  const { previews } = await cpFetch<{ previews: CpPreviewEnvironment[] }>(
+    `${org(orgId)}/git/connections/${encodeURIComponent(connId)}/previews`,
+    undefined, { orgId }
+  );
+  return previews;
+}
 
 export type CpBranchMap = {
   id: string;

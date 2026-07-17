@@ -223,6 +223,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/branch-maps/{mapId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBranchMap))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/branch-maps/{mapId}/promote", s.requireService(store.RoleProjectAdmin, s.handlePromoteBranch))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/deploy-requests", s.requireService(store.RoleDeveloper, s.handleListDeployRequests))
+	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
+	// environment list is member-visible.
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleDeveloper, s.handleListPreviews))
 
 	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
 	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);

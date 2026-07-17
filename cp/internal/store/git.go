@@ -26,6 +26,10 @@ type GitConnection struct {
 	RepoFullName   string    `json:"repoFullName"`
 	CreatedBy      string    `json:"createdBy"`
 	CreatedAt      time.Time `json:"createdAt"`
+	// Previews (P1-12): PR events spawn ephemeral environments on the
+	// designated preview server when enabled.
+	PreviewsEnabled bool   `json:"previewsEnabled"`
+	PreviewServerID string `json:"previewServerId,omitempty"`
 }
 
 // BranchMap routes pushes on one branch to one environment under a deploy policy.
@@ -76,6 +80,7 @@ type GitWebhookEvent struct {
 	SHA          string
 	Branch       string // extracted branch (push head, or PR head ref)
 	Action       string // pull_request action (opened|synchronize|closed|...)
+	PRNumber     int    // pull_request number (0 for non-PR events)
 	Deleted      bool   // push that deleted the branch — never deploys
 }
 
@@ -86,6 +91,10 @@ type WebhookOutcome struct {
 	Connection *GitConnection // nil when the repo is not connected
 	Enqueued   *DeployRequest // set when an auto-deploy was enqueued
 	PRHook     *DeployRequest // set when a pull_request routing hook was recorded
+	// Previews (P1-12): PreviewDeploy is the enqueued preview deploy request;
+	// PreviewTeardown is the server whose DSD must re-render after a close.
+	PreviewDeploy   *DeployRequest
+	PreviewTeardown *ServerRef
 }
 
 // gitTokenPurpose namespaces the provider-token wrapping key per org.
@@ -170,7 +179,7 @@ func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in Create
 // project (pass "" for all).
 func (s *Store) ListGitConnections(ctx context.Context, orgID, projectID string) ([]GitConnection, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at, previews_enabled, COALESCE(preview_server_id, '')
 		  FROM git_connections
 		 WHERE org_id = $1 AND ($2 = '' OR project_id = $2)
 		 ORDER BY created_at DESC`, orgID, projectID)
@@ -181,7 +190,7 @@ func (s *Store) ListGitConnections(ctx context.Context, orgID, projectID string)
 	out := []GitConnection{}
 	for rows.Next() {
 		var c GitConnection
-		if err := rows.Scan(&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt, &c.PreviewsEnabled, &c.PreviewServerID); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -193,9 +202,9 @@ func (s *Store) ListGitConnections(ctx context.Context, orgID, projectID string)
 func (s *Store) GetGitConnection(ctx context.Context, orgID, connID string) (GitConnection, error) {
 	var c GitConnection
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at, previews_enabled, COALESCE(preview_server_id, '')
 		  FROM git_connections WHERE org_id = $1 AND id = $2`, orgID, connID).Scan(
-		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt)
+		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt, &c.PreviewsEnabled, &c.PreviewServerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GitConnection{}, ErrNotFound
 	}
@@ -470,6 +479,31 @@ func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (Webho
 			"Git pull_request "+strings.TrimSpace(ev.Action)+" ("+ev.Branch+")", conn.RepoFullName); err != nil {
 			return WebhookOutcome{}, err
 		}
+		// Previews (P1-12): opened/synchronized PRs spawn (or redeploy) the PR's
+		// ephemeral environment; a closed PR tears it down. Same-repo PRs only —
+		// a fork's head SHA is not fetchable with the connection's credential.
+		if conn.PreviewsEnabled && ev.PRNumber > 0 {
+			switch ev.Action {
+			case "opened", "reopened", "synchronize", "ready_for_review":
+				envID, _, err := ensurePreviewTx(ctx, tx, conn, ev.PRNumber, ev.Branch, ev.SHA)
+				if err != nil {
+					return WebhookOutcome{}, err
+				}
+				pd, err := enqueueDeployTx(ctx, tx, conn.OrgID, conn.ID, envID, ev.Ref, ev.SHA, ev.Branch)
+				if err != nil {
+					return WebhookOutcome{}, err
+				}
+				out.PreviewDeploy = &pd
+			case "closed":
+				serverID, torn, err := teardownPreviewTx(ctx, tx, conn, ev.PRNumber)
+				if err != nil {
+					return WebhookOutcome{}, err
+				}
+				if torn && serverID != "" {
+					out.PreviewTeardown = &ServerRef{ServerID: serverID, OrgID: conn.OrgID}
+				}
+			}
+		}
 
 	default:
 		// Acknowledge + audit any other subscribed event; no routing.
@@ -544,10 +578,10 @@ func (s *Store) gitProviderToken(ctx context.Context, orgID, connID string) (str
 func gitConnectionByRepoTx(ctx context.Context, tx pgx.Tx, provider, repo string) (GitConnection, error) {
 	var c GitConnection
 	err := tx.QueryRow(ctx, `
-		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at
+		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at, previews_enabled, COALESCE(preview_server_id, '')
 		  FROM git_connections
 		 WHERE provider = $1 AND lower(repo_full_name) = $2`, provider, normalizeRepo(repo)).Scan(
-		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt)
+		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt, &c.PreviewsEnabled, &c.PreviewServerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GitConnection{}, ErrNotFound
 	}

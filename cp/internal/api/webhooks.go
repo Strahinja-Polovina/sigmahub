@@ -80,10 +80,14 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	case "pull_request":
 		var p struct {
 			Action      string `json:"action"`
+			Number      int    `json:"number"`
 			PullRequest struct {
 				Head struct {
-					Ref string `json:"ref"`
-					SHA string `json:"sha"`
+					Ref  string `json:"ref"`
+					SHA  string `json:"sha"`
+					Repo struct {
+						FullName string `json:"full_name"`
+					} `json:"repo"`
 				} `json:"head"`
 			} `json:"pull_request"`
 			Repository struct {
@@ -98,6 +102,13 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		ev.Branch = p.PullRequest.Head.Ref
 		ev.SHA = p.PullRequest.Head.SHA
 		ev.RepoFullName = p.Repository.FullName
+		// Previews build only same-repo PRs: a fork's head SHA is not fetchable
+		// with the connection's credential, so the PR number is withheld and the
+		// event degrades to the plain routing hook.
+		if p.PullRequest.Head.Repo.FullName == "" ||
+			strings.EqualFold(p.PullRequest.Head.Repo.FullName, p.Repository.FullName) {
+			ev.PRNumber = p.Number
+		}
 	default:
 		// Other subscribed events: still need the repo to route/audit.
 		var p struct {
@@ -116,6 +127,13 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A preview teardown removed a resource — re-render its server so the
+	// container and (pre-authorised) volume removal actually ship. Preview
+	// deploys ride the ordinary deploy-request drain.
+	if outcome.PreviewTeardown != nil && s.reconcile != nil {
+		s.reconcile.ReconcileAsync(outcome.PreviewTeardown.OrgID, outcome.PreviewTeardown.ServerID)
+	}
+
 	resp := map[string]any{"delivered": true, "event": event}
 	switch {
 	case outcome.Duplicate:
@@ -125,6 +143,11 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	case outcome.Enqueued != nil:
 		resp["status"] = "deploy enqueued"
 		resp["deployRequestId"] = outcome.Enqueued.ID
+	case outcome.PreviewDeploy != nil:
+		resp["status"] = "preview deploy enqueued"
+		resp["deployRequestId"] = outcome.PreviewDeploy.ID
+	case outcome.PreviewTeardown != nil:
+		resp["status"] = "preview torn down"
 	case outcome.PRHook != nil:
 		resp["status"] = "pr recorded"
 	default:
