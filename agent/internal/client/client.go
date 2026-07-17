@@ -230,6 +230,58 @@ func (c *Client) PostBackupResult(ctx context.Context, agentToken, runID string,
 	}, nil)
 }
 
+// TelemetrySample is one metric point shipped over the outbound channel
+// (P1-13). Labels are restricted to the agent-suppliable allowlist
+// {resource, service}; the CP adds {org, project, env, server} itself.
+type TelemetrySample struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
+	Value  float64           `json:"value"`
+	TS     int64             `json:"ts"` // unix millis
+}
+
+// TelemetryAck is the CP's ingest answer; Accepted=false carries the reason
+// (e.g. no sink configured) so the agent backs off instead of retrying hot.
+type TelemetryAck struct {
+	Accepted bool   `json:"accepted"`
+	Reason   string `json:"reason"`
+}
+
+// PostTelemetryMetrics ships one metric batch. dropped counts series the
+// agent-side cap discarded (surfaced in CP logs for cardinality forensics).
+func (c *Client) PostTelemetryMetrics(ctx context.Context, agentToken string, samples []TelemetrySample, dropped int) (TelemetryAck, error) {
+	var ack TelemetryAck
+	err := c.post(ctx, "/v1/agent/telemetry/metrics", agentToken, map[string]any{
+		"samples": samples,
+		"dropped": dropped,
+	}, &ack)
+	return ack, err
+}
+
+// TelemetryLogLine / TelemetryLogStream carry container stdout/stderr batches.
+type TelemetryLogLine struct {
+	TS   int64  `json:"ts"` // unix millis
+	Text string `json:"text"`
+}
+
+type TelemetryLogStream struct {
+	ResourceID string             `json:"resourceId"`
+	Service    string             `json:"service,omitempty"`
+	Stream     string             `json:"stream"`
+	Lines      []TelemetryLogLine `json:"lines"`
+}
+
+// PostTelemetryLogs ships one log batch. dropped counts lines the bounded
+// agent buffer discarded under backpressure.
+func (c *Client) PostTelemetryLogs(ctx context.Context, agentToken string, streams []TelemetryLogStream, dropped int) (TelemetryAck, error) {
+	var ack TelemetryAck
+	err := c.post(ctx, "/v1/agent/telemetry/logs", agentToken, map[string]any{
+		"streams": streams,
+		"dropped": dropped,
+	}, &ack)
+	return ack, err
+}
+
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, bearer, body, out)
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/telemetry"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
@@ -218,6 +219,22 @@ func run() error {
 	// Actual-state reconcile: converge managed containers every 30s (well under
 	// the 60s drift-repair SLO); survives control-plane outages.
 	go driver.RunReconcile(ctx, 30*time.Second)
+
+	// Telemetry shipper (P1-13): host + per-container metrics every 15s and
+	// container stdout/stderr tails, over the outbound authenticated channel.
+	// Label allowlist + series cap enforced pre-egress; with no sink configured
+	// the CP acks-and-drops and the shipper backs off.
+	shipper := telemetry.New(
+		docker,
+		func(ctx context.Context, samples []client.TelemetrySample, dropped int) (client.TelemetryAck, error) {
+			return c.PostTelemetryMetrics(ctx, st.AgentToken, samples, dropped)
+		},
+		func(ctx context.Context, streams []client.TelemetryLogStream, dropped int) (client.TelemetryAck, error) {
+			return c.PostTelemetryLogs(ctx, st.AgentToken, streams, dropped)
+		},
+		log,
+	)
+	go shipper.Run(ctx)
 
 	// The DSD loop runs alongside the heartbeat loop, outbound-only. After each
 	// applied DSD it garbage-collects containers the document no longer describes.

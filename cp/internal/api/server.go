@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
 
 // Pinger is the slice of the store the API needs for readiness.
@@ -62,7 +63,12 @@ type Server struct {
 	devServiceToken     string
 	provisionToken      string
 	githubWebhookSecret string
-	mux                 *http.ServeMux
+	// telemetry forwards metrics/logs to VictoriaMetrics/Loki and proxies
+	// tenant-isolated queries (P1-13); tel is its store slice. Nil in handler
+	// unit tests → telemetry endpoints answer "not configured".
+	telemetry *telemetry.Forwarder
+	tel       TelemetryAPI
+	mux       *http.ServeMux
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -84,6 +90,10 @@ type Options struct {
 	DSDWaiter           DSDWaiter
 	Reconcile           ReconcileTrigger
 	DSDPublicKey        ed25519.PublicKey
+	// Telemetry is the P1-13 forwarder (nil disables the pipeline endpoints);
+	// TelemetryStore is its store slice.
+	Telemetry      *telemetry.Forwarder
+	TelemetryStore TelemetryAPI
 }
 
 // New builds the HTTP surface.
@@ -99,6 +109,8 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		devServiceToken:     opts.DevServiceToken,
 		provisionToken:      opts.ProvisionToken,
 		githubWebhookSecret: opts.GitHubWebhookSecret,
+		telemetry:           opts.Telemetry,
+		tel:                 opts.TelemetryStore,
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()
@@ -194,6 +206,12 @@ func (s *Server) routes() {
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
 
+	// Telemetry (P1-13): tenant-isolated PromQL/LogQL proxies for the embedded
+	// dashboards + the M1 beta-metrics feed. All member-visible reads.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/metrics/query", s.requireService(store.RoleDeveloper, s.handleMetricsQuery))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/logs/query", s.requireService(store.RoleDeveloper, s.handleLogsQuery))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/beta-metrics", s.requireService(store.RoleDeveloper, s.handleBetaMetrics))
+
 	// Git integration (P1-7). Detection is a read-only preview (Developer+);
 	// connecting a repo and editing branch routes/policies are Project Admin+.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/detect", s.requireService(store.RoleDeveloper, s.handleGitDetect))
@@ -228,6 +246,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
 	s.mux.HandleFunc("GET /v1/agent/backup-credential", s.requireAgent(s.handleAgentBackupCredential))
 	s.mux.HandleFunc("POST /v1/agent/backup-status", s.requireAgent(s.handleAgentBackupStatus))
+	s.mux.HandleFunc("POST /v1/agent/telemetry/metrics", s.requireAgent(s.handleAgentTelemetryMetrics))
+	s.mux.HandleFunc("POST /v1/agent/telemetry/logs", s.requireAgent(s.handleAgentTelemetryLogs))
 }
 
 func (s *Server) Handler() http.Handler {

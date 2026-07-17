@@ -23,6 +23,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
@@ -206,6 +207,28 @@ func run() error {
 		Retention:  24 * time.Hour,
 	})
 
+	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates
+	// (the A-4 metering hook Phase 2 billing reads).
+	tel := telemetry.New(telemetry.Config{
+		VMWriteURL: cfg.VMWriteURL,
+		VMReadURL:  cfg.VMReadURL,
+		LokiURL:    cfg.LokiURL,
+	})
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
+					log.Error("usage sweep", "err", err)
+				}
+			}
+		}
+	}()
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: api.New(log, st, st, st, api.Options{
@@ -218,6 +241,8 @@ func run() error {
 			DSDWaiter:           rec,
 			Reconcile:           rec,
 			DSDPublicKey:        dsdKey.Public().(ed25519.PublicKey),
+			Telemetry:           tel,
+			TelemetryStore:      st,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

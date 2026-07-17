@@ -725,6 +725,128 @@ type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
+// ContainerStatsOnce reads one non-streaming stats sample and returns the
+// container's CPU utilisation (percent of one core, like `docker stats`) and
+// memory usage in bytes. Used by the P1-13 telemetry collector.
+func (d *DockerClient) ContainerStatsOnce(ctx context.Context, id string) (cpuPct float64, memBytes int64, err error) {
+	var st struct {
+		CPUStats struct {
+			CPUUsage struct {
+				TotalUsage uint64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+			SystemUsage uint64 `json:"system_cpu_usage"`
+			OnlineCPUs  int    `json:"online_cpus"`
+		} `json:"cpu_stats"`
+		PreCPUStats struct {
+			CPUUsage struct {
+				TotalUsage uint64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+			SystemUsage uint64 `json:"system_cpu_usage"`
+		} `json:"precpu_stats"`
+		MemoryStats struct {
+			Usage uint64 `json:"usage"`
+			Stats struct {
+				InactiveFile uint64 `json:"inactive_file"`
+			} `json:"stats"`
+		} `json:"memory_stats"`
+	}
+	if err := d.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/stats?stream=false", nil, &st); err != nil {
+		return 0, 0, err
+	}
+	cpuDelta := float64(st.CPUStats.CPUUsage.TotalUsage) - float64(st.PreCPUStats.CPUUsage.TotalUsage)
+	sysDelta := float64(st.CPUStats.SystemUsage) - float64(st.PreCPUStats.SystemUsage)
+	cpus := st.CPUStats.OnlineCPUs
+	if cpus <= 0 {
+		cpus = 1
+	}
+	if cpuDelta > 0 && sysDelta > 0 {
+		cpuPct = cpuDelta / sysDelta * float64(cpus) * 100.0
+	}
+	// Match docker stats: usage minus the reclaimable page cache.
+	mem := st.MemoryStats.Usage
+	if st.MemoryStats.Stats.InactiveFile < mem {
+		mem -= st.MemoryStats.Stats.InactiveFile
+	}
+	return cpuPct, int64(mem), nil
+}
+
+// FollowContainerLogs tails a container's stdout/stderr from `since`, invoking
+// fn per line with the Docker-stamped timestamp. Blocks until ctx is done, the
+// container stops, or the stream errors. Used by the P1-13 log shipper.
+func (d *DockerClient) FollowContainerLogs(ctx context.Context, id string, since time.Time, fn func(stream string, ts time.Time, line string)) error {
+	q := url.Values{}
+	q.Set("follow", "true")
+	q.Set("stdout", "true")
+	q.Set("stderr", "true")
+	q.Set("timestamps", "true")
+	q.Set("since", fmt.Sprintf("%d", since.Unix()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url("/containers/"+url.PathEscape(id)+"/logs?"+q.Encode()), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+	stdout := &logLineSplitter{stream: "stdout", fn: fn}
+	stderr := &logLineSplitter{stream: "stderr", fn: fn}
+	err = demuxDockerStream(resp.Body, stdout, stderr)
+	stdout.flush()
+	stderr.flush()
+	return err
+}
+
+// logLineSplitter splits a demuxed log stream into timestamped lines. Docker
+// prefixes each line with an RFC3339Nano timestamp when timestamps=true.
+type logLineSplitter struct {
+	stream string
+	fn     func(stream string, ts time.Time, line string)
+	buf    []byte
+}
+
+func (l *logLineSplitter) Write(p []byte) (int, error) {
+	l.buf = append(l.buf, p...)
+	for {
+		i := bytes.IndexByte(l.buf, '\n')
+		if i < 0 {
+			break
+		}
+		l.emit(string(l.buf[:i]))
+		l.buf = l.buf[i+1:]
+	}
+	// Backstop: an absurdly long line without a newline is emitted in chunks
+	// rather than growing the buffer without bound.
+	if len(l.buf) > 64*1024 {
+		l.emit(string(l.buf))
+		l.buf = nil
+	}
+	return len(p), nil
+}
+
+func (l *logLineSplitter) flush() {
+	if len(l.buf) > 0 {
+		l.emit(string(l.buf))
+		l.buf = nil
+	}
+}
+
+func (l *logLineSplitter) emit(raw string) {
+	ts := time.Now()
+	line := raw
+	if sp := strings.IndexByte(raw, ' '); sp > 0 {
+		if parsed, err := time.Parse(time.RFC3339Nano, raw[:sp]); err == nil {
+			ts = parsed
+			line = raw[sp+1:]
+		}
+	}
+	l.fn(l.stream, ts, line)
+}
+
 // PutArchive extracts a tar stream into a container at path. Content lands on
 // the container's writable layer — callers must only ship non-secret payloads
 // (P1-11 uses it to place dumps into throwaway verify/restore containers that

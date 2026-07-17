@@ -10,11 +10,14 @@ import {
   cpGetDatabase,
   cpListBackupTargets,
   cpListBackupRuns,
+  cpQueryResourceMetrics,
+  cpQueryLogs,
   cpKind,
   type CpDatabaseInfo,
   type CpBackupTarget,
   type CpBackupRun,
 } from "@/server/cp";
+import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -90,6 +93,25 @@ async function loadDatabase(
   }
 }
 
+/** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
+ *  the explicit not-configured state — CP mode never shows synthetic data. */
+async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
+  if (!cpEnabled()) return null;
+  try {
+    const [metrics, logs] = await Promise.all([
+      cpQueryResourceMetrics(orgId, resourceId),
+      cpQueryLogs(orgId, { resourceId, limit: 200 }),
+    ]);
+    return {
+      pipeline: metrics !== null || logs !== null,
+      metrics: metrics ?? [],
+      logs: logs ?? [],
+    };
+  } catch {
+    return { pipeline: true, metrics: [], logs: [] };
+  }
+}
+
 /** Load a database's backup targets + run history (P1-11, CP mode only). */
 async function loadBackups(
   orgId: string,
@@ -137,6 +159,7 @@ export default async function ResourceDetailPage({
   );
   const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null);
+  const telemetry = await loadTelemetry(orgId, resourceId);
 
   return (
     <ResourceDetail
@@ -151,6 +174,7 @@ export default async function ResourceDetailPage({
       backupTargets={backups.targets}
       backupRuns={backups.runs}
       environmentId={detail.resource.environmentId}
+      cpTelemetry={telemetry}
     />
   );
 }

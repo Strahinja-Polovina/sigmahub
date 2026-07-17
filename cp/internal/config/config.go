@@ -39,6 +39,13 @@ type Config struct {
 	// Defaults to all four engines; "postgres" alone is the pre-agreed M6
 	// fallback build — a configuration cut, not a rewrite.
 	DBEngines []string
+	// Telemetry sinks (P1-13). VMWriteURL/VMReadURL point at the
+	// VictoriaMetrics cluster's vminsert/vmselect; LokiURL at Loki. Empty
+	// disables that half of the pipeline — ingest is acknowledged-and-dropped
+	// with a reason and the dashboards show an explicit not-configured state.
+	VMWriteURL string
+	VMReadURL  string
+	LokiURL    string
 }
 
 func FromEnv() (Config, error) {
@@ -51,6 +58,9 @@ func FromEnv() (Config, error) {
 		GitHubWebhookSecret: os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
 		ACMEEmail:           os.Getenv("CP_ACME_EMAIL"),
 		ACMECADirURL:        os.Getenv("CP_ACME_CA_DIR_URL"),
+		VMWriteURL:          os.Getenv("CP_VM_WRITE_URL"),
+		VMReadURL:           os.Getenv("CP_VM_READ_URL"),
+		LokiURL:             os.Getenv("CP_LOKI_URL"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
