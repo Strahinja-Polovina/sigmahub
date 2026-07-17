@@ -364,6 +364,11 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	if allowed == nil {
 		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown resource kind %q", in.Kind)}
 	}
+	// P1-10 engine gate: the Postgres-only fallback build disables engines by
+	// configuration, so creation must fail loudly rather than provision nothing.
+	if IsDBKind(in.Kind) && !s.dbEngineEnabled(in.Kind) {
+		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("database engine %q is not enabled on this control plane", in.Kind)}
+	}
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -372,9 +377,10 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var projectID, envName string
+	var envProduction bool
 	if err := tx.QueryRow(ctx,
-		`SELECT project_id, name FROM environments WHERE org_id = $1 AND id = $2`,
-		orgID, in.EnvironmentID).Scan(&projectID, &envName); errors.Is(err, pgx.ErrNoRows) {
+		`SELECT project_id, name, production FROM environments WHERE org_id = $1 AND id = $2`,
+		orgID, in.EnvironmentID).Scan(&projectID, &envName, &envProduction); errors.Is(err, pgx.ErrNoRows) {
 		return Resource{}, ErrNotFound
 	} else if err != nil {
 		return Resource{}, err
@@ -425,6 +431,14 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 	if err != nil {
 		return Resource{}, fmt.Errorf("insert resource: %w", err)
+	}
+	// P1-10: a database resource is provisioned in the same transaction —
+	// generated credentials (envelope-encrypted), mesh port allocation and the
+	// default backup-policy row — so it can never exist half-provisioned.
+	if IsDBKind(in.Kind) {
+		if err := s.provisionDatabaseTx(ctx, tx, orgID, r, envProduction); err != nil {
+			return Resource{}, err
+		}
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Resource created", in.Name+" ("+in.Kind+")"); err != nil {
 		return Resource{}, err

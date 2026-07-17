@@ -4,7 +4,12 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
+
+// knownDBEngines validates CP_DB_ENGINES entries; a typo must fail boot, not
+// silently disable an engine.
+var knownDBEngines = map[string]bool{"postgres": true, "mysql": true, "redis": true, "mongodb": true}
 
 type Config struct {
 	// Addr is the HTTP listen address, e.g. ":8080".
@@ -30,6 +35,17 @@ type Config struct {
 	// LE-staging URL for e2e; empty means Let's Encrypt production.
 	ACMEEmail    string
 	ACMECADirURL string
+	// DBEngines is the P1-10 engine allowlist (CP_DB_ENGINES, comma-separated).
+	// Defaults to all four engines; "postgres" alone is the pre-agreed M6
+	// fallback build — a configuration cut, not a rewrite.
+	DBEngines []string
+	// Telemetry sinks (P1-13). VMWriteURL/VMReadURL point at the
+	// VictoriaMetrics cluster's vminsert/vmselect; LokiURL at Loki. Empty
+	// disables that half of the pipeline — ingest is acknowledged-and-dropped
+	// with a reason and the dashboards show an explicit not-configured state.
+	VMWriteURL string
+	VMReadURL  string
+	LokiURL    string
 }
 
 func FromEnv() (Config, error) {
@@ -42,6 +58,9 @@ func FromEnv() (Config, error) {
 		GitHubWebhookSecret: os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
 		ACMEEmail:           os.Getenv("CP_ACME_EMAIL"),
 		ACMECADirURL:        os.Getenv("CP_ACME_CA_DIR_URL"),
+		VMWriteURL:          os.Getenv("CP_VM_WRITE_URL"),
+		VMReadURL:           os.Getenv("CP_VM_READ_URL"),
+		LokiURL:             os.Getenv("CP_LOKI_URL"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
@@ -63,6 +82,21 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.Env == "dev" && cfg.ProvisionToken == "" {
 		cfg.ProvisionToken = "dev-provision-token"
+	}
+	// P1-10 engine allowlist. Empty = all engines enabled.
+	raw := getenv("CP_DB_ENGINES", "postgres,mysql,redis,mongodb")
+	for _, e := range strings.Split(raw, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !knownDBEngines[e] {
+			return Config{}, fmt.Errorf("CP_DB_ENGINES: unknown engine %q (known: postgres, mysql, redis, mongodb)", e)
+		}
+		cfg.DBEngines = append(cfg.DBEngines, e)
+	}
+	if len(cfg.DBEngines) == 0 {
+		return Config{}, fmt.Errorf("CP_DB_ENGINES must enable at least one engine")
 	}
 	return cfg, nil
 }

@@ -53,6 +53,12 @@ func (f *fakeGit) PromoteBranch(context.Context, string, string, string) (store.
 func (f *fakeGit) ListDeployRequests(context.Context, string, int) ([]store.DeployRequest, error) {
 	return []store.DeployRequest{}, nil
 }
+func (f *fakeGit) SetConnectionPreviews(context.Context, string, string, bool, string, string) error {
+	return nil
+}
+func (f *fakeGit) ListPreviewEnvironments(context.Context, string, string) ([]store.PreviewEnvironment, error) {
+	return []store.PreviewEnvironment{}, nil
+}
 
 // fakeInspector returns a scripted detection.
 type fakeInspector struct {

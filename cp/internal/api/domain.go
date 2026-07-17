@@ -54,6 +54,19 @@ type DomainAPI interface {
 	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
 	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
+	// Database resources (P1-10). Info is the Developer-visible metadata;
+	// Reveal decrypts credentials (Project Admin+, audited in the store).
+	GetDatabaseInfo(ctx context.Context, orgID, resourceID string) (store.DatabaseInfo, error)
+	RevealDatabaseConnection(ctx context.Context, orgID, resourceID, actor string) (store.DatabaseConnection, error)
+	// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
+	// the per-day verify feed and the fire-drill restore.
+	CreateBackupTarget(ctx context.Context, orgID, actor string, in store.CreateBackupTargetInput) (store.BackupTarget, error)
+	ListBackupTargets(ctx context.Context, orgID string) ([]store.BackupTarget, error)
+	DeleteBackupTarget(ctx context.Context, orgID, targetID, actor string) error
+	UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor string, in store.UpdateBackupPolicyInput) (store.BackupPolicy, error)
+	ListBackupRuns(ctx context.Context, orgID, resourceID string, limit int) ([]store.BackupRun, error)
+	VerifyDays(ctx context.Context, orgID string, days int) ([]store.VerifyDay, error)
+	CreateRestoreRun(ctx context.Context, orgID, sourceResourceID, newResourceID, actor string) (store.BackupRun, error)
 	// Custom domains (P1-8). Attach/Detach return the host server id so the
 	// handler can re-render its DSD.
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)

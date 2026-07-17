@@ -98,11 +98,14 @@ type ImageSpec struct {
 }
 
 // PortMapping publishes a container port on the host. Host 0 means "do not
-// publish" (the port is only reachable on the project network).
+// publish" (the port is only reachable on the project network). HostIP, when
+// set, restricts the published port to that one host address — P1-10 databases
+// bind to the server's mesh IP so the engine is never publicly reachable.
 type PortMapping struct {
 	Container int    `json:"container"`
 	Host      int    `json:"host,omitempty"`
 	Protocol  string `json:"protocol,omitempty"` // tcp (default) | udp
+	HostIP    string `json:"hostIp,omitempty"`
 }
 
 // VolumeMount attaches a named volume. Host-path binds are intentionally not

@@ -12,7 +12,12 @@ async function loadGitConnections(orgId: string, projectId: string): Promise<Git
   try {
     const rows = await cpListGitConnectionsWithMaps(orgId, projectId);
     return rows.map((r: { connection: CpGitConnection; branchMaps: CpBranchMap[] }) => ({
-      connection: { id: r.connection.id, repoFullName: r.connection.repoFullName },
+      connection: {
+        id: r.connection.id,
+        repoFullName: r.connection.repoFullName,
+        previewsEnabled: r.connection.previewsEnabled,
+        previewServerId: r.connection.previewServerId,
+      },
       branchMaps: r.branchMaps.map((m) => ({
         id: m.id,
         branch: m.branch,

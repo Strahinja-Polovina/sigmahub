@@ -62,6 +62,23 @@ import { EnvVarsTable } from "./env-vars-table";
 import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
+import { DatabasePanel } from "./database-panel";
+import { DatabaseBackupsPanel } from "./database-backups-panel";
+import type {
+  CpDatabaseInfo,
+  CpBackupTarget,
+  CpBackupRun,
+  CpTelemetryPoint,
+  CpLogLine,
+} from "@/server/cp";
+
+/** CP-mode telemetry payload. `pipeline` false = VictoriaMetrics/Loki are not
+ *  configured — the UI shows an explicit state, never fabricated series. */
+export type CpTelemetry = {
+  pipeline: boolean;
+  metrics: CpTelemetryPoint[];
+  logs: CpLogLine[];
+};
 
 type Deployment = {
   id: string;
@@ -193,6 +210,11 @@ export function ResourceDetail({
   cpDeployments,
   rollbackTargetIds = [],
   deploymentsEnabled = false,
+  database = null,
+  backupTargets = [],
+  backupRuns = [],
+  environmentId = "",
+  cpTelemetry = null,
 }: {
   detail: Detail;
   orgId?: string;
@@ -207,14 +229,47 @@ export function ResourceDetail({
   /** True when the control plane backs deployments; swaps the demo timeline for
    *  the real release history + build logs + rollback. */
   deploymentsEnabled?: boolean;
+  /** P1-10 database connection metadata (CP mode, database kinds only). */
+  database?: CpDatabaseInfo | null;
+  /** P1-11 backups (CP mode, database kinds only). */
+  backupTargets?: CpBackupTarget[];
+  backupRuns?: CpBackupRun[];
+  environmentId?: string;
+  /** P1-13 telemetry (CP mode): real pipeline data or the explicit
+   *  not-configured state. null = demo mode (labeled synthetic data). */
+  cpTelemetry?: CpTelemetry | null;
 }) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
 
-  const metrics = React.useMemo(() => getMetrics(resource.id), [resource.id]);
-  const logs = React.useMemo(() => getLogs(resource.id), [resource.id]);
+  // CP mode renders REAL pipeline telemetry (or the explicit not-configured
+  // state); only demo mode falls back to the labeled synthetic series.
+  const isCp = cpTelemetry !== null;
+  const demoMetrics = React.useMemo(
+    () => (isCp ? [] : getMetrics(resource.id)),
+    [isCp, resource.id]
+  );
+  const demoLogs = React.useMemo(
+    () => (isCp ? [] : getLogs(resource.id)),
+    [isCp, resource.id]
+  );
+  const metrics = isCp ? cpTelemetry.metrics : demoMetrics;
+  const logs = isCp ? cpTelemetry.logs : demoLogs;
+  const pipelineOff = isCp && !cpTelemetry.pipeline;
   const latest = metrics[metrics.length - 1];
+
+  const telemetryEmptyState = pipelineOff ? (
+    <p className="py-8 text-center text-sm text-muted-foreground">
+      Telemetry pipeline not configured — set CP_VM_WRITE_URL / CP_VM_READ_URL /
+      CP_LOKI_URL on the control plane to collect metrics and logs.
+    </p>
+  ) : (
+    <p className="py-8 text-center text-sm text-muted-foreground">
+      No telemetry received yet — data appears within a minute of the agent’s
+      first ship.
+    </p>
+  );
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -341,31 +396,62 @@ export function ResourceDetail({
               </CardContent>
             </Card>
 
-            <Card className="lg:col-span-2">
-              <CardHeader className="border-b">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex flex-col gap-1">
-                    <CardTitle>Resource usage</CardTitle>
-                    <CardDescription>Last 24 hours</CardDescription>
-                  </div>
-                  {latest && (
-                    <div className="flex items-center gap-4 text-sm">
-                      <span className="inline-flex items-center gap-1.5">
-                        <Cpu className="size-4 text-muted-foreground" />
-                        <span className="tabular-nums text-foreground">{latest.cpu}%</span>
-                      </span>
-                      <span className="inline-flex items-center gap-1.5">
-                        <MemoryStick className="size-4 text-muted-foreground" />
-                        <span className="tabular-nums text-foreground">{latest.mem}%</span>
-                      </span>
+            <div className="flex flex-col gap-4 lg:col-span-2">
+              {database && orgId && (
+                <DatabasePanel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  info={database}
+                  canManage={canManage}
+                />
+              )}
+              {database && orgId && (
+                <DatabaseBackupsPanel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  environmentId={environmentId}
+                  serverId={resource.serverId}
+                  resourceName={resource.name}
+                  policy={database.backupPolicy ?? null}
+                  targets={backupTargets}
+                  runs={backupRuns}
+                  canManage={canManage}
+                />
+              )}
+              <Card>
+                <CardHeader className="border-b">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex flex-col gap-1">
+                      <CardTitle>Resource usage</CardTitle>
+                      <CardDescription>Last 24 hours</CardDescription>
                     </div>
+                    {latest && (
+                      <div className="flex items-center gap-4 text-sm">
+                        <span className="inline-flex items-center gap-1.5">
+                          <Cpu className="size-4 text-muted-foreground" />
+                          <span className="tabular-nums text-foreground">{latest.cpu}%</span>
+                        </span>
+                        <span className="inline-flex items-center gap-1.5">
+                          <MemoryStick className="size-4 text-muted-foreground" />
+                          <span className="tabular-nums text-foreground">{latest.mem}%</span>
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {isCp && metrics.length === 0 ? (
+                    telemetryEmptyState
+                  ) : (
+                    <MetricsChart
+                      data={metrics}
+                      keys={isCp ? ["cpu", "mem"] : ["cpu", "mem", "net"]}
+                      className="aspect-[16/7] w-full"
+                    />
                   )}
-                </div>
-              </CardHeader>
-              <CardContent>
-                <MetricsChart data={metrics} className="aspect-[16/7] w-full" />
-              </CardContent>
-            </Card>
+                </CardContent>
+              </Card>
+            </div>
           </div>
         </TabsContent>
 
@@ -384,7 +470,7 @@ export function ResourceDetail({
               </div>
             </CardHeader>
             <CardContent>
-              <LogsViewer logs={logs} />
+              {isCp && logs.length === 0 ? telemetryEmptyState : <LogsViewer logs={logs} />}
             </CardContent>
           </Card>
         </TabsContent>
@@ -394,21 +480,29 @@ export function ResourceDetail({
             <Card>
               <CardHeader className="border-b">
                 <CardTitle>CPU &amp; Memory</CardTitle>
-                <CardDescription>Utilization %, last 24 hours</CardDescription>
+                <CardDescription>
+                  {isCp ? "CPU % and memory MiB, last 24 hours" : "Utilization %, last 24 hours"}
+                </CardDescription>
               </CardHeader>
               <CardContent>
-                <MetricsChart data={metrics} keys={["cpu", "mem"]} className="aspect-[16/6] w-full" />
+                {isCp && metrics.length === 0 ? (
+                  telemetryEmptyState
+                ) : (
+                  <MetricsChart data={metrics} keys={["cpu", "mem"]} className="aspect-[16/6] w-full" />
+                )}
               </CardContent>
             </Card>
-            <Card>
-              <CardHeader className="border-b">
-                <CardTitle>Network</CardTitle>
-                <CardDescription>Throughput Mb/s, last 24 hours</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <MetricsChart data={metrics} keys={["net"]} className="aspect-[16/6] w-full" />
-              </CardContent>
-            </Card>
+            {!isCp && (
+              <Card>
+                <CardHeader className="border-b">
+                  <CardTitle>Network</CardTitle>
+                  <CardDescription>Throughput Mb/s, last 24 hours</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <MetricsChart data={metrics} keys={["net"]} className="aspect-[16/6] w-full" />
+                </CardContent>
+              </Card>
+            )}
           </div>
         </TabsContent>
 

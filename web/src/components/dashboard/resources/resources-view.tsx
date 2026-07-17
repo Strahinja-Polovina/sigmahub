@@ -95,10 +95,14 @@ export function ResourcesView({
   orgName,
   resources,
   targets,
+  cpMode = false,
+  orgId = "",
 }: {
   orgName: string;
   resources: ResourceItem[];
   targets: DeployTarget[];
+  cpMode?: boolean;
+  orgId?: string;
 }) {
   const [wizardOpen, setWizardOpen] = React.useState(false);
   const [kindFilter, setKindFilter] = React.useState<string>(ALL);
@@ -252,7 +256,7 @@ export function ResourcesView({
         </CardContent>
       </Card>
 
-      <DeployWizard open={wizardOpen} onOpenChange={setWizardOpen} targets={targets} />
+      <DeployWizard open={wizardOpen} onOpenChange={setWizardOpen} targets={targets} cpMode={cpMode} orgId={orgId} />
     </div>
   );
 }

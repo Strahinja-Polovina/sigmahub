@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   web:
-    name: web (lint · typecheck · build)
+    name: web (lint · typecheck · test · build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -33,6 +33,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm exec tsc --noEmit
+      - run: pnpm test
       - run: pnpm build
 
   cp:

@@ -330,7 +330,13 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 		key := fmt.Sprintf("%d/%s", p.Container, proto)
 		exposed[key] = map[string]any{}
 		if p.Host > 0 {
-			portBindings[key] = []map[string]string{{"HostPort": fmt.Sprintf("%d", p.Host)}}
+			binding := map[string]string{"HostPort": fmt.Sprintf("%d", p.Host)}
+			// A HostIP-restricted binding (P1-10 mesh-only databases) publishes on
+			// exactly that address; without it Docker binds 0.0.0.0.
+			if p.HostIP != "" {
+				binding["HostIp"] = p.HostIP
+			}
+			portBindings[key] = []map[string]string{binding}
 		}
 	}
 

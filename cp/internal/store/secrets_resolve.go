@@ -132,6 +132,15 @@ func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, 
 		out = append(out, ResolvedSecret{Name: r.name, Value: string(plaintext), EnvVar: r.envVar})
 	}
 
+	// P1-10: a database resource's generated credentials ride the same audited
+	// resolve channel, appended LAST so the engine env names always win over a
+	// same-named user secret in the agent's by-name merge.
+	dbSecrets, err := s.resolveDBSecretsTx(ctx, tx, orgID, serverID, resourceID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, dbSecrets...)
+
 	if len(out) > 0 {
 		if err := auditTx(ctx, tx, orgID, actor, "Secrets fetched (agent)", resourceID); err != nil {
 			return nil, err

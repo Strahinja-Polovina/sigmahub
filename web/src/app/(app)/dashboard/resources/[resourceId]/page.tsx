@@ -2,7 +2,22 @@ import { notFound, redirect } from "next/navigation";
 import { getActiveOrgId, requireMembership } from "@/server/active-org";
 import { getResourceDetail } from "@/server/queries";
 import { effectiveSecrets } from "@/server/secrets-data";
-import { cpEnabled, cpListDomains, cpListDeployments, cpRollbackTargets } from "@/server/cp";
+import {
+  cpEnabled,
+  cpListDomains,
+  cpListDeployments,
+  cpRollbackTargets,
+  cpGetDatabase,
+  cpListBackupTargets,
+  cpListBackupRuns,
+  cpQueryResourceMetrics,
+  cpQueryLogs,
+  cpKind,
+  type CpDatabaseInfo,
+  type CpBackupTarget,
+  type CpBackupRun,
+} from "@/server/cp";
+import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -61,6 +76,60 @@ async function loadDeployments(
   }
 }
 
+const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongo", "mongodb"]);
+
+/** Load a database resource's connection metadata (P1-10, CP mode only). A CP
+ *  failure degrades to null rather than breaking the page. */
+async function loadDatabase(
+  orgId: string,
+  resourceId: string,
+  kind: string
+): Promise<CpDatabaseInfo | null> {
+  if (!cpEnabled() || !DB_KINDS.has(cpKind(kind))) return null;
+  try {
+    return await cpGetDatabase(orgId, resourceId);
+  } catch {
+    return null;
+  }
+}
+
+/** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
+ *  the explicit not-configured state — CP mode never shows synthetic data. */
+async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
+  if (!cpEnabled()) return null;
+  try {
+    const [metrics, logs] = await Promise.all([
+      cpQueryResourceMetrics(orgId, resourceId),
+      cpQueryLogs(orgId, { resourceId, limit: 200 }),
+    ]);
+    return {
+      pipeline: metrics !== null || logs !== null,
+      metrics: metrics ?? [],
+      logs: logs ?? [],
+    };
+  } catch {
+    return { pipeline: true, metrics: [], logs: [] };
+  }
+}
+
+/** Load a database's backup targets + run history (P1-11, CP mode only). */
+async function loadBackups(
+  orgId: string,
+  resourceId: string,
+  isDatabase: boolean
+): Promise<{ targets: CpBackupTarget[]; runs: CpBackupRun[] }> {
+  if (!isDatabase) return { targets: [], runs: [] };
+  try {
+    const [targets, runs] = await Promise.all([
+      cpListBackupTargets(orgId),
+      cpListBackupRuns(orgId, resourceId),
+    ]);
+    return { targets, runs };
+  } catch {
+    return { targets: [], runs: [] };
+  }
+}
+
 export default async function ResourceDetailPage({
   params,
 }: {
@@ -88,6 +157,9 @@ export default async function ResourceDetailPage({
     resourceId,
     detail.resource.kind
   );
+  const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
+  const backups = await loadBackups(orgId, resourceId, database !== null);
+  const telemetry = await loadTelemetry(orgId, resourceId);
 
   return (
     <ResourceDetail
@@ -98,6 +170,11 @@ export default async function ResourceDetailPage({
       cpDeployments={deployments}
       rollbackTargetIds={rollbackTargetIds}
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
+      database={database}
+      backupTargets={backups.targets}
+      backupRuns={backups.runs}
+      environmentId={detail.resource.environmentId}
+      cpTelemetry={telemetry}
     />
   );
 }

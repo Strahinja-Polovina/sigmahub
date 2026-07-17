@@ -9,7 +9,16 @@ import { db, authSchema } from "../server/db";
 export const auth = betterAuth({
   appName: "SigmaHub",
   database: drizzleAdapter(db, { provider: "pg", schema: authSchema }),
-  emailAndPassword: { enabled: true },
+  emailAndPassword: {
+    enabled: true,
+    // Reset emails: no SMTP is bundled, so the reset link goes to the server
+    // log — genuinely usable in dev/self-hosted setups (the operator can
+    // relay it), and honest about what happens instead of silently dropping.
+    // Wire a real transport here for hosted deployments.
+    sendResetPassword: async ({ user, url }) => {
+      console.info(`[auth] password reset requested for ${user.email}: ${url}`);
+    },
+  },
   plugins: [twoFactor()],
 });
 

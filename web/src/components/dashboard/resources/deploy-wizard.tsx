@@ -43,13 +43,15 @@ import { cn } from "@/lib/utils";
 import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import { createResource } from "@/server/actions/resources";
+import { createSecretAction } from "@/server/actions/secrets";
+import { detectRepo } from "@/server/actions/git";
 import {
   KIND_LABELS,
   SERVER_TYPE_LABELS,
   type DeployTarget,
 } from "./resource-meta";
 
-// ---- Mock Git surface -------------------------------------------------------
+// ---- Demo-mode Git surface (CP mode uses real detection below) --------------
 
 type Repo = {
   fullName: string;
@@ -134,15 +136,27 @@ export function DeployWizard({
   open,
   onOpenChange,
   targets,
+  cpMode = false,
+  orgId = "",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   targets: DeployTarget[];
+  /** CP mode replaces the demo repo picker with real repo detection and the
+   *  timed deploy animation with the actual (single) create call. */
+  cpMode?: boolean;
+  orgId?: string;
 }) {
   const router = useRouter();
   const [step, setStep] = React.useState(1);
   const [repoQuery, setRepoQuery] = React.useState("");
   const [repo, setRepo] = React.useState<Repo | null>(null);
+  // CP mode: real repo detection state.
+  const [detecting, setDetecting] = React.useState(false);
+  // CP mode: honest create outcome for step 5 (no simulated pipeline).
+  const [createState, setCreateState] = React.useState<"idle" | "creating" | "done" | "error">("idle");
+  const [createdId, setCreatedId] = React.useState<string | null>(null);
+  const createStartedRef = React.useRef(false);
   const [projectId, setProjectId] = React.useState<string>("");
   const [environmentId, setEnvironmentId] = React.useState<string>("");
   const [serverId, setServerId] = React.useState<string>("");
@@ -219,6 +233,9 @@ export function DeployWizard({
       setStep(1);
       setRepoQuery("");
       setRepo(null);
+      setDetecting(false);
+      setCreateState("idle");
+      setCreatedId(null);
       setProjectId("");
       setEnvironmentId("");
       setServerId("");
@@ -231,11 +248,96 @@ export function DeployWizard({
     }
   }
 
-  // Drive the mock deploy animation once step 5 is reached. `deploying`/phase
-  // are primed by next() on the transition into step 5, so this effect only
-  // owns the timer — its setState calls all run inside async callbacks.
+  // CP mode: real repo detection for step 1 (the CP inspects the repo's
+  // Dockerfile/compose over the provider API; no mock list).
+  function runDetect() {
+    const fullName = repoQuery.trim();
+    if (!fullName.includes("/")) {
+      toast.error("Enter the repository as owner/name.");
+      return;
+    }
+    setDetecting(true);
+    setRepo(null);
+    detectRepo({ orgId, repoFullName: fullName })
+      .then((d) => {
+        if (!d.deployable) {
+          toast.error("Repository is not deployable", {
+            description: d.reason ?? "No Dockerfile or compose file detected.",
+          });
+          return;
+        }
+        setRepo({
+          fullName,
+          description: d.hasCompose ? `compose: ${d.composePath ?? "docker-compose.yml"}` : `dockerfile: ${d.dockerfilePath ?? "Dockerfile"}`,
+          private: false,
+          defaultBranch: "main",
+          detectedKind: "app",
+          build: d.hasCompose ? "docker-compose.yml" : "Dockerfile",
+          buildDetail: d.ports.length ? `ports ${d.ports.join(", ")}` : "no ports detected",
+          port: d.ports[0] ?? 0,
+        });
+      })
+      .catch((err) => {
+        toast.error("Detection failed", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      })
+      .finally(() => setDetecting(false));
+  }
+
+  // Step 5. CP mode: ONE honest create call — the resource lands as
+  // `provisioning` and the real pipeline (P1-9) drives it from the git panel;
+  // nothing is animated or fabricated. Demo mode keeps the simulated pipeline.
+  // Re-arm the one-shot create guard on every dialog open (refs are mutated
+  // only inside effects, per the hooks rules).
+  React.useEffect(() => {
+    if (open) createStartedRef.current = false;
+  }, [open]);
+
   React.useEffect(() => {
     if (step !== 5) return;
+    if (cpMode) {
+      if (createStartedRef.current) return;
+      createStartedRef.current = true;
+      (async () => {
+        try {
+          const { id } = await createResource({
+            projectId,
+            environmentId,
+            serverId,
+            name: repo?.fullName.split("/").pop() ?? "resource",
+            kind: repo?.detectedKind ?? "app",
+            repo: repo?.fullName,
+          });
+          // Persist the wizard's env vars as env-scoped secrets (encrypted at
+          // rest; injected on deploy).
+          for (const ev of envVars) {
+            if (!ev.key.trim() || !ev.value) continue;
+            await createSecretAction({
+              resourceId: id,
+              name: ev.key.trim(),
+              value: ev.value,
+              scope: "environment",
+              envVar: true,
+            });
+          }
+          setCreatedId(id);
+          setCreateState("done");
+          setDeploying(false);
+          router.refresh();
+          toast.success(`${repo?.fullName ?? "Resource"} created`, {
+            description: "Connect the repository in the project's Git panel to enable push-to-deploy.",
+          });
+        } catch (err) {
+          setCreateState("error");
+          setDeploying(false);
+          toast.error("Create failed", {
+            description: err instanceof Error ? err.message : "Please try again.",
+          });
+        }
+      })();
+      return;
+    }
     let phase = 0;
     const timer = setInterval(() => {
       phase += 1;
@@ -318,7 +420,11 @@ export function DeployWizard({
     setEnvVars((v) => v.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   }
 
-  const deployDone = step === 5 && !deploying && deployPhase >= DEPLOY_PHASES.length;
+  const deployDone =
+    step === 5 &&
+    (cpMode
+      ? createState === "done" || createState === "error"
+      : !deploying && deployPhase >= DEPLOY_PHASES.length);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -372,8 +478,40 @@ export function DeployWizard({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {/* Step 1 — pick repository */}
-          {step === 1 && (
+          {/* Step 1 — pick repository. CP mode: real detection; demo: mock list. */}
+          {step === 1 && cpMode && (
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-2">
+                <Input
+                  value={repoQuery}
+                  onChange={(e) => setRepoQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && runDetect()}
+                  placeholder="owner/repository"
+                  className="font-mono"
+                />
+                <Button size="sm" className="h-9" onClick={runDetect} disabled={detecting}>
+                  {detecting ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
+                  Detect
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Public GitHub repositories detect directly; private ones connect
+                with a token from the project’s Git panel.
+              </p>
+              {repo && (
+                <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
+                  <CircleCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-foreground">
+                      Detected <span className="font-mono">{repo.build}</span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">{repo.buildDetail}</p>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {step === 1 && !cpMode && (
             <div className="flex flex-col gap-3">
               <div className="relative">
                 <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -676,8 +814,68 @@ export function DeployWizard({
             </div>
           )}
 
-          {/* Step 5 — deploy progress */}
-          {step === 5 && repo && (
+          {/* Step 5 (CP mode) — one honest create; the pipeline runs on the CP. */}
+          {step === 5 && repo && cpMode && (
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-3">
+                <span
+                  className={cn(
+                    "grid size-9 shrink-0 place-items-center rounded-lg",
+                    createState === "done"
+                      ? "bg-emerald-500/10 text-emerald-600"
+                      : createState === "error"
+                        ? "bg-destructive/10 text-destructive"
+                        : "bg-primary/10 text-primary"
+                  )}
+                >
+                  {createState === "done" ? (
+                    <CircleCheck className="size-5" />
+                  ) : createState === "error" ? (
+                    <CircleAlert className="size-5" />
+                  ) : (
+                    <Loader2 className="size-5 animate-spin" />
+                  )}
+                </span>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-foreground">
+                    {createState === "done"
+                      ? "Resource created"
+                      : createState === "error"
+                        ? "Create failed"
+                        : "Creating resource…"}
+                  </p>
+                  <p className="truncate font-mono text-xs text-muted-foreground">
+                    {repo.fullName} → {selectedServer?.name}
+                  </p>
+                </div>
+              </div>
+              {createState === "done" && (
+                <p className="rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+                  The resource starts as <span className="font-medium">provisioning</span>.
+                  Connect <span className="font-mono">{repo.fullName}</span> in the
+                  project’s Git panel and map a branch to this environment — every
+                  push then builds and rolls out with zero downtime.
+                </p>
+              )}
+              {createState === "done" && createdId && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-fit"
+                  onClick={() => {
+                    onOpenChange(false);
+                    router.push(`/dashboard/resources/${createdId}`);
+                  }}
+                >
+                  Open resource
+                  <ArrowRight className="size-4" />
+                </Button>
+              )}
+            </div>
+          )}
+
+          {/* Step 5 (demo) — simulated deploy progress */}
+          {step === 5 && repo && !cpMode && (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-3">
                 <span

@@ -198,6 +198,90 @@ func (c *Client) PostBuildLog(ctx context.Context, agentToken, deploymentID, str
 	}, nil)
 }
 
+// BackupCredentialResponse is the per-run restic material the CP releases to
+// this server (P1-11): repo location + key and the S3 credentials. In-memory
+// use only; the CP audits every fetch.
+type BackupCredentialResponse struct {
+	Repository     string `json:"repository"`
+	RepoKey        string `json:"repoKey"`
+	AccessKey      string `json:"accessKey"`
+	SecretKey      string `json:"secretKey"`
+	Region         string `json:"region"`
+	ForcePathStyle bool   `json:"forcePathStyle"`
+}
+
+// FetchBackupCredential resolves one open backup run's repo key + target
+// credentials. Scope is derived server-side from the agent token.
+func (c *Client) FetchBackupCredential(ctx context.Context, agentToken, runID string) (BackupCredentialResponse, error) {
+	var res BackupCredentialResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/backup-credential?runId="+url.QueryEscape(runID), agentToken, nil, &res)
+	return res, err
+}
+
+// PostBackupResult reports a backup/verify/restore run's terminal outcome with
+// its metadata (snapshot id, dump sha256).
+func (c *Client) PostBackupResult(ctx context.Context, agentToken, runID string, ok bool, snapshotID, dumpSha, detail string) error {
+	return c.post(ctx, "/v1/agent/backup-status", agentToken, map[string]any{
+		"runId":      runID,
+		"ok":         ok,
+		"snapshotId": snapshotID,
+		"dumpSha256": dumpSha,
+		"detail":     detail,
+	}, nil)
+}
+
+// TelemetrySample is one metric point shipped over the outbound channel
+// (P1-13). Labels are restricted to the agent-suppliable allowlist
+// {resource, service}; the CP adds {org, project, env, server} itself.
+type TelemetrySample struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
+	Value  float64           `json:"value"`
+	TS     int64             `json:"ts"` // unix millis
+}
+
+// TelemetryAck is the CP's ingest answer; Accepted=false carries the reason
+// (e.g. no sink configured) so the agent backs off instead of retrying hot.
+type TelemetryAck struct {
+	Accepted bool   `json:"accepted"`
+	Reason   string `json:"reason"`
+}
+
+// PostTelemetryMetrics ships one metric batch. dropped counts series the
+// agent-side cap discarded (surfaced in CP logs for cardinality forensics).
+func (c *Client) PostTelemetryMetrics(ctx context.Context, agentToken string, samples []TelemetrySample, dropped int) (TelemetryAck, error) {
+	var ack TelemetryAck
+	err := c.post(ctx, "/v1/agent/telemetry/metrics", agentToken, map[string]any{
+		"samples": samples,
+		"dropped": dropped,
+	}, &ack)
+	return ack, err
+}
+
+// TelemetryLogLine / TelemetryLogStream carry container stdout/stderr batches.
+type TelemetryLogLine struct {
+	TS   int64  `json:"ts"` // unix millis
+	Text string `json:"text"`
+}
+
+type TelemetryLogStream struct {
+	ResourceID string             `json:"resourceId"`
+	Service    string             `json:"service,omitempty"`
+	Stream     string             `json:"stream"`
+	Lines      []TelemetryLogLine `json:"lines"`
+}
+
+// PostTelemetryLogs ships one log batch. dropped counts lines the bounded
+// agent buffer discarded under backpressure.
+func (c *Client) PostTelemetryLogs(ctx context.Context, agentToken string, streams []TelemetryLogStream, dropped int) (TelemetryAck, error) {
+	var ack TelemetryAck
+	err := c.post(ctx, "/v1/agent/telemetry/logs", agentToken, map[string]any{
+		"streams": streams,
+		"dropped": dropped,
+	}, &ack)
+	return ack, err
+}
+
 func (c *Client) post(ctx context.Context, path, bearer string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, bearer, body, out)
 }

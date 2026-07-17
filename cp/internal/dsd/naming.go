@@ -23,6 +23,13 @@ const (
 	KindImageBuild     = "image.build"
 	KindDeployRollout  = "deploy.rollout"
 	KindDeployRecreate = "deploy.recreate"
+	// Backups (P1-11): engine-native dump piped into restic, restic check +
+	// GFS forget, automated restore-verify into a scratch container, and the
+	// fire-drill restore into a fresh resource. Names must match the agent's
+	// backup package byte-for-byte.
+	KindBackupRun     = "backup.run"
+	KindBackupVerify  = "backup.verify"
+	KindBackupRestore = "backup.restore"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
 
 // Pinger is the slice of the store the API needs for readiness.
@@ -36,6 +37,11 @@ type StoreAPI interface {
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error
 	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string) error
 	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
+	// Backups (P1-11): the audited per-run credential release and the agent's
+	// terminal result report, plus the op-status failure fallback.
+	BackupCredentialForRun(ctx context.Context, serverID, runID string) (store.BackupCredential, error)
+	SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error
+	FailBackupRunFromOpStatus(ctx context.Context, serverID, runID, errText string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -57,7 +63,12 @@ type Server struct {
 	devServiceToken     string
 	provisionToken      string
 	githubWebhookSecret string
-	mux                 *http.ServeMux
+	// telemetry forwards metrics/logs to VictoriaMetrics/Loki and proxies
+	// tenant-isolated queries (P1-13); tel is its store slice. Nil in handler
+	// unit tests → telemetry endpoints answer "not configured".
+	telemetry *telemetry.Forwarder
+	tel       TelemetryAPI
+	mux       *http.ServeMux
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -79,6 +90,10 @@ type Options struct {
 	DSDWaiter           DSDWaiter
 	Reconcile           ReconcileTrigger
 	DSDPublicKey        ed25519.PublicKey
+	// Telemetry is the P1-13 forwarder (nil disables the pipeline endpoints);
+	// TelemetryStore is its store slice.
+	Telemetry      *telemetry.Forwarder
+	TelemetryStore TelemetryAPI
 }
 
 // New builds the HTTP surface.
@@ -94,6 +109,8 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		devServiceToken:     opts.DevServiceToken,
 		provisionToken:      opts.ProvisionToken,
 		githubWebhookSecret: opts.GitHubWebhookSecret,
+		telemetry:           opts.Telemetry,
+		tel:                 opts.TelemetryStore,
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()
@@ -154,6 +171,25 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources", s.requireService(store.RoleDeveloper, s.handleListResources))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteResource))
 
+	// Database resources (P1-10). Metadata is member-visible; the credential
+	// reveal is Project Admin+ (a Developer 403s) and audited; the public-
+	// exposure hook returns the typed not-enabled error (mesh-only v1).
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database", s.requireService(store.RoleDeveloper, s.handleGetDatabase))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealDatabaseConnection))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/database/expose", s.requireService(store.RoleProjectAdmin, s.handleExposeDatabase))
+
+	// Backups (P1-11). Target metadata + run history + the verify-day feed are
+	// member-visible; target lifecycle, policy edits and the fire-drill restore
+	// are Project Admin+. Target creation carries credentials, so like token
+	// minting it is deliberately not idempotency-replayable.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/backup-targets", s.requireService(store.RoleProjectAdmin, s.handleCreateBackupTarget))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/backup-targets", s.requireService(store.RoleDeveloper, s.handleListBackupTargets))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/backup-targets/{targetId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBackupTarget))
+	s.mux.HandleFunc("PATCH /v1/orgs/{orgId}/resources/{resourceId}/backup-policy", s.requireService(store.RoleProjectAdmin, s.handleUpdateBackupPolicy))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/backup-runs", s.requireService(store.RoleDeveloper, s.handleListBackupRuns))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/backups/verify-days", s.requireService(store.RoleDeveloper, s.handleVerifyDays))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/restore", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleRestoreDatabase)))
+
 	// Custom domains (P1-8): attach/detach are Project Admin+, listing is member-visible.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleDeveloper, s.handleListDomains))
@@ -170,6 +206,12 @@ func (s *Server) routes() {
 	// members); mutations above stay Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/audit", s.requireService(store.RoleDeveloper, s.handleListAudit))
 
+	// Telemetry (P1-13): tenant-isolated PromQL/LogQL proxies for the embedded
+	// dashboards + the M1 beta-metrics feed. All member-visible reads.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/metrics/query", s.requireService(store.RoleDeveloper, s.handleMetricsQuery))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/logs/query", s.requireService(store.RoleDeveloper, s.handleLogsQuery))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/beta-metrics", s.requireService(store.RoleDeveloper, s.handleBetaMetrics))
+
 	// Git integration (P1-7). Detection is a read-only preview (Developer+);
 	// connecting a repo and editing branch routes/policies are Project Admin+.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/detect", s.requireService(store.RoleDeveloper, s.handleGitDetect))
@@ -181,6 +223,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/branch-maps/{mapId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBranchMap))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/branch-maps/{mapId}/promote", s.requireService(store.RoleProjectAdmin, s.handlePromoteBranch))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/deploy-requests", s.requireService(store.RoleDeveloper, s.handleListDeployRequests))
+	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
+	// environment list is member-visible.
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleDeveloper, s.handleListPreviews))
 
 	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
 	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);
@@ -202,6 +248,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/domains/status", s.requireAgent(s.handleAgentDomainStatus))
 	s.mux.HandleFunc("GET /v1/agent/git-credential", s.requireAgent(s.handleAgentGitCredential))
 	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
+	s.mux.HandleFunc("GET /v1/agent/backup-credential", s.requireAgent(s.handleAgentBackupCredential))
+	s.mux.HandleFunc("POST /v1/agent/backup-status", s.requireAgent(s.handleAgentBackupStatus))
+	s.mux.HandleFunc("POST /v1/agent/telemetry/metrics", s.requireAgent(s.handleAgentTelemetryMetrics))
+	s.mux.HandleFunc("POST /v1/agent/telemetry/logs", s.requireAgent(s.handleAgentTelemetryLogs))
 }
 
 func (s *Server) Handler() http.Handler {

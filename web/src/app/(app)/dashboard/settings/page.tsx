@@ -50,6 +50,11 @@ export default async function SettingsPage() {
       audit={merged}
       currentUserId={currentUserId}
       currentUserRole={currentUserRole}
+      cpMode={cpEnabled()}
+      orgCreatedAt={org.createdAt}
+      twoFactorEnabled={Boolean(
+        (sessionUser as { twoFactorEnabled?: boolean | null }).twoFactorEnabled
+      )}
     />
   );
 }

@@ -58,6 +58,9 @@ type portMapping struct {
 	Container int    `json:"container"`
 	Host      int    `json:"host,omitempty"`
 	Protocol  string `json:"protocol,omitempty"`
+	// HostIP restricts the published port to one host address. P1-10 databases
+	// bind to the server's mesh IP so the engine is unreachable publicly.
+	HostIP string `json:"hostIp,omitempty"`
 }
 
 type volumeMount struct {

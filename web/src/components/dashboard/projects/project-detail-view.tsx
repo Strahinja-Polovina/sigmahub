@@ -528,6 +528,7 @@ export function ProjectDetailView({
           projectId={project.id}
           connections={gitConnections!}
           environments={environments}
+          servers={orgServers.map((sv) => ({ id: sv.id, name: sv.name }))}
         />
       )}
     </div>

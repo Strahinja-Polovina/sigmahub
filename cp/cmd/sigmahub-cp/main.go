@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
@@ -174,6 +176,8 @@ func run() error {
 		return err
 	}
 	defer st.Close()
+	// P1-10 engine allowlist (the Postgres-only fallback build is CP_DB_ENGINES=postgres).
+	st.SetEnabledDBEngines(cfg.DBEngines)
 
 	// DSD signing key (custody-wrapped, stable across restarts) + reconciler.
 	dsdKey, err := loadDSDKey(ctx, st)
@@ -188,6 +192,13 @@ func run() error {
 	// deployments and re-render the affected servers so the pipeline runs.
 	go runDeployDrain(ctx, log, st, rec)
 
+	// Backup scheduler (P1-11): the wall-clock primitive that turns policies
+	// into due backup/verify runs and fails runs that stopped making progress.
+	go backup.Run(ctx, log, st, rec, backup.Config{
+		Interval:   time.Minute,
+		RunTimeout: 30 * time.Minute,
+	})
+
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
 	go sweeper.Run(ctx, log, st, sweeper.Config{
@@ -195,6 +206,28 @@ func run() error {
 		StaleAfter: 90 * time.Second,
 		Retention:  24 * time.Hour,
 	})
+
+	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates
+	// (the A-4 metering hook Phase 2 billing reads).
+	tel := telemetry.New(telemetry.Config{
+		VMWriteURL: cfg.VMWriteURL,
+		VMReadURL:  cfg.VMReadURL,
+		LokiURL:    cfg.LokiURL,
+	})
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
+					log.Error("usage sweep", "err", err)
+				}
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr: cfg.Addr,
@@ -208,6 +241,8 @@ func run() error {
 			DSDWaiter:           rec,
 			Reconcile:           rec,
 			DSDPublicKey:        dsdKey.Public().(ed25519.PublicKey),
+			Telemetry:           tel,
+			TelemetryStore:      st,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

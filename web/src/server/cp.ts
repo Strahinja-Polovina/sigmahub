@@ -384,6 +384,280 @@ export async function cpDeleteResource(orgId: string, resourceId: string, actor:
   }, { orgId, actor });
 }
 
+// Database resources (P1-10). Databases are mesh-only in v1: the CP publishes
+// the engine port exclusively on the server's WireGuard mesh address.
+export type CpBackupPolicy = {
+  id: string;
+  resourceId: string;
+  schedule: string;
+  keepDaily: number;
+  keepWeekly: number;
+  keepMonthly: number;
+  targetId: string | null;
+  enabled: boolean;
+};
+
+export type CpDatabaseInfo = {
+  resourceId: string;
+  engine: string;
+  image: string;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  meshOnly: boolean;
+  backupPolicy?: CpBackupPolicy;
+};
+
+export type CpDatabaseConnection = CpDatabaseInfo & {
+  password: string;
+  url: string;
+};
+
+/** Non-secret connection metadata + backup policy. Developer-visible. */
+export async function cpGetDatabase(orgId: string, resourceId: string): Promise<CpDatabaseInfo | null> {
+  try {
+    return await cpFetch<CpDatabaseInfo>(
+      `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/database`,
+      undefined, { orgId }
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Control plane 404")) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** Audited credential reveal. The CP gates this at Project Admin+ (Developer
+ *  tokens 403) and writes an audit row per reveal. */
+export async function cpRevealDatabaseConnection(
+  orgId: string,
+  resourceId: string,
+  actor: CpActor
+): Promise<CpDatabaseConnection> {
+  return cpFetch(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/database/connection`,
+    undefined, { orgId, actor }
+  );
+}
+
+// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
+// the per-day verify feed and the fire-drill restore.
+export type CpBackupTarget = {
+  id: string;
+  name: string;
+  endpoint: string;
+  bucket: string;
+  region: string;
+  forcePathStyle: boolean;
+  accessKey: string;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CpBackupRun = {
+  id: string;
+  resourceId: string;
+  kind: string; // backup | verify | restore
+  status: string; // pending | running | success | failed
+  snapshotId: string;
+  dumpSha256: string;
+  detail: string;
+  restoreResourceId?: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+};
+
+export type CpVerifyDay = { day: string; runs: number; failed: number; green: boolean };
+
+export async function cpListBackupTargets(orgId: string): Promise<CpBackupTarget[]> {
+  const { targets } = await cpFetch<{ targets: CpBackupTarget[] }>(
+    `${org(orgId)}/backup-targets`, undefined, { orgId }
+  );
+  return targets;
+}
+
+export async function cpCreateBackupTarget(
+  orgId: string,
+  input: {
+    name: string;
+    endpoint: string;
+    bucket: string;
+    region: string;
+    accessKey: string;
+    secretKey: string;
+  },
+  actor: CpActor
+): Promise<CpBackupTarget> {
+  return cpFetch(`${org(orgId)}/backup-targets`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteBackupTarget(orgId: string, targetId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/backup-targets/${encodeURIComponent(targetId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpUpdateBackupPolicy(
+  orgId: string,
+  resourceId: string,
+  input: { targetId?: string | null; enabled?: boolean; keepDaily?: number; keepWeekly?: number; keepMonthly?: number },
+  actor: CpActor
+): Promise<CpBackupPolicy> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-policy`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpListBackupRuns(orgId: string, resourceId: string, limit = 25): Promise<CpBackupRun[]> {
+  const { runs } = await cpFetch<{ runs: CpBackupRun[] }>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-runs?limit=${limit}`,
+    undefined, { orgId }
+  );
+  return runs;
+}
+
+export async function cpVerifyDays(orgId: string, days = 30): Promise<CpVerifyDay[]> {
+  const { days: out } = await cpFetch<{ days: CpVerifyDay[] }>(
+    `${org(orgId)}/backups/verify-days?days=${days}`, undefined, { orgId }
+  );
+  return out;
+}
+
+// Telemetry (P1-13): tenant-isolated query proxies + the M1 beta-metrics feed.
+export type CpTelemetryPoint = { t: string; cpu: number; mem: number; net: number };
+export type CpLogLine = { t: string; level: "info" | "warn" | "error"; msg: string };
+export type CpBetaMetrics = {
+  deploys: { window: number; total: number; succeeded: number; rate: number };
+  firstDeployAt: string | null;
+  verifyStreakDays: number;
+  connectedServers: number;
+};
+
+type PromMatrix = {
+  data?: { result?: { metric: Record<string, string>; values: [number, string][] }[] };
+};
+
+function isNotConfigured(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("telemetry_not_configured");
+}
+
+/** Per-resource cpu/mem series from the pipeline. Returns null when the
+ *  telemetry pipeline is not configured (the UI shows an explicit state —
+ *  never fabricated data). */
+export async function cpQueryResourceMetrics(
+  orgId: string,
+  resourceId: string
+): Promise<CpTelemetryPoint[] | null> {
+  const query = `{__name__=~"sigmahub_container_cpu_pct|sigmahub_container_mem_bytes",resource="${resourceId}"}`;
+  let res: PromMatrix;
+  try {
+    res = await cpFetch<PromMatrix>(
+      `${org(orgId)}/metrics/query?query=${encodeURIComponent(query)}&step=900`,
+      undefined, { orgId }
+    );
+  } catch (err) {
+    if (isNotConfigured(err)) return null;
+    throw err;
+  }
+  const byTs = new Map<number, CpTelemetryPoint>();
+  for (const series of res.data?.result ?? []) {
+    const name = series.metric.__name__;
+    for (const [ts, valS] of series.values) {
+      const val = Number(valS);
+      if (!Number.isFinite(val)) continue;
+      let p = byTs.get(ts);
+      if (!p) {
+        const d = new Date(ts * 1000);
+        p = {
+          t: `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`,
+          cpu: 0, mem: 0, net: 0,
+        };
+        byTs.set(ts, p);
+      }
+      if (name === "sigmahub_container_cpu_pct") p.cpu = Math.round(val * 10) / 10;
+      // Memory renders in MiB so the chart shares a usable scale with CPU %.
+      if (name === "sigmahub_container_mem_bytes") p.mem = Math.round(val / (1024 * 1024));
+    }
+  }
+  return [...byTs.entries()].sort((a, b) => a[0] - b[0]).map(([, p]) => p);
+}
+
+type LokiResult = {
+  data?: { result?: { stream: Record<string, string>; values: [string, string][] }[] };
+};
+
+/** Tenant-isolated log search. Filters are allowlisted parameters — the CP
+ *  builds the LogQL selector server-side. Returns null when Loki is not
+ *  configured. */
+export async function cpQueryLogs(
+  orgId: string,
+  filter: { resourceId?: string; environmentId?: string; q?: string; limit?: number }
+): Promise<CpLogLine[] | null> {
+  const params = new URLSearchParams();
+  if (filter.resourceId) params.set("resource", filter.resourceId);
+  if (filter.environmentId) params.set("env", filter.environmentId);
+  if (filter.q) params.set("q", filter.q);
+  params.set("limit", String(filter.limit ?? 200));
+  let res: LokiResult;
+  try {
+    res = await cpFetch<LokiResult>(
+      `${org(orgId)}/logs/query?${params.toString()}`, undefined, { orgId }
+    );
+  } catch (err) {
+    if (isNotConfigured(err)) return null;
+    throw err;
+  }
+  const lines: { ms: number; line: CpLogLine }[] = [];
+  for (const stream of res.data?.result ?? []) {
+    const level: CpLogLine["level"] = stream.stream.stream === "stderr" ? "error" : "info";
+    for (const [ns, text] of stream.values) {
+      // Loki timestamps are ns-precision strings; millisecond precision is
+      // plenty for display ordering and stays inside Number's safe range.
+      const ms = Number(ns.slice(0, -6) || "0");
+      lines.push({
+        ms,
+        line: {
+          t: new Date(ms).toLocaleTimeString("en-GB", { hour12: false }),
+          level,
+          msg: text,
+        },
+      });
+    }
+  }
+  lines.sort((a, b) => a.ms - b.ms);
+  return lines.map((l) => l.line);
+}
+
+/** The M1 exit-criteria feed (org-scoped). */
+export async function cpBetaMetrics(orgId: string): Promise<CpBetaMetrics | null> {
+  try {
+    return await cpFetch<CpBetaMetrics>(`${org(orgId)}/beta-metrics`, undefined, { orgId });
+  } catch (err) {
+    if (isNotConfigured(err)) return null;
+    throw err;
+  }
+}
+
+/** Fire-drill restore: provision a fresh database and load the source's latest
+ *  snapshot into it. */
+export async function cpRestoreDatabase(
+  orgId: string,
+  resourceId: string,
+  input: { name: string; environmentId: string; serverId: string },
+  actor: CpActor
+): Promise<{ resource: CpResource; run: CpBackupRun }> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/restore`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
 // Server + token lifecycle (P1-4). Server delete tombstones the CP record and
 // revokes its agent token; a 409 (with the bound-resource list) surfaces as a
 // thrown "Control plane 409" error the caller can show.
@@ -573,7 +847,43 @@ export type CpGitConnection = {
   repoFullName: string;
   createdBy: string;
   createdAt: string;
+  previewsEnabled: boolean;
+  previewServerId?: string;
 };
+
+// Previews (P1-12): per-PR ephemeral environments.
+export type CpPreviewEnvironment = {
+  id: string;
+  connectionId: string;
+  prNumber: number;
+  environmentId: string;
+  resourceId: string | null;
+  branch: string;
+  sha: string;
+  status: string; // open | closed
+  createdAt: string;
+  closedAt: string | null;
+};
+
+export async function cpSetPreviews(
+  orgId: string,
+  connId: string,
+  input: { enabled: boolean; serverId?: string },
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}/previews`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: input.enabled, serverId: input.serverId ?? "" }),
+  }, { orgId, actor });
+}
+
+export async function cpListPreviews(orgId: string, connId: string): Promise<CpPreviewEnvironment[]> {
+  const { previews } = await cpFetch<{ previews: CpPreviewEnvironment[] }>(
+    `${org(orgId)}/git/connections/${encodeURIComponent(connId)}/previews`,
+    undefined, { orgId }
+  );
+  return previews;
+}
 
 export type CpBranchMap = {
   id: string;

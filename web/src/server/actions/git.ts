@@ -11,9 +11,12 @@ import {
   cpDeleteBranchMap,
   cpPromoteBranch,
   cpDisconnectRepo,
+  cpSetPreviews,
+  cpListPreviews,
   type CpDetected,
   type CpGitConnection,
   type CpBranchMap,
+  type CpPreviewEnvironment,
 } from "../cp";
 
 /** Git integration is a control-plane feature; the demo path has no webhook
@@ -140,4 +143,40 @@ export async function disconnectRepo(input: {
     target: input.repoFullName,
   });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+/** Toggle per-PR preview environments on a connection (P1-12). Enabling
+ *  designates the server ephemeral preview resources land on. */
+export async function setPreviews(input: {
+  orgId: string;
+  projectId: string;
+  connectionId: string;
+  enabled: boolean;
+  serverId?: string;
+}): Promise<void> {
+  ensureCp();
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  await cpSetPreviews(
+    input.orgId,
+    input.connectionId,
+    { enabled: input.enabled, serverId: input.serverId },
+    { name: user.name, role }
+  );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: input.enabled ? "Previews enabled" : "Previews disabled",
+    target: input.connectionId,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+/** List a connection's preview environments (open PRs first). */
+export async function listPreviews(input: {
+  orgId: string;
+  connectionId: string;
+}): Promise<CpPreviewEnvironment[]> {
+  ensureCp();
+  await requireMembership(input.orgId);
+  return cpListPreviews(input.orgId, input.connectionId);
 }

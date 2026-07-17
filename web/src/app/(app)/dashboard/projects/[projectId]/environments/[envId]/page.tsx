@@ -27,6 +27,8 @@ import {
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import { getActiveOrgId } from "@/server/active-org";
 import { getEnvironmentPanel, getProject } from "@/server/queries";
+import { cpEnabled } from "@/server/cp";
+import { EnvLogSearch } from "@/components/dashboard/environments/env-log-search";
 
 export default async function EnvironmentDetailPage({
   params,
@@ -198,6 +200,8 @@ export default async function EnvironmentDetailPage({
           )}
         </CardContent>
       </Card>
+
+      {cpEnabled() && <EnvLogSearch orgId={orgId} environmentId={envId} />}
     </div>
   );
 }

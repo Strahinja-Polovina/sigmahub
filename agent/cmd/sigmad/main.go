@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/build"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/container"
@@ -25,6 +26,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/telemetry"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
@@ -170,6 +172,39 @@ func run() error {
 		},
 	)
 	builder.Register(registry)
+	// Backup ops (P1-11): engine-native dump → restic (client-side encrypted),
+	// restic check + GFS retention, restore-verify into a scratch container, and
+	// the fire-drill restore. The repo key + S3 credentials are fetched per run
+	// over the authenticated channel (audited CP-side) and live only in the
+	// restic child process env.
+	backupRunner := backup.NewRunner(
+		docker,
+		func(ctx context.Context, runID string) (backup.Credential, error) {
+			res, err := c.FetchBackupCredential(ctx, st.AgentToken, runID)
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return backup.Credential{}, backup.ErrRunSettled
+			}
+			if err != nil {
+				return backup.Credential{}, err
+			}
+			return backup.Credential{
+				Repository: res.Repository,
+				RepoKey:    res.RepoKey,
+				AccessKey:  res.AccessKey,
+				SecretKey:  res.SecretKey,
+				Region:     res.Region,
+			}, nil
+		},
+		func(ctx context.Context, runID string, ok bool, snapshotID, dumpSha, detail string) {
+			if err := c.PostBackupResult(ctx, st.AgentToken, runID, ok, snapshotID, dumpSha, detail); err != nil {
+				log.Warn("backup result post failed", "err", err, "run", runID)
+			}
+		},
+		filepath.Join(*dataDir, "backup"),
+		log,
+	)
+	backupRunner.Register(registry)
 	// Host-hardening ops (P1-5): nftables / sshd / CIS. These mutate the host
 	// itself and require root; the handlers fail cleanly (reported as a failed op)
 	// when sigmad is not root. Registered behind the same apply registry, so an
@@ -184,6 +219,22 @@ func run() error {
 	// Actual-state reconcile: converge managed containers every 30s (well under
 	// the 60s drift-repair SLO); survives control-plane outages.
 	go driver.RunReconcile(ctx, 30*time.Second)
+
+	// Telemetry shipper (P1-13): host + per-container metrics every 15s and
+	// container stdout/stderr tails, over the outbound authenticated channel.
+	// Label allowlist + series cap enforced pre-egress; with no sink configured
+	// the CP acks-and-drops and the shipper backs off.
+	shipper := telemetry.New(
+		docker,
+		func(ctx context.Context, samples []client.TelemetrySample, dropped int) (client.TelemetryAck, error) {
+			return c.PostTelemetryMetrics(ctx, st.AgentToken, samples, dropped)
+		},
+		func(ctx context.Context, streams []client.TelemetryLogStream, dropped int) (client.TelemetryAck, error) {
+			return c.PostTelemetryLogs(ctx, st.AgentToken, streams, dropped)
+		},
+		log,
+	)
+	go shipper.Run(ctx)
 
 	// The DSD loop runs alongside the heartbeat loop, outbound-only. After each
 	// applied DSD it garbage-collects containers the document no longer describes.

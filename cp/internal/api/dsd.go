@@ -190,6 +190,16 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 					s.log.Error("mark destructive op applied", "err", err, "op", opID)
 				}
 			}
+		case strings.HasPrefix(opID, "bkr:"):
+			// Backup runs (P1-11): the dedicated /v1/agent/backup-status report is
+			// authoritative (it carries snapshot id + dump sha). This is the safety
+			// net for op-level failures (dependency skip, unknown kind) so a run
+			// whose handler never executed still lands terminal-failed.
+			if os.State == "failed" {
+				if err := s.store.FailBackupRunFromOpStatus(r.Context(), srv.ID, strings.TrimPrefix(opID, "bkr:"), os.Error); err != nil {
+					s.log.Error("fail backup run from op status", "err", err, "op", opID)
+				}
+			}
 		}
 	}
 	sort.SliceStable(advances, func(i, j int) bool {
