@@ -11,6 +11,9 @@ import (
 // silently disable an engine.
 var knownDBEngines = map[string]bool{"postgres": true, "mysql": true, "redis": true, "mongodb": true}
 
+// knownS3Engines validates CP_S3_ENGINES entries (P2-2), same fail-loud rule.
+var knownS3Engines = map[string]bool{"minio": true, "seaweedfs": true}
+
 type Config struct {
 	// Addr is the HTTP listen address, e.g. ":8080".
 	Addr string
@@ -47,6 +50,9 @@ type Config struct {
 	// Defaults to all four engines; "postgres" alone is the pre-agreed M6
 	// fallback build — a configuration cut, not a rewrite.
 	DBEngines []string
+	// S3Engines is the P2-2 object-storage engine allowlist (CP_S3_ENGINES).
+	// Defaults to minio,seaweedfs; "minio" alone is the MinIO-only build.
+	S3Engines []string
 	// Telemetry sinks (P1-13). VMWriteURL/VMReadURL point at the
 	// VictoriaMetrics cluster's vminsert/vmselect; LokiURL at Loki. Empty
 	// disables that half of the pipeline — ingest is acknowledged-and-dropped
@@ -129,6 +135,22 @@ func FromEnv() (Config, error) {
 	}
 	if len(cfg.DBEngines) == 0 {
 		return Config{}, fmt.Errorf("CP_DB_ENGINES must enable at least one engine")
+	}
+
+	// P2-2 S3 engine allowlist. Empty = both engines enabled.
+	rawS3 := getenv("CP_S3_ENGINES", "minio,seaweedfs")
+	for _, e := range strings.Split(rawS3, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !knownS3Engines[e] {
+			return Config{}, fmt.Errorf("CP_S3_ENGINES: unknown engine %q (known: minio, seaweedfs)", e)
+		}
+		cfg.S3Engines = append(cfg.S3Engines, e)
+	}
+	if len(cfg.S3Engines) == 0 {
+		return Config{}, fmt.Errorf("CP_S3_ENGINES must enable at least one engine")
 	}
 	return cfg, nil
 }

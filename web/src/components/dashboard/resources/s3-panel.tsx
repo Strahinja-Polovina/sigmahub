@@ -20,6 +20,25 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : "Please try again.";
 }
 
+// Human labels for the object-storage engines (P2-2). SeaweedFS is the
+// Apache-2.0 hedge against MinIO's AGPL license; both speak the S3 API.
+const ENGINE_LABELS: Record<string, string> = {
+  minio: "MinIO",
+  seaweedfs: "SeaweedFS",
+};
+
+// The honest support matrix: what maps 1:1 across engines and what does not,
+// so an operator picking SeaweedFS knows exactly what stays the same. Mirrors
+// the database-engine matrix — no silent feature gaps.
+const SUPPORT_MATRIX: { capability: string; minio: string; seaweedfs: string }[] = [
+  { capability: "S3 API over the mesh", minio: "yes", seaweedfs: "yes" },
+  { capability: "Root credentials (env)", minio: "yes", seaweedfs: "yes" },
+  { capability: "Buckets via any S3 client", minio: "yes", seaweedfs: "yes" },
+  { capability: "In-dashboard bucket CRUD", minio: "follow-up", seaweedfs: "follow-up" },
+  { capability: "Built-in web console", minio: "off (disabled)", seaweedfs: "n/a" },
+  { capability: "License", minio: "AGPL-3.0", seaweedfs: "Apache-2.0" },
+];
+
 function copy(value: string, label: string) {
   void navigator.clipboard.writeText(value).then(
     () => toast.success(`${label} copied`),
@@ -112,7 +131,17 @@ export function S3Panel({
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="flex flex-col divide-y divide-border">
-          <ConnRow label="Engine" value={info.image} />
+          <div className="flex items-center justify-between gap-4 py-2">
+            <span className="text-sm text-muted-foreground">Engine</span>
+            <span className="inline-flex min-w-0 items-center gap-2">
+              <Badge variant="secondary" className="shrink-0">
+                {ENGINE_LABELS[info.engine] ?? info.engine}
+              </Badge>
+              <span className="truncate font-mono text-xs text-muted-foreground">
+                {info.image}
+              </span>
+            </span>
+          </div>
           <ConnRow
             label="Endpoint"
             value={info.endpoint || "pending mesh enrollment"}
@@ -174,6 +203,44 @@ export function S3Panel({
           Bucket management from the dashboard (per-bucket keys, quotas) is coming in a
           follow-up; until then the root credentials above manage everything.
         </p>
+
+        {/* P2-2 honest engine support matrix — what maps 1:1 and what doesn't. */}
+        <div className="overflow-x-auto rounded-md border border-border">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-border bg-muted/40 text-left text-muted-foreground">
+                <th className="px-3 py-2 font-medium">Capability</th>
+                <th className="px-3 py-2 font-medium">MinIO</th>
+                <th className="px-3 py-2 font-medium">SeaweedFS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {SUPPORT_MATRIX.map((row) => (
+                <tr key={row.capability} className="border-b border-border last:border-0">
+                  <td className="px-3 py-2 text-foreground">{row.capability}</td>
+                  <td
+                    className={
+                      row.minio === "yes"
+                        ? "px-3 py-2 font-medium text-emerald-600"
+                        : "px-3 py-2 text-muted-foreground"
+                    }
+                  >
+                    {row.minio}
+                  </td>
+                  <td
+                    className={
+                      row.seaweedfs === "yes"
+                        ? "px-3 py-2 font-medium text-emerald-600"
+                        : "px-3 py-2 text-muted-foreground"
+                    }
+                  >
+                    {row.seaweedfs}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </CardContent>
     </Card>
   );

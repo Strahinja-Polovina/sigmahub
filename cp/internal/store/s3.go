@@ -8,65 +8,128 @@ package store
 // is a follow-up (it needs a typed agent op).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
 
-// S3EngineDef pins one object-storage engine the CP can provision.
+// S3Kind is the single object-storage resource kind. The concrete engine
+// (MinIO or SeaweedFS) is a per-resource selection under it, not a distinct
+// kind — mirroring how a database "kind" already names its engine, but S3 needs
+// engine choice under one semantic category (P2-2).
+const S3Kind = "s3"
+
+// DefaultS3Engine is what an s3 resource provisions when its spec names no
+// engine. MinIO stays the default; SeaweedFS is opt-in (the Apache-2.0 hedge
+// against MinIO's AGPL license, per P2-2).
+const DefaultS3Engine = "minio"
+
+// S3EngineDef pins one object-storage engine the CP can provision. Both engines
+// take their root credentials purely through environment variables so the agent
+// stays engine-agnostic: the access key rides plain env, the secret rides an
+// env-mode secret reference. (SeaweedFS also supports a JSON config file, but
+// that reloads only on SIGHUP — which would need engine-specific agent code —
+// so env-var admin credentials are the deliberate choice, pinned by digest to
+// freeze the behavior against upstream env-cred regressions.)
 type S3EngineDef struct {
 	Engine string
 	// Image is the pinned release; the agent's image policy refuses floating
-	// tags, so this must always carry an explicit version.
+	// tags. A digest (@sha256:) is the ideal, immutable form.
 	Image string
 	// APIPort is the in-container S3 API port.
 	APIPort int
 	// DataMount is where the data volume mounts.
 	DataMount string
-	// SecretEnvNames are env vars carrying generated credentials; the DSD
+	// AccessKeyEnv is the plain (non-secret) env var carrying the access key.
+	AccessKeyEnv string
+	// StaticEnv is the non-credential engine environment (console toggles etc).
+	StaticEnv map[string]string
+	// SecretEnvNames are env vars carrying the generated secret key; the DSD
 	// renders them as secret REFERENCES only.
 	SecretEnvNames []string
+	// Cmd is the container command that starts the S3 API.
+	Cmd []string
 }
 
 var s3Engines = map[string]S3EngineDef{
-	"s3": {
-		Engine:         "s3",
+	// MinIO: the P2-1 engine. Console disabled — the dashboard is the UI, and
+	// one less exposed surface is one less thing to harden.
+	"minio": {
+		Engine:         "minio",
 		Image:          "minio/minio:RELEASE.2025-04-22T22-12-26Z",
 		APIPort:        9000,
 		DataMount:      "/data",
+		AccessKeyEnv:   "MINIO_ROOT_USER",
+		StaticEnv:      map[string]string{"MINIO_BROWSER": "off"},
 		SecretEnvNames: []string{"MINIO_ROOT_PASSWORD"},
+		Cmd:            []string{"server", "/data", "--address", ":9000"},
+	},
+	// SeaweedFS: all-in-one `weed server -s3`, S3 gateway on 8333. Pinned to 3.94
+	// by digest — the release where AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY seed
+	// the admin S3 identity (regressed in 3.97, upstream #7311); the digest
+	// freezes that behavior. Only the S3 port is published on the mesh; the
+	// master/volume/filer ports stay container-internal.
+	"seaweedfs": {
+		Engine:         "seaweedfs",
+		Image:          "chrislusf/seaweedfs:3.94@sha256:d8ab8284bf4fd221e3cbf25f114f2f317c5bc942b1df032c43cc9d7bfe9bb1c6",
+		APIPort:        8333,
+		DataMount:      "/data",
+		AccessKeyEnv:   "AWS_ACCESS_KEY_ID",
+		StaticEnv:      map[string]string{},
+		SecretEnvNames: []string{"AWS_SECRET_ACCESS_KEY"},
+		Cmd:            []string{"server", "-dir=/data", "-s3", "-s3.port=8333"},
 	},
 }
 
-// S3Engine returns the engine definition for a resource kind.
-func S3Engine(kind string) (S3EngineDef, bool) {
-	def, ok := s3Engines[kind]
+// S3EngineByName returns the engine definition for an engine name (minio,
+// seaweedfs). ok=false for an unknown engine.
+func S3EngineByName(engine string) (S3EngineDef, bool) {
+	def, ok := s3Engines[engine]
 	return def, ok
 }
 
-// IsS3Kind reports whether the kind is CP-provisioned object storage.
-func IsS3Kind(kind string) bool {
-	_, ok := s3Engines[kind]
+// IsS3Engine reports whether the name is a known object-storage engine.
+func IsS3Engine(engine string) bool {
+	_, ok := s3Engines[engine]
 	return ok
 }
 
-// PlainEnv is the non-secret engine environment. The console is disabled —
-// the dashboard is the UI, and one less exposed surface is one less thing to
-// harden.
-func (d S3EngineDef) PlainEnv(accessKey string) map[string]string {
-	return map[string]string{
-		"MINIO_ROOT_USER": accessKey,
-		"MINIO_BROWSER":   "off",
+// IsS3Kind reports whether the kind is CP-provisioned object storage.
+func IsS3Kind(kind string) bool { return kind == S3Kind }
+
+// s3EngineFromSpec reads the selected engine from an s3 resource's spec,
+// defaulting to MinIO when unspecified — backward-compatible with pre-P2-2
+// resources whose spec carries no engine field.
+func s3EngineFromSpec(spec json.RawMessage) string {
+	if len(bytes.TrimSpace(spec)) == 0 {
+		return DefaultS3Engine
 	}
+	var s struct {
+		Engine string `json:"engine"`
+	}
+	if err := json.Unmarshal(spec, &s); err != nil || s.Engine == "" {
+		return DefaultS3Engine
+	}
+	return s.Engine
+}
+
+// PlainEnv is the non-secret engine environment: the access key under the
+// engine's access-key env var, plus any static engine env.
+func (d S3EngineDef) PlainEnv(accessKey string) map[string]string {
+	env := map[string]string{d.AccessKeyEnv: accessKey}
+	for k, v := range d.StaticEnv {
+		env[k] = v
+	}
+	return env
 }
 
 // Command starts the S3 API on the fixed in-container port.
-func (d S3EngineDef) Command() []string {
-	return []string{"server", d.DataMount, "--address", fmt.Sprintf(":%d", d.APIPort)}
-}
+func (d S3EngineDef) Command() []string { return d.Cmd }
 
 // EndpointURL renders the mesh endpoint S3 clients dial.
 func (d S3EngineDef) EndpointURL(host string, port int) string {
@@ -74,6 +137,25 @@ func (d S3EngineDef) EndpointURL(host string, port int) string {
 		return ""
 	}
 	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// SetEnabledS3Engines installs the S3 engine allowlist (CP_S3_ENGINES),
+// mirroring SetEnabledDBEngines: disabling an engine only gates NEW resource
+// creation here. A nil allowlist enables every engine.
+func (s *Store) SetEnabledS3Engines(engines []string) {
+	m := map[string]bool{}
+	for _, e := range engines {
+		m[strings.TrimSpace(e)] = true
+	}
+	s.enabledS3Engines = m
+}
+
+// s3EngineEnabled reports whether new s3 resources of this engine may be created.
+func (s *Store) s3EngineEnabled(engine string) bool {
+	if s.enabledS3Engines == nil {
+		return true
+	}
+	return s.enabledS3Engines[engine]
 }
 
 // s3AAD binds the credential ciphertext to its row identity.
@@ -110,10 +192,10 @@ func allocateS3Port(ctx context.Context, tx pgx.Tx, serverID string) (int, error
 // mesh port inside CreateResource's transaction. No backup-policy row: the
 // P1-11 dump/restore path is database-engine-specific, and pretending an S3
 // store is covered by it would be fake safety (object-store DR is Phase 4).
-func (s *Store) provisionS3Tx(ctx context.Context, tx pgx.Tx, orgID string, r Resource) error {
-	def, ok := S3Engine(r.Kind)
+func (s *Store) provisionS3Tx(ctx context.Context, tx pgx.Tx, orgID string, r Resource, engine string) error {
+	def, ok := S3EngineByName(engine)
 	if !ok {
-		return fmt.Errorf("provision s3: unknown engine %q", r.Kind)
+		return fmt.Errorf("provision s3: unknown engine %q", engine)
 	}
 	port, err := allocateS3Port(ctx, tx, r.ServerID)
 	if err != nil {
@@ -208,7 +290,7 @@ func (s *Store) s3Info(ctx context.Context, q pgxQuerier, orgID, resourceID stri
 	if err != nil {
 		return S3Info{}, "", nil, nil, err
 	}
-	def, _ := S3Engine(info.Engine)
+	def, _ := S3EngineByName(info.Engine)
 	info.Image = def.Image
 	info.MeshOnly = true
 	if meshIP != nil {
@@ -261,18 +343,22 @@ func (s *Store) RevealS3Connection(ctx context.Context, orgID, resourceID, actor
 // resolved secret for the agent's container-create injection. nil, nil when
 // the resource has no s3_credentials row.
 func (s *Store) resolveS3SecretsTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resourceID string) ([]ResolvedSecret, error) {
-	var dekID string
+	var engine, dekID string
 	var ct, nonce []byte
 	err := tx.QueryRow(ctx, `
-		SELECT dek_id, ciphertext, nonce
+		SELECT engine, dek_id, ciphertext, nonce
 		  FROM s3_credentials
 		 WHERE org_id = $1 AND resource_id = $2 AND server_id = $3`,
-		orgID, resourceID, serverID).Scan(&dekID, &ct, &nonce)
+		orgID, resourceID, serverID).Scan(&engine, &dekID, &ct, &nonce)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	def, ok := S3EngineByName(engine)
+	if !ok {
+		return nil, fmt.Errorf("resolve s3 secrets: unknown engine %q", engine)
 	}
 	dek, err := s.dekPlaintext(ctx, tx, dekID)
 	if err != nil {
@@ -286,5 +372,11 @@ func (s *Store) resolveS3SecretsTx(ctx context.Context, tx pgx.Tx, orgID, server
 	if err := json.Unmarshal(plaintext, &creds); err != nil {
 		return nil, err
 	}
-	return []ResolvedSecret{{Name: "MINIO_ROOT_PASSWORD", Value: creds.SecretKey, EnvVar: true}}, nil
+	// The secret key rides under whatever env var(s) the engine reads it from
+	// (MINIO_ROOT_PASSWORD for MinIO, AWS_SECRET_ACCESS_KEY for SeaweedFS).
+	out := make([]ResolvedSecret, 0, len(def.SecretEnvNames))
+	for _, name := range def.SecretEnvNames {
+		out = append(out, ResolvedSecret{Name: name, Value: creds.SecretKey, EnvVar: true})
+	}
+	return out, nil
 }

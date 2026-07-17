@@ -369,6 +369,19 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	if IsDBKind(in.Kind) && !s.dbEngineEnabled(in.Kind) {
 		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("database engine %q is not enabled on this control plane", in.Kind)}
 	}
+	// P2-2 S3 engine selection + gate: the engine rides the resource spec
+	// (default MinIO). An unknown or disabled engine fails create loudly rather
+	// than provisioning the wrong (or no) engine.
+	var s3Engine string
+	if IsS3Kind(in.Kind) {
+		s3Engine = s3EngineFromSpec(in.Spec)
+		if !IsS3Engine(s3Engine) {
+			return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown s3 engine %q", s3Engine)}
+		}
+		if !s.s3EngineEnabled(s3Engine) {
+			return Resource{}, ErrInvalid{Msg: fmt.Sprintf("s3 engine %q is not enabled on this control plane", s3Engine)}
+		}
+	}
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -442,8 +455,9 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 	// P2-1: S3 storage provisions the same way (root credentials + mesh port),
 	// minus the backup-policy row — object-store DR is out of the P1-11 path.
+	// P2-2: the selected engine (gated above) is recorded on the credentials row.
 	if IsS3Kind(in.Kind) {
-		if err := s.provisionS3Tx(ctx, tx, orgID, r); err != nil {
+		if err := s.provisionS3Tx(ctx, tx, orgID, r, s3Engine); err != nil {
 			return Resource{}, err
 		}
 	}

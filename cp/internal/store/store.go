@@ -32,6 +32,9 @@ type Store struct {
 	// enabledDBEngines is the P1-10 engine allowlist (CP_DB_ENGINES). Nil means
 	// all engines; the Postgres-only fallback build is this map with one entry.
 	enabledDBEngines map[string]bool
+	// enabledS3Engines is the P2-2 S3 engine allowlist (CP_S3_ENGINES). Nil
+	// means all engines (minio, seaweedfs).
+	enabledS3Engines map[string]bool
 	// installTokens mints GitHub App installation tokens (SIGMA-55). Nil when
 	// no App is configured — connections then rely on their stored PAT.
 	installTokens InstallationTokenSource
