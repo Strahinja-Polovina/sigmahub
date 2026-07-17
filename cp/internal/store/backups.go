@@ -341,17 +341,41 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 
 // TimeoutStaleBackupRuns fails runs stuck pending/running longer than maxAge,
 // so a crashed agent can't freeze the schedule (tomorrow's run still enqueues)
-// and the day honestly reads not-green.
+// and the day honestly reads not-green. Timed-out runs alert like any other
+// failure (P2-6) — this path bypasses SetBackupRunResult.
 func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, maxAge time.Duration) (int, error) {
-	tag, err := s.Pool.Exec(ctx, `
-		UPDATE backup_runs
-		   SET status = 'failed', detail = 'timed out', finished_at = now()
-		 WHERE status IN ('pending', 'running') AND created_at < $1`,
-		time.Now().Add(-maxAge))
+	var timedOut int
+	err := s.Pool.QueryRow(ctx, `
+		WITH failed AS (
+			UPDATE backup_runs
+			   SET status = 'failed', detail = 'timed out', finished_at = now()
+			 WHERE status IN ('pending', 'running') AND created_at < $1
+			 RETURNING id, org_id, kind, resource_id
+		),
+		enqueued AS (
+			INSERT INTO alert_outbox (org_id, channel_id, event, dedup_key, title, body)
+			SELECT f.org_id, r.channel_id,
+			       CASE WHEN f.kind = 'verify' THEN 'verify_failed' ELSE 'backup_failed' END,
+			       'bkr:' || f.id,
+			       CASE f.kind WHEN 'backup' THEN 'Backup' WHEN 'verify' THEN 'Restore-verify' ELSE 'Restore' END
+			         || ' timed out for ' || COALESCE(res.name, f.resource_id),
+			       'The run made no progress and was failed by the scheduler (agent crashed or unreachable mid-run).'
+			  FROM failed f
+			  LEFT JOIN resources res ON res.id = f.resource_id
+			  JOIN alert_rules r ON r.org_id = f.org_id
+			   AND r.event = CASE WHEN f.kind = 'verify' THEN 'verify_failed' ELSE 'backup_failed' END
+			  JOIN alert_channels c ON c.id = r.channel_id AND c.enabled
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM alert_outbox o
+				 WHERE o.channel_id = r.channel_id AND o.dedup_key = 'bkr:' || f.id
+			 )
+		)
+		SELECT count(*) FROM failed`,
+		time.Now().Add(-maxAge)).Scan(&timedOut)
 	if err != nil {
 		return 0, err
 	}
-	return int(tag.RowsAffected()), nil
+	return timedOut, nil
 }
 
 // BackupRunSpec is the reconciler's render input for one open backup run.
@@ -543,6 +567,29 @@ func (s *Store) SetBackupRunResult(ctx context.Context, serverID, runID string, 
 	}
 	if err := auditTx(ctx, tx, orgID, "agent:"+serverID, action, resourceID+" run "+runID); err != nil {
 		return err
+	}
+	// P2-6: failed runs alert once each (dedup = run id). Verify failures get
+	// their own event — a red verify day blocks the M1 gate, so orgs may route
+	// it louder than an ordinary backup failure.
+	if !ok {
+		event := AlertBackupFailed
+		if kind == "verify" {
+			event = AlertVerifyFailed
+		}
+		var resName string
+		if err := tx.QueryRow(ctx,
+			`SELECT name FROM resources WHERE id = $1`, resourceID).Scan(&resName); err != nil {
+			// The resource may have been deleted mid-run; alert with the id.
+			resName = resourceID
+		}
+		body := detail
+		if body == "" {
+			body = "no failure detail reported"
+		}
+		if err := enqueueAlertTx(ctx, tx, orgID, event, "bkr:"+runID, 0,
+			action+" for "+resName, body); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

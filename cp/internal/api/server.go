@@ -70,7 +70,9 @@ type Server struct {
 	// unit tests → telemetry endpoints answer "not configured".
 	telemetry *telemetry.Forwarder
 	tel       TelemetryAPI
-	mux       *http.ServeMux
+	// alertSender test-fires alert channels (P2-6); nil → test endpoint 503s.
+	alertSender AlertSender
+	mux         *http.ServeMux
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -102,6 +104,8 @@ type Options struct {
 	// TelemetryStore is its store slice.
 	Telemetry      *telemetry.Forwarder
 	TelemetryStore TelemetryAPI
+	// AlertSender test-fires alert channels (P2-6); nil in handler unit tests.
+	AlertSender AlertSender
 }
 
 // New builds the HTTP surface.
@@ -121,6 +125,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		githubWebhookSecret: opts.GitHubWebhookSecret,
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
+		alertSender:         opts.AlertSender,
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()
@@ -241,6 +246,14 @@ func (s *Server) routes() {
 	// environment list is member-visible.
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleDeveloper, s.handleListPreviews))
+
+	// Alerting (P2-6): channel CRUD/rules/test are Org Admin (org-wide
+	// notification wiring); the list is member-visible metadata.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/alert-channels", s.requireService(store.RoleOrgAdmin, s.idempotent(s.handleCreateAlertChannel)))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/alert-channels", s.requireService(store.RoleDeveloper, s.handleListAlertChannels))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/alert-channels/{channelId}", s.requireService(store.RoleOrgAdmin, s.handleDeleteAlertChannel))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/alert-channels/{channelId}/rules", s.requireService(store.RoleOrgAdmin, s.handleSetAlertRules))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/alert-channels/{channelId}/test", s.requireService(store.RoleOrgAdmin, s.handleTestAlertChannel))
 
 	// Secrets (P1-6). List is Developer+ (metadata only); create/delete need
 	// Project Admin; raw-value reveal needs Project Admin (Developer 403s);

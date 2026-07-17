@@ -7,6 +7,7 @@ import { AuditTab } from "./audit-tab";
 import { TokensTab } from "./tokens-tab";
 import { BetaMetricsTab } from "./beta-metrics-tab";
 import { SecurityTab } from "./security-tab";
+import { AlertsTab } from "./alerts-tab";
 
 export type SettingsOrg = {
   id: string;
@@ -66,6 +67,7 @@ export function SettingsView({
           <TabsTrigger value="tokens">Tokens</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
           <TabsTrigger value="audit">Audit log</TabsTrigger>
+          {cpMode && <TabsTrigger value="alerts">Alerts</TabsTrigger>}
           {cpMode && <TabsTrigger value="beta">Beta metrics</TabsTrigger>}
         </TabsList>
 
@@ -89,6 +91,11 @@ export function SettingsView({
         <TabsContent value="audit">
           <AuditTab entries={audit} />
         </TabsContent>
+        {cpMode && (
+          <TabsContent value="alerts">
+            <AlertsTab orgId={org.id} isAdmin={isAdmin} />
+          </TabsContent>
+        )}
         {cpMode && (
           <TabsContent value="beta">
             <BetaMetricsTab orgId={org.id} orgCreatedAt={orgCreatedAt} />

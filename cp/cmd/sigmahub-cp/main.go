@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/alerts"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
@@ -261,6 +262,11 @@ func run() error {
 		RunTimeout: 30 * time.Minute,
 	})
 
+	// Alert dispatcher (P2-6): drains the alert outbox that state-change
+	// producers fill, with retry/backoff per delivery.
+	alertSender := alerts.NewSender()
+	go alerts.Run(ctx, log, st, alertSender, alerts.Config{})
+
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
 	go sweeper.Run(ctx, log, st, sweeper.Config{
@@ -307,6 +313,7 @@ func run() error {
 			DSDPublicKey:        dsdKey.Public().(ed25519.PublicKey),
 			Telemetry:           tel,
 			TelemetryStore:      st,
+			AlertSender:         alertSender,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
