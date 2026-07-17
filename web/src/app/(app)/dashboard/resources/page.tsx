@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { getActiveOrgId, getMyOrgs } from "@/server/active-org";
 import { getDeployTargets, getOrgResources } from "@/server/queries";
 import { ResourcesView } from "@/components/dashboard/resources/resources-view";
+import { cpEnabled } from "@/server/cp";
 
 export default async function ResourcesPage() {
   const orgId = await getActiveOrgId();
@@ -26,5 +27,13 @@ export default async function ResourcesPage() {
     domain: r.domain,
   }));
 
-  return <ResourcesView orgName={orgName} resources={items} targets={targets} />;
+  return (
+    <ResourcesView
+      orgName={orgName}
+      resources={items}
+      targets={targets}
+      cpMode={cpEnabled()}
+      orgId={orgId}
+    />
+  );
 }
