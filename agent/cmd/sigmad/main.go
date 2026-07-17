@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/build"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/client"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/container"
@@ -170,6 +171,39 @@ func run() error {
 		},
 	)
 	builder.Register(registry)
+	// Backup ops (P1-11): engine-native dump → restic (client-side encrypted),
+	// restic check + GFS retention, restore-verify into a scratch container, and
+	// the fire-drill restore. The repo key + S3 credentials are fetched per run
+	// over the authenticated channel (audited CP-side) and live only in the
+	// restic child process env.
+	backupRunner := backup.NewRunner(
+		docker,
+		func(ctx context.Context, runID string) (backup.Credential, error) {
+			res, err := c.FetchBackupCredential(ctx, st.AgentToken, runID)
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return backup.Credential{}, backup.ErrRunSettled
+			}
+			if err != nil {
+				return backup.Credential{}, err
+			}
+			return backup.Credential{
+				Repository: res.Repository,
+				RepoKey:    res.RepoKey,
+				AccessKey:  res.AccessKey,
+				SecretKey:  res.SecretKey,
+				Region:     res.Region,
+			}, nil
+		},
+		func(ctx context.Context, runID string, ok bool, snapshotID, dumpSha, detail string) {
+			if err := c.PostBackupResult(ctx, st.AgentToken, runID, ok, snapshotID, dumpSha, detail); err != nil {
+				log.Warn("backup result post failed", "err", err, "run", runID)
+			}
+		},
+		filepath.Join(*dataDir, "backup"),
+		log,
+	)
+	backupRunner.Register(registry)
 	// Host-hardening ops (P1-5): nftables / sshd / CIS. These mutate the host
 	// itself and require root; the handlers fail cleanly (reported as a failed op)
 	// when sigmad is not root. Registered behind the same apply registry, so an

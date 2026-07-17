@@ -95,6 +95,15 @@ func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, st
 func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
 	return nil
 }
+func (f *fakeStore) BackupCredentialForRun(context.Context, string, string) (store.BackupCredential, error) {
+	return store.BackupCredential{}, store.ErrNotFound
+}
+func (f *fakeStore) SetBackupRunResult(context.Context, string, string, bool, string, string, string) error {
+	return nil
+}
+func (f *fakeStore) FailBackupRunFromOpStatus(context.Context, string, string, string) error {
+	return nil
+}
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -204,6 +213,25 @@ func (f *fakeDomain) GetDatabaseInfo(_ context.Context, _, _ string) (store.Data
 }
 func (f *fakeDomain) RevealDatabaseConnection(_ context.Context, _, _, _ string) (store.DatabaseConnection, error) {
 	return store.DatabaseConnection{}, store.ErrNotDatabase
+}
+func (f *fakeDomain) CreateBackupTarget(_ context.Context, _, _ string, _ store.CreateBackupTargetInput) (store.BackupTarget, error) {
+	return store.BackupTarget{ID: "bkt_1"}, nil
+}
+func (f *fakeDomain) ListBackupTargets(_ context.Context, _ string) ([]store.BackupTarget, error) {
+	return []store.BackupTarget{}, nil
+}
+func (f *fakeDomain) DeleteBackupTarget(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeDomain) UpdateBackupPolicy(_ context.Context, _, _, _ string, _ store.UpdateBackupPolicyInput) (store.BackupPolicy, error) {
+	return store.BackupPolicy{}, store.ErrNotDatabase
+}
+func (f *fakeDomain) ListBackupRuns(_ context.Context, _, _ string, _ int) ([]store.BackupRun, error) {
+	return []store.BackupRun{}, nil
+}
+func (f *fakeDomain) VerifyDays(_ context.Context, _ string, _ int) ([]store.VerifyDay, error) {
+	return []store.VerifyDay{}, nil
+}
+func (f *fakeDomain) CreateRestoreRun(_ context.Context, _, _, _, _ string) (store.BackupRun, error) {
+	return store.BackupRun{}, store.ErrNotFound
 }
 func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
 	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil

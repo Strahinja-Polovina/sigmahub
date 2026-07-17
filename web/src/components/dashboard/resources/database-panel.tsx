@@ -1,16 +1,7 @@
 "use client";
 
 import * as React from "react";
-import {
-  Copy,
-  Database,
-  Eye,
-  EyeOff,
-  Loader2,
-  Lock,
-  ShieldAlert,
-  Archive,
-} from "lucide-react";
+import { Copy, Database, Eye, EyeOff, Loader2, Lock } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -102,8 +93,6 @@ export function DatabasePanel({
     });
   }
 
-  const backup = info.backupPolicy;
-
   return (
     <Card>
       <CardHeader>
@@ -190,31 +179,6 @@ export function DatabasePanel({
                 </Button>
               </span>
             </div>
-          )}
-        </div>
-
-        <div className="rounded-md border border-border bg-muted/40 p-3">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <Archive className="size-4" />
-            Backups
-          </div>
-          {backup ? (
-            <div className="pt-1.5 text-sm text-muted-foreground">
-              <p>
-                {backup.schedule} · keep {backup.keepDaily} daily
-                {backup.keepWeekly > 0 && ` / ${backup.keepWeekly} weekly`}
-                {backup.keepMonthly > 0 && ` / ${backup.keepMonthly} monthly`}
-              </p>
-              {!backup.targetId && (
-                <p className="mt-2 inline-flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-amber-700 dark:text-amber-400">
-                  <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-                  No backup target configured — this database is NOT being backed
-                  up. Add an S3-compatible target as soon as backups ship.
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="pt-1.5 text-sm text-muted-foreground">No backup policy.</p>
           )}
         </div>
 

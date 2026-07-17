@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
@@ -189,6 +190,13 @@ func run() error {
 	// Deploy-request drain (P1-9): turn queued git deploy_requests into
 	// deployments and re-render the affected servers so the pipeline runs.
 	go runDeployDrain(ctx, log, st, rec)
+
+	// Backup scheduler (P1-11): the wall-clock primitive that turns policies
+	// into due backup/verify runs and fails runs that stopped making progress.
+	go backup.Run(ctx, log, st, rec, backup.Config{
+		Interval:   time.Minute,
+		RunTimeout: 30 * time.Minute,
+	})
 
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.

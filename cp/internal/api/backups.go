@@ -1,0 +1,213 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+// ── Backup targets (P1-11) ──────────────────────────────────────────────────
+
+func (s *Server) handleCreateBackupTarget(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name           string `json:"name"`
+		Endpoint       string `json:"endpoint"`
+		Bucket         string `json:"bucket"`
+		Region         string `json:"region"`
+		ForcePathStyle *bool  `json:"forcePathStyle"`
+		AccessKey      string `json:"accessKey"`
+		SecretKey      string `json:"secretKey"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	forcePath := true
+	if req.ForcePathStyle != nil {
+		forcePath = *req.ForcePathStyle
+	}
+	t, err := s.domain.CreateBackupTarget(r.Context(), r.PathValue("orgId"), principalFrom(r).Name, store.CreateBackupTargetInput{
+		Name:           strings.TrimSpace(req.Name),
+		Endpoint:       strings.TrimSpace(req.Endpoint),
+		Bucket:         strings.TrimSpace(req.Bucket),
+		Region:         strings.TrimSpace(req.Region),
+		ForcePathStyle: forcePath,
+		AccessKey:      strings.TrimSpace(req.AccessKey),
+		SecretKey:      req.SecretKey,
+	})
+	if err != nil {
+		s.writeStoreErr(w, err, "create backup target")
+		return
+	}
+	writeJSON(w, http.StatusCreated, t)
+}
+
+func (s *Server) handleListBackupTargets(w http.ResponseWriter, r *http.Request) {
+	targets, err := s.domain.ListBackupTargets(r.Context(), r.PathValue("orgId"))
+	if err != nil {
+		s.writeStoreErr(w, err, "list backup targets")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"targets": targets})
+}
+
+func (s *Server) handleDeleteBackupTarget(w http.ResponseWriter, r *http.Request) {
+	err := s.domain.DeleteBackupTarget(r.Context(), r.PathValue("orgId"), r.PathValue("targetId"), principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "delete backup target")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ── Backup policy + history ─────────────────────────────────────────────────
+
+func (s *Server) handleUpdateBackupPolicy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TargetID    *string `json:"targetId"`
+		Schedule    *string `json:"schedule"`
+		KeepDaily   *int    `json:"keepDaily"`
+		KeepWeekly  *int    `json:"keepWeekly"`
+		KeepMonthly *int    `json:"keepMonthly"`
+		Enabled     *bool   `json:"enabled"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	bp, err := s.domain.UpdateBackupPolicy(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"), principalFrom(r).Name, store.UpdateBackupPolicyInput{
+		TargetID:    req.TargetID,
+		Schedule:    req.Schedule,
+		KeepDaily:   req.KeepDaily,
+		KeepWeekly:  req.KeepWeekly,
+		KeepMonthly: req.KeepMonthly,
+		Enabled:     req.Enabled,
+	})
+	if err != nil {
+		s.writeDBErr(w, err, "update backup policy")
+		return
+	}
+	writeJSON(w, http.StatusOK, bp)
+}
+
+func (s *Server) handleListBackupRuns(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	runs, err := s.domain.ListBackupRuns(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"), limit)
+	if err != nil {
+		s.writeStoreErr(w, err, "list backup runs")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
+func (s *Server) handleVerifyDays(w http.ResponseWriter, r *http.Request) {
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	out, err := s.domain.VerifyDays(r.Context(), r.PathValue("orgId"), days)
+	if err != nil {
+		s.writeStoreErr(w, err, "verify days")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"days": out})
+}
+
+// handleRestoreDatabase is the fire-drill flow: provision a FRESH database
+// resource (full P1-10 path: new credentials, port, policy row) and queue a
+// restore run that loads the source's latest snapshot into it. Redis restore
+// is not supported in v1 (RDB loading needs a coordinated engine restart);
+// verify still covers redis integrity via the checksum + redis-check-rdb path.
+func (s *Server) handleRestoreDatabase(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name          string `json:"name"`
+		EnvironmentID string `json:"environmentId"`
+		ServerID      string `json:"serverId"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || strings.TrimSpace(req.Name) == "" || req.EnvironmentID == "" || req.ServerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name, environmentId and serverId are required"})
+		return
+	}
+	orgID, sourceID := r.PathValue("orgId"), r.PathValue("resourceId")
+	actor := principalFrom(r).Name
+
+	src, err := s.domain.GetDatabaseInfo(r.Context(), orgID, sourceID)
+	if err != nil {
+		s.writeDBErr(w, err, "restore database")
+		return
+	}
+	if src.Engine == "redis" {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "redis restore-into-new-resource is not supported in v1; restore-verify still checks snapshot integrity",
+		})
+		return
+	}
+	res, err := s.domain.CreateResource(r.Context(), orgID, store.CreateResourceInput{
+		EnvironmentID: req.EnvironmentID,
+		ServerID:      req.ServerID,
+		Name:          strings.TrimSpace(req.Name),
+		Kind:          src.Engine,
+		Spec:          json.RawMessage(`{}`),
+	}, actor)
+	if err != nil {
+		s.writeStoreErr(w, err, "restore: create resource")
+		return
+	}
+	run, err := s.domain.CreateRestoreRun(r.Context(), orgID, sourceID, res.ID, actor)
+	if err != nil {
+		// The fresh resource stays (visible, empty) — the operator can retry the
+		// restore or delete it; silently unwinding a provisioned DB is riskier.
+		s.writeStoreErr(w, err, "restore: queue run")
+		return
+	}
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(orgID, res.ServerID)
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"resource": res, "run": run})
+}
+
+// ── Agent-facing (P1-11) ────────────────────────────────────────────────────
+
+// handleAgentBackupCredential releases the restic repo key + S3 credentials
+// for ONE open run scheduled on the calling agent's server. Every call is
+// audited by the store (the per-run key-release invariant).
+func (s *Server) handleAgentBackupCredential(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	runID := r.URL.Query().Get("runId")
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "runId is required"})
+		return
+	}
+	cred, err := s.store.BackupCredentialForRun(r.Context(), srv.ID, runID)
+	if err != nil {
+		s.writeStoreErr(w, err, "backup credential")
+		return
+	}
+	writeJSON(w, http.StatusOK, cred)
+}
+
+// handleAgentBackupStatus records a run's terminal outcome with its metadata
+// (snapshot id, dump sha). BOLA-scoped: only the run's own server may report.
+func (s *Server) handleAgentBackupStatus(w http.ResponseWriter, r *http.Request) {
+	srv := serverFrom(r)
+	var req struct {
+		RunID      string `json:"runId"`
+		OK         bool   `json:"ok"`
+		SnapshotID string `json:"snapshotId"`
+		DumpSha256 string `json:"dumpSha256"`
+		Detail     string `json:"detail"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.RunID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "runId is required"})
+		return
+	}
+	if err := s.store.SetBackupRunResult(r.Context(), srv.ID, req.RunID, req.OK, req.SnapshotID, req.DumpSha256, req.Detail); err != nil {
+		s.writeStoreErr(w, err, "backup status")
+		return
+	}
+	// The run left the open set — re-render so its op drops out of the DSD.
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(srv.OrgID, srv.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
+}

@@ -8,8 +8,12 @@ import {
   cpListDeployments,
   cpRollbackTargets,
   cpGetDatabase,
+  cpListBackupTargets,
+  cpListBackupRuns,
   cpKind,
   type CpDatabaseInfo,
+  type CpBackupTarget,
+  type CpBackupRun,
 } from "@/server/cp";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
@@ -86,6 +90,24 @@ async function loadDatabase(
   }
 }
 
+/** Load a database's backup targets + run history (P1-11, CP mode only). */
+async function loadBackups(
+  orgId: string,
+  resourceId: string,
+  isDatabase: boolean
+): Promise<{ targets: CpBackupTarget[]; runs: CpBackupRun[] }> {
+  if (!isDatabase) return { targets: [], runs: [] };
+  try {
+    const [targets, runs] = await Promise.all([
+      cpListBackupTargets(orgId),
+      cpListBackupRuns(orgId, resourceId),
+    ]);
+    return { targets, runs };
+  } catch {
+    return { targets: [], runs: [] };
+  }
+}
+
 export default async function ResourceDetailPage({
   params,
 }: {
@@ -114,6 +136,7 @@ export default async function ResourceDetailPage({
     detail.resource.kind
   );
   const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
+  const backups = await loadBackups(orgId, resourceId, database !== null);
 
   return (
     <ResourceDetail
@@ -125,6 +148,9 @@ export default async function ResourceDetailPage({
       rollbackTargetIds={rollbackTargetIds}
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
       database={database}
+      backupTargets={backups.targets}
+      backupRuns={backups.runs}
+      environmentId={detail.resource.environmentId}
     />
   );
 }

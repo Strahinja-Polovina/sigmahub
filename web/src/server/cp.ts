@@ -442,6 +442,107 @@ export async function cpRevealDatabaseConnection(
   );
 }
 
+// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
+// the per-day verify feed and the fire-drill restore.
+export type CpBackupTarget = {
+  id: string;
+  name: string;
+  endpoint: string;
+  bucket: string;
+  region: string;
+  forcePathStyle: boolean;
+  accessKey: string;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CpBackupRun = {
+  id: string;
+  resourceId: string;
+  kind: string; // backup | verify | restore
+  status: string; // pending | running | success | failed
+  snapshotId: string;
+  dumpSha256: string;
+  detail: string;
+  restoreResourceId?: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+};
+
+export type CpVerifyDay = { day: string; runs: number; failed: number; green: boolean };
+
+export async function cpListBackupTargets(orgId: string): Promise<CpBackupTarget[]> {
+  const { targets } = await cpFetch<{ targets: CpBackupTarget[] }>(
+    `${org(orgId)}/backup-targets`, undefined, { orgId }
+  );
+  return targets;
+}
+
+export async function cpCreateBackupTarget(
+  orgId: string,
+  input: {
+    name: string;
+    endpoint: string;
+    bucket: string;
+    region: string;
+    accessKey: string;
+    secretKey: string;
+  },
+  actor: CpActor
+): Promise<CpBackupTarget> {
+  return cpFetch(`${org(orgId)}/backup-targets`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteBackupTarget(orgId: string, targetId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/backup-targets/${encodeURIComponent(targetId)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpUpdateBackupPolicy(
+  orgId: string,
+  resourceId: string,
+  input: { targetId?: string | null; enabled?: boolean; keepDaily?: number; keepWeekly?: number; keepMonthly?: number },
+  actor: CpActor
+): Promise<CpBackupPolicy> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-policy`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+export async function cpListBackupRuns(orgId: string, resourceId: string, limit = 25): Promise<CpBackupRun[]> {
+  const { runs } = await cpFetch<{ runs: CpBackupRun[] }>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/backup-runs?limit=${limit}`,
+    undefined, { orgId }
+  );
+  return runs;
+}
+
+export async function cpVerifyDays(orgId: string, days = 30): Promise<CpVerifyDay[]> {
+  const { days: out } = await cpFetch<{ days: CpVerifyDay[] }>(
+    `${org(orgId)}/backups/verify-days?days=${days}`, undefined, { orgId }
+  );
+  return out;
+}
+
+/** Fire-drill restore: provision a fresh database and load the source's latest
+ *  snapshot into it. */
+export async function cpRestoreDatabase(
+  orgId: string,
+  resourceId: string,
+  input: { name: string; environmentId: string; serverId: string },
+  actor: CpActor
+): Promise<{ resource: CpResource; run: CpBackupRun }> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/restore`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
 // Server + token lifecycle (P1-4). Server delete tombstones the CP record and
 // revokes its agent token; a 409 (with the bound-resource list) surfaces as a
 // thrown "Control plane 409" error the caller can show.

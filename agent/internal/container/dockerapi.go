@@ -635,3 +635,116 @@ func (d *DockerClient) ContainerRemove(ctx context.Context, id string, force boo
 	}
 	return err
 }
+
+// ContainerExec runs cmd inside a running container and streams its stdout to
+// out (stderr is captured into the returned tail for diagnostics). Returns the
+// command's exit code. Used by the P1-11 backup ops to run engine-native dump
+// and load tools inside the database's own container — the command comes from
+// the agent's engine catalog, never from the DSD, preserving the
+// no-generic-run-shell invariant.
+func (d *DockerClient) ContainerExec(ctx context.Context, containerID string, cmd []string, out io.Writer) (exitCode int, stderrTail string, err error) {
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if err := d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/exec", map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Tty":          false,
+		"Cmd":          cmd,
+	}, &created); err != nil {
+		return -1, "", err
+	}
+	body, _ := json.Marshal(map[string]any{"Detach": false, "Tty": false})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.url("/exec/"+created.ID+"/start"), bytes.NewReader(body))
+	if err != nil {
+		return -1, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return -1, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return -1, "", &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+	var stderr bytes.Buffer
+	if err := demuxDockerStream(resp.Body, out, capWriter(&stderr, 4096)); err != nil {
+		return -1, stderr.String(), fmt.Errorf("exec stream: %w", err)
+	}
+	var st struct {
+		ExitCode int  `json:"ExitCode"`
+		Running  bool `json:"Running"`
+	}
+	if err := d.do(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil, &st); err != nil {
+		return -1, stderr.String(), err
+	}
+	return st.ExitCode, stderr.String(), nil
+}
+
+// demuxDockerStream splits Docker's non-TTY attach framing (8-byte header:
+// stream type, 3 padding bytes, 4-byte big-endian frame length) into stdout
+// and stderr writers.
+func demuxDockerStream(r io.Reader, stdout, stderr io.Writer) error {
+	hdr := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(r, hdr); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return err
+		}
+		length := int(hdr[4])<<24 | int(hdr[5])<<16 | int(hdr[6])<<8 | int(hdr[7])
+		dst := stdout
+		if hdr[0] == 2 {
+			dst = stderr
+		}
+		if _, err := io.CopyN(dst, r, int64(length)); err != nil {
+			return err
+		}
+	}
+}
+
+// capWriter bounds a diagnostics buffer so a chatty stderr can't balloon memory.
+func capWriter(buf *bytes.Buffer, max int) io.Writer {
+	return writerFunc(func(p []byte) (int, error) {
+		if buf.Len() < max {
+			room := max - buf.Len()
+			if len(p) > room {
+				buf.Write(p[:room])
+			} else {
+				buf.Write(p)
+			}
+		}
+		return len(p), nil
+	})
+}
+
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// PutArchive extracts a tar stream into a container at path. Content lands on
+// the container's writable layer — callers must only ship non-secret payloads
+// (P1-11 uses it to place dumps into throwaway verify/restore containers that
+// are removed right after).
+func (d *DockerClient) PutArchive(ctx context.Context, containerID, path string, tarStream io.Reader) error {
+	u := d.url("/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(path))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, tarStream)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}

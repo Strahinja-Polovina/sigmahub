@@ -1,0 +1,69 @@
+package reconciler
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+func TestRenderBackupOpsOrderingAndSecretFreedom(t *testing.T) {
+	runs := []store.BackupRunSpec{
+		{RunID: "run_b", Kind: "backup", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", KeepDaily: 7, KeepWeekly: 4, KeepMonthly: 6},
+		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: "abc123"},
+	}
+	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), runs, ACMEConfig{})
+
+	bk, ok := opByID(ops, "bkr:run_b")
+	if !ok || bk.Kind != dsd.KindBackupRun {
+		t.Fatalf("backup op = %+v", bk)
+	}
+	// The backup depends on the database container being applied first.
+	if len(bk.DependsOn) != 1 || bk.DependsOn[0] != "res:res_db" {
+		t.Fatalf("backup deps = %v", bk.DependsOn)
+	}
+	if !strings.Contains(string(bk.Spec), `"keepDaily":7`) {
+		t.Fatalf("backup spec missing retention: %s", bk.Spec)
+	}
+	vf, ok := opByID(ops, "bkr:run_v")
+	if !ok || vf.Kind != dsd.KindBackupVerify {
+		t.Fatalf("verify op = %+v", vf)
+	}
+	// First-day verify runs after the same-document backup.
+	if len(vf.DependsOn) != 1 || vf.DependsOn[0] != "bkr:run_b" {
+		t.Fatalf("verify deps = %v", vf.DependsOn)
+	}
+	if !strings.Contains(string(vf.Spec), `"expectedSha":"abc123"`) {
+		t.Fatalf("verify spec missing pinned sha: %s", vf.Spec)
+	}
+	// A backup op spec carries identifiers only — no command and no credential.
+	raw, _ := json.Marshal(ops)
+	for _, needle := range []string{"restic", "pg_dump", "secretKey", "repoKey", "accessKey"} {
+		if strings.Contains(string(raw), needle) {
+			t.Fatalf("DSD leaks %q", needle)
+		}
+	}
+}
+
+func TestRenderRestoreOpTargetsNewResource(t *testing.T) {
+	runs := []store.BackupRunSpec{
+		{RunID: "run_r", Kind: "restore", ResourceID: "res_src", Engine: "postgres",
+			Database: "shop", Username: "sigma", ExpectedSha: "sha-a",
+			RestoreResourceID: "res_new", RestoreDatabase: "shop_restore", RestoreUsername: "sigma"},
+	}
+	ops, _ := renderOps("srv_t", nil, nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, runs, ACMEConfig{})
+	op, ok := opByID(ops, "bkr:run_r")
+	if !ok || op.Kind != dsd.KindBackupRestore {
+		t.Fatalf("restore op = %+v", op)
+	}
+	s := string(op.Spec)
+	if !strings.Contains(s, `"targetContainer":"sigmahub-res_new"`) ||
+		!strings.Contains(s, `"targetDatabase":"shop_restore"`) ||
+		!strings.Contains(s, `"expectedSha":"sha-a"`) {
+		t.Fatalf("restore spec = %s", s)
+	}
+}

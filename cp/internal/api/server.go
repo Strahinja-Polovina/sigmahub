@@ -36,6 +36,11 @@ type StoreAPI interface {
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error
 	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string) error
 	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
+	// Backups (P1-11): the audited per-run credential release and the agent's
+	// terminal result report, plus the op-status failure fallback.
+	BackupCredentialForRun(ctx context.Context, serverID, runID string) (store.BackupCredential, error)
+	SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error
+	FailBackupRunFromOpStatus(ctx context.Context, serverID, runID, errText string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -161,6 +166,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealDatabaseConnection))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/database/expose", s.requireService(store.RoleProjectAdmin, s.handleExposeDatabase))
 
+	// Backups (P1-11). Target metadata + run history + the verify-day feed are
+	// member-visible; target lifecycle, policy edits and the fire-drill restore
+	// are Project Admin+. Target creation carries credentials, so like token
+	// minting it is deliberately not idempotency-replayable.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/backup-targets", s.requireService(store.RoleProjectAdmin, s.handleCreateBackupTarget))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/backup-targets", s.requireService(store.RoleDeveloper, s.handleListBackupTargets))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/backup-targets/{targetId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBackupTarget))
+	s.mux.HandleFunc("PATCH /v1/orgs/{orgId}/resources/{resourceId}/backup-policy", s.requireService(store.RoleProjectAdmin, s.handleUpdateBackupPolicy))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/backup-runs", s.requireService(store.RoleDeveloper, s.handleListBackupRuns))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/backups/verify-days", s.requireService(store.RoleDeveloper, s.handleVerifyDays))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/restore", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleRestoreDatabase)))
+
 	// Custom domains (P1-8): attach/detach are Project Admin+, listing is member-visible.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleDeveloper, s.handleListDomains))
@@ -209,6 +226,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/domains/status", s.requireAgent(s.handleAgentDomainStatus))
 	s.mux.HandleFunc("GET /v1/agent/git-credential", s.requireAgent(s.handleAgentGitCredential))
 	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
+	s.mux.HandleFunc("GET /v1/agent/backup-credential", s.requireAgent(s.handleAgentBackupCredential))
+	s.mux.HandleFunc("POST /v1/agent/backup-status", s.requireAgent(s.handleAgentBackupStatus))
 }
 
 func (s *Server) Handler() http.Handler {

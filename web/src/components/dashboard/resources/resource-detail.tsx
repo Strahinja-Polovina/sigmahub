@@ -63,7 +63,8 @@ import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 import { DatabasePanel } from "./database-panel";
-import type { CpDatabaseInfo } from "@/server/cp";
+import { DatabaseBackupsPanel } from "./database-backups-panel";
+import type { CpDatabaseInfo, CpBackupTarget, CpBackupRun } from "@/server/cp";
 
 type Deployment = {
   id: string;
@@ -196,6 +197,9 @@ export function ResourceDetail({
   rollbackTargetIds = [],
   deploymentsEnabled = false,
   database = null,
+  backupTargets = [],
+  backupRuns = [],
+  environmentId = "",
 }: {
   detail: Detail;
   orgId?: string;
@@ -212,6 +216,10 @@ export function ResourceDetail({
   deploymentsEnabled?: boolean;
   /** P1-10 database connection metadata (CP mode, database kinds only). */
   database?: CpDatabaseInfo | null;
+  /** P1-11 backups (CP mode, database kinds only). */
+  backupTargets?: CpBackupTarget[];
+  backupRuns?: CpBackupRun[];
+  environmentId?: string;
 }) {
   const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
@@ -352,6 +360,19 @@ export function ResourceDetail({
                   orgId={orgId}
                   resourceId={resource.id}
                   info={database}
+                  canManage={canManage}
+                />
+              )}
+              {database && orgId && (
+                <DatabaseBackupsPanel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  environmentId={environmentId}
+                  serverId={resource.serverId}
+                  resourceName={resource.name}
+                  policy={database.backupPolicy ?? null}
+                  targets={backupTargets}
+                  runs={backupRuns}
                   canManage={canManage}
                 />
               )}

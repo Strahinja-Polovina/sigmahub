@@ -63,6 +63,8 @@ ensure_tool tar tar
 # stock base images; the host.cis / host.nftables DSD ops need them present.
 need nft || { echo "installing nftables..."; apt-get update -qq && apt-get install -y -qq nftables; }
 apt-get install -y -qq auditd >/dev/null 2>&1 || echo "warning: could not install auditd; the CIS auditd control will score as unmet"
+# restic executes the P1-11 backup/verify ops (client-side encrypted backups).
+ensure_tool restic restic
 # cosign is required to verify the release before we run it.
 if ! need cosign; then
   echo "installing cosign..."
