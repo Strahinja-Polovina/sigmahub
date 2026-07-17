@@ -10,9 +10,11 @@ import {
   getServerCounts,
   getCommandIndex,
 } from "@/server/queries";
+import { maybeSyncOrgMirror } from "@/server/cp-sync";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { OrgProvider } from "@/components/dashboard/org-context";
 import { AppSidebar } from "@/components/dashboard/app-sidebar";
+import { CpStatusBanner } from "@/components/dashboard/cp-status-banner";
 import { TopBar } from "@/components/dashboard/top-bar";
 
 export default async function AppLayout({
@@ -29,6 +31,10 @@ export default async function AppLayout({
     orgId = await getActiveOrgId();
   }
   if (!orgId) redirect("/login");
+
+  // Repair CP↔mirror drift before the reads below (throttled, no-op in demo
+  // mode); the returned health drives the "control plane unreachable" banner.
+  const cpStatus = await maybeSyncOrgMirror(orgId);
 
   const [myOrgs, sessionUser, projects, commandIndex] = await Promise.all([
     getMyOrgs(),
@@ -56,6 +62,7 @@ export default async function AppLayout({
         <AppSidebar projects={projects} />
         <SidebarInset>
           <TopBar commandIndex={commandIndex} />
+          <CpStatusBanner status={cpStatus} />
           <div className="flex flex-1 flex-col">{children}</div>
         </SidebarInset>
       </SidebarProvider>

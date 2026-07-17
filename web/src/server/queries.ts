@@ -4,6 +4,7 @@ import { db } from "./db";
 import * as s from "./db/schema";
 import { user } from "./db/auth-schema";
 import { cpEnabled, cpListServers, cpServerToRow } from "./cp";
+import { reportCpFailure } from "./cp-sync";
 
 export const UNIT_PRICE = 5;
 export const FREE_TIER_SERVERS = 3;
@@ -34,10 +35,17 @@ export async function getEnvironment(id: string) {
 }
 /** Org servers. CP mode reads the control plane (mapped onto the local row
  *  shape); demo mode reads the simulated PGlite rows. Every server-reading
- *  query below goes through here so both modes stay consistent. */
+ *  query below goes through here so both modes stay consistent. When the CP
+ *  is unreachable this falls back to the reconciled mirror instead of
+ *  throwing or silently returning nothing — the layout banner (SIGMA-56)
+ *  tells the user the view may be stale. */
 export async function getServers(orgId: string) {
   if (cpEnabled()) {
-    return (await cpListServers(orgId)).map(cpServerToRow);
+    try {
+      return (await cpListServers(orgId)).map(cpServerToRow);
+    } catch (err) {
+      reportCpFailure(orgId, err);
+    }
   }
   return db.select().from(s.servers).where(eq(s.servers.orgId, orgId));
 }

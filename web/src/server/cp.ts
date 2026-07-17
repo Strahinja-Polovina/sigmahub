@@ -330,6 +330,23 @@ export async function cpListProjects(orgId: string): Promise<CpProject[]> {
   return projects;
 }
 
+export async function cpListEnvironments(
+  orgId: string,
+  projectId: string
+): Promise<CpEnvironment[]> {
+  const { environments } = await cpFetch<{ environments: CpEnvironment[] }>(
+    `${org(orgId)}/projects/${encodeURIComponent(projectId)}/environments`,
+    undefined, { orgId });
+  return environments;
+}
+
+export async function cpEnvServerIds(orgId: string, envId: string): Promise<string[]> {
+  const { serverIds } = await cpFetch<{ serverIds: string[] }>(
+    `${org(orgId)}/environments/${encodeURIComponent(envId)}/servers`,
+    undefined, { orgId });
+  return serverIds ?? [];
+}
+
 export async function cpCreateEnvironment(
   orgId: string,
   projectId: string,
