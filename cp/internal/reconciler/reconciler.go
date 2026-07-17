@@ -27,6 +27,7 @@ type Store interface {
 	DomainsForServer(ctx context.Context, serverID string) (map[string][]store.Domain, error)
 	DeployTargetsForServer(ctx context.Context, serverID string) (map[string]store.DeployTarget, error)
 	DBTargetsForServer(ctx context.Context, serverID string) (map[string]store.DBTarget, error)
+	S3TargetsForServer(ctx context.Context, serverID string) (map[string]store.S3Target, error)
 	BackupRunsForServer(ctx context.Context, serverID string) ([]store.BackupRunSpec, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
@@ -58,7 +59,7 @@ func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
 // address; the remaining kinds (s3/llm) keep the P1-2 no-op "resource.sync"
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, backupRuns []store.BackupRunSpec, acme ACMEConfig) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, backupRuns []store.BackupRunSpec, acme ACMEConfig) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
@@ -66,6 +67,13 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 		if target, isDB := dbTargets[rs.ResourceID]; isDB {
 			if dbOps, netID, ok := renderDatabaseOps(rs, target, hardening.MeshIP); ok {
 				resourceOps = append(resourceOps, dbOps...)
+				networks[netID] = dsd.NetworkName(rs.ProjectID)
+				continue
+			}
+		}
+		if target, isS3 := s3Targets[rs.ResourceID]; isS3 {
+			if s3Ops, netID, ok := renderS3Ops(rs, target, hardening.MeshIP); ok {
+				resourceOps = append(resourceOps, s3Ops...)
 				networks[netID] = dsd.NetworkName(rs.ProjectID)
 				continue
 			}
@@ -171,11 +179,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
+	s3Targets, err := r.st.S3TargetsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
 	backupRuns, err := r.st.BackupRunsForServer(ctx, serverID)
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, backupRuns, r.acme)
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, backupRuns, r.acme)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

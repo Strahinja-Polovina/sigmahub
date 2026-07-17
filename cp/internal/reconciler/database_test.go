@@ -23,7 +23,7 @@ func dbTargets(engine string, serverType string) map[string]store.DBTarget {
 
 func TestRenderDatabaseFansIntoContainerOps(t *testing.T) {
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, ACMEConfig{})
 
 	if _, ok := opByID(ops, "net:proj_x"); !ok {
 		t.Fatal("missing network op")
@@ -82,7 +82,7 @@ func TestRenderDatabaseFansIntoContainerOps(t *testing.T) {
 
 func TestRenderDatabaseTuningFollowsServerType(t *testing.T) {
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "general"), nil, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "general"), nil, nil, ACMEConfig{})
 	ctr, _ := opByID(ops, "res:res_db")
 	if !strings.Contains(string(ctr.Spec), "shared_buffers=128MB") {
 		t.Fatalf("general server must get dev-grade tuning, got %s", ctr.Spec)
@@ -93,7 +93,7 @@ func TestRenderDatabaseWithoutMeshFallsBackToStub(t *testing.T) {
 	// Before mesh enrollment there is no address to bind to; the resource must
 	// stay a no-op stub rather than publish on an undefined interface.
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{}, nil, nil, dbTargets("postgres", "database"), nil, ACMEConfig{})
+		store.HostHardening{}, nil, nil, dbTargets("postgres", "database"), nil, nil, ACMEConfig{})
 	op, ok := opByID(ops, "res:res_db")
 	if !ok || op.Kind != dsd.KindResourceSync {
 		t.Fatalf("want resource.sync stub without mesh IP, got %+v", op)
@@ -105,7 +105,7 @@ func TestRenderDatabaseDSDCarriesNoSecret(t *testing.T) {
 	// contain a credential value for any engine.
 	for _, engine := range []string{"postgres", "mysql", "redis", "mongodb"} {
 		ops, _ := renderOps("srv_t", dbSpecs(engine), nil, nil,
-			store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets(engine, "database"), nil, ACMEConfig{})
+			store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets(engine, "database"), nil, nil, ACMEConfig{})
 		raw, _ := json.Marshal(ops)
 		if strings.Contains(string(raw), "password=") || strings.Contains(string(raw), `"password"`) {
 			t.Fatalf("%s DSD leaks a password: %s", engine, raw)
@@ -115,7 +115,7 @@ func TestRenderDatabaseDSDCarriesNoSecret(t *testing.T) {
 
 func TestRenderMySQLIncludesRootPasswordRef(t *testing.T) {
 	ops, _ := renderOps("srv_t", dbSpecs("mysql"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("mysql", "database"), nil, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("mysql", "database"), nil, nil, ACMEConfig{})
 	ctr, _ := opByID(ops, "res:res_db")
 	s := string(ctr.Spec)
 	if !strings.Contains(s, "MYSQL_PASSWORD") || !strings.Contains(s, "MYSQL_ROOT_PASSWORD") {
@@ -125,7 +125,7 @@ func TestRenderMySQLIncludesRootPasswordRef(t *testing.T) {
 
 func TestRenderRedisTakesPasswordFromEnvNotArgs(t *testing.T) {
 	ops, _ := renderOps("srv_t", dbSpecs("redis"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("redis", "general"), nil, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("redis", "general"), nil, nil, ACMEConfig{})
 	ctr, _ := opByID(ops, "res:res_db")
 	var spec struct {
 		Command []string `json:"command"`

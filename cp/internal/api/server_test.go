@@ -214,6 +214,12 @@ func (f *fakeDomain) GetDatabaseInfo(_ context.Context, _, _ string) (store.Data
 func (f *fakeDomain) RevealDatabaseConnection(_ context.Context, _, _, _ string) (store.DatabaseConnection, error) {
 	return store.DatabaseConnection{}, store.ErrNotDatabase
 }
+func (f *fakeDomain) GetS3Info(_ context.Context, _, _ string) (store.S3Info, error) {
+	return store.S3Info{}, store.ErrNotS3
+}
+func (f *fakeDomain) RevealS3Connection(_ context.Context, _, _, _ string) (store.S3Connection, error) {
+	return store.S3Connection{}, store.ErrNotS3
+}
 func (f *fakeDomain) CreateBackupTarget(_ context.Context, _, _ string, _ store.CreateBackupTargetInput) (store.BackupTarget, error) {
 	return store.BackupTarget{ID: "bkt_1"}, nil
 }

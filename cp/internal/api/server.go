@@ -192,6 +192,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database", s.requireService(store.RoleDeveloper, s.handleGetDatabase))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/database/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealDatabaseConnection))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/database/expose", s.requireService(store.RoleProjectAdmin, s.handleExposeDatabase))
+	// S3 storage (P2-1): same split as databases.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/s3", s.requireService(store.RoleDeveloper, s.handleGetS3))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/s3/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealS3Connection))
 
 	// Backups (P1-11). Target metadata + run history + the verify-day feed are
 	// member-visible; target lifecycle, policy edits and the fire-drill restore
