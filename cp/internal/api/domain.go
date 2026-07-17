@@ -58,6 +58,10 @@ type DomainAPI interface {
 	// Reveal decrypts credentials (Project Admin+, audited in the store).
 	GetDatabaseInfo(ctx context.Context, orgID, resourceID string) (store.DatabaseInfo, error)
 	RevealDatabaseConnection(ctx context.Context, orgID, resourceID, actor string) (store.DatabaseConnection, error)
+	// S3 storage (P2-1): same split — Info is member-visible, Reveal is
+	// Project Admin+ and audited in the store.
+	GetS3Info(ctx context.Context, orgID, resourceID string) (store.S3Info, error)
+	RevealS3Connection(ctx context.Context, orgID, resourceID, actor string) (store.S3Connection, error)
 	// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
 	// the per-day verify feed and the fire-drill restore.
 	CreateBackupTarget(ctx context.Context, orgID, actor string, in store.CreateBackupTargetInput) (store.BackupTarget, error)

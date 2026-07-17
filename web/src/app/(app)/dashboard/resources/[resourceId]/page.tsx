@@ -8,12 +8,14 @@ import {
   cpListDeployments,
   cpRollbackTargets,
   cpGetDatabase,
+  cpGetS3,
   cpListBackupTargets,
   cpListBackupRuns,
   cpQueryResourceMetrics,
   cpQueryLogs,
   cpKind,
   type CpDatabaseInfo,
+  type CpS3Info,
   type CpBackupTarget,
   type CpBackupRun,
 } from "@/server/cp";
@@ -93,6 +95,20 @@ async function loadDatabase(
   }
 }
 
+/** Load an S3 resource's endpoint metadata (P2-1, CP mode only). */
+async function loadS3(
+  orgId: string,
+  resourceId: string,
+  kind: string
+): Promise<CpS3Info | null> {
+  if (!cpEnabled() || kind !== "s3") return null;
+  try {
+    return await cpGetS3(orgId, resourceId);
+  } catch {
+    return null;
+  }
+}
+
 /** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
  *  the explicit not-configured state — CP mode never shows synthetic data. */
 async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
@@ -158,6 +174,7 @@ export default async function ResourceDetailPage({
     detail.resource.kind
   );
   const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
+  const s3 = await loadS3(orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null);
   const telemetry = await loadTelemetry(orgId, resourceId);
 
@@ -171,6 +188,7 @@ export default async function ResourceDetailPage({
       rollbackTargetIds={rollbackTargetIds}
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
       database={database}
+      s3={s3}
       backupTargets={backups.targets}
       backupRuns={backups.runs}
       environmentId={detail.resource.environmentId}

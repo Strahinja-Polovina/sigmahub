@@ -962,6 +962,44 @@ export async function cpConnectRepo(
   }, { orgId, actor });
 }
 
+// ── S3 storage (P2-1) ───────────────────────────────────────────────────────
+
+export type CpS3Info = {
+  resourceId: string;
+  engine: string;
+  image: string;
+  accessKey: string;
+  host: string;
+  port: number;
+  meshOnly: boolean;
+  endpoint: string;
+};
+
+export type CpS3Connection = CpS3Info & { secretKey: string };
+
+export async function cpGetS3(orgId: string, resourceId: string): Promise<CpS3Info | null> {
+  try {
+    return await cpFetch<CpS3Info>(
+      `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/s3`,
+      undefined, { orgId });
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Control plane 404")) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function cpRevealS3Connection(
+  orgId: string,
+  resourceId: string,
+  actor: CpActor
+): Promise<CpS3Connection> {
+  return cpFetch(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/s3/connection`,
+    undefined, { orgId, actor });
+}
+
 // ── Alerting (P2-6) ─────────────────────────────────────────────────────────
 
 export type CpAlertChannel = {

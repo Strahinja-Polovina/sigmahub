@@ -140,6 +140,12 @@ func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, 
 		return nil, err
 	}
 	out = append(out, dbSecrets...)
+	// P2-1: S3 root credentials ride the same channel under the same rule.
+	s3Secrets, err := s.resolveS3SecretsTx(ctx, tx, orgID, serverID, resourceID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, s3Secrets...)
 
 	if len(out) > 0 {
 		if err := auditTx(ctx, tx, orgID, actor, "Secrets fetched (agent)", resourceID); err != nil {

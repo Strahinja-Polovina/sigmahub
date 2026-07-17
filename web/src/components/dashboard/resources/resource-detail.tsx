@@ -63,9 +63,11 @@ import { DeployStatusBadge } from "./deploy-status-badge";
 import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 import { DatabasePanel } from "./database-panel";
+import { S3Panel } from "./s3-panel";
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import type {
   CpDatabaseInfo,
+  CpS3Info,
   CpBackupTarget,
   CpBackupRun,
   CpTelemetryPoint,
@@ -211,6 +213,7 @@ export function ResourceDetail({
   rollbackTargetIds = [],
   deploymentsEnabled = false,
   database = null,
+  s3 = null,
   backupTargets = [],
   backupRuns = [],
   environmentId = "",
@@ -231,6 +234,8 @@ export function ResourceDetail({
   deploymentsEnabled?: boolean;
   /** P1-10 database connection metadata (CP mode, database kinds only). */
   database?: CpDatabaseInfo | null;
+  /** P2-1 S3 endpoint metadata (CP mode, s3 kind only). */
+  s3?: CpS3Info | null;
   /** P1-11 backups (CP mode, database kinds only). */
   backupTargets?: CpBackupTarget[];
   backupRuns?: CpBackupRun[];
@@ -402,6 +407,14 @@ export function ResourceDetail({
                   orgId={orgId}
                   resourceId={resource.id}
                   info={database}
+                  canManage={canManage}
+                />
+              )}
+              {s3 && orgId && (
+                <S3Panel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  info={s3}
                   canManage={canManage}
                 />
               )}

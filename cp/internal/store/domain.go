@@ -440,6 +440,13 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 			return Resource{}, err
 		}
 	}
+	// P2-1: S3 storage provisions the same way (root credentials + mesh port),
+	// minus the backup-policy row — object-store DR is out of the P1-11 path.
+	if IsS3Kind(in.Kind) {
+		if err := s.provisionS3Tx(ctx, tx, orgID, r); err != nil {
+			return Resource{}, err
+		}
+	}
 	if err := auditTx(ctx, tx, orgID, actor, "Resource created", in.Name+" ("+in.Kind+")"); err != nil {
 		return Resource{}, err
 	}
