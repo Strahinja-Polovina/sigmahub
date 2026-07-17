@@ -9,8 +9,46 @@ permissions:
   id-token: write # keyless cosign signing via GitHub OIDC
 
 jobs:
+  # A tag on a broken commit must not ship: the release gates on the same
+  # vet+test (with the race detector and the Postgres-backed integration
+  # suite) that branch CI runs.
+  test:
+    name: test before release
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sigmahub_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cp/go.mod
+      - name: cp vet & test
+        working-directory: cp
+        env:
+          CP_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sigmahub_test
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: agent vet & test
+        working-directory: agent
+        run: |
+          go vet ./...
+          go test -race ./...
+
   release:
     name: goreleaser (sign + SBOM) & verify
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

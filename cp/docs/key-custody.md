@@ -81,17 +81,30 @@ dev stub records the action but does not enforce the split.
   wrapped, tokens authenticate, plain SHA-256 of a token is absent from the
   DB, pepper stable across CP restarts.
 
+**Landed (prod-readiness pass):**
+
+- `VaultCustody` (`cp/internal/kms/vault_custody.go`): production custody over
+  HashiCorp Vault's transit engine — master key material never exists on the
+  CP host; wraps store Vault's versioned ciphertext so transit key rotation
+  applies transparently to new wraps. Selected via `CP_KMS_BACKEND=vault`
+  (`CP_VAULT_ADDR`, `CP_VAULT_TOKEN`, `CP_VAULT_TRANSIT_KEY`, optional
+  `CP_VAULT_NAMESPACE`); connectivity + key readability verified at boot.
+  Vault's own server-side audit log is the **out-of-band unwrap anchor** the
+  threat model calls for, alongside the local `cp_audit_log` rows.
+  Note: switching backends does not re-wrap existing envelopes — bootstrap
+  fresh on vault, or re-wrap (KEK rotation covers org DEKs) before flipping.
+
 **Deferred to the hardening milestone (documented gaps):**
 
-- `FileCustody` is **dev only** — the master key sits on the same host as the
-  ciphertext, so it provides envelope hygiene and the audit trail, not a real
-  trust boundary. Production replaces it with an external KMS/HSM
-  implementation of the same interface (e.g. Vault transit / cloud KMS).
-- **Unwrap audit anchored outside the primary infra** — today the audit row is
-  in the same Postgres as the ciphertext. Production ships these events to an
-  append-only external sink.
-- **Quorum + break-glass** on bulk decrypt (T4) — not enforced by the dev stub.
-- **Operator ↔ unwrap identity separation** (T3) — recorded, not enforced.
+- `FileCustody` remains the **dev default** (`CP_KMS_BACKEND=file`) — the
+  master key sits on the same host as the ciphertext; envelope hygiene and the
+  audit trail, not a trust boundary. Use `vault` in production.
+- **Quorum + break-glass** on bulk decrypt (T4) — enforceable via Vault
+  policies on the transit key (control-group approvals), not enforced by the
+  CP itself yet.
+- **Operator ↔ unwrap identity separation** (T3) — recorded, not enforced;
+  Vault tokens per role narrow this in practice.
+- Cloud-KMS backends (AWS/GCP) — same interface, add on demand.
 
 ---
 
