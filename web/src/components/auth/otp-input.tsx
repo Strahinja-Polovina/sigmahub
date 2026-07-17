@@ -4,7 +4,7 @@ import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-// A 6-digit segmented input for the mock TOTP step. Value is owned by the
+// A 6-digit segmented input for the TOTP challenge step. Value is owned by the
 // parent; this component only renders the boxes and handles keyboard/paste UX.
 
 type OtpInputProps = {

@@ -6,6 +6,7 @@ import { MembersTab } from "./members-tab";
 import { AuditTab } from "./audit-tab";
 import { TokensTab } from "./tokens-tab";
 import { BetaMetricsTab } from "./beta-metrics-tab";
+import { SecurityTab } from "./security-tab";
 
 export type SettingsOrg = {
   id: string;
@@ -35,6 +36,7 @@ export function SettingsView({
   currentUserRole,
   cpMode = false,
   orgCreatedAt = null,
+  twoFactorEnabled = false,
 }: {
   org: SettingsOrg;
   members: SettingsMember[];
@@ -44,6 +46,7 @@ export function SettingsView({
   /** CP mode adds the beta-metrics tab (P1-13 M1 instrumentation). */
   cpMode?: boolean;
   orgCreatedAt?: string | Date | null;
+  twoFactorEnabled?: boolean;
 }) {
   const isAdmin = currentUserRole === "Org Admin";
 
@@ -61,6 +64,7 @@ export function SettingsView({
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
           <TabsTrigger value="tokens">Tokens</TabsTrigger>
+          <TabsTrigger value="security">Security</TabsTrigger>
           <TabsTrigger value="audit">Audit log</TabsTrigger>
           {cpMode && <TabsTrigger value="beta">Beta metrics</TabsTrigger>}
         </TabsList>
@@ -78,6 +82,9 @@ export function SettingsView({
         </TabsContent>
         <TabsContent value="tokens">
           <TokensTab orgId={org.id} isAdmin={isAdmin} />
+        </TabsContent>
+        <TabsContent value="security">
+          <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} />
         </TabsContent>
         <TabsContent value="audit">
           <AuditTab entries={audit} />
