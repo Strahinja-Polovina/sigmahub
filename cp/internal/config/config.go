@@ -30,6 +30,14 @@ type Config struct {
 	// (X-Hub-Signature-256 HMAC-SHA256). Empty disables the webhook receiver
 	// (returns 503) rather than accepting unverifiable deliveries.
 	GitHubWebhookSecret string
+	// GitHub App (SIGMA-55): AppID + the downloaded private-key PEM enable
+	// installation-token minting (the key is imported into KMS custody on
+	// boot; the file can be removed afterwards). AppSlug builds the
+	// dashboard's github.com/apps/<slug>/installations/new install link.
+	// All empty = App integration off; PATs keep working.
+	GitHubAppID             string
+	GitHubAppPrivateKeyFile string
+	GitHubAppSlug           string
 	// ACMEEmail is the Let's Encrypt account contact rendered into proxy.traefik
 	// ops (P1-8). ACMECADirURL overrides the CA directory — set to the Pebble /
 	// LE-staging URL for e2e; empty means Let's Encrypt production.
@@ -50,17 +58,20 @@ type Config struct {
 
 func FromEnv() (Config, error) {
 	cfg := Config{
-		Addr:                getenv("CP_ADDR", ":8080"),
-		DatabaseURL:         os.Getenv("CP_DATABASE_URL"),
-		Env:                 getenv("CP_ENV", "dev"),
-		ServiceToken:        os.Getenv("CP_SERVICE_TOKEN"),
-		ProvisionToken:      os.Getenv("CP_PROVISION_TOKEN"),
-		GitHubWebhookSecret: os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
-		ACMEEmail:           os.Getenv("CP_ACME_EMAIL"),
-		ACMECADirURL:        os.Getenv("CP_ACME_CA_DIR_URL"),
-		VMWriteURL:          os.Getenv("CP_VM_WRITE_URL"),
-		VMReadURL:           os.Getenv("CP_VM_READ_URL"),
-		LokiURL:             os.Getenv("CP_LOKI_URL"),
+		Addr:                    getenv("CP_ADDR", ":8080"),
+		DatabaseURL:             os.Getenv("CP_DATABASE_URL"),
+		Env:                     getenv("CP_ENV", "dev"),
+		ServiceToken:            os.Getenv("CP_SERVICE_TOKEN"),
+		ProvisionToken:          os.Getenv("CP_PROVISION_TOKEN"),
+		GitHubWebhookSecret:     os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
+		GitHubAppID:             os.Getenv("CP_GITHUB_APP_ID"),
+		GitHubAppPrivateKeyFile: os.Getenv("CP_GITHUB_APP_PRIVATE_KEY_FILE"),
+		GitHubAppSlug:           os.Getenv("CP_GITHUB_APP_SLUG"),
+		ACMEEmail:               os.Getenv("CP_ACME_EMAIL"),
+		ACMECADirURL:            os.Getenv("CP_ACME_CA_DIR_URL"),
+		VMWriteURL:              os.Getenv("CP_VM_WRITE_URL"),
+		VMReadURL:               os.Getenv("CP_VM_READ_URL"),
+		LokiURL:                 os.Getenv("CP_LOKI_URL"),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")

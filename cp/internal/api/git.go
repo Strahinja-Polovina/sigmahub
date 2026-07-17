@@ -24,6 +24,13 @@ type GitAPI interface {
 	// Previews (P1-12): the per-connection toggle + PR environment records.
 	SetConnectionPreviews(ctx context.Context, orgID, connID string, enabled bool, serverID, actor string) error
 	ListPreviewEnvironments(ctx context.Context, orgID, connID string) ([]store.PreviewEnvironment, error)
+	// GitHub App (SIGMA-55): link an installation to an existing connection.
+	SetConnectionInstallation(ctx context.Context, orgID, connID, installationID, actor string) error
+}
+
+// InstallationTokenSource mints GitHub App installation access tokens.
+type InstallationTokenSource interface {
+	InstallationToken(ctx context.Context, installationID string) (string, error)
 }
 
 // handleSetPreviews flips a connection's preview flag and designates the
@@ -61,6 +68,24 @@ type RepoInspector interface {
 	Inspect(ctx context.Context, repoFullName, token string) (gitdetect.Detected, error)
 }
 
+// effectiveGitToken picks the credential detect/connect read the repo with:
+// an explicitly pasted token wins; otherwise an App installation token is
+// minted when the request references an installation and the App is
+// configured. Minting failures degrade to unauthenticated (public-repo) reads
+// — the resulting 404s surface as "could not read repository", the same
+// behaviour as a wrong PAT.
+func (s *Server) effectiveGitToken(ctx context.Context, token, installationID string) string {
+	if token != "" || strings.TrimSpace(installationID) == "" || s.installTokens == nil {
+		return token
+	}
+	minted, err := s.installTokens.InstallationToken(ctx, strings.TrimSpace(installationID))
+	if err != nil {
+		s.log.Warn("github app installation token", "installation", installationID, "err", err)
+		return ""
+	}
+	return minted
+}
+
 // handleGitDetect previews the deploy config sigmahub detects for a repo, so the
 // connect wizard can pre-fill it. Read-only; persists nothing.
 func (s *Server) handleGitDetect(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +106,8 @@ func (s *Server) handleGitDetect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "repoFullName is required"})
 		return
 	}
-	detected, err := s.inspector.Inspect(r.Context(), req.RepoFullName, req.Token)
+	token := s.effectiveGitToken(r.Context(), req.Token, req.InstallationID)
+	detected, err := s.inspector.Inspect(r.Context(), req.RepoFullName, token)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not read repository: " + err.Error()})
 		return
@@ -120,7 +146,8 @@ func (s *Server) handleGitConnect(w http.ResponseWriter, r *http.Request) {
 	// repo, transient) is not a hard block — the connection is still allowed and
 	// detection can be retried from the UI.
 	if s.inspector != nil {
-		if detected, derr := s.inspector.Inspect(r.Context(), req.RepoFullName, req.Token); derr == nil && !detected.Deployable {
+		token := s.effectiveGitToken(r.Context(), req.Token, req.InstallationID)
+		if detected, derr := s.inspector.Inspect(r.Context(), req.RepoFullName, token); derr == nil && !detected.Deployable {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 				"error":    detected.Reason,
 				"detected": detected,
@@ -236,6 +263,39 @@ func (s *Server) handlePromoteBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, dr)
+}
+
+// handleGitAppInfo tells the dashboard whether a GitHub App is registered:
+// the slug builds the install link, enabled says the CP can mint installation
+// tokens (i.e. the App private key + id are configured).
+func (s *Server) handleGitAppInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": s.installTokens != nil,
+		"slug":    s.githubAppSlug,
+	})
+}
+
+// handleSetInstallation links a GitHub App installation to a connection — the
+// dashboard's post-install callback lands here. Project Admin+.
+func (s *Server) handleSetInstallation(w http.ResponseWriter, r *http.Request) {
+	if s.git == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "git integration is not configured"})
+		return
+	}
+	var req struct {
+		InstallationID string `json:"installationId"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	err := s.git.SetConnectionInstallation(r.Context(), r.PathValue("orgId"), r.PathValue("connId"),
+		req.InstallationID, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "link installation")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "linked"})
 }
 
 func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request) {

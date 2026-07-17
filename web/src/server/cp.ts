@@ -962,6 +962,29 @@ export async function cpConnectRepo(
   }, { orgId, actor });
 }
 
+/** GitHub App metadata (SIGMA-55): whether the CP can mint installation
+ *  tokens, and the App slug for the installations/new link. */
+export type CpGitAppInfo = { enabled: boolean; slug: string };
+
+export async function cpGitAppInfo(orgId: string): Promise<CpGitAppInfo> {
+  return cpFetch(`${org(orgId)}/git/app`, undefined, { orgId });
+}
+
+/** Link a GitHub App installation to an existing connection — from then on
+ *  the CP clones and inspects with short-lived installation tokens. */
+export async function cpLinkInstallation(
+  orgId: string,
+  connId: string,
+  installationId: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/git/connections/${encodeURIComponent(connId)}/installation`,
+    { method: "POST", body: JSON.stringify({ installationId }) },
+    { orgId, actor }
+  );
+}
+
 export async function cpListGitConnections(orgId: string, projectId?: string): Promise<CpGitConnection[]> {
   const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
   const { connections } = await cpFetch<{ connections: CpGitConnection[] }>(

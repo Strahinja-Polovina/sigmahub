@@ -56,6 +56,8 @@ type Server struct {
 	domain              DomainAPI
 	git                 GitAPI
 	inspector           RepoInspector
+	installTokens       InstallationTokenSource
+	githubAppSlug       string
 	dsdStore            DSDStore
 	dsdWaiter           DSDWaiter
 	reconcile           ReconcileTrigger
@@ -84,6 +86,12 @@ type Options struct {
 	// Inspector reads a connected repo's files to derive the deploy config. Nil
 	// disables detection (the detect endpoint 503s and connect skips its gate).
 	Inspector RepoInspector
+	// InstallationTokens mints GitHub App installation tokens (SIGMA-55); nil
+	// when no App is configured — detect/connect then rely on pasted PATs.
+	// GitHubAppSlug is the registered App's slug, so the dashboard can build
+	// the https://github.com/apps/<slug>/installations/new install link.
+	InstallationTokens InstallationTokenSource
+	GitHubAppSlug      string
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
 	GitHubWebhookSecret string
 	DSDStore            DSDStore
@@ -102,6 +110,8 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		log: log, db: db, store: st, domain: dom,
 		git:                 opts.Git,
 		inspector:           opts.Inspector,
+		installTokens:       opts.InstallationTokens,
+		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
 		reconcile:           opts.Reconcile,
@@ -223,6 +233,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/branch-maps/{mapId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBranchMap))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/branch-maps/{mapId}/promote", s.requireService(store.RoleProjectAdmin, s.handlePromoteBranch))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/deploy-requests", s.requireService(store.RoleDeveloper, s.handleListDeployRequests))
+	// GitHub App (SIGMA-55): install-link metadata is member-visible; linking
+	// an installation to a connection mutates it, so Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/app", s.requireService(store.RoleDeveloper, s.handleGitAppInfo))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/connections/{connId}/installation", s.requireService(store.RoleProjectAdmin, s.handleSetInstallation))
 	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
 	// environment list is member-visible.
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))
