@@ -36,6 +36,13 @@ archives:
 
 checksum:
   name_template: "checksums.txt"
+  # The installer/units ship as extra release assets; hashing them here puts
+  # them under the cosign-signed checksums.txt, closing the trust-chain gap
+  # where extra_files were previously served unsigned.
+  extra_files:
+    - glob: ./agent/packaging/install.sh
+    - glob: ./agent/packaging/sigmad.service
+    - glob: ./cp/packaging/sigmahub-cp.service
 
 # Software bill of materials per archive (syft).
 sboms:
@@ -64,6 +71,9 @@ release:
   extra_files:
     - glob: ./agent/packaging/install.sh
     - glob: ./agent/packaging/sigmad.service
+    # Control-plane self-hosting (bare-binary deployments; the container path
+    # builds from cp/Dockerfile + cp/deploy/docker-compose.yml).
+    - glob: ./cp/packaging/sigmahub-cp.service
 
 changelog:
   disable: true

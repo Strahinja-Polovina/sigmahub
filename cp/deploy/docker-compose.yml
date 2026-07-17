@@ -1,0 +1,53 @@
+# Production self-hosting for the SigmaHub control plane: the CP container +
+# PostgreSQL 16. Copy .env.example to .env and fill in the secrets first.
+#
+#   docker compose -f cp/deploy/docker-compose.yml up -d
+#
+# The KMS custody key is generated on first boot inside the cp-data volume —
+# BACK IT UP: every wrapped secret (DEKs, DSD signing key, tokens) depends on it.
+services:
+  db:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sigmahub
+      POSTGRES_PASSWORD: ${CP_DB_PASSWORD:?set CP_DB_PASSWORD in .env}
+      POSTGRES_DB: sigmahub
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sigmahub -d sigmahub"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  cp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sigmahub-cp:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CP_ENV: prod
+      CP_ADDR: ":8080"
+      CP_DATABASE_URL: postgres://sigmahub:${CP_DB_PASSWORD}@db:5432/sigmahub
+      CP_KMS_KEY_FILE: /data/cp-kms.key
+      CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN:?set CP_PROVISION_TOKEN in .env}
+      CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
+      CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
+      CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
+      # P1-13 telemetry sinks (optional; empty = pipeline off, UI shows it).
+      CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
+      CP_VM_READ_URL: ${CP_VM_READ_URL:-}
+      CP_LOKI_URL: ${CP_LOKI_URL:-}
+    volumes:
+      - cp-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  db-data:
+  cp-data:

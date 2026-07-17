@@ -1,0 +1,29 @@
+# systemd unit for a bare-binary control-plane deployment (the goreleaser
+# archive ships /usr/local/bin/sigmahub-cp). Postgres runs separately.
+# Configuration lives in /etc/sigmahub-cp/env (0600 root):
+#   CP_ENV=prod
+#   CP_DATABASE_URL=postgres://...
+#   CP_KMS_KEY_FILE=/var/lib/sigmahub-cp/cp-kms.key   <- BACK THIS FILE UP
+#   CP_PROVISION_TOKEN=...
+[Unit]
+Description=SigmaHub control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sigmahub-cp
+Group=sigmahub-cp
+DynamicUser=yes
+StateDirectory=sigmahub-cp
+EnvironmentFile=/etc/sigmahub-cp/env
+ExecStart=/usr/local/bin/sigmahub-cp
+Restart=always
+RestartSec=3
+# Hardening: the CP needs outbound network + its state dir, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
