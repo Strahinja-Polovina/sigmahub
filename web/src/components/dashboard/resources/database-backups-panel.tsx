@@ -6,6 +6,7 @@ import {
   Archive,
   CheckCircle2,
   Clock,
+  History,
   Loader2,
   Plus,
   RefreshCcw,
@@ -53,6 +54,7 @@ import {
   createBackupTarget,
   listBackupRuns,
   restoreDatabase,
+  restoreDatabaseToTimestamp,
   setBackupPolicy,
 } from "@/server/actions/backups";
 import type { CpBackupPolicy, CpBackupRun, CpBackupTarget } from "@/server/cp";
@@ -238,6 +240,115 @@ function RestoreDialog({
   );
 }
 
+/** Format an ISO instant as a `datetime-local` input value in the viewer's
+ *  local time (the browser converts it back to UTC on submit). */
+function toLocalInput(iso: string): string {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** P2-5b point-in-time recovery: provision a fresh postgres resource recovered
+ *  to a chosen moment. The time picker is bounded by the live recovery window
+ *  (the newest archived WAL); the CP re-validates the window server-side. */
+function RestorePITRDialog({
+  orgId,
+  resourceId,
+  environmentId,
+  serverId,
+  sourceName,
+  maxWalAt,
+}: {
+  orgId: string;
+  resourceId: string;
+  environmentId: string;
+  serverId: string;
+  sourceName: string;
+  maxWalAt: string;
+}) {
+  const router = useRouter();
+  const [open, setOpen] = React.useState(false);
+  const [name, setName] = React.useState(`${sourceName}-pitr`);
+  const [when, setWhen] = React.useState(toLocalInput(maxWalAt));
+  const [pending, startTransition] = React.useTransition();
+
+  function submit() {
+    if (!when) {
+      toast.error("Pick a recovery time");
+      return;
+    }
+    const targetTime = new Date(when).toISOString();
+    startTransition(async () => {
+      try {
+        const out = await restoreDatabaseToTimestamp({
+          orgId,
+          resourceId,
+          name,
+          environmentId,
+          serverId,
+          targetTime,
+        });
+        toast.success("Point-in-time restore queued", {
+          description: `Recovering ${out.resource.name} to ${new Date(targetTime).toLocaleString("en-GB")}.`,
+        });
+        setOpen(false);
+        router.refresh();
+      } catch (err) {
+        toast.error("Couldn’t queue recovery", { description: errMsg(err) });
+      }
+    });
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger
+        render={
+          <Button variant="outline" size="sm">
+            <History className="size-4" />
+            Restore to time
+          </Button>
+        }
+      />
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Restore to a point in time</DialogTitle>
+          <DialogDescription>
+            Provisions a fresh database and recovers it to the moment you choose —
+            the newest base backup before that time, then WAL replayed up to it.
+            The source database is untouched.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="pitr-name">New resource name</Label>
+            <Input id="pitr-name" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="pitr-when">Recover to</Label>
+            <Input
+              id="pitr-when"
+              type="datetime-local"
+              value={when}
+              max={toLocalInput(maxWalAt)}
+              onChange={(e) => setWhen(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Recoverable up to {new Date(maxWalAt).toLocaleString("en-GB")} — the newest
+              archived WAL. Earlier times replay less.
+            </p>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button onClick={submit} disabled={pending || !name.trim() || !when}>
+            {pending ? <Loader2 className="size-4 animate-spin" /> : <History className="size-4" />}
+            Queue recovery
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** P1-11 backups panel on a database resource: policy target + enable toggle,
  *  run history (backup / restore-verify / restore), and the fire-drill
  *  restore-into-new-resource flow. */
@@ -408,11 +519,23 @@ export function DatabaseBackupsPanel({
               )}
             </div>
             {policy.pitrEnabled && (
-              <p className="text-xs text-muted-foreground">
-                {pitrWindow?.lastWalAt
-                  ? `Recoverable up to ${new Date(pitrWindow.lastWalAt).toLocaleString("en-GB")} (last archived segment ${pitrWindow.lastWalSegment ?? "—"}).`
-                  : "Waiting for the first WAL segment to ship — the recovery window opens once archiving reports in."}
-              </p>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">
+                  {pitrWindow?.lastWalAt
+                    ? `Recoverable up to ${new Date(pitrWindow.lastWalAt).toLocaleString("en-GB")} (last archived segment ${pitrWindow.lastWalSegment ?? "—"}).`
+                    : "Waiting for the first WAL segment to ship — the recovery window opens once archiving reports in."}
+                </p>
+                {canManage && serverId && pitrWindow?.lastWalAt && (
+                  <RestorePITRDialog
+                    orgId={orgId}
+                    resourceId={resourceId}
+                    environmentId={environmentId}
+                    serverId={serverId}
+                    sourceName={resourceName}
+                    maxWalAt={pitrWindow.lastWalAt}
+                  />
+                )}
+              </div>
             )}
           </div>
         )}

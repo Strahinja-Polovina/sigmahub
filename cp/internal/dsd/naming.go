@@ -33,6 +33,11 @@ const (
 	// P2-5: daily physical base backup (pg_basebackup → restic), the PITR
 	// starting point WAL segments replay from.
 	KindBackupBase = "backup.base"
+	// P2-5b (SIGMA-67): restore-to-timestamp. Recover a fresh resource to a
+	// chosen point in time — restore the newest base backup taken before the
+	// target, replay WAL up to recovery_target_time, then load the recovered
+	// state into the fresh resource.
+	KindBackupRestorePITR = "backup.restore-pitr"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

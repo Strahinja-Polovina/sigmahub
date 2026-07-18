@@ -239,6 +239,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/backup-runs", s.requireService(store.RoleDeveloper, s.handleListBackupRuns))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/backups/verify-days", s.requireService(store.RoleDeveloper, s.handleVerifyDays))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/restore", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleRestoreDatabase)))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/restore-pitr", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleRestoreToTimestamp)))
 
 	// Custom domains (P1-8): attach/detach are Project Admin+, listing is member-visible.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/domains", s.requireService(store.RoleProjectAdmin, s.handleAttachDomain))

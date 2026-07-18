@@ -24,6 +24,38 @@ func baseBackupCommand(engine, username string) ([]string, error) {
 	return []string{"pg_basebackup", "-U", username, "-D", "-", "-Ft", "-X", "fetch"}, nil
 }
 
+// pitrRecoveryScript is the entrypoint for the throwaway PITR recovery
+// container (P2-5b, postgres only). Running as root, it untars the base backup
+// into PGDATA, stages the archived WAL, writes the recovery configuration
+// (replay stops at recovery_target_time, then the cluster promotes), fixes
+// ownership, and hands off to postgres as the postgres user. Like every other
+// in-container command it is derived HERE from the engine — the DSD op carries
+// only the target time, so no shell is smuggled through the op (the
+// no-generic-run-shell invariant holds). targetTime is a validated RFC3339
+// string (no quotes) so single-quoting it in the conf is injection-safe.
+func pitrRecoveryScript(engine, targetTime string) ([]string, error) {
+	if engine != "postgres" {
+		return nil, fmt.Errorf("point-in-time recovery is postgres-only, got %q", engine)
+	}
+	script := `set -e
+PGDATA=/var/lib/postgresql/data
+WALDIR=/walrestore
+mkdir -p "$PGDATA" "$WALDIR"
+tar -xf /tmp/base.tar -C "$PGDATA"
+for b in /tmp/wal-*.tar; do [ -e "$b" ] && tar -xf "$b" -C "$WALDIR"; done
+touch "$PGDATA/recovery.signal"
+{
+  echo "restore_command = 'cp $WALDIR/%f %p'"
+  echo "recovery_target_time = '` + targetTime + `'"
+  echo "recovery_target_action = 'promote'"
+  echo "archive_mode = 'off'"
+} >> "$PGDATA/postgresql.auto.conf"
+chown -R postgres:postgres "$PGDATA" "$WALDIR"
+chmod 700 "$PGDATA"
+exec gosu postgres postgres`
+	return []string{"sh", "-c", script}, nil
+}
+
 func dumpFilename(engine string) string {
 	switch engine {
 	case "redis":

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -45,6 +46,33 @@ func TestRenderBackupOpsOrderingAndSecretFreedom(t *testing.T) {
 		if strings.Contains(string(raw), needle) {
 			t.Fatalf("DSD leaks %q", needle)
 		}
+	}
+}
+
+func TestRenderRestorePITROpCarriesTargetTime(t *testing.T) {
+	target := time.Date(2027, 3, 1, 12, 0, 0, 0, time.UTC)
+	runs := []store.BackupRunSpec{
+		{RunID: "run_p", Kind: "restore-pitr", ResourceID: "res_src", Engine: "postgres",
+			Database: "shop", Username: "sigma",
+			RestoreResourceID: "res_new", RestoreDatabase: "shop_pitr", RestoreUsername: "sigma",
+			RecoveryTargetTime: &target},
+	}
+	ops, _ := renderOps("srv_t", nil, nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, runs, ACMEConfig{})
+	op, ok := opByID(ops, "bkr:run_p")
+	if !ok || op.Kind != dsd.KindBackupRestorePITR {
+		t.Fatalf("pitr op = %+v", op)
+	}
+	s := string(op.Spec)
+	if !strings.Contains(s, `"targetContainer":"sigmahub-res_new"`) ||
+		!strings.Contains(s, `"targetDatabase":"shop_pitr"`) ||
+		!strings.Contains(s, `"recoveryTargetTime":"2027-03-01T12:00:00Z"`) {
+		t.Fatalf("pitr spec = %s", s)
+	}
+	// The recovery secret/repo material never rides the DSD (same invariant as
+	// every backup op).
+	if strings.Contains(s, "repoKey") || strings.Contains(s, "secretKey") {
+		t.Fatalf("pitr spec leaked credentials: %s", s)
 	}
 }
 

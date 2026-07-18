@@ -41,14 +41,43 @@ rather than implying coverage that doesn't exist yet.
 - Disabling PITR re-renders the container without archiving and drops the
   resource from the shipper's target list.
 
-## Restore-to-timestamp
+## Restore-to-timestamp (phase B, P2-5b)
 
-The actual "restore to a chosen timestamp" flow — provision a fresh resource,
-restore the latest base backup before the target time, then replay WAL to a
-`recovery_target_time` — is tracked as a **follow-up ticket**. Phase A lands
-the archiving pipeline and window so the data needed for that restore is being
-captured continuously from the moment PITR is switched on.
+Restoring to a chosen moment provisions a **fresh** postgres resource (the
+source is never touched) and recovers it to the target time. A Project Admin
+picks the time on the database's Backups panel — the picker is bounded by the
+live recovery window (the newest archived WAL).
 
-Operationally, until the restore-to-timestamp UI ships, the archived base +
-WAL in the restic repo can be restored manually by an operator with the repo
+**Server-side window validation.** Before a run is queued the CP checks the
+target is reachable, so the agent never starts a recovery that can't finish:
+
+- PITR is enabled and the repo key exists.
+- A **base backup finished at or before** the target — the replay start point.
+- The **WAL archive already covers** the target (`last_shipped_at >= target`).
+- The target is not in the future.
+
+**How the agent recovers.** The `restore-pitr` run carries only the target time
+(the restic repo key + S3 credentials are fetched per run over the audited
+credential path — the DSD leaks nothing). The agent:
+
+1. selects the newest `base` snapshot taken ≤ the target and every `wal` bundle
+   up to the first one past it;
+2. runs recovery in a **throwaway container** (network-isolated, no ports):
+   untar the base into `PGDATA`, stage the WAL, write `recovery.signal` +
+   `restore_command` + `recovery_target_time` + `recovery_target_action =
+   promote`, and start postgres — it replays WAL to the target, then promotes;
+3. `pg_dump`s the recovered state and loads it into the fresh target resource
+   (the same load+probe as the fire-drill restore), then tears the recovery
+   container down.
+
+Recovery happens in the scratch container rather than the reconciler-managed
+target so the two never fight over the container; the target ends up with a
+logical copy of the point-in-time state.
+
+> **Staging note.** The recovery orchestration (snapshot selection, staging,
+> recovery-container lifecycle, load) is covered by unit tests against a stub
+> restic + fake docker. The actual postgres WAL replay to a timestamp is a
+> standard-postgres path validated end-to-end on staging, not in CI.
+
+Operators can still restore manually from the archived base + WAL with the repo
 credentials (standard postgres `restore_command` + `recovery_target_time`).
