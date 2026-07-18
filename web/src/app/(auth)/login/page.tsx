@@ -7,6 +7,7 @@ import { ArrowLeft, Loader2, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { authClient } from "@/lib/auth-client";
+import { destAfterAuth } from "@/lib/after-auth";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
@@ -64,7 +65,7 @@ export default function LoginPage() {
       return;
     }
     toast.success("Welcome back");
-    router.push("/dashboard");
+    router.push(destAfterAuth());
   };
 
   const verifyCode = async (value?: string) => {
@@ -82,7 +83,7 @@ export default function LoginPage() {
       return;
     }
     toast.success("Welcome back");
-    router.push("/dashboard");
+    router.push(destAfterAuth());
   };
 
   if (step === "totp") {

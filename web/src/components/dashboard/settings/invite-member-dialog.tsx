@@ -50,12 +50,21 @@ export function InviteMemberDialog({ orgId }: { orgId: string }) {
     if (!emailValid) return;
     startTransition(async () => {
       try {
-        await inviteMember({ orgId, email, role });
-        toast.success(`${email} added to the organization`, { description: `Role: ${role}` });
+        const { delivered, inviteUrl } = await inviteMember({ orgId, email, role });
+        if (delivered) {
+          toast.success(`Invitation sent to ${email}`, { description: `Role: ${role}` });
+        } else {
+          // Honest degradation: no mail transport is wired, so copy the link
+          // for the admin to relay rather than pretend an email went out.
+          await navigator.clipboard?.writeText(inviteUrl).catch(() => {});
+          toast.success(`Invite created for ${email}`, {
+            description: "Email delivery isn’t configured — the invite link was copied to your clipboard.",
+          });
+        }
         setOpen(false);
         reset();
       } catch (err) {
-        toast.error("Couldn’t add member", {
+        toast.error("Couldn’t create invite", {
           description: err instanceof Error ? err.message : "Please try again.",
         });
       }
@@ -84,7 +93,8 @@ export function InviteMemberDialog({ orgId }: { orgId: string }) {
           <DialogHeader>
             <DialogTitle>Invite a member</DialogTitle>
             <DialogDescription>
-              Add a teammate by email and assign a role. They join the organization immediately.
+              Send a teammate an invite link by email. They join with the assigned role once
+              they accept and sign in.
             </DialogDescription>
           </DialogHeader>
 
@@ -130,7 +140,7 @@ export function InviteMemberDialog({ orgId }: { orgId: string }) {
             </DialogClose>
             <Button type="submit" disabled={!emailValid || pending}>
               {pending && <Loader2 className="size-4 animate-spin" />}
-              Add member
+              Send invite
             </Button>
           </DialogFooter>
         </form>

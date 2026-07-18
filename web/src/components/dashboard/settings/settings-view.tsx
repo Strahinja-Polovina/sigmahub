@@ -21,6 +21,13 @@ export type SettingsMember = {
   email: string;
   role: string;
 };
+export type PendingInvite = {
+  id: string;
+  email: string;
+  role: string;
+  invitedBy: string;
+  expiresAt: string | Date;
+};
 export type AuditEntry = {
   id: string;
   actor: string;
@@ -32,6 +39,7 @@ export type AuditEntry = {
 export function SettingsView({
   org,
   members,
+  pendingInvites = [],
   audit,
   currentUserId,
   currentUserRole,
@@ -41,6 +49,7 @@ export function SettingsView({
 }: {
   org: SettingsOrg;
   members: SettingsMember[];
+  pendingInvites?: PendingInvite[];
   audit: AuditEntry[];
   currentUserId: string;
   currentUserRole: string;
@@ -78,6 +87,7 @@ export function SettingsView({
           <MembersTab
             orgId={org.id}
             members={members}
+            pendingInvites={pendingInvites}
             currentUserId={currentUserId}
             isAdmin={isAdmin}
           />

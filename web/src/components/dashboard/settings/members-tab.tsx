@@ -30,9 +30,10 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { changeMemberRole, removeMember } from "@/server/actions/members";
-import type { SettingsMember } from "./settings-view";
+import { changeMemberRole, removeMember, resendInvite, revokeInvite } from "@/server/actions/members";
+import type { PendingInvite, SettingsMember } from "./settings-view";
 import { InviteMemberDialog } from "./invite-member-dialog";
+import { Mail, RefreshCw, X } from "lucide-react";
 
 const ROLES = ["Org Admin", "Project Admin", "Developer"] as const;
 const ROLE_VARIANT: Record<string, React.ComponentProps<typeof Badge>["variant"]> = {
@@ -125,14 +126,91 @@ function MemberActions({
   );
 }
 
+function PendingInviteRow({ orgId, invite }: { orgId: string; invite: PendingInvite }) {
+  const [pending, startTransition] = React.useTransition();
+  const expires = new Date(invite.expiresAt);
+
+  function resend() {
+    startTransition(async () => {
+      try {
+        const { delivered, inviteUrl } = await resendInvite({ orgId, invitationId: invite.id });
+        if (delivered) {
+          toast.success(`Invite re-sent to ${invite.email}`);
+        } else {
+          await navigator.clipboard?.writeText(inviteUrl).catch(() => {});
+          toast.success("Invite link refreshed", {
+            description: "Email delivery isn’t configured — the new link was copied to your clipboard.",
+          });
+        }
+      } catch (err) {
+        toast.error("Couldn’t resend invite", { description: msg(err) });
+      }
+    });
+  }
+
+  function revoke() {
+    startTransition(async () => {
+      try {
+        await revokeInvite({ orgId, invitationId: invite.id });
+        toast.success(`Invite to ${invite.email} revoked`);
+      } catch (err) {
+        toast.error("Couldn’t revoke invite", { description: msg(err) });
+      }
+    });
+  }
+
+  return (
+    <TableRow>
+      <TableCell className="pl-4">
+        <span className="flex items-center gap-2.5">
+          <span className="grid size-8 place-items-center rounded-full bg-muted text-muted-foreground">
+            <Mail className="size-4" />
+          </span>
+          <span className="font-medium text-foreground">{invite.email}</span>
+        </span>
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        Invited by {invite.invitedBy} · expires {expires.toLocaleDateString()}
+      </TableCell>
+      <TableCell>
+        <Badge variant={ROLE_VARIANT[invite.role] ?? "outline"}>{invite.role}</Badge>
+      </TableCell>
+      <TableCell className="pr-4 text-right">
+        <span className="inline-flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Resend invite to ${invite.email}`}
+            disabled={pending}
+            onClick={resend}
+          >
+            {pending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Revoke invite to ${invite.email}`}
+            disabled={pending}
+            onClick={revoke}
+          >
+            <X className="size-4 text-muted-foreground" />
+          </Button>
+        </span>
+      </TableCell>
+    </TableRow>
+  );
+}
+
 export function MembersTab({
   orgId,
   members,
+  pendingInvites,
   currentUserId,
   isAdmin,
 }: {
   orgId: string;
   members: SettingsMember[];
+  pendingInvites: PendingInvite[];
   currentUserId: string;
   isAdmin: boolean;
 }) {
@@ -191,6 +269,36 @@ export function MembersTab({
           </Table>
         </CardContent>
       </Card>
+
+      {isAdmin && pendingInvites.length > 0 && (
+        <Card>
+          <CardHeader className="border-b">
+            <CardTitle className="text-base">Pending invitations</CardTitle>
+            <CardDescription>
+              These people have been invited but haven’t accepted yet.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="pl-4">Email</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Role</TableHead>
+                  <TableHead className="w-20 pr-4 text-right">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pendingInvites.map((inv) => (
+                  <PendingInviteRow key={inv.id} orgId={orgId} invite={inv} />
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
         <Info className="mt-0.5 size-3.5 shrink-0" />
