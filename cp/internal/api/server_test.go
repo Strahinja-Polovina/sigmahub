@@ -248,6 +248,9 @@ func (f *fakeDomain) VerifyDays(_ context.Context, _ string, _ int) ([]store.Ver
 func (f *fakeDomain) CreateRestoreRun(_ context.Context, _, _, _, _ string) (store.BackupRun, error) {
 	return store.BackupRun{}, store.ErrNotFound
 }
+func (f *fakeDomain) CreateRestoreToTimestampRun(_ context.Context, _, _, _ string, _ time.Time, _ string) (store.BackupRun, error) {
+	return store.BackupRun{}, store.ErrNotFound
+}
 func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
 	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil
 }

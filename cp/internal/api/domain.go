@@ -71,6 +71,7 @@ type DomainAPI interface {
 	ListBackupRuns(ctx context.Context, orgID, resourceID string, limit int) ([]store.BackupRun, error)
 	VerifyDays(ctx context.Context, orgID string, days int) ([]store.VerifyDay, error)
 	CreateRestoreRun(ctx context.Context, orgID, sourceResourceID, newResourceID, actor string) (store.BackupRun, error)
+	CreateRestoreToTimestampRun(ctx context.Context, orgID, sourceResourceID, newResourceID string, targetTime time.Time, actor string) (store.BackupRun, error)
 	// Custom domains (P1-8). Attach/Detach return the host server id so the
 	// handler can re-render its DSD.
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)

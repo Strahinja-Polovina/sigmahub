@@ -24,10 +24,11 @@ import (
 // Op kinds registered on both the control plane (reconciler render) and the
 // agent. Kept byte-identical with the CP's dsd package.
 const (
-	KindBackupRun     = "backup.run"
-	KindBackupBase    = "backup.base"
-	KindBackupVerify  = "backup.verify"
-	KindBackupRestore = "backup.restore"
+	KindBackupRun         = "backup.run"
+	KindBackupBase        = "backup.base"
+	KindBackupVerify      = "backup.verify"
+	KindBackupRestore     = "backup.restore"
+	KindBackupRestorePITR = "backup.restore-pitr"
 )
 
 // opTimeout bounds one backup/verify/restore execution agent-side, under the
@@ -73,6 +74,7 @@ type opSpec struct {
 	TargetContainer string `json:"targetContainer"`
 	TargetDatabase  string `json:"targetDatabase"`
 	TargetUsername  string `json:"targetUsername"`
+	TargetTime      string `json:"recoveryTargetTime"`
 }
 
 // Runner owns the backup op handlers.
@@ -95,6 +97,7 @@ func (r *Runner) Register(reg *apply.Registry) {
 	reg.Register(KindBackupBase, r.opBackupBase)
 	reg.Register(KindBackupVerify, r.opBackupVerify)
 	reg.Register(KindBackupRestore, r.opBackupRestore)
+	reg.Register(KindBackupRestorePITR, r.opBackupRestorePITR)
 }
 
 func parseSpec(op dsd.Op) (opSpec, error) {
@@ -500,3 +503,208 @@ func (r *Runner) opBackupRestore(ctx context.Context, op dsd.Op) error {
 	return nil
 }
 
+// opBackupRestorePITR: point-in-time recovery (P2-5b, postgres only). Recover a
+// throwaway container to the target time — untar the newest base backup taken
+// before it, replay the archived WAL up to recovery_target_time, promote — then
+// pg_dump the recovered state and load it into the freshly provisioned target
+// resource. Recovery happens in a scratch container so the reconciler-managed
+// target is never fought over; the target ends up with a logical copy of the
+// point-in-time state (mirrors the fire-drill restore's load half).
+func (r *Runner) opBackupRestorePITR(ctx context.Context, op dsd.Op) error {
+	spec, err := parseSpec(op)
+	if err != nil {
+		return err
+	}
+	if spec.Engine != "postgres" {
+		return fmt.Errorf("pitr restore is postgres-only, got %q", spec.Engine)
+	}
+	if spec.TargetContainer == "" {
+		return fmt.Errorf("pitr restore missing target container")
+	}
+	targetTime, err := time.Parse(time.RFC3339, spec.TargetTime)
+	if err != nil {
+		return fmt.Errorf("pitr restore: invalid target time %q", spec.TargetTime)
+	}
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	cred, err := r.creds(ctx, spec.RunID)
+	if errors.Is(err, ErrRunSettled) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("fetch backup credential: %w", err)
+	}
+	dir := filepath.Join(r.workDir, spec.RunID)
+	defer os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+
+	// 1. The newest base backup taken at or before the target is the replay
+	//    start point; WAL rolls forward from it to the target time.
+	bases, err := resticSnapshotsByTag(ctx, cred, "base")
+	if err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("list base snapshots: %w", err))
+	}
+	var base snapshotMeta
+	for _, b := range bases {
+		if !b.Time.After(targetTime) {
+			base = b // sorted oldest-first: keep the latest ≤ target
+		}
+	}
+	if base.ID == "" {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("no base backup on or before %s", targetTime.UTC().Format(time.RFC3339)))
+	}
+
+	// 2. Stage the base tar + the WAL bundles that carry the target. restic
+	//    restore recovers each snapshot's file by id, so exact filenames aren't
+	//    needed. WAL bundles up to and including the first one after the target
+	//    hold every segment replay needs; earlier ones are harmless (postgres
+	//    requests only the segments the base's checkpoint rolls forward through).
+	if err := resticRestoreSnapshot(ctx, cred, base.ID, dir); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("restore base: %w", err))
+	}
+	basePath := filepath.Join(dir, "base.tar")
+	if _, err := os.Stat(basePath); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("base backup missing after restore: %w", err))
+	}
+	wals, err := resticSnapshotsByTag(ctx, cred, "wal")
+	if err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("list wal snapshots: %w", err))
+	}
+	walDir := filepath.Join(dir, "wal")
+	if err := os.MkdirAll(walDir, 0o700); err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	for _, w := range wals {
+		if err := resticRestoreSnapshot(ctx, cred, w.ID, walDir); err != nil {
+			return r.fail(ctx, spec.RunID, fmt.Errorf("restore wal: %w", err))
+		}
+		if w.Time.After(targetTime) {
+			break // this bundle spans the target; no later WAL is needed
+		}
+	}
+	walBundles, err := filepath.Glob(filepath.Join(walDir, "wal-*.tar"))
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+
+	// 3. Recovery scratch container: base image, isolated, no ports. The
+	//    entrypoint (derived from the engine, never the DSD) untars PGDATA +
+	//    WAL, writes the recovery config, and starts postgres as the postgres
+	//    user; postgres replays to the target time and promotes.
+	recoveryCmd, err := pitrRecoveryScript(spec.Engine, targetTime.UTC().Format(time.RFC3339))
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	name := "sigmahub-pitr-" + spec.RunID
+	body := map[string]any{
+		"Image":      spec.Image,
+		"Entrypoint": recoveryCmd,
+		"Labels":     map[string]string{"sigmahub.pitr": "true"},
+		"HostConfig": map[string]any{
+			"NetworkMode":   "none",
+			"SecurityOpt":   []string{"no-new-privileges:true", "apparmor=docker-default"},
+			"Privileged":    false,
+			"RestartPolicy": map[string]any{"Name": "no"},
+		},
+	}
+	id, err := r.docker.ContainerCreate(ctx, name, body)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("create recovery container: %w", err))
+	}
+	defer func() {
+		rmCtx, rmCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer rmCancel()
+		if err := r.docker.ContainerRemove(rmCtx, id, true); err != nil {
+			r.log.Warn("pitr recovery remove failed", "err", err, "container", name)
+		}
+	}()
+
+	// Stage the tars into the created (not yet started) container's /tmp; the
+	// entrypoint untars them on start.
+	baseSt, err := os.Stat(basePath)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	if err := r.putFile(ctx, id, "/tmp", "base.tar", basePath, baseSt.Size()); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("stage base: %w", err))
+	}
+	for i, b := range walBundles {
+		st, err := os.Stat(b)
+		if err != nil {
+			return r.fail(ctx, spec.RunID, err)
+		}
+		if err := r.putFile(ctx, id, "/tmp", fmt.Sprintf("wal-%03d.tar", i), b, st.Size()); err != nil {
+			return r.fail(ctx, spec.RunID, fmt.Errorf("stage wal: %w", err))
+		}
+	}
+	if err := r.docker.ContainerStart(ctx, id); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("start recovery container: %w", err))
+	}
+	// Recovery + promote can take a while; pg_isready only accepts connections
+	// once the cluster has finished replaying and promoted.
+	readyCmd, err := readyCommand(spec.Engine, spec.Database, spec.Username)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	if err := r.waitReady(ctx, id, readyCmd, 10*time.Minute); err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("recovery did not complete: %w", err))
+	}
+
+	// 4. Dump the recovered source database and load it into the fresh target.
+	dumpCmd, err := dumpCommand(spec.Engine, spec.Database, spec.Username)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	dumpPath := filepath.Join(dir, dumpFilename(spec.Engine))
+	sha, size, err := r.execDumpToFile(ctx, id, dumpCmd, dumpPath)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("dump recovered state: %w", err))
+	}
+	targetReady, err := readyCommand(spec.Engine, spec.TargetDatabase, spec.TargetUsername)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	if err := r.waitReady(ctx, spec.TargetContainer, targetReady, 120*time.Second); err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	probe, err := r.loadAndProbe(ctx, spec.TargetContainer, spec.Engine, spec.TargetDatabase, spec.TargetUsername, dumpPath, size)
+	if err != nil {
+		return r.fail(ctx, spec.RunID, err)
+	}
+	detail := "recovered to " + targetTime.UTC().Format(time.RFC3339) + "; loaded into " + spec.TargetContainer
+	if probe != "" {
+		detail += "; probe=" + probe
+	}
+	r.report(ctx, spec.RunID, true, "", sha, detail)
+	r.log.Info("pitr restore complete", "run", spec.RunID, "target", spec.TargetContainer, "time", spec.TargetTime)
+	return nil
+}
+
+// execDumpToFile runs an engine dump inside a container, streaming stdout to a
+// 0600 host work file, and returns the dump's sha256 + size.
+func (r *Runner) execDumpToFile(ctx context.Context, container string, cmd []string, path string) (string, int64, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", 0, err
+	}
+	hasher := sha256.New()
+	code, stderrTail, err := r.docker.ContainerExec(ctx, container, cmd, io.MultiWriter(f, hasher))
+	cerr := f.Close()
+	if err != nil {
+		return "", 0, fmt.Errorf("exec dump: %w", err)
+	}
+	if code != 0 {
+		return "", 0, fmt.Errorf("dump exited %d: %s", code, stderrTail)
+	}
+	if cerr != nil {
+		return "", 0, cerr
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), st.Size(), nil
+}

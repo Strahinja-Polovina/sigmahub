@@ -24,8 +24,8 @@ const (
 
 // targetAAD / repoKeyAAD bind ciphertexts to their row identity (mirrors
 // secretAAD): moved ciphertext fails to open.
-func targetAAD(orgID, targetID string) []byte   { return []byte(orgID + "|bktarget|" + targetID) }
-func repoKeyAAD(orgID, policyID string) []byte  { return []byte(orgID + "|bkrepo|" + policyID) }
+func targetAAD(orgID, targetID string) []byte  { return []byte(orgID + "|bktarget|" + targetID) }
+func repoKeyAAD(orgID, policyID string) []byte { return []byte(orgID + "|bkrepo|" + policyID) }
 
 // BackupTarget is an S3-compatible backup destination's metadata. The secret
 // key never rides on this type.
@@ -424,6 +424,9 @@ type BackupRunSpec struct {
 	RestoreResourceID string
 	RestoreDatabase   string
 	RestoreUsername   string
+	// RecoveryTargetTime is set only for restore-pitr runs: the point in time
+	// the agent replays WAL up to. nil for every other kind.
+	RecoveryTargetTime *time.Time
 }
 
 // BackupRunsForServer returns the open (pending/running) runs the reconciler
@@ -436,7 +439,8 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 		                  WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
 		                  ORDER BY b.finished_at DESC LIMIT 1), '') AS expected_sha,
 		       COALESCE(r.restore_resource_id, ''),
-		       COALESCE(rdc.dbname, ''), COALESCE(rdc.username, '')
+		       COALESCE(rdc.dbname, ''), COALESCE(rdc.username, ''),
+		       r.recovery_target_time
 		  FROM backup_runs r
 		  JOIN backup_policies p ON p.id = r.policy_id
 		  JOIN db_credentials dc ON dc.resource_id = r.resource_id
@@ -454,7 +458,7 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 		var b BackupRunSpec
 		if err := rows.Scan(&b.RunID, &b.Kind, &b.ResourceID, &b.ServerID, &b.Engine, &b.Database, &b.Username,
 			&b.KeepDaily, &b.KeepWeekly, &b.KeepMonthly, &b.ExpectedSha,
-			&b.RestoreResourceID, &b.RestoreDatabase, &b.RestoreUsername); err != nil {
+			&b.RestoreResourceID, &b.RestoreDatabase, &b.RestoreUsername, &b.RecoveryTargetTime); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -763,6 +767,95 @@ func (s *Store) CreateRestoreRun(ctx context.Context, orgID, sourceResourceID, n
 		return BackupRun{}, err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Restore queued", sourceResourceID+" -> "+newResourceID); err != nil {
+		return BackupRun{}, err
+	}
+	return run, tx.Commit(ctx)
+}
+
+// CreateRestoreToTimestampRun queues a PITR restore (P2-5b): recover a freshly
+// provisioned resource to targetTime. It validates the recoverable window
+// server-side so the agent never starts a recovery that can't reach the target:
+// PITR must be on, the repo key must exist, a physical base backup taken BEFORE
+// the target must exist (WAL replays forward from it), and the WAL archive must
+// already cover the target (last_shipped_at >= target). The run executes on the
+// NEW resource's server. Audited. Postgres-only (WAL replay is a postgres path).
+func (s *Store) CreateRestoreToTimestampRun(ctx context.Context, orgID, sourceResourceID, newResourceID string, targetTime time.Time, actor string) (BackupRun, error) {
+	if targetTime.After(time.Now()) {
+		return BackupRun{}, ErrInvalid{Msg: "recovery target time is in the future"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return BackupRun{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var policyID string
+	var pitrEnabled, hasKey bool
+	err = tx.QueryRow(ctx, `
+		SELECT p.id, p.pitr_enabled, p.repo_key_ciphertext IS NOT NULL
+		  FROM backup_policies p WHERE p.org_id = $1 AND p.resource_id = $2 AND p.target_id IS NOT NULL`,
+		orgID, sourceResourceID).Scan(&policyID, &pitrEnabled, &hasKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BackupRun{}, ErrInvalid{Msg: "source database has no backup target configured"}
+	}
+	if err != nil {
+		return BackupRun{}, err
+	}
+	if !pitrEnabled {
+		return BackupRun{}, ErrInvalid{Msg: "point-in-time recovery is not enabled on the source database"}
+	}
+	if !hasKey {
+		return BackupRun{}, ErrInvalid{Msg: "source database has no backups yet"}
+	}
+	// A base backup that finished at or before the target is the replay start
+	// point; without one there is nothing to roll WAL forward from.
+	var hasBase bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM backup_runs
+		                WHERE policy_id = $1 AND kind = 'basebackup' AND status = 'success'
+		                  AND finished_at IS NOT NULL AND finished_at <= $2)`,
+		policyID, targetTime).Scan(&hasBase); err != nil {
+		return BackupRun{}, err
+	}
+	if !hasBase {
+		return BackupRun{}, ErrInvalid{Msg: "no base backup was taken before the requested time"}
+	}
+	// The WAL archive must already extend past the target, else replay can't
+	// reach it. last_shipped_at is the high-water mark the shipper reports.
+	var walCovers bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM wal_archive_status
+		                WHERE resource_id = $1 AND last_shipped_at IS NOT NULL AND last_shipped_at >= $2)`,
+		sourceResourceID, targetTime).Scan(&walCovers); err != nil {
+		return BackupRun{}, err
+	}
+	if !walCovers {
+		return BackupRun{}, ErrInvalid{Msg: "the archived WAL does not yet cover the requested time; pick an earlier time"}
+	}
+
+	var newServerID, newEngine string
+	err = tx.QueryRow(ctx, `
+		SELECT dc.server_id, dc.engine FROM db_credentials dc
+		 WHERE dc.org_id = $1 AND dc.resource_id = $2`, orgID, newResourceID).Scan(&newServerID, &newEngine)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BackupRun{}, ErrInvalid{Msg: "restore target is not a database resource"}
+	}
+	if err != nil {
+		return BackupRun{}, err
+	}
+	if newEngine != "postgres" {
+		return BackupRun{}, ErrInvalid{Msg: "point-in-time recovery is postgres-only"}
+	}
+
+	run := BackupRun{ID: newID("run"), ResourceID: sourceResourceID, Kind: "restore-pitr", Status: BackupRunPending, RestoreResourceID: &newResourceID}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, restore_resource_id, recovery_target_time)
+		VALUES ($1, $2, $3, $4, $5, 'restore-pitr', $6, $7)`,
+		run.ID, orgID, sourceResourceID, policyID, newServerID, newResourceID, targetTime); err != nil {
+		return BackupRun{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "PITR restore queued",
+		fmt.Sprintf("%s -> %s @ %s", sourceResourceID, newResourceID, targetTime.UTC().Format(time.RFC3339))); err != nil {
 		return BackupRun{}, err
 	}
 	return run, tx.Commit(ctx)

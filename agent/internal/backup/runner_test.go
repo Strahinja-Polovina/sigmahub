@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
@@ -30,6 +31,8 @@ case "$cmd" in
   check) exit 0 ;;
   forget) exit 0 ;;
   dump) cat "$state/stored.bin" ;;
+  snapshots) tag="$3"; if [ -f "$state/snapshots-$tag.json" ]; then cat "$state/snapshots-$tag.json"; else echo "[]"; fi ;;
+  restore) snap="$2"; target="$4"; mkdir -p "$target"; case "$snap" in base*) echo basedata > "$target/base.tar" ;; *) echo waldata > "$target/wal-$snap.tar" ;; esac ;;
   *) echo "unknown cmd $cmd" >&2; exit 1 ;;
 esac
 `
@@ -86,10 +89,10 @@ func (f *fakeDocker) ContainerRemove(_ context.Context, id string, _ bool) error
 func (f *fakeDocker) ImagePull(context.Context, string) error { return nil }
 
 type reported struct {
-	ok               bool
-	snapshot, sha    string
-	detail           string
-	count            int
+	ok            bool
+	snapshot, sha string
+	detail        string
+	count         int
 }
 
 func testRunner(t *testing.T, fd *fakeDocker) (*Runner, *reported) {
@@ -310,5 +313,122 @@ func TestDumpCommandsNeverCarrySecrets(t *testing.T) {
 	}
 	if _, err := dumpCommand("clickhouse", "db", "user"); err == nil {
 		t.Fatal("unknown engine must be rejected")
+	}
+}
+
+// TestPITRRestoreRecoversAndLoadsIntoTarget is the P2-5b orchestration contract
+// (stub restic + fake docker): pick the newest base ≤ the target, stage base +
+// WAL, run recovery in a throwaway container (created + removed), then pg_dump
+// the recovered state and load it into the fresh target. Real WAL replay is a
+// postgres path validated on staging; this asserts the flow, not the bytes.
+func TestPITRRestoreRecoversAndLoadsIntoTarget(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	now := time.Now().UTC()
+	base := now.Add(-2 * time.Hour)
+	target := now.Add(-1 * time.Hour)
+	// base ≤ target; two WAL bundles, one before and one after the target.
+	if err := os.WriteFile(filepath.Join(dir, "snapshots-base.json"),
+		[]byte(`[{"id":"basesnap","time":"`+base.Format(time.RFC3339Nano)+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "snapshots-wal.json"),
+		[]byte(`[{"id":"walA","time":"`+base.Add(30*time.Minute).Format(time.RFC3339Nano)+`"},`+
+			`{"id":"walB","time":"`+now.Format(time.RFC3339Nano)+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fd := &fakeDocker{dumpData: []byte("recovered dump payload")}
+	rep := &reported{}
+	r := NewRunner(fd,
+		func(context.Context, string) (Credential, error) {
+			return Credential{Repository: "s3:s3.example/bucket/sigmahub/res_db", RepoKey: "k", AccessKey: "a", SecretKey: "s"}, nil
+		},
+		func(_ context.Context, _ string, ok bool, snapshotID, sha, detail string) {
+			rep.ok, rep.snapshot, rep.sha, rep.detail = ok, snapshotID, sha, detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	op := backupOp(t, KindBackupRestorePITR, opSpec{
+		RunID: "run_pitr", ResourceID: "res_db", Engine: "postgres",
+		Database: "shop", Username: "sigma",
+		TargetContainer: "sigmahub-res_new", TargetDatabase: "shop2", TargetUsername: "sigma",
+		TargetTime: target.Format(time.RFC3339),
+	})
+	if err := r.opBackupRestorePITR(context.Background(), op); err != nil {
+		t.Fatalf("pitr restore: %v", err)
+	}
+	if !rep.ok {
+		t.Fatalf("expected success, detail=%q", rep.detail)
+	}
+	// A throwaway recovery container was created and torn down.
+	if len(fd.created) != 1 || !strings.HasPrefix(fd.created[0], "sigmahub-pitr-") {
+		t.Fatalf("recovery container = %v", fd.created)
+	}
+	if len(fd.removed) != 1 {
+		t.Fatalf("recovery container must be removed, removed=%v", fd.removed)
+	}
+	// pg_dump ran (inside the recovery container), then a psql load into the target.
+	var sawDump, sawLoad bool
+	for _, c := range fd.execCalls {
+		if c[0] == "pg_dump" {
+			sawDump = true
+		}
+		if c[0] == "psql" && strings.Contains(strings.Join(c, " "), "-f") {
+			sawLoad = true
+		}
+	}
+	if !sawDump {
+		t.Fatal("recovered state must be dumped with pg_dump")
+	}
+	if !sawLoad {
+		t.Fatal("recovered dump must be loaded into the target with psql")
+	}
+}
+
+func TestPITRRestoreRejectsNonPostgres(t *testing.T) {
+	r, _ := testRunner(t, &fakeDocker{})
+	op := backupOp(t, KindBackupRestorePITR, opSpec{
+		RunID: "run_x", Engine: "mysql", TargetContainer: "c",
+		TargetTime: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	})
+	if err := r.opBackupRestorePITR(context.Background(), op); err == nil {
+		t.Fatal("pitr restore must reject non-postgres engines")
+	}
+}
+
+func TestPITRRestoreFailsWithoutBaseBeforeTarget(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	now := time.Now().UTC()
+	// The only base backup is NEWER than the target — nothing to replay from.
+	if err := os.WriteFile(filepath.Join(dir, "snapshots-base.json"),
+		[]byte(`[{"id":"basesnap","time":"`+now.Format(time.RFC3339Nano)+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep := &reported{}
+	r := NewRunner(&fakeDocker{},
+		func(context.Context, string) (Credential, error) { return Credential{Repository: "s3:x/y/z"}, nil },
+		func(_ context.Context, _ string, ok bool, _, _, detail string) {
+			rep.ok = ok
+			rep.detail = detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	op := backupOp(t, KindBackupRestorePITR, opSpec{
+		RunID: "run_nb", Engine: "postgres", Database: "shop", Username: "sigma",
+		TargetContainer: "sigmahub-res_new", TargetDatabase: "shop2", TargetUsername: "sigma",
+		TargetTime: now.Add(-2 * time.Hour).Format(time.RFC3339),
+	})
+	if err := r.opBackupRestorePITR(context.Background(), op); err == nil {
+		t.Fatal("expected failure when no base backup precedes the target")
+	}
+	if rep.ok {
+		t.Fatal("run must be reported failed")
 	}
 }

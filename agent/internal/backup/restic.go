@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
+	"time"
 )
 
 // resticBin is resolved via PATH; a var so tests can point it at a stub.
@@ -145,4 +147,51 @@ func resticForget(ctx context.Context, cred Credential, keepDaily, keepWeekly, k
 // resticDumpLatest streams the latest snapshot's dump file to w.
 func resticDumpLatest(ctx context.Context, cred Credential, filename string, w io.Writer) error {
 	return restic(ctx, cred, nil, w, "dump", "latest", filename)
+}
+
+// snapshotMeta is one restic snapshot's id + creation time (P2-5b PITR needs to
+// order base/WAL snapshots against a recovery target).
+type snapshotMeta struct {
+	ID   string
+	Time time.Time
+}
+
+// resticSnapshotsByTag lists the repo's snapshots carrying a tag, oldest first.
+// Used to select the base backup ≤ the recovery target and the WAL bundles that
+// roll forward to it.
+func resticSnapshotsByTag(ctx context.Context, cred Credential, tag string) ([]snapshotMeta, error) {
+	var out bytes.Buffer
+	if err := restic(ctx, cred, nil, &out, "snapshots", "--tag", tag, "--json"); err != nil {
+		return nil, err
+	}
+	var raw []struct {
+		ID   string `json:"id"`
+		Time string `json:"time"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+		return nil, fmt.Errorf("parse snapshots: %w", err)
+	}
+	metas := make([]snapshotMeta, 0, len(raw))
+	for _, s := range raw {
+		if s.ID == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339Nano, s.Time)
+		if err != nil {
+			if t, err = time.Parse(time.RFC3339, s.Time); err != nil {
+				continue
+			}
+		}
+		metas = append(metas, snapshotMeta{ID: s.ID, Time: t})
+	}
+	sort.Slice(metas, func(i, j int) bool { return metas[i].Time.Before(metas[j].Time) })
+	return metas, nil
+}
+
+// resticRestoreSnapshot restores one snapshot's file(s) into targetDir. Used for
+// PITR staging: it recovers the stdin-backed base.tar / wal-*.tar without the
+// caller needing the exact stored filename (restic restore writes them under
+// targetDir at their in-snapshot path).
+func resticRestoreSnapshot(ctx context.Context, cred Credential, snapshotID, targetDir string) error {
+	return restic(ctx, cred, nil, io.Discard, "restore", snapshotID, "--target", targetDir)
 }

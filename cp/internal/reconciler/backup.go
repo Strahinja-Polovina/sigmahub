@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -33,6 +34,10 @@ type backupOpSpec struct {
 	TargetContainer string `json:"targetContainer,omitempty"`
 	TargetDatabase  string `json:"targetDatabase,omitempty"`
 	TargetUsername  string `json:"targetUsername,omitempty"`
+	// Restore-to-timestamp (P2-5b): the point in time WAL is replayed up to,
+	// RFC3339. The agent selects the base snapshot ≤ this time and stops replay
+	// at it (recovery_target_time). Empty for every other op.
+	RecoveryTargetTime string `json:"recoveryTargetTime,omitempty"`
 }
 
 // renderBackupOps renders a server's open backup runs (P1-11). Each run is one
@@ -94,6 +99,21 @@ func renderBackupOps(runs []store.BackupRunSpec, rendered map[string]bool) []dsd
 			spec.TargetContainer = dsd.ContainerName(r.RestoreResourceID)
 			spec.TargetDatabase = r.RestoreDatabase
 			spec.TargetUsername = r.RestoreUsername
+			if rendered["res:"+r.RestoreResourceID] {
+				deps = append(deps, "res:"+r.RestoreResourceID)
+			}
+		case "restore-pitr":
+			// P2-5b: recover the fresh resource to a chosen time. The agent
+			// replays WAL from the newest base backup up to recoveryTargetTime,
+			// then loads the recovered state into the target container.
+			if r.RecoveryTargetTime == nil {
+				continue
+			}
+			kind = dsd.KindBackupRestorePITR
+			spec.TargetContainer = dsd.ContainerName(r.RestoreResourceID)
+			spec.TargetDatabase = r.RestoreDatabase
+			spec.TargetUsername = r.RestoreUsername
+			spec.RecoveryTargetTime = r.RecoveryTargetTime.UTC().Format(time.RFC3339)
 			if rendered["res:"+r.RestoreResourceID] {
 				deps = append(deps, "res:"+r.RestoreResourceID)
 			}

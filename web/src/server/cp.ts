@@ -679,6 +679,20 @@ export async function cpRestoreDatabase(
   }, { orgId, actor });
 }
 
+// P2-5b: point-in-time recovery. Provisions a fresh postgres resource recovered
+// to targetTime (RFC3339). The CP validates the recoverable window server-side.
+export async function cpRestoreDatabaseToTimestamp(
+  orgId: string,
+  resourceId: string,
+  input: { name: string; environmentId: string; serverId: string; targetTime: string },
+  actor: CpActor
+): Promise<{ resource: CpResource; run: CpBackupRun }> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/restore-pitr`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
 // Server + token lifecycle (P1-4). Server delete tombstones the CP record and
 // revokes its agent token; a 409 (with the bound-resource list) surfaces as a
 // thrown "Control plane 409" error the caller can show.

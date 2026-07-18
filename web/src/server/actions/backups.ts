@@ -11,6 +11,7 @@ import {
   cpUpdateBackupPolicy,
   cpListBackupRuns,
   cpRestoreDatabase,
+  cpRestoreDatabaseToTimestamp,
   type CpBackupTarget,
   type CpBackupRun,
   type CpBackupPolicy,
@@ -111,6 +112,39 @@ export async function restoreDatabase(input: {
     actor: user.name,
     action: "Restore queued",
     target: `${input.resourceId} -> ${out.resource.id}`,
+  });
+  revalidatePath("/dashboard", "layout");
+  return out;
+}
+
+/** P2-5b: point-in-time recovery — provision a fresh postgres resource
+ *  recovered to targetTime. The CP validates the recoverable window. */
+export async function restoreDatabaseToTimestamp(input: {
+  orgId: string;
+  resourceId: string;
+  name: string;
+  environmentId: string;
+  serverId: string;
+  targetTime: string; // RFC3339
+}) {
+  ensureCp();
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
+  const out = await cpRestoreDatabaseToTimestamp(
+    input.orgId,
+    input.resourceId,
+    {
+      name: input.name.trim(),
+      environmentId: input.environmentId,
+      serverId: input.serverId,
+      targetTime: input.targetTime,
+    },
+    { name: user.name, role }
+  );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "PITR restore queued",
+    target: `${input.resourceId} -> ${out.resource.id} @ ${input.targetTime}`,
   });
   revalidatePath("/dashboard", "layout");
   return out;
