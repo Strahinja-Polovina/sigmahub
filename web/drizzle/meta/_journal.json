@@ -15,6 +15,13 @@
       "when": 1784311657052,
       "tag": "0001_lovely_johnny_storm",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784412353470,
+      "tag": "0002_noisy_silhouette",
+      "breakpoints": true
     }
   ]
 }

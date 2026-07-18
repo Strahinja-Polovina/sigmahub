@@ -5,56 +5,93 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { user } from "../db/auth-schema";
-import { requireOrgAdmin } from "../active-org";
+import { requireOrgAdmin, getSessionUser } from "../active-org";
 import { writeAudit } from "../audit";
+import { sendInviteEmail } from "../email";
+import {
+  INVITE_TTL_MS,
+  appBaseUrl,
+  hashInviteToken,
+  inviteRejection,
+  inviteRejectionMessage,
+  inviteUrl,
+  newInviteToken,
+  normalizeOrgRole,
+  parseProjectGrants,
+  sameEmail,
+  serializeProjectGrants,
+  type InviteProjectGrant,
+} from "../../lib/invite";
 
 function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
 
-const ROLES = new Set(["Org Admin", "Project Admin", "Developer"]);
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function nameFromEmail(email: string) {
-  return email
-    .split("@")[0]
-    .replace(/[._-]+/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-    .trim();
+/** The org's display name, for the invite email/link copy. */
+async function orgName(orgId: string): Promise<string> {
+  const [org] = await db
+    .select({ name: s.orgs.name })
+    .from(s.orgs)
+    .where(eq(s.orgs.id, orgId));
+  return org?.name ?? "an organization";
 }
 
-/** Add a member by email. v1 is invite-and-join in one step (no email/accept
- *  flow yet): if no user has that email we create a display-only account. */
+/** P2-7b: invite a member by email. Instead of the old instant-join (which
+ *  minted a login-less display-only user row), this records a pending
+ *  invitation with a hashed one-time token and sends the accept link. Delivery
+ *  degrades honestly: with no mail transport the link is logged AND returned so
+ *  an admin can copy it. Membership + grants materialize only on accept. */
 export async function inviteMember(input: {
   orgId: string;
   email: string;
   role: string;
-}) {
+  projectGrants?: InviteProjectGrant[];
+}): Promise<{ inviteUrl: string; delivered: boolean }> {
   const actor = await requireOrgAdmin(input.orgId);
   const email = input.email.trim().toLowerCase();
   if (!EMAIL_RE.test(email)) throw new Error("Enter a valid email address.");
-  const role = ROLES.has(input.role) ? input.role : "Developer";
+  const role = normalizeOrgRole(input.role);
 
-  let [u] = await db.select().from(user).where(eq(user.email, email));
-  if (!u) {
-    const id = rid("usr");
-    await db
-      .insert(user)
-      .values({ id, name: nameFromEmail(email), email, emailVerified: false });
-    [u] = await db.select().from(user).where(eq(user.id, id));
+  // Already a member? (match by the account's email, case-insensitive).
+  const [alreadyMember] = await db
+    .select({ id: s.memberships.id })
+    .from(s.memberships)
+    .innerJoin(user, eq(s.memberships.userId, user.id))
+    .where(and(eq(s.memberships.orgId, input.orgId), eq(user.email, email)));
+  if (alreadyMember) throw new Error("That person is already a member.");
+
+  // One outstanding invite per email — resend/revoke manage an existing one.
+  const [pending] = await db
+    .select({ id: s.invitations.id })
+    .from(s.invitations)
+    .where(
+      and(
+        eq(s.invitations.orgId, input.orgId),
+        eq(s.invitations.email, email),
+        eq(s.invitations.status, "pending")
+      )
+    );
+  if (pending) {
+    throw new Error("An invite is already pending for that email — resend or revoke it first.");
   }
 
-  const [existing] = await db
-    .select()
-    .from(s.memberships)
-    .where(
-      and(eq(s.memberships.orgId, input.orgId), eq(s.memberships.userId, u.id))
-    );
-  if (existing) throw new Error("That person is already a member.");
+  const { raw, hash } = newInviteToken();
+  await db.insert(s.invitations).values({
+    id: rid("inv"),
+    orgId: input.orgId,
+    email,
+    role,
+    projectGrants: serializeProjectGrants(input.projectGrants ?? []),
+    tokenHash: hash,
+    invitedBy: actor.name,
+    status: "pending",
+    expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+  });
 
-  await db
-    .insert(s.memberships)
-    .values({ id: rid("mem"), orgId: input.orgId, userId: u.id, role });
+  const url = inviteUrl(appBaseUrl(), raw);
+  const { delivered } = await sendInviteEmail({ to: email, orgName: await orgName(input.orgId), role, url });
   await writeAudit({
     orgId: input.orgId,
     actor: actor.name,
@@ -62,6 +99,119 @@ export async function inviteMember(input: {
     target: `${email} · ${role}`,
   });
   revalidatePath("/dashboard", "layout");
+  return { inviteUrl: url, delivered };
+}
+
+/** Rotate a pending invite's token (killing the old link) and re-send it. */
+export async function resendInvite(input: {
+  orgId: string;
+  invitationId: string;
+}): Promise<{ inviteUrl: string; delivered: boolean }> {
+  const actor = await requireOrgAdmin(input.orgId);
+  const [inv] = await db
+    .select({ email: s.invitations.email, role: s.invitations.role, status: s.invitations.status })
+    .from(s.invitations)
+    .where(and(eq(s.invitations.id, input.invitationId), eq(s.invitations.orgId, input.orgId)));
+  if (!inv || inv.status !== "pending") throw new Error("No pending invite to resend.");
+
+  const { raw, hash } = newInviteToken();
+  await db
+    .update(s.invitations)
+    .set({ tokenHash: hash, expiresAt: new Date(Date.now() + INVITE_TTL_MS) })
+    .where(eq(s.invitations.id, input.invitationId));
+
+  const url = inviteUrl(appBaseUrl(), raw);
+  const { delivered } = await sendInviteEmail({ to: inv.email, orgName: await orgName(input.orgId), role: inv.role, url });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: actor.name,
+    action: "Resent invite",
+    target: `${inv.email} · ${inv.role}`,
+  });
+  revalidatePath("/dashboard", "layout");
+  return { inviteUrl: url, delivered };
+}
+
+/** Revoke a pending invite — its link stops working; the email is free to
+ *  re-invite (the pending-dup guard only sees pending rows). */
+export async function revokeInvite(input: { orgId: string; invitationId: string }): Promise<void> {
+  const actor = await requireOrgAdmin(input.orgId);
+  const [inv] = await db
+    .select({ email: s.invitations.email, status: s.invitations.status })
+    .from(s.invitations)
+    .where(and(eq(s.invitations.id, input.invitationId), eq(s.invitations.orgId, input.orgId)));
+  if (!inv || inv.status !== "pending") throw new Error("No pending invite to revoke.");
+
+  await db.update(s.invitations).set({ status: "revoked" }).where(eq(s.invitations.id, input.invitationId));
+  await writeAudit({ orgId: input.orgId, actor: actor.name, action: "Revoked invite", target: inv.email });
+  revalidatePath("/dashboard", "layout");
+}
+
+/** Accept an invite: the signed-in account (whose email must match the invite)
+ *  gains the org membership + any project grants, and the token is
+ *  one-time-invalidated. Runs in one locked transaction so a double-submit
+ *  can't create two memberships or accept twice. */
+export async function acceptInvite(input: { token: string }): Promise<{ orgId: string }> {
+  const sessionUser = await getSessionUser();
+  const hash = hashInviteToken(input.token);
+  const now = new Date();
+
+  const orgId = await db.transaction(async (tx) => {
+    const [inv] = await tx
+      .select()
+      .from(s.invitations)
+      .where(eq(s.invitations.tokenHash, hash))
+      .for("update");
+    const rejection = inviteRejection(inv ?? null, now);
+    if (rejection) throw new Error(inviteRejectionMessage(rejection));
+    if (!sameEmail(sessionUser.email, inv.email)) {
+      throw new Error(
+        `This invitation was sent to ${inv.email}. Sign in with that email to accept it.`
+      );
+    }
+
+    // Membership first (idempotent) so any project grant has an org membership
+    // to narrow — a project grant is never a backdoor into the org.
+    const [existing] = await tx
+      .select({ id: s.memberships.id })
+      .from(s.memberships)
+      .where(and(eq(s.memberships.orgId, inv.orgId), eq(s.memberships.userId, sessionUser.id)));
+    if (!existing) {
+      await tx.insert(s.memberships).values({
+        id: rid("mem"),
+        orgId: inv.orgId,
+        userId: sessionUser.id,
+        role: normalizeOrgRole(inv.role),
+      });
+    }
+
+    // Materialize grants, skipping any project that has since been deleted or
+    // moved orgs — a stale grant must never block joining the org.
+    for (const g of parseProjectGrants(inv.projectGrants)) {
+      const [proj] = await tx
+        .select({ id: s.projects.id })
+        .from(s.projects)
+        .where(and(eq(s.projects.id, g.projectId), eq(s.projects.orgId, inv.orgId)));
+      if (!proj) continue;
+      await tx
+        .insert(s.projectMemberships)
+        .values({ id: rid("pm"), projectId: g.projectId, userId: sessionUser.id, role: g.role })
+        .onConflictDoUpdate({
+          target: [s.projectMemberships.projectId, s.projectMemberships.userId],
+          set: { role: g.role },
+        });
+    }
+
+    await tx
+      .update(s.invitations)
+      .set({ status: "accepted", acceptedAt: now })
+      .where(eq(s.invitations.id, inv.id));
+    return inv.orgId;
+  });
+
+  await writeAudit({ orgId, actor: sessionUser.name, action: "Accepted invite", target: sessionUser.email });
+  revalidatePath("/dashboard", "layout");
+  return { orgId };
 }
 
 export async function changeMemberRole(input: {
@@ -70,7 +220,7 @@ export async function changeMemberRole(input: {
   role: string;
 }) {
   const actor = await requireOrgAdmin(input.orgId);
-  const role = ROLES.has(input.role) ? input.role : "Developer";
+  const role = normalizeOrgRole(input.role);
 
   // Guard + mutation share one transaction with the admin rows locked
   // (FOR UPDATE) so two concurrent demotions can't both pass the last-admin

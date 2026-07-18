@@ -1,10 +1,11 @@
 import "server-only";
-import { eq, inArray, desc } from "drizzle-orm";
+import { and, eq, inArray, desc } from "drizzle-orm";
 import { db } from "./db";
 import * as s from "./db/schema";
 import { user } from "./db/auth-schema";
 import { cpEnabled, cpListServers, cpServerToRow } from "./cp";
 import { reportCpFailure } from "./cp-sync";
+import { hashInviteToken } from "../lib/invite";
 
 export const UNIT_PRICE = 5;
 export const FREE_TIER_SERVERS = 3;
@@ -469,4 +470,41 @@ export async function getOrgResources(orgId: string): Promise<OrgResource[]> {
       };
     })
   );
+}
+
+/** P2-7b: pending (unaccepted, unrevoked) invitations for an org's Members tab. */
+export async function getPendingInvites(orgId: string) {
+  return db
+    .select({
+      id: s.invitations.id,
+      email: s.invitations.email,
+      role: s.invitations.role,
+      invitedBy: s.invitations.invitedBy,
+      expiresAt: s.invitations.expiresAt,
+      createdAt: s.invitations.createdAt,
+    })
+    .from(s.invitations)
+    .where(and(eq(s.invitations.orgId, orgId), eq(s.invitations.status, "pending")))
+    .orderBy(desc(s.invitations.createdAt));
+}
+
+/** P2-7b: resolve an invite by its raw token (hashed for lookup) for the accept
+ *  page. Returns the invite plus its org name, or null when unknown. Read-only —
+ *  status/expiry are judged by the caller so the page can show honest copy. */
+export async function getInviteByToken(rawToken: string) {
+  const hash = hashInviteToken(rawToken);
+  const [inv] = await db
+    .select({
+      id: s.invitations.id,
+      orgId: s.invitations.orgId,
+      orgName: s.orgs.name,
+      email: s.invitations.email,
+      role: s.invitations.role,
+      status: s.invitations.status,
+      expiresAt: s.invitations.expiresAt,
+    })
+    .from(s.invitations)
+    .innerJoin(s.orgs, eq(s.invitations.orgId, s.orgs.id))
+    .where(eq(s.invitations.tokenHash, hash));
+  return inv ?? null;
 }

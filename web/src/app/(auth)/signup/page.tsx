@@ -7,6 +7,7 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { authClient } from "@/lib/auth-client";
+import { destAfterAuth } from "@/lib/after-auth";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
@@ -67,7 +68,7 @@ export default function SignupPage() {
     toast.success("Account created", {
       description: "Welcome to SigmaHub. Your first 3 servers are free.",
     });
-    router.push("/dashboard");
+    router.push(destAfterAuth());
   };
 
   return (

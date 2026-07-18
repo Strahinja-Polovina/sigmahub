@@ -56,6 +56,29 @@ export const projectMemberships = pgTable(
   (t) => ({ uniq: unique().on(t.projectId, t.userId) })
 );
 
+// P2-7b: pending email invitations. Replaces instant-join (which minted a
+// display-only user row with no account — a member who could never log in).
+// An invite carries the intended org role and optional per-project grants; the
+// raw token lives only in the emailed link, we store its SHA-256 hash. On
+// accept (by a real signed-in account whose email matches), the membership and
+// grants are materialized and the token is one-time-invalidated.
+export const invitations = pgTable("invitations", {
+  id: text("id").primaryKey(),
+  orgId: text("org_id")
+    .notNull()
+    .references(() => orgs.id, { onDelete: "cascade" }),
+  email: text("email").notNull(),
+  role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
+  // Optional per-project grants to materialize on accept: JSON [{projectId, role}].
+  projectGrants: text("project_grants").notNull().default("[]"),
+  tokenHash: text("token_hash").notNull().unique(), // SHA-256 of the raw token
+  invitedBy: text("invited_by").notNull(), // actor display name (audit-consistent)
+  status: text("status").notNull().default("pending"), // pending | accepted | revoked
+  expiresAt: timestamp("expires_at").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  acceptedAt: timestamp("accepted_at"),
+});
+
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),
   orgId: text("org_id")
