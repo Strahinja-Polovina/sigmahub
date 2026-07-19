@@ -47,6 +47,13 @@ type StoreAPI interface {
 	SetWALStatus(ctx context.Context, serverID, resourceID, lastSegment string, at time.Time) error
 	SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error
 	FailBackupRunFromOpStatus(ctx context.Context, serverID, runID, errText string) error
+	// S3 bucket/key/quota ops (SIGMA-65): the audited per-op credential release,
+	// the agent's terminal status report, and the DSD op-status failure fallback.
+	S3OpCredentialForOp(ctx context.Context, serverID, opID string) (store.S3OpCredential, error)
+	MarkS3OpApplied(ctx context.Context, serverID, opID, detail string) error
+	MarkS3OpFailed(ctx context.Context, serverID, opID, detail string) error
+	RecordStorageBytes(ctx context.Context, serverID, opID string, bytes int64, now time.Time) error
+	FailS3OpFromOpStatus(ctx context.Context, serverID, opID, errText string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -227,6 +234,13 @@ func (s *Server) routes() {
 	// S3 storage (P2-1): same split as databases.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/s3", s.requireService(store.RoleDeveloper, s.handleGetS3))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/s3/connection", s.requireService(store.RoleProjectAdmin, s.handleRevealS3Connection))
+	// S3 bucket/key/quota CRUD (SIGMA-65): list is member-visible; bucket + key +
+	// quota mutations are Project Admin+ and re-render the host server's DSD.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/buckets", s.requireService(store.RoleDeveloper, s.handleListBuckets))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/buckets", s.requireService(store.RoleProjectAdmin, s.handleCreateBucket))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBucket))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/quota", s.requireService(store.RoleProjectAdmin, s.handleSetBucketQuota))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/key", s.requireService(store.RoleProjectAdmin, s.handleCreateBucketKey))
 
 	// Backups (P1-11). Target metadata + run history + the verify-day feed are
 	// member-visible; target lifecycle, policy edits and the fire-drill restore
@@ -319,6 +333,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agent/build-logs", s.requireAgent(s.handleAgentBuildLog))
 	s.mux.HandleFunc("GET /v1/agent/backup-credential", s.requireAgent(s.handleAgentBackupCredential))
 	s.mux.HandleFunc("POST /v1/agent/backup-status", s.requireAgent(s.handleAgentBackupStatus))
+	// S3 bucket/key/quota ops (SIGMA-65): audited per-op credential release + the
+	// agent's terminal status report.
+	s.mux.HandleFunc("GET /v1/agent/s3-op-credential", s.requireAgent(s.handleAgentS3OpCredential))
+	s.mux.HandleFunc("POST /v1/agent/s3-op-status", s.requireAgent(s.handleAgentS3OpStatus))
 	// WAL shipping (P2-5).
 	s.mux.HandleFunc("GET /v1/agent/wal-targets", s.requireAgent(s.handleAgentWALTargets))
 	s.mux.HandleFunc("GET /v1/agent/wal-credential", s.requireAgent(s.handleAgentWALCredential))

@@ -38,6 +38,11 @@ const (
 	// target, replay WAL up to recovery_target_time, then load the recovered
 	// state into the fresh resource.
 	KindBackupRestorePITR = "backup.restore-pitr"
+	// S3 bucket/key/quota CRUD + storage metering (SIGMA-65): the on-demand op
+	// the agent runs against a provisioned MinIO/SeaweedFS engine (create/delete
+	// a bucket, set a quota, mint a per-bucket key, measure usage). Name must
+	// match the agent's s3ops package byte-for-byte.
+	KindS3Configure = "s3.configure"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

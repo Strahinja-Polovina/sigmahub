@@ -300,6 +300,11 @@ func run() error {
 				if _, err := st.SweepServerHours(ctx, time.Now()); err != nil {
 					log.Error("server-hours sweep", "err", err)
 				}
+				// SIGMA-65: enqueue a daily per-bucket storage measurement so the
+				// object-storage meter stays current.
+				if _, err := st.SweepS3Measure(ctx, time.Now()); err != nil {
+					log.Error("s3 measure sweep", "err", err)
+				}
 			}
 		}
 	}()

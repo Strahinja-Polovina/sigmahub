@@ -113,6 +113,15 @@ func (f *fakeStore) SetBackupRunResult(context.Context, string, string, bool, st
 func (f *fakeStore) FailBackupRunFromOpStatus(context.Context, string, string, string) error {
 	return nil
 }
+func (f *fakeStore) S3OpCredentialForOp(context.Context, string, string) (store.S3OpCredential, error) {
+	return store.S3OpCredential{}, store.ErrNotFound
+}
+func (f *fakeStore) MarkS3OpApplied(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) MarkS3OpFailed(context.Context, string, string, string) error  { return nil }
+func (f *fakeStore) RecordStorageBytes(context.Context, string, string, int64, time.Time) error {
+	return nil
+}
+func (f *fakeStore) FailS3OpFromOpStatus(context.Context, string, string, string) error { return nil }
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -228,6 +237,21 @@ func (f *fakeDomain) GetS3Info(_ context.Context, _, _ string) (store.S3Info, er
 }
 func (f *fakeDomain) RevealS3Connection(_ context.Context, _, _, _ string) (store.S3Connection, error) {
 	return store.S3Connection{}, store.ErrNotS3
+}
+func (f *fakeDomain) ListBuckets(_ context.Context, _, _ string) ([]store.Bucket, error) {
+	return []store.Bucket{}, nil
+}
+func (f *fakeDomain) CreateBucket(_ context.Context, _, _, _, _ string) (store.Bucket, string, error) {
+	return store.Bucket{}, "", store.ErrNotS3
+}
+func (f *fakeDomain) DeleteBucket(_ context.Context, _, _, _, _ string) (string, error) {
+	return "", store.ErrNotFound
+}
+func (f *fakeDomain) SetBucketQuota(_ context.Context, _, _, _ string, _ int64, _ string) (string, error) {
+	return "", store.ErrNotFound
+}
+func (f *fakeDomain) CreateBucketKey(_ context.Context, _, _, _, _ string) (string, string, error) {
+	return "", "", store.ErrNotFound
 }
 func (f *fakeDomain) CreateBackupTarget(_ context.Context, _, _ string, _ store.CreateBackupTargetInput) (store.BackupTarget, error) {
 	return store.BackupTarget{ID: "bkt_1"}, nil

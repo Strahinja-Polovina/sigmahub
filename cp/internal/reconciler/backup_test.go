@@ -16,7 +16,7 @@ func TestRenderBackupOpsOrderingAndSecretFreedom(t *testing.T) {
 		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: "abc123"},
 	}
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, runs, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, runs, nil, ACMEConfig{})
 
 	bk, ok := opByID(ops, "bkr:run_b")
 	if !ok || bk.Kind != dsd.KindBackupRun {
@@ -58,7 +58,7 @@ func TestRenderRestorePITROpCarriesTargetTime(t *testing.T) {
 			RecoveryTargetTime: &target},
 	}
 	ops, _ := renderOps("srv_t", nil, nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, runs, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, runs, nil, ACMEConfig{})
 	op, ok := opByID(ops, "bkr:run_p")
 	if !ok || op.Kind != dsd.KindBackupRestorePITR {
 		t.Fatalf("pitr op = %+v", op)
@@ -83,7 +83,7 @@ func TestRenderRestoreOpTargetsNewResource(t *testing.T) {
 			RestoreResourceID: "res_new", RestoreDatabase: "shop_restore", RestoreUsername: "sigma"},
 	}
 	ops, _ := renderOps("srv_t", nil, nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, runs, ACMEConfig{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, runs, nil, ACMEConfig{})
 	op, ok := opByID(ops, "bkr:run_r")
 	if !ok || op.Kind != dsd.KindBackupRestore {
 		t.Fatalf("restore op = %+v", op)

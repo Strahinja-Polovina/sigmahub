@@ -62,6 +62,14 @@ type DomainAPI interface {
 	// Project Admin+ and audited in the store.
 	GetS3Info(ctx context.Context, orgID, resourceID string) (store.S3Info, error)
 	RevealS3Connection(ctx context.Context, orgID, resourceID, actor string) (store.S3Connection, error)
+	// S3 bucket/key/quota CRUD (SIGMA-65): List is member-visible; the mutations
+	// return the host server id so the handler can re-render its DSD. Create key
+	// returns only the access key id (the secret rides the audited agent path).
+	ListBuckets(ctx context.Context, orgID, resourceID string) ([]store.Bucket, error)
+	CreateBucket(ctx context.Context, orgID, resourceID, name, actor string) (store.Bucket, string, error)
+	DeleteBucket(ctx context.Context, orgID, resourceID, name, actor string) (string, error)
+	SetBucketQuota(ctx context.Context, orgID, resourceID, name string, quotaBytes int64, actor string) (string, error)
+	CreateBucketKey(ctx context.Context, orgID, resourceID, name, actor string) (accessKey, serverID string, err error)
 	// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
 	// the per-day verify feed and the fire-drill restore.
 	CreateBackupTarget(ctx context.Context, orgID, actor string, in store.CreateBackupTargetInput) (store.BackupTarget, error)
