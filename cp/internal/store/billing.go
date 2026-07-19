@@ -209,7 +209,13 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 		return nil
 	}
 
-	if _, err := tx.Exec(ctx, `
+	// The DO UPDATE is guarded by last_event_at too (SIGMA-125): the FOR UPDATE
+	// read above closes the race only when a row already EXISTS to lock. Two
+	// concurrent FIRST-EVER deliveries both read no row (prevEventAt nil), both
+	// pass the guard above, and race to INSERT; the loser's ON CONFLICT DO UPDATE
+	// would otherwise clobber the winner even if it is older. The WHERE makes the
+	// stale one a no-op, and RowsAffected==0 then skips its audit/alert.
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO org_billing (org_id, paddle_customer_id, paddle_subscription_id, status, quantity, last_event_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, now())
 		ON CONFLICT (org_id) DO UPDATE SET
@@ -220,9 +226,16 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 			status                 = EXCLUDED.status,
 			quantity               = EXCLUDED.quantity,
 			last_event_at          = EXCLUDED.last_event_at,
-			updated_at             = now()`,
-		orgID, in.CustomerID, in.SubscriptionID, in.Status, in.Quantity, occurredAt); err != nil {
+			updated_at             = now()
+		WHERE org_billing.last_event_at IS NULL OR EXCLUDED.last_event_at >= org_billing.last_event_at`,
+		orgID, in.CustomerID, in.SubscriptionID, in.Status, in.Quantity, occurredAt)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// The conflicting row was newer (a concurrent creator won with a later
+		// event) — this delivery is stale, so do not audit or alert on it.
+		return nil
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Subscription "+in.Status, in.SubscriptionID); err != nil {
 		return err

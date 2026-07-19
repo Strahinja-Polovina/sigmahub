@@ -420,6 +420,18 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 	}
 	backoff := time.Second      // fetch-error backoff (reset on a successful fetch)
 	applyBackoff := time.Second // apply-error backoff (reset on a successful apply)
+	// Establish the SIGMA-123 report watermark at the CURRENT applied version on
+	// startup. LastReportedVersion is a newer journal key, so on upgrade it reads 0
+	// while LastAppliedVersion may already be high; without this the loop would
+	// re-post that old version's status once — re-running handleDSDStatus's
+	// deploy-advance side effects, which target the CURRENT in-flight deployment and
+	// would falsely move an unrelated newer deploy to a terminal state. Already-
+	// applied history is treated as reported; only drops from here on are re-sent.
+	if reported, rerr := journal.LastReportedVersion(); rerr == nil {
+		if applied, aerr := journal.LastAppliedVersion(); aerr == nil && reported < applied {
+			_ = journal.SetLastReportedVersion(applied)
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return

@@ -140,3 +140,58 @@ func TestPreviewEnvironmentLifecycle(t *testing.T) {
 		t.Fatalf("reopen outcome = %+v", out)
 	}
 }
+
+// TestPreviewRejectsUnavailablePreviewServer covers SIGMA-127 and SIGMA-128: a PR
+// preview must not be scheduled onto a preview server that is tombstoned
+// (deleted_at) or of a type that can't run an app resource — the same invariants
+// CreateResource enforces, which ensurePreviewTx previously bypassed.
+func TestPreviewRejectsUnavailablePreviewServer(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_prev_reject"
+	envID, serverID := dbTestFixture(t, st, orgID, false, "general")
+
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: projectID, RepoFullName: "acme/shop",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appSpec, _ := json.Marshal(map[string]any{"image": "", "ports": []map[string]any{{"container": 3000}}})
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "web", Kind: "app", Spec: appSpec,
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetConnectionPreviews(ctx, orgID, conn.ID, true, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case A: preview server is the wrong type for an app resource (SIGMA-128).
+	if _, err := st.Pool.Exec(ctx, `UPDATE servers SET type = 'storage' WHERE id = $1`, serverID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HandleGitWebhook(ctx, store.GitWebhookEvent{
+		DeliveryID: "d-reject-type", EventType: "pull_request", RepoFullName: "acme/shop",
+		Action: "opened", PRNumber: 1, Branch: "b1", SHA: "s1",
+	}); err == nil {
+		t.Fatal("preview was scheduled onto a storage-type server")
+	}
+
+	// Case B: preview server is tombstoned (SIGMA-127).
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE servers SET type = 'general', deleted_at = now() WHERE id = $1`, serverID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HandleGitWebhook(ctx, store.GitWebhookEvent{
+		DeliveryID: "d-reject-tombstone", EventType: "pull_request", RepoFullName: "acme/shop",
+		Action: "opened", PRNumber: 2, Branch: "b2", SHA: "s2",
+	}); err == nil {
+		t.Fatal("preview was scheduled onto a tombstoned server")
+	}
+}
