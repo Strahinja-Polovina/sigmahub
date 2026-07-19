@@ -25,7 +25,7 @@ import {
   formatDate,
 } from "@/components/dashboard/projects/shared";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
-import { getActiveOrgId } from "@/server/active-org";
+import { getActiveOrgId, requireMembership, visibleProjects } from "@/server/active-org";
 import { getEnvironmentPanel, getProject } from "@/server/queries";
 import { cpEnabled } from "@/server/cp";
 import { EnvLogSearch } from "@/components/dashboard/environments/env-log-search";
@@ -42,12 +42,19 @@ export default async function EnvironmentDetailPage({
   const project = await getProject(projectId);
   const panel = await getEnvironmentPanel(envId);
 
-  // Guard: unknown ids, or an env/project that belongs to another org.
+  // P2-7 read scoping: a project-scoped user must not open environments (server
+  // topology, resources, logs) in a project they were never granted (SIGMA-75).
+  const { user, role } = await requireMembership(orgId);
+  const visible = await visibleProjects(user.id, orgId, role);
+
+  // Guard: unknown ids, an env/project that belongs to another org, or a
+  // project outside the user's grants.
   if (
     !project ||
     !panel ||
     project.orgId !== orgId ||
-    panel.env.projectId !== projectId
+    panel.env.projectId !== projectId ||
+    (visible && !visible.has(projectId))
   ) {
     return (
       <div className="p-4 md:p-6">

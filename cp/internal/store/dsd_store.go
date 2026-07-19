@@ -209,9 +209,12 @@ func (s *Store) PendingDestructiveOpsForServer(ctx context.Context, orgID, serve
 
 // MarkDestructiveOpApplied records that the agent applied a destructive op so it
 // drops out of future DSDs.
-func (s *Store) MarkDestructiveOpApplied(ctx context.Context, id string) error {
+func (s *Store) MarkDestructiveOpApplied(ctx context.Context, serverID, id string) error {
+	// Scope by server_id (SIGMA-74): a compromised agent must not be able to mark
+	// another server's destructive op applied — matches every sibling agent-status
+	// write. server_id is the executing server the op was rendered for.
 	_, err := s.Pool.Exec(ctx,
-		`UPDATE pending_destructive_ops SET applied_at = now() WHERE id = $1 AND applied_at IS NULL`, id)
+		`UPDATE pending_destructive_ops SET applied_at = now() WHERE id = $1 AND server_id = $2 AND applied_at IS NULL`, id, serverID)
 	return err
 }
 

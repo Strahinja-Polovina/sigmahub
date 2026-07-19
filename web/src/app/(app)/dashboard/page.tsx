@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId, getMyOrgs } from "@/server/active-org";
+import { getActiveOrgId, getMyOrgs, requireMembership, visibleProjects } from "@/server/active-org";
 import {
   getBillingSummary,
   getOrgResources,
@@ -11,10 +11,15 @@ export default async function DashboardPage() {
   const orgId = await getActiveOrgId();
   if (!orgId) redirect("/login");
 
+  // P2-7 read scoping: a project-scoped user's overview only counts and lists
+  // resources in projects they were granted (SIGMA-75).
+  const { user, role } = await requireMembership(orgId);
+  const visible = await visibleProjects(user.id, orgId, role);
+
   const [servers, billing, resources, myOrgs] = await Promise.all([
     getServers(orgId),
     getBillingSummary(orgId),
-    getOrgResources(orgId),
+    getOrgResources(orgId, visible),
     getMyOrgs(),
   ]);
   const orgName = myOrgs.find((o) => o.id === orgId)?.name ?? "your organization";

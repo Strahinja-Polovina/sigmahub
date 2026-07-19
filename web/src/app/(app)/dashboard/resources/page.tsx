@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId, getMyOrgs } from "@/server/active-org";
+import { getActiveOrgId, getMyOrgs, requireMembership, visibleProjects } from "@/server/active-org";
 import { getDeployTargets, getOrgResources } from "@/server/queries";
 import { ResourcesView } from "@/components/dashboard/resources/resources-view";
 import { cpEnabled } from "@/server/cp";
@@ -8,9 +8,14 @@ export default async function ResourcesPage() {
   const orgId = await getActiveOrgId();
   if (!orgId) redirect("/login");
 
+  // P2-7 read scoping: only list resources — and offer deploy targets — in
+  // projects the user was granted (SIGMA-75).
+  const { user, role } = await requireMembership(orgId);
+  const visible = await visibleProjects(user.id, orgId, role);
+
   const [resources, targets, myOrgs] = await Promise.all([
-    getOrgResources(orgId),
-    getDeployTargets(orgId),
+    getOrgResources(orgId, visible),
+    getDeployTargets(orgId, visible),
     getMyOrgs(),
   ]);
   const orgName = myOrgs.find((o) => o.id === orgId)?.name ?? "your organization";

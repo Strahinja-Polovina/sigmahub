@@ -246,3 +246,45 @@ func TestPITRRestoreToTimestampWindow(t *testing.T) {
 		t.Fatalf("PITR restore audits = %d, want 1", audits)
 	}
 }
+
+// TestPITRRequiresBackupTarget is the SIGMA-71 regression: PITR can't be enabled
+// without a backup target (archiving to nowhere fills the spool), and clearing
+// the target forces PITR off.
+func TestPITRRequiresBackupTarget(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_pitr_t"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	pg, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "shop", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	// No target yet → enabling PITR is refused.
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, pg.ID, "admin", store.UpdateBackupPolicyInput{PitrEnabled: &on}); err == nil {
+		t.Fatal("PITR without a backup target must be rejected")
+	}
+	// Set a target, then PITR enables.
+	tgt, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://m:9000", Bucket: "b", AccessKey: "AK", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := tgt.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, pg.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &tid, PitrEnabled: &on}); err != nil {
+		t.Fatalf("enable PITR with target: %v", err)
+	}
+	// Clearing the target forces PITR off in the same update.
+	clear := ""
+	bp, err := st.UpdateBackupPolicy(ctx, orgID, pg.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &clear})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bp.PitrEnabled {
+		t.Fatal("clearing the backup target must force PITR off (SIGMA-71)")
+	}
+}

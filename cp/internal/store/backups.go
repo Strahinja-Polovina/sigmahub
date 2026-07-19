@@ -230,8 +230,19 @@ func (s *Store) UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor
 			if engine != "postgres" {
 				return BackupPolicy{}, ErrInvalid{Msg: "point-in-time recovery is available for postgres resources only"}
 			}
+			// PITR turns on archive_mode; with no target the WAL shipper has
+			// nowhere to drain to, so the spool grows until archive_command
+			// fails and Postgres stops recycling WAL (SIGMA-71).
+			if bp.TargetID == nil {
+				return BackupPolicy{}, ErrInvalid{Msg: "point-in-time recovery requires a backup target"}
+			}
 		}
 		bp.PitrEnabled = *in.PitrEnabled
+	}
+	// Clearing the target must force PITR off in the same update — archiving to
+	// nowhere would otherwise silently fill the spool (SIGMA-71).
+	if bp.TargetID == nil {
+		bp.PitrEnabled = false
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE backup_policies
@@ -338,7 +349,7 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.backup {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'backup')`,
+				VALUES ($1, $2, $3, $4, $5, 'backup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -346,7 +357,7 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.verify {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'verify')`,
+				VALUES ($1, $2, $3, $4, $5, 'verify') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -355,7 +366,7 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.base {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'basebackup')`,
+				VALUES ($1, $2, $3, $4, $5, 'basebackup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}

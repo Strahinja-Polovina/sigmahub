@@ -163,14 +163,18 @@ export async function requireProjectRole(
 }
 
 /** Project Admin gate for actions addressed by resource id: the project is
- *  resolved through the local mirror. A missing mirror row falls back to the
- *  org-level gate rather than breaking the action — the mirror self-heals via
- *  the SIGMA-56 sync, and the CP still enforces its own org+role checks. */
+ *  resolved through the local mirror. The lookup is org-scoped (join through
+ *  projects, assert orgId) so a resource in another org is never resolved to a
+ *  foreign project here — defense-in-depth on top of the CP's own org checks
+ *  (SIGMA-76). A missing/foreign mirror row falls back to the org-level gate
+ *  rather than breaking the action — the mirror self-heals via the SIGMA-56
+ *  sync, and the CP still enforces its own org+role checks. */
 export async function requireProjectAdminForResource(orgId: string, resourceId: string) {
   const [res] = await db
     .select({ projectId: s.resources.projectId })
     .from(s.resources)
-    .where(eq(s.resources.id, resourceId));
+    .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
+    .where(and(eq(s.resources.id, resourceId), eq(s.projects.orgId, orgId)));
   if (res) {
     return requireProjectRole(orgId, res.projectId, "Project Admin");
   }

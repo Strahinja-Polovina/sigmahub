@@ -185,3 +185,71 @@ func TestBackupLifecycle(t *testing.T) {
 		t.Fatalf("timeout sweep n=%d err=%v", n, err)
 	}
 }
+
+// TestDailySweepIsIdempotentAcrossRuns is the SIGMA-72 regression: running the
+// daily scheduler twice for the same day must not double-insert backup runs
+// (partial unique index + ON CONFLICT DO NOTHING), and MarkDestructiveOpApplied
+// is server-scoped (SIGMA-74).
+func TestDailySweepIsIdempotentAcrossRuns(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_sweep"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	pg, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "shop", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://m:9000", Bucket: "b", AccessKey: "AK", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := tgt.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, pg.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	if _, err := st.CreateDueBackupRuns(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateDueBackupRuns(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	// Even after two sweeps in the same day, exactly one 'backup' run exists.
+	var backups int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM backup_runs WHERE resource_id=$1 AND kind='backup'`, pg.ID).Scan(&backups); err != nil {
+		t.Fatal(err)
+	}
+	if backups != 1 {
+		t.Fatalf("two sweeps produced %d backup runs, want 1 (SIGMA-72)", backups)
+	}
+
+	// SIGMA-74: MarkDestructiveOpApplied is scoped by server_id. Seed a pending
+	// destructive op on this server and confirm a foreign server can't apply it.
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO pending_destructive_ops (id, org_id, server_id, op_kind, target)
+		VALUES ('pdo_x', $1, $2, 'volume.remove', 'sigmahub-x-data')`, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkDestructiveOpApplied(ctx, "srv_other", "pdo_x"); err != nil {
+		t.Fatal(err)
+	}
+	var applied *time.Time
+	st.Pool.QueryRow(ctx, `SELECT applied_at FROM pending_destructive_ops WHERE id='pdo_x'`).Scan(&applied)
+	if applied != nil {
+		t.Fatal("a foreign server must not mark this server's destructive op applied (SIGMA-74)")
+	}
+	if err := st.MarkDestructiveOpApplied(ctx, serverID, "pdo_x"); err != nil {
+		t.Fatal(err)
+	}
+	st.Pool.QueryRow(ctx, `SELECT applied_at FROM pending_destructive_ops WHERE id='pdo_x'`).Scan(&applied)
+	if applied == nil {
+		t.Fatal("the owning server should mark its own destructive op applied")
+	}
+}
