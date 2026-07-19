@@ -8,6 +8,11 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
+// deliverySendTimeout caps a single alert delivery so one slow channel can't
+// stall the whole batch (SIGMA-119). Above the per-transport ceilings (10s) with
+// headroom for the SMTP conversation.
+const deliverySendTimeout = 20 * time.Second
+
 // Store is the outbox slice the dispatcher needs; *store.Store satisfies it.
 type Store interface {
 	DueAlertDeliveries(ctx context.Context, limit int) ([]store.AlertDelivery, error)
@@ -89,7 +94,12 @@ func drain(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Con
 		if err != nil {
 			sendErr = err
 		} else {
-			sendErr = snd.Send(ctx, ch, d.Event, d.Title, d.Body)
+			// Bound each delivery so one slow/unreachable channel can't stall the
+			// serial, cross-org drain (SIGMA-119). The transports honour ctx; the
+			// SMTP path additionally dials with its own deadline.
+			sendCtx, cancel := context.WithTimeout(ctx, deliverySendTimeout)
+			sendErr = snd.Send(sendCtx, ch, d.Event, d.Title, d.Body)
+			cancel()
 		}
 		ok := sendErr == nil
 		errText := ""

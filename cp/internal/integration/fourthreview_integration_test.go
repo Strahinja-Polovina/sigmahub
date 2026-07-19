@@ -56,9 +56,9 @@ func TestDSDReDrivesOnOpFailure(t *testing.T) {
 		t.Fatalf("first reconcile version = %d, want 1", v)
 	}
 
-	// The agent reports the resource op FAILED for v1.
+	// The agent reports the resource op FAILED for v1 (not converged).
 	failed := map[string]json.RawMessage{"res:" + res.ID: json.RawMessage(`{"state":"failed","error":"registry unreachable"}`)}
-	if ok, err := st.ApplyDSDStatus(ctx, serverID, 1, failed); err != nil || !ok {
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, 1, failed, false); err != nil || !ok {
 		t.Fatalf("apply failed status: ok=%v err=%v", ok, err)
 	}
 
@@ -74,7 +74,7 @@ func TestDSDReDrivesOnOpFailure(t *testing.T) {
 	// The agent now reports success for v2 → converged; a further resync with the
 	// same specs must NOT bump the version.
 	okStatus := map[string]json.RawMessage{"res:" + res.ID: json.RawMessage(`{"state":"applied"}`)}
-	if ok, err := st.ApplyDSDStatus(ctx, serverID, 2, okStatus); err != nil || !ok {
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, 2, okStatus, true); err != nil || !ok {
 		t.Fatalf("apply ok status: ok=%v err=%v", ok, err)
 	}
 	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
@@ -82,6 +82,142 @@ func TestDSDReDrivesOnOpFailure(t *testing.T) {
 	}
 	if v, _ := st.CurrentDSDVersion(ctx, serverID); v != 2 {
 		t.Fatalf("converged resync bumped version to %d, want 2", v)
+	}
+}
+
+// TestDSDReDriveIsBounded covers SIGMA-116: a permanently-failing op must NOT
+// re-issue a new DSD version on every resync forever — the re-drive is capped, so
+// the version stabilizes instead of climbing without bound (which also grows the
+// audit log and re-applies the doomed op every cycle).
+func TestDSDReDriveIsBounded(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	rec := reconciler.New(slog.New(slog.NewTextHandler(io.Discard, nil)), st, dsdKey)
+
+	orgID := "org_redrive_cap"
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID := reg.Server.ID
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "app1", Kind: "app", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep reporting the op as failed and resyncing. Early on the version bumps
+	// (re-drive retries), but it must stop once the cap is hit.
+	failed := map[string]json.RawMessage{"res:" + res.ID: json.RawMessage(`{"state":"failed","error":"bad image tag"}`)}
+	var lastV int64
+	stable := 0
+	for i := 0; i < 12; i++ {
+		v, _ := st.CurrentDSDVersion(ctx, serverID)
+		if ok, err := st.ApplyDSDStatus(ctx, serverID, v, failed, false); err != nil || !ok {
+			t.Fatalf("apply failed status: ok=%v err=%v", ok, err)
+		}
+		if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+			t.Fatal(err)
+		}
+		nv, _ := st.CurrentDSDVersion(ctx, serverID)
+		if nv == lastV {
+			stable++
+		} else {
+			stable = 0
+		}
+		lastV = nv
+	}
+	if stable < 3 {
+		t.Fatalf("re-drive never stopped churning the version (last=%d)", lastV)
+	}
+	if lastV > 8 {
+		t.Fatalf("re-drive not bounded: version climbed to %d", lastV)
+	}
+
+	// A real config change (new rendered doc_hash) must reset the retry budget and
+	// re-issue again, so a resource fixed after the cap still converges.
+	if _, err := st.Pool.Exec(ctx, `UPDATE resources SET spec = $2 WHERE id = $1`,
+		res.ID, json.RawMessage(`{"image":"nginx:1.27"}`)); err != nil {
+		t.Fatalf("update resource spec: %v", err)
+	}
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := st.CurrentDSDVersion(ctx, serverID); v <= lastV {
+		t.Fatalf("a config change did not re-issue after the cap: version %d, was %d", v, lastV)
+	}
+}
+
+// TestDSDReDriveHonorsConvergedParam covers SIGMA-117: convergence is driven by
+// the caller's whole-document signal, not by the resource-scoped status map — so
+// a failed NON-resource op (host/proxy/volume.remove, which never enters the
+// byResource map) still clears apply_ok and triggers a re-drive.
+func TestDSDReDriveHonorsConvergedParam(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	rec := reconciler.New(slog.New(slog.NewTextHandler(io.Discard, nil)), st, dsdKey)
+
+	orgID := "org_conv"
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID := reg.Server.ID
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "app1", Kind: "app", Spec: json.RawMessage(`{}`),
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	v1, _ := st.CurrentDSDVersion(ctx, serverID)
+
+	// Report with an EMPTY resource-status map but converged=false — this is how a
+	// failed host:/proxy:/volrm: op arrives (it produces no res: entry). The
+	// server must NOT be treated as converged.
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, v1, map[string]json.RawMessage{}, false); err != nil || !ok {
+		t.Fatalf("apply non-resource failure: ok=%v err=%v", ok, err)
+	}
+	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := st.CurrentDSDVersion(ctx, serverID); v <= v1 {
+		t.Fatalf("a failed non-resource op did not trigger a re-drive: version %d, want > %d", v, v1)
 	}
 }
 

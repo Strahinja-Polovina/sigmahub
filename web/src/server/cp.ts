@@ -170,7 +170,14 @@ async function cpFetch<T>(path: string, init: RequestInit | undefined, opts: CpF
     }
     throw new Error(message);
   }
-  return res.json() as Promise<T>;
+  // Some CP endpoints (delete git connection / branch map / alert channel) reply
+  // 204 No Content with an empty body. res.json() on an empty body throws
+  // "Unexpected end of JSON input", which would make a SUCCEEDED delete report
+  // failure and skip its audit write (SIGMA-118). Treat 204 / empty as void.
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export async function cpListServers(orgId: string): Promise<CpServer[]> {

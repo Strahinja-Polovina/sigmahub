@@ -18,25 +18,71 @@ import (
 // reconciles for one server, so two overlapping reconciles (a nudge racing the
 // 60s resync, or multiple replicas) can't lost-update the document to a stale
 // snapshot — the later-committing reconcile might otherwise hold an OLDER read
-// (SIGMA-94). Returns an unlock func that releases the lock and the held
-// connection; call it (deferred) when the reconcile finishes.
-func (s *Store) LockServerReconcile(ctx context.Context, serverID string) (func(), error) {
-	conn, err := s.Pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('reconcile:' || $1))`, serverID); err != nil {
+// (SIGMA-94).
+//
+// It uses pg_TRY_advisory_lock in a bounded retry loop that RELEASES the pool
+// connection between attempts (SIGMA-120). The lock is held on a checked-out pool
+// connection for the whole reconcile, so BLOCKING on it (pg_advisory_lock) would
+// pin that connection while the reconcile needs several MORE pool connections for
+// its reads+write; under a burst of same-server reconciles that pins every pool
+// connection on lock-waiters and the winner can't get a connection for its own
+// queries — a pool-exhaustion deadlock. Blocking-free skip-on-first-contention is
+// the other extreme: a synchronous caller that expects the reconcile to have run
+// (e.g. right after confirming a destructive op) would silently no-op. So we wait
+// a short, bounded time — retrying pg_try_advisory_lock while holding NO
+// connection during the sleep — which lets a brief concurrent reconcile finish
+// without pinning connections. Only if the lock stays held past the deadline do
+// we report acquired=false and let the caller skip (safe: reconcile is
+// level-triggered and the 60s resync re-runs it). Returns (unlock, acquired, err);
+// call unlock (deferred) only when acquired is true.
+func (s *Store) LockServerReconcile(ctx context.Context, serverID string) (func(), bool, error) {
+	deadline := time.Now().Add(reconcileLockWait)
+	for {
+		conn, err := s.Pool.Acquire(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		var got bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('reconcile:' || $1))`, serverID).Scan(&got); err != nil {
+			conn.Release()
+			return nil, false, err
+		}
+		if got {
+			return func() {
+				// Best-effort unlock on a fresh context (the reconcile ctx may be done).
+				uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext('reconcile:' || $1))`, serverID)
+				conn.Release()
+			}, true, nil
+		}
+		// Contended: release the connection (never hold it while waiting, or the
+		// pool exhausts) and retry until the deadline, then skip.
 		conn.Release()
-		return nil, err
+		if time.Now().After(deadline) {
+			return func() {}, false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-time.After(reconcileLockRetry):
+		}
 	}
-	return func() {
-		// Best-effort unlock on a fresh context (the reconcile ctx may be done).
-		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext('reconcile:' || $1))`, serverID)
-		conn.Release()
-	}, nil
 }
+
+const (
+	// reconcileLockWait bounds how long a reconcile waits for a concurrent
+	// same-server reconcile to finish before skipping (SIGMA-120).
+	reconcileLockWait = 5 * time.Second
+	// reconcileLockRetry is the poll interval while waiting for the lock.
+	reconcileLockRetry = 25 * time.Millisecond
+)
+
+// maxDSDRedrive caps how many times StoreDSD re-issues an UNCHANGED document to
+// retry a failed apply (SIGMA-116). At the 60s resync cadence this is ~5 minutes
+// of retries for a transient failure; a permanently-failing op then stops
+// churning the version/audit log until a real config change resets the budget.
+const maxDSDRedrive = 5
 
 const dsdSigningKeyName = "dsd_signing_key"
 
@@ -131,25 +177,33 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	var curVersion, appliedVersion int64
 	var curHash string
 	var applyOK bool
+	var redriveCount int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO server_dsd (server_id, org_id, version, doc_hash)
 		VALUES ($1, $2, 0, '')
 		ON CONFLICT (server_id) DO UPDATE SET server_id = server_dsd.server_id
-		RETURNING version, doc_hash, applied_version, apply_ok`,
-		serverID, orgID).Scan(&curVersion, &curHash, &appliedVersion, &applyOK)
+		RETURNING version, doc_hash, applied_version, apply_ok, redrive_count`,
+		serverID, orgID).Scan(&curVersion, &curHash, &appliedVersion, &applyOK, &redriveCount)
 	if err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("lock dsd row: %w", err)
 	}
-	// Suppress re-issue when the desired ops are unchanged — UNLESS the last
-	// applied version did not fully converge (SIGMA-104). A failed/skipped op
-	// leaves apply_ok false; re-issuing the same ops as a new version is what
-	// makes the agent retry, since it only applies versions greater than the one
-	// it last saw. We re-issue only once the agent has CAUGHT UP to the current
-	// version (applied_version == curVersion) and reported a failure for it — if
-	// an apply is still in flight (applied_version < curVersion) the ops may yet
-	// succeed, so re-issuing then would churn the version mid-apply.
+	sameDoc := curHash == docHash && curVersion > 0
+	// The applied version has fully converged when the agent reported every op
+	// applied (apply_ok), or an apply is still in flight (applied_version <
+	// curVersion) so the ops may yet succeed — re-issuing mid-apply would churn
+	// the version. Only a caught-up, failed apply is a candidate for re-drive.
 	converged := applyOK || appliedVersion < curVersion
-	if curHash == docHash && curVersion > 0 && converged {
+	if sameDoc && converged {
+		return dsd.Signed{}, false, tx.Commit(ctx)
+	}
+	// Bounded re-drive (SIGMA-104 / SIGMA-116): when the desired ops are unchanged
+	// but the last apply failed, re-issue them as a new version so the agent
+	// retries (it only applies versions greater than the one it last saw). Cap the
+	// retries so a PERMANENTLY-failing op (e.g. a mistyped image tag) does not
+	// re-issue a new signed version + audit row on every 60s resync forever; after
+	// the cap we suppress and leave the failure visible on resources.status until a
+	// real config change (a new doc_hash) resets the budget.
+	if sameDoc && !converged && redriveCount >= maxDSDRedrive {
 		return dsd.Signed{}, false, tx.Commit(ctx)
 	}
 
@@ -163,13 +217,19 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	if err != nil {
 		return dsd.Signed{}, false, err
 	}
-	// apply_ok resets to true for the freshly issued version (it is not yet known
-	// to have failed); the agent's next status report sets it authoritatively.
+	// A re-drive of the SAME failing doc increments the retry budget; any real
+	// change (new doc_hash) resets it to 0. apply_ok resets to true for the freshly
+	// issued version (not yet known to have failed); the agent's next status report
+	// sets it authoritatively.
+	nextRedrive := 0
+	if sameDoc {
+		nextRedrive = redriveCount + 1
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE server_dsd
-		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, apply_ok = true, updated_at = now()
+		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, apply_ok = true, redrive_count = $6, updated_at = now()
 		 WHERE server_id = $1`,
-		serverID, next, docJSON, sig, docHash); err != nil {
+		serverID, next, docJSON, sig, docHash, nextRedrive); err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("update dsd: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, "reconciler", "DSD issued",
@@ -279,9 +339,15 @@ func (s *Store) AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID str
 
 // ApplyDSDStatus records agent-reported op results for a server at a given DSD
 // version. Status for a version below the last recorded one is ignored
-// (superseded). Per-resource op states are written into resources.status.
-// Returns false when the report was superseded (ignored).
-func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage) (bool, error) {
+// (superseded). Per-resource op states in opStatus are written into
+// resources.status. `converged` is the caller's whole-document convergence
+// signal — true only when EVERY reported op (resource, host, proxy, volume.remove,
+// …) applied; it drives apply_ok and thus the SIGMA-104 resync re-drive. It must
+// be computed from the full op-status set, not just the resource-scoped opStatus
+// map (SIGMA-117) — otherwise a failed host/proxy/volume.remove op would report
+// false convergence and never be retried. Returns false when the report was
+// superseded (ignored).
+func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool) (bool, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -305,21 +371,8 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 	if version < applied || version > issued {
 		return false, tx.Commit(ctx)
 	}
-	// Convergence signal for the resync re-drive (SIGMA-104): the version is fully
-	// applied only if every reported op is "applied". A "failed" or "skipped" op
-	// clears apply_ok so StoreDSD re-issues the same ops (a retry) on the next
-	// reconcile instead of treating the server as converged forever.
-	applyOK := true
-	for _, st := range opStatus {
-		var s struct {
-			State string `json:"state"`
-		}
-		if err := json.Unmarshal(st, &s); err == nil && (s.State == "failed" || s.State == "skipped") {
-			applyOK = false
-		}
-	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE server_dsd SET applied_version = $2, apply_ok = $3 WHERE server_id = $1`, serverID, version, applyOK); err != nil {
+		`UPDATE server_dsd SET applied_version = $2, apply_ok = $3 WHERE server_id = $1`, serverID, version, converged); err != nil {
 		return false, err
 	}
 	for resourceID, st := range opStatus {

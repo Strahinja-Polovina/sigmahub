@@ -60,7 +60,18 @@ func (s *Store) SetCustody(c kms.KeyCustody) {
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	// A reconcile holds one connection for its advisory lock (SIGMA-94/120) AND
+	// needs several more for its reads+write, so the pgxpool default floor of
+	// max(4, NumCPU) is too tight under concurrent reconciles. Raise the floor
+	// (respecting an explicit higher pool_max_conns in the DSN).
+	if cfg.MaxConns < 20 {
+		cfg.MaxConns = 20
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
