@@ -432,3 +432,52 @@ func TestPITRRestoreFailsWithoutBaseBeforeTarget(t *testing.T) {
 		t.Fatal("run must be reported failed")
 	}
 }
+
+// TestBackupRunDoesNotDeadlockWhenResticExitsEarly reproduces SIGMA-69: if
+// restic exits non-zero WITHOUT draining stdin, the dump goroutine used to block
+// on pw.Write forever and the handler hung on <-execDone. The fix closes pr
+// after restic returns. Run under a timeout so a regression fails, not hangs.
+func TestBackupRunDoesNotDeadlockWhenResticExitsEarly(t *testing.T) {
+	dir := t.TempDir()
+	// `backup` exits 1 immediately without reading stdin (the early-exit case).
+	script := "#!/bin/sh\ncase \"$1\" in\n  init) exit 0 ;;\n  backup) exit 1 ;;\n  *) exit 0 ;;\nesac\n"
+	path := filepath.Join(dir, "restic")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := resticBin
+	resticBin = path
+	t.Cleanup(func() { resticBin = old })
+
+	// A large dump so pw.Write blocks with no reader draining the pipe.
+	fd := &fakeDocker{dumpData: []byte(strings.Repeat("x", 1<<20))}
+	rep := &reported{}
+	r := NewRunner(fd,
+		func(context.Context, string) (Credential, error) { return Credential{Repository: "s3:x/y/z"}, nil },
+		func(_ context.Context, _ string, ok bool, _, _, detail string) {
+			rep.ok = ok
+			rep.detail = detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	op := backupOp(t, KindBackupRun, opSpec{
+		RunID: "run_dl", ResourceID: "res_db", Container: "c",
+		Engine: "postgres", Database: "db", Username: "u",
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- r.opBackupRun(context.Background(), op) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a failure from the early restic exit")
+		}
+		if rep.ok {
+			t.Fatal("run must be reported failed")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("opBackupRun deadlocked on early restic exit (SIGMA-69 regression)")
+	}
+}

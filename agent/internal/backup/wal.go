@@ -130,6 +130,11 @@ func (s *WALShipper) shipOne(ctx context.Context, resourceID string) error {
 
 	bundle := walBundlePrefix + s.now().UTC().Format("20060102T150405Z") + ".tar"
 	_, backupErr := resticBackupStdinTagged(ctx, cred, pr, bundle, "wal")
+	// Close the read end as soon as restic returns. If restic exited early with
+	// an error, os/exec does NOT close pr, so the tar goroutine would block
+	// forever on pw.Write and <-execDone would deadlock the whole shipper
+	// (SIGMA-69). Closing pr makes the pending write return ErrClosedPipe.
+	_ = pr.Close()
 	tarErr := <-execDone
 	if tarErr != nil {
 		return tarErr

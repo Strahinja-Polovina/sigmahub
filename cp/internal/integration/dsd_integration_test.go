@@ -927,3 +927,99 @@ func resourceStatusState(t *testing.T, st *store.Store, resourceID string) strin
 	json.Unmarshal(raw, &s)
 	return s.State
 }
+
+// TestDEKRotationReencryptsAllCredentialTables is the SIGMA-68 regression: DEK
+// rotation must re-encrypt EVERY table that stores ciphertext under the org DEK
+// (secrets, db/s3 credentials, backup targets, …), not just `secrets`. Before
+// the fix, db/s3/backup credentials stayed on the old DEK, which was then wrongly
+// retired — a latent data-loss trap.
+func TestDEKRotationReencryptsAllCredentialTables(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_rot"
+
+	proj, _ := st.CreateProject(ctx, orgID, "p", "", "test")
+	env, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	btG, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "gen", "general", "", "", "test", time.Hour)
+	regG, _ := st.RegisterServer(ctx, btG, "gen", "0.1.0", json.RawMessage(`{}`), "")
+	st.AttachServer(ctx, orgID, env.ID, regG.Server.ID, "test")
+	btS, _, _, _ := st.IssueBootstrapToken(ctx, orgID, "sto", "storage", "", "", "test", time.Hour)
+	regS, _ := st.RegisterServer(ctx, btS, "sto", "0.1.0", json.RawMessage(`{}`), "")
+	st.AttachServer(ctx, orgID, env.ID, regS.Server.ID, "test")
+
+	sec, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{ProjectID: proj.ID, Name: "API_KEY", Value: "s3cr3t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pg, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{EnvironmentID: env.ID, ServerID: regG.Server.ID, Name: "db", Kind: "postgres", Spec: json.RawMessage(`{}`)}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{EnvironmentID: env.ID, ServerID: regS.Server.ID, Name: "media", Kind: "s3", Spec: json.RawMessage(`{}`)}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{Name: "minio", Endpoint: "http://m:9000", Bucket: "b", AccessKey: "AK", SecretKey: "supersecret", ForcePathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var oldDEK string
+	if err := st.Pool.QueryRow(ctx, `SELECT id FROM org_deks WHERE org_id=$1 AND active`, orgID).Scan(&oldDEK); err != nil {
+		t.Fatal(err)
+	}
+	pgConn, err := st.RevealDatabaseConnection(ctx, orgID, pg.ID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3Conn, err := st.RevealS3Connection(ctx, orgID, s3res.ID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newDEK, err := st.RotateDEK(ctx, orgID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newDEK == oldDEK {
+		t.Fatal("rotate must mint a new active DEK")
+	}
+	if _, err := st.ReencryptSecrets(ctx, orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every credential table now points at the NEW DEK.
+	checkDEK := func(table, pkCol, id string) {
+		var dek string
+		if err := st.Pool.QueryRow(ctx, "SELECT dek_id FROM "+table+" WHERE "+pkCol+"=$1", id).Scan(&dek); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+		if dek != newDEK {
+			t.Fatalf("%s still on DEK %s, want re-keyed to %s (SIGMA-68)", table, dek, newDEK)
+		}
+	}
+	checkDEK("secrets", "id", sec.ID)
+	checkDEK("db_credentials", "resource_id", pg.ID)
+	checkDEK("s3_credentials", "resource_id", s3res.ID)
+	checkDEK("backup_targets", "id", tgt.ID)
+
+	// …and they still decrypt to the same plaintext under the new DEK.
+	if c, err := st.RevealDatabaseConnection(ctx, orgID, pg.ID, "admin"); err != nil || c.Password != pgConn.Password {
+		t.Fatalf("db reveal after rotate: err=%v password-match=%v", err, c.Password == pgConn.Password)
+	}
+	if c, err := st.RevealS3Connection(ctx, orgID, s3res.ID, "admin"); err != nil || c.SecretKey != s3Conn.SecretKey {
+		t.Fatalf("s3 reveal after rotate: err=%v key-match=%v", err, c.SecretKey == s3Conn.SecretKey)
+	}
+	if v, err := st.RevealSecret(ctx, orgID, sec.ID, "admin"); err != nil || v != "s3cr3t" {
+		t.Fatalf("secret reveal after rotate: %q %v", v, err)
+	}
+
+	// The old DEK backs nothing now, so it is correctly retired.
+	var retired *time.Time
+	if err := st.Pool.QueryRow(ctx, `SELECT retired_at FROM org_deks WHERE id=$1`, oldDEK).Scan(&retired); err != nil {
+		t.Fatal(err)
+	}
+	if retired == nil {
+		t.Fatal("old DEK should be retired after a full re-encrypt")
+	}
+}
