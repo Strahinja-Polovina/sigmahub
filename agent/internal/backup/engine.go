@@ -28,7 +28,18 @@ func baseBackupCommand(engine, username string) ([]string, error) {
 // container (P2-5b, postgres only). Running as root, it untars the base backup
 // into PGDATA, stages the archived WAL, writes the recovery configuration
 // (replay stops at recovery_target_time, then the cluster promotes), fixes
-// ownership, and hands off to postgres as the postgres user. Like every other
+// ownership, and hands off to postgres as the postgres user.
+//
+// hot_standby is forced off (SIGMA-105): the base backup inherits hot_standby=on
+// from the source, and a hot standby accepts read-only connections as soon as it
+// reaches the base backup's consistency point — the START of WAL replay, long
+// before recovery_target_time. The caller gates the post-recovery dump on
+// pg_isready, so with hot standby on it would dump the ~base-backup state and
+// silently report success "recovered to <target>". With hot_standby=off the
+// cluster refuses connections until recovery_target_action='promote' fires at
+// the target, so pg_isready succeeds only after replay has reached the target.
+//
+// Like every other
 // in-container command it is derived HERE from the engine — the DSD op carries
 // only the target time, so no shell is smuggled through the op (the
 // no-generic-run-shell invariant holds). targetTime is a validated RFC3339
@@ -49,6 +60,7 @@ touch "$PGDATA/recovery.signal"
   echo "recovery_target_time = '` + targetTime + `'"
   echo "recovery_target_action = 'promote'"
   echo "archive_mode = 'off'"
+  echo "hot_standby = 'off'"
 } >> "$PGDATA/postgresql.auto.conf"
 chown -R postgres:postgres "$PGDATA" "$WALDIR"
 chmod 700 "$PGDATA"

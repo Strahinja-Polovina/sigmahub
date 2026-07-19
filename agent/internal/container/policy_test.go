@@ -21,6 +21,20 @@ func TestPolicyDenies(t *testing.T) {
 		{"network container join", func(s *ContainerSpec) { s.Network = "container:abc123" }, "network"},
 		{"network raw ns", func(s *ContainerSpec) { s.Network = "ns:/proc/1/ns/net" }, "network"},
 		{"empty network", func(s *ContainerSpec) { s.Network = "" }, "network"},
+		// SIGMA-101: only managed project networks; bare/foreign names are refused.
+		{"network default bridge", func(s *ContainerSpec) { s.Network = "bridge" }, "network"},
+		{"network unmanaged name", func(s *ContainerSpec) { s.Network = "some-net" }, "network"},
+		{"network path escape", func(s *ContainerSpec) { s.Network = "sigmahub-x/../evil" }, "network"},
+		// SIGMA-100: a VolumeMount.Name is the Binds SOURCE — an absolute path or
+		// any non-managed name would become a host bind mount.
+		{"volume host socket", func(s *ContainerSpec) {
+			s.Volumes = []VolumeMount{{Name: "/var/run/docker.sock", MountPath: "/var/run/docker.sock"}}
+		}, "volume"},
+		{"volume host root", func(s *ContainerSpec) { s.Volumes = []VolumeMount{{Name: "/", MountPath: "/host"}} }, "volume"},
+		{"volume relative escape", func(s *ContainerSpec) {
+			s.Volumes = []VolumeMount{{Name: "sigmahub-r-data/../../etc", MountPath: "/data"}}
+		}, "volume"},
+		{"volume unmanaged name", func(s *ContainerSpec) { s.Volumes = []VolumeMount{{Name: "data", MountPath: "/data"}} }, "volume"},
 		{"floating latest", func(s *ContainerSpec) { s.Image = "nginx:latest" }, "image"},
 		{"untagged", func(s *ContainerSpec) { s.Image = "nginx" }, "image"},
 		{"empty image", func(s *ContainerSpec) { s.Image = "" }, "image"},

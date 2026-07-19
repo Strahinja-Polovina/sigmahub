@@ -165,6 +165,7 @@ func (s *Store) MarkStaleUnreachable(ctx context.Context, threshold time.Duratio
 			UPDATE servers
 			   SET status = 'unreachable'
 			 WHERE status = 'running'
+			   AND deleted_at IS NULL
 			   AND (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $1))
 			 RETURNING id, org_id, name
 		),

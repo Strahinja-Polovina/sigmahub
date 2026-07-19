@@ -187,7 +187,16 @@ func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, ev
 func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID string, in BillingStatus, actor string, occurredAt time.Time) error {
 	var prevStatus string
 	var prevEventAt *time.Time
-	err := tx.QueryRow(ctx, `SELECT status, last_event_at FROM org_billing WHERE org_id = $1`, orgID).Scan(&prevStatus, &prevEventAt)
+	// FOR UPDATE (SIGMA-102): the out-of-order guard below is a read-modify-write,
+	// and the Paddle handler runs one goroutine per delivery with no per-org
+	// serialization. Without the row lock, two concurrent deliveries both read the
+	// same pre-image and both pass the guard, and the later-committing (possibly
+	// older) one wins the unconditional UPSERT — defeating SIGMA-99. The lock makes
+	// the second delivery block until the first commits, then re-read the newer
+	// last_event_at so the guard drops the stale event. (No row yet → nothing to
+	// lock, but then prevEventAt is nil and there is no ordering to enforce; the
+	// INSERT ... ON CONFLICT itself serializes concurrent creators.)
+	err := tx.QueryRow(ctx, `SELECT status, last_event_at FROM org_billing WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&prevStatus, &prevEventAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		prevStatus = "none"
 	} else if err != nil {
@@ -205,7 +214,9 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 		VALUES ($1, $2, $3, $4, $5, $6, now())
 		ON CONFLICT (org_id) DO UPDATE SET
 			paddle_customer_id     = EXCLUDED.paddle_customer_id,
-			paddle_subscription_id = EXCLUDED.paddle_subscription_id,
+			-- Never blank the stored subscription id: a transaction.* event with no
+			-- subscription_id would otherwise clear it (SIGMA-103 defense-in-depth).
+			paddle_subscription_id = COALESCE(NULLIF(EXCLUDED.paddle_subscription_id, ''), org_billing.paddle_subscription_id),
 			status                 = EXCLUDED.status,
 			quantity               = EXCLUDED.quantity,
 			last_event_at          = EXCLUDED.last_event_at,

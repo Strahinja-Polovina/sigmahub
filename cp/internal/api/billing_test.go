@@ -157,6 +157,35 @@ func TestPaddleWebhookVerifyAndIdempotency(t *testing.T) {
 	_ = ts
 }
 
+// TestPaddleTransactionEventUsesSubscriptionID covers SIGMA-103: for a
+// transaction.* event, data.id is a transaction id (txn_…) and the real
+// subscription id is in data.subscription_id. The applied BillingStatus must
+// carry the sub_… id, never the txn_… id (which would corrupt the stored
+// subscription id keyed on by billing reads, alerts, and Paddle operations).
+func TestPaddleTransactionEventUsesSubscriptionID(t *testing.T) {
+	const secret = "pdl_secret"
+	fb := &fakeBilling{}
+	s := billingServer(t, fb, secret)
+	body := []byte(`{"event_id":"evt_tx","event_type":"transaction.payment_failed","data":{"id":"txn_777","customer_id":"ctm_9","subscription_id":"sub_9","custom_data":{"orgId":"org_1"}}}`)
+	realTs := time.Now().Unix()
+	r := httptest.NewRequest("POST", "/v1/webhooks/paddle", strings.NewReader(string(body)))
+	r.Header.Set("Paddle-Signature", paddleSig(secret, realTs, body))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("transaction webhook = %d body %s", w.Code, w.Body)
+	}
+	if len(fb.applied) != 1 {
+		t.Fatalf("applied = %d, want 1", len(fb.applied))
+	}
+	if fb.applied[0].SubscriptionID != "sub_9" {
+		t.Fatalf("subscription id = %q, want sub_9 (never the txn id)", fb.applied[0].SubscriptionID)
+	}
+	if fb.applied[0].Status != "past_due" {
+		t.Fatalf("status = %q, want past_due", fb.applied[0].Status)
+	}
+}
+
 // paddleSig mirrors paddle.VerifySignature's signing for the handler tests.
 func paddleSig(secret string, ts int64, body []byte) string {
 	return paddle.SignForTest(secret, ts, body)

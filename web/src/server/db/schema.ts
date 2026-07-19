@@ -12,7 +12,9 @@ import {
   timestamp,
   primaryKey,
   unique,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { user } from "./auth-schema";
 
 export const orgs = pgTable("orgs", {
@@ -23,17 +25,24 @@ export const orgs = pgTable("orgs", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
-export const memberships = pgTable("memberships", {
-  id: text("id").primaryKey(),
-  orgId: text("org_id")
-    .notNull()
-    .references(() => orgs.id, { onDelete: "cascade" }),
-  userId: text("user_id")
-    .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+export const memberships = pgTable(
+  "memberships",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id")
+      .notNull()
+      .references(() => orgs.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  // At most one membership per (org, user) — the DB is the authority so a
+  // concurrent acceptInvite race can't create duplicate rows with divergent
+  // roles (SIGMA-111). Mirrors project_memberships.
+  (t) => ({ uniq: unique().on(t.orgId, t.userId) })
+);
 
 // P2-7: per-project role grants. Semantics (enforced in active-org.ts):
 // the org role is always the ceiling; a user with ZERO rows here keeps
@@ -62,22 +71,34 @@ export const projectMemberships = pgTable(
 // raw token lives only in the emailed link, we store its SHA-256 hash. On
 // accept (by a real signed-in account whose email matches), the membership and
 // grants are materialized and the token is one-time-invalidated.
-export const invitations = pgTable("invitations", {
-  id: text("id").primaryKey(),
-  orgId: text("org_id")
-    .notNull()
-    .references(() => orgs.id, { onDelete: "cascade" }),
-  email: text("email").notNull(),
-  role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
-  // Optional per-project grants to materialize on accept: JSON [{projectId, role}].
-  projectGrants: text("project_grants").notNull().default("[]"),
-  tokenHash: text("token_hash").notNull().unique(), // SHA-256 of the raw token
-  invitedBy: text("invited_by").notNull(), // actor display name (audit-consistent)
-  status: text("status").notNull().default("pending"), // pending | accepted | revoked
-  expiresAt: timestamp("expires_at").notNull(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  acceptedAt: timestamp("accepted_at"),
-});
+export const invitations = pgTable(
+  "invitations",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id")
+      .notNull()
+      .references(() => orgs.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
+    // Optional per-project grants to materialize on accept: JSON [{projectId, role}].
+    projectGrants: text("project_grants").notNull().default("[]"),
+    tokenHash: text("token_hash").notNull().unique(), // SHA-256 of the raw token
+    invitedBy: text("invited_by").notNull(), // actor display name (audit-consistent)
+    status: text("status").notNull().default("pending"), // pending | accepted | revoked
+    expiresAt: timestamp("expires_at").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    acceptedAt: timestamp("accepted_at"),
+  },
+  // At most one PENDING invite per (org, lower(email)) — the DB is the authority
+  // so a concurrent inviteMember race can't create two live invite links for the
+  // same email, which would break the revoke workflow (SIGMA-115). Partial so
+  // accepted/revoked rows don't collide.
+  (t) => ({
+    pendingEmailUniq: uniqueIndex("invitations_org_pending_email_uniq")
+      .on(t.orgId, sql`lower(${t.email})`)
+      .where(sql`${t.status} = 'pending'`),
+  })
+);
 
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),

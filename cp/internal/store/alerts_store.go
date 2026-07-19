@@ -381,15 +381,32 @@ type AlertDelivery struct {
 	Attempts  int
 }
 
-// DueAlertDeliveries returns pending deliveries whose next attempt is due,
-// oldest first.
+// deliveryLease is how long a claimed ('sending') delivery is reserved before it
+// becomes reclaimable. It bounds double-delivery to the case where a single send
+// runs longer than the lease; a crashed dispatcher's rows are retried after it.
+const deliveryLease = 5 * time.Minute
+
+// DueAlertDeliveries atomically CLAIMS pending deliveries whose next attempt is
+// due (oldest first) and returns them. Without the claim (SIGMA-106) the drain
+// was a plain SELECT that left rows visibly 'pending' for the whole external
+// send, so two CP replicas' dispatchers both selected the same row and both sent
+// — a duplicate webhook/email/Slack/Telegram delivery. The single UPDATE ...
+// FOR UPDATE SKIP LOCKED marks the rows 'sending' and leases them, so a sibling
+// replica skips locked rows and never re-sends a claimed one. A 'sending' row
+// whose lease has expired (the dispatcher crashed mid-send) is reclaimable.
 func (s *Store) DueAlertDeliveries(ctx context.Context, limit int) ([]AlertDelivery, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, org_id, channel_id, event, title, body, attempts
-		  FROM alert_outbox
-		 WHERE status = 'pending' AND next_attempt_at <= now()
-		 ORDER BY next_attempt_at
-		 LIMIT $1`, limit)
+		UPDATE alert_outbox
+		   SET status = 'sending', next_attempt_at = now() + make_interval(secs => $2)
+		 WHERE id IN (
+		     SELECT id FROM alert_outbox
+		      WHERE status IN ('pending', 'sending') AND next_attempt_at <= now()
+		      ORDER BY next_attempt_at
+		      LIMIT $1
+		      FOR UPDATE SKIP LOCKED
+		 )
+		 RETURNING id, org_id, channel_id, event, title, body, attempts`,
+		limit, deliveryLease.Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -416,11 +433,14 @@ func (s *Store) SetAlertDeliveryResult(ctx context.Context, deliveryID int64, ok
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Finalize the row this dispatcher CLAIMED (status='sending' after
+	// DueAlertDeliveries). A failure re-queues it as 'pending' with backoff so it
+	// is re-claimed on a later drain (SIGMA-106).
 	var channelID string
 	if ok {
 		err = tx.QueryRow(ctx, `
 			UPDATE alert_outbox SET status = 'sent', sent_at = now(), last_error = ''
-			 WHERE id = $1 AND status = 'pending' RETURNING channel_id`, deliveryID).Scan(&channelID)
+			 WHERE id = $1 AND status = 'sending' RETURNING channel_id`, deliveryID).Scan(&channelID)
 	} else {
 		err = tx.QueryRow(ctx, `
 			UPDATE alert_outbox
@@ -428,7 +448,7 @@ func (s *Store) SetAlertDeliveryResult(ctx context.Context, deliveryID int64, ok
 			       last_error = left($2, 2000),
 			       status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END,
 			       next_attempt_at = now() + make_interval(secs => LEAST(3600, 30 * POWER(2, attempts)))
-			 WHERE id = $1 AND status = 'pending' RETURNING channel_id`,
+			 WHERE id = $1 AND status = 'sending' RETURNING channel_id`,
 			deliveryID, errText, maxAttempts).Scan(&channelID)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -179,32 +179,31 @@ func TestAlertingEndToEnd(t *testing.T) {
 	if status != "pending" || attempts != 1 || !nextAt.After(time.Now()) {
 		t.Fatalf("after failed attempt: %s attempts=%d next=%v", status, attempts, nextAt)
 	}
-	// The backed-off row is no longer due.
+	// A fresh drain must return NOTHING: DueAlertDeliveries now CLAIMS and leases
+	// the rows it returns (SIGMA-106), so the backed-off row is not yet due and
+	// the still-'sending' siblings from the first drain are leased out — a sibling
+	// replica's drain has nothing to double-send.
 	due2, err := st.DueAlertDeliveries(ctx, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range due2 {
-		if d.ID == first.ID {
-			t.Fatal("backed-off delivery still listed as due")
-		}
+	if len(due2) != 0 {
+		t.Fatalf("second drain re-surfaced %d already-claimed deliveries", len(due2))
 	}
-	// maxAttempts=1 → the next failure is terminal.
-	if err := st.SetAlertDeliveryResult(ctx, due2[0].ID, false, "410 gone", 1); err != nil {
+	// maxAttempts=1 → the next failure is terminal. Use another delivery the first
+	// drain already claimed.
+	term := due[1]
+	if err := st.SetAlertDeliveryResult(ctx, term.ID, false, "410 gone", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Pool.QueryRow(ctx, `SELECT status FROM alert_outbox WHERE id = $1`, due2[0].ID).Scan(&status); err != nil {
+	if err := st.Pool.QueryRow(ctx, `SELECT status FROM alert_outbox WHERE id = $1`, term.ID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != "failed" {
 		t.Fatalf("terminal failure status = %q", status)
 	}
-	// Success path.
-	var okID int64
-	if err := st.Pool.QueryRow(ctx, `
-		SELECT id FROM alert_outbox WHERE status = 'pending' AND next_attempt_at <= now() LIMIT 1`).Scan(&okID); err != nil {
-		t.Fatal(err)
-	}
+	// Success path: a third claimed delivery marks the channel healthy.
+	okID := due[2].ID
 	if err := st.SetAlertDeliveryResult(ctx, okID, true, "", 8); err != nil {
 		t.Fatal(err)
 	}

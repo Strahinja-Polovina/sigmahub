@@ -67,11 +67,14 @@ func (d *Driver) RunReconcile(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// GC removes managed containers that the applied DSD no longer describes,
-// converging actual state to desired after a resource deletion. It is called
-// from the DSD loop AFTER a document applies, so the desired set is exactly the
-// container.apply ops in that (validly signed) document. The desired-state
-// store is pruned to match.
+// GC removes managed containers that the DSD no longer describes, converging
+// actual state to desired after a resource deletion. It is called from the DSD
+// loop BEFORE the document's ops apply (SIGMA-113), so a bare volume.remove for
+// a deleted resource is not blocked by the still-running container that held the
+// volume; the desired set is exactly the container.apply ops in that (validly
+// signed) document, independent of apply. The desired-state store is pruned to
+// match. Live rollout/recreate generations are never reaped (see below), so
+// running before apply cannot cut a blue-green swap.
 func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 	// Held for the whole prune+remove so a concurrent reconcile cannot recreate
 	// a container between the desired-store prune and the container removal.
