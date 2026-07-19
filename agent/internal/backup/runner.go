@@ -117,6 +117,17 @@ func (r *Runner) fail(ctx context.Context, runID string, err error) error {
 	return err
 }
 
+// shortSha caps a digest for error messages. A raw `s[:12]` slice-panics if the
+// CP ever sends a non-empty digest shorter than 12 chars, and there is no
+// recover() anywhere in the agent — one malformed field would take the process
+// down (SIGMA-78).
+func shortSha(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
 // opBackupRun: engine-native dump (docker exec inside the database's own
 // container) piped straight into restic --stdin — the dump stream never
 // touches host disk on the backup path. Followed by restic check and the GFS
@@ -394,7 +405,7 @@ func (r *Runner) opBackupVerify(ctx context.Context, op dsd.Op) error {
 		return r.fail(ctx, spec.RunID, err)
 	}
 	if spec.ExpectedSha != "" && sha != spec.ExpectedSha {
-		return r.fail(ctx, spec.RunID, fmt.Errorf("checksum mismatch: restored %s, recorded %s", sha[:12], spec.ExpectedSha[:12]))
+		return r.fail(ctx, spec.RunID, fmt.Errorf("checksum mismatch: restored %s, recorded %s", shortSha(sha), shortSha(spec.ExpectedSha)))
 	}
 
 	// Scratch container: engine image, isolated (network none), throwaway
@@ -487,9 +498,15 @@ func (r *Runner) opBackupRestore(ctx context.Context, op dsd.Op) error {
 		return r.fail(ctx, spec.RunID, err)
 	}
 	// The CP pins the last successful backup's digest on the run — a restore
-	// must never load bytes that don't match what was backed up.
-	if spec.ExpectedSha != "" && sha != spec.ExpectedSha {
-		return r.fail(ctx, spec.RunID, fmt.Errorf("checksum mismatch: restored %s, recorded %s", sha[:12], spec.ExpectedSha[:12]))
+	// must never load bytes that don't match what was backed up. Unlike verify,
+	// an EMPTY recorded digest is a hard failure here: loading an unverifiable
+	// snapshot straight into the freshly provisioned target is exactly the
+	// silent-gate-skip this must not allow (SIGMA-78).
+	if spec.ExpectedSha == "" {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("restore refused: run carries no recorded checksum to verify the snapshot against"))
+	}
+	if sha != spec.ExpectedSha {
+		return r.fail(ctx, spec.RunID, fmt.Errorf("checksum mismatch: restored %s, recorded %s", shortSha(sha), shortSha(spec.ExpectedSha)))
 	}
 	readyCmd, err := readyCommand(spec.Engine, spec.TargetDatabase, spec.TargetUsername)
 	if err != nil {
@@ -585,13 +602,32 @@ func (r *Runner) opBackupRestorePITR(ctx context.Context, op dsd.Op) error {
 	if err := os.MkdirAll(walDir, 0o700); err != nil {
 		return r.fail(ctx, spec.RunID, err)
 	}
+	var walSpansTarget bool
 	for _, w := range wals {
 		if err := resticRestoreSnapshot(ctx, cred, w.ID, walDir); err != nil {
 			return r.fail(ctx, spec.RunID, fmt.Errorf("restore wal: %w", err))
 		}
 		if w.Time.After(targetTime) {
+			walSpansTarget = true
 			break // this bundle spans the target; no later WAL is needed
 		}
+	}
+	// If no shipped WAL bundle was archived AFTER the target, the segments that
+	// carry the state up to the target are still in the source's spool (not yet
+	// shipped) or missing. Postgres would then promote at the last consistent
+	// point it CAN reach — an earlier time — and we'd report the restore as a
+	// success at a silently-earlier timestamp (SIGMA-77). Refuse instead of
+	// delivering quiet data-currency loss on a DR operation. (The CP's SIGMA-67
+	// window check reduces but can't eliminate this — the shipped high-water mark
+	// can advance past a bundle that later isn't replayable.)
+	if !walSpansTarget {
+		newest := "none"
+		if len(wals) > 0 {
+			newest = wals[len(wals)-1].Time.UTC().Format(time.RFC3339)
+		}
+		return r.fail(ctx, spec.RunID, fmt.Errorf(
+			"cannot recover to %s: no archived WAL shipped past the target (newest archived WAL is %s) — retry after the next WAL ship or choose an earlier target",
+			targetTime.UTC().Format(time.RFC3339), newest))
 	}
 	walBundles, err := filepath.Glob(filepath.Join(walDir, "wal-*.tar"))
 	if err != nil {

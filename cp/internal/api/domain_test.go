@@ -80,6 +80,48 @@ func TestActorIdentity(t *testing.T) {
 	})
 }
 
+// TestRequireActorStrictMode is the SIGMA-82 opt-in: with RequireActor set, an
+// org-scoped token presented with NO actor header is rejected (so a stolen
+// user-facing token can't act with its full unnarrowed role); a valid actor
+// still passes, and the dev wildcard token stays exempt as a system bypass.
+func TestRequireActorStrictMode(t *testing.T) {
+	st := &fakeStore{serviceTokens: map[string]store.ServicePrincipal{
+		"sst_admin": {ID: "st_1", OrgID: "org_1", Name: "web", Role: store.RoleOrgAdmin},
+	}}
+	s := New(slog.Default(), fakePinger{}, st, &fakeDomain{}, Options{
+		DevServiceToken: testServiceToken,
+		RequireActor:    true,
+	})
+	post := func(token, actorB64, sig string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/orgs/org_1/projects", strings.NewReader(`{"name":"api"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		if actorB64 != "" {
+			req.Header.Set("X-Sigmahub-Actor", actorB64)
+			req.Header.Set("X-Sigmahub-Actor-Signature", sig)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("org token without actor is rejected", func(t *testing.T) {
+		if rec := post("sst_admin", "", ""); rec.Code != 401 {
+			t.Fatalf("status = %d, want 401; body %s", rec.Code, rec.Body)
+		}
+	})
+	t.Run("org token with valid actor passes", func(t *testing.T) {
+		b64, sig := signActor(t, "pa.user", "Project Admin", "sst_admin")
+		if rec := post("sst_admin", b64, sig); rec.Code != 201 {
+			t.Fatalf("status = %d, want 201; body %s", rec.Code, rec.Body)
+		}
+	})
+	t.Run("dev wildcard token stays exempt", func(t *testing.T) {
+		if rec := post(testServiceToken, "", ""); rec.Code != 201 {
+			t.Fatalf("status = %d, want 201; body %s", rec.Code, rec.Body)
+		}
+	})
+}
+
 // TestIdempotency pins replay semantics: same key+body replays the stored
 // response without re-executing; same key with a different body is a 409.
 func TestIdempotency(t *testing.T) {

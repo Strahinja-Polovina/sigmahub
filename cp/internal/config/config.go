@@ -69,6 +69,14 @@ type Config struct {
 	PaddleWebhookSecret string
 	PaddleEnv           string
 	PaddlePriceID       string
+	// RequireActor (CP_REQUIRE_ACTOR=true) makes a valid X-Sigmahub-Actor header
+	// mandatory on org-scoped service tokens (SIGMA-82). Off by default: the
+	// actor header only ever NARROWS a token's role and is self-signed by the
+	// token holder, so it is convenience, not a trust boundary — but an operator
+	// who provisions per-role tokens can turn this on to fail closed when a
+	// user-facing token is used with no actor. The dev wildcard token is exempt
+	// (it is a system bypass with no per-user identity).
+	RequireActor bool
 }
 
 func FromEnv() (Config, error) {
@@ -91,6 +99,7 @@ func FromEnv() (Config, error) {
 		PaddleWebhookSecret:     os.Getenv("CP_PADDLE_WEBHOOK_SECRET"),
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
+		RequireActor:            os.Getenv("CP_REQUIRE_ACTOR") == "true",
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")

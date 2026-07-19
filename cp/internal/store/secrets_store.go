@@ -69,6 +69,12 @@ func gcmOpen(dek, aad, nonce, ciphertext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// aead.Open PANICS on a wrong-length nonce, so a corrupted/truncated `nonce`
+	// column would turn a data-integrity fault into a per-request panic instead
+	// of the clean "decrypt failed" error callers expect (SIGMA-80).
+	if len(nonce) != aead.NonceSize() {
+		return nil, fmt.Errorf("decrypt: invalid nonce length %d, want %d", len(nonce), aead.NonceSize())
+	}
 	return aead.Open(nil, nonce, ciphertext, aad)
 }
 

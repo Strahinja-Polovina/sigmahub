@@ -11,7 +11,6 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -73,9 +72,7 @@ func validateBucketName(name string) error {
 
 // randomBucketKeyID mints a per-bucket access key id.
 func randomBucketKeyID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "bk_" + hex.EncodeToString(b)
+	return "bk_" + hex.EncodeToString(randBytes(8))
 }
 
 // s3ResourceCredsTx returns an s3 resource's server id + engine, or ErrNotS3
@@ -475,19 +472,19 @@ func (s *Store) FailS3OpFromOpStatus(ctx context.Context, serverID, opID, errTex
 // for the op's (resource, bucket, today). Idempotent per day (upsert). The op is
 // resolved BOLA-scoped by server; ErrNotFound when it does not belong here.
 func (s *Store) RecordStorageBytes(ctx context.Context, serverID, opID string, bytes int64, now time.Time) error {
-	ct, err := s.Pool.Exec(ctx, `
+	// Scope the row to `action = 'measure'` so this is a genuine no-op for every
+	// other applied op (create-bucket/key, set-quota, delete) — the handler can
+	// call it for any applied op without gating on the byte count, which is what
+	// lets a genuinely-empty (0-byte) bucket still record its daily row instead
+	// of leaving a metering gap (SIGMA-81). A 0-row result therefore means "not a
+	// measure op" (or an already-gone op), which is expected, not a fault.
+	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO s3_storage_bytes (resource_id, org_id, bucket, day, bytes)
 		SELECT resource_id, org_id, bucket, date_trunc('day', $3::timestamptz), $4
-		  FROM pending_s3_ops WHERE id = $1 AND server_id = $2
+		  FROM pending_s3_ops WHERE id = $1 AND server_id = $2 AND action = 'measure'
 		ON CONFLICT (resource_id, bucket, day) DO UPDATE SET bytes = EXCLUDED.bytes`,
 		opID, serverID, now.UTC(), bytes)
-	if err != nil {
-		return err
-	}
-	if ct.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return err
 }
 
 // SweepS3Measure enqueues (at most) one measure op per active bucket per day, so

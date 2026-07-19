@@ -79,13 +79,16 @@ func loadOrCreateKey(keyPath string) ([]byte, error) {
 	}
 }
 
-func (c *FileCustody) Wrap(_ context.Context, _ string, plaintext []byte) ([]byte, error) {
+func (c *FileCustody) Wrap(_ context.Context, purpose string, plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	// Envelope = nonce || ciphertext(+tag).
-	return c.aead.Seal(nonce, nonce, plaintext, nil), nil
+	// Bind the KEK envelope to its purpose (e.g. "org_dek:<orgID>") as GCM AAD so
+	// a wrapped_dek copied into another org's row fails to unwrap at the KEK layer
+	// too, not only one layer up at secretAAD (SIGMA-80). Envelope = nonce ||
+	// ciphertext(+tag).
+	return c.aead.Seal(nonce, nonce, plaintext, []byte(purpose)), nil
 }
 
 func (c *FileCustody) Unwrap(ctx context.Context, purpose string, envelope []byte) ([]byte, error) {
@@ -94,9 +97,18 @@ func (c *FileCustody) Unwrap(ctx context.Context, purpose string, envelope []byt
 		return nil, errors.New("kms: ciphertext too short")
 	}
 	nonce, ct := envelope[:ns], envelope[ns:]
-	plaintext, err := c.aead.Open(nil, nonce, ct, nil)
+	plaintext, err := c.aead.Open(nil, nonce, ct, []byte(purpose))
 	if err != nil {
-		return nil, fmt.Errorf("kms: unwrap failed: %w", err)
+		// Backward-compat: envelopes wrapped before purpose-binding used nil AAD.
+		// Fall back so pre-existing DEKs still open (the swap-defence they lack is
+		// still provided upstream by secretAAD); every new wrap is fully bound, and
+		// a purpose-bound envelope opened under the wrong purpose fails BOTH the
+		// bound attempt and this nil fallback, so the binding is not weakened.
+		if legacy, legacyErr := c.aead.Open(nil, nonce, ct, nil); legacyErr == nil {
+			plaintext = legacy
+		} else {
+			return nil, fmt.Errorf("kms: unwrap failed: %w", err)
+		}
 	}
 
 	ev := AuditEvent{Action: "kms.unwrap", Purpose: purpose}

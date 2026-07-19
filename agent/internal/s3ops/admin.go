@@ -25,16 +25,38 @@ import (
 // no-generic-run-shell invariant.
 
 // Execer runs a command inside a container (the backup package's Docker slice).
+// ContainerExecEnv additionally sets the exec's process environment so a secret
+// can be handed to the command out of band of its argv (SIGMA-79).
 type Execer interface {
 	ContainerExec(ctx context.Context, containerID string, cmd []string, out io.Writer) (int, string, error)
+	ContainerExecEnv(ctx context.Context, containerID string, cmd, env []string, out io.Writer) (int, string, error)
 }
 
-// weedShell runs one weed-shell command inside the SeaweedFS container. weed
-// shell reads from stdin, so the command is piped in via `sh -c 'echo … | weed
-// shell'`. The filer address is the in-container default.
+// weedShell runs one (non-secret) weed-shell command inside the SeaweedFS
+// container. weed shell reads from stdin, so the command is piped in via
+// `sh -c 'echo … | weed shell'`. The filer address is the in-container default.
 func weedShell(ctx context.Context, ex Execer, container, command string) error {
 	full := fmt.Sprintf("echo %s | weed shell -filer=localhost:8888", shQuote(command))
 	code, tail, err := ex.ContainerExec(ctx, container, []string{"sh", "-c", full}, io.Discard)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("weed shell exited %d: %s", code, tail)
+	}
+	return nil
+}
+
+// weedShellSecret runs a weed-shell command whose secret is supplied via the
+// exec environment as $SK, never via argv. `command` must reference the secret
+// as the literal token $SK; the container shell expands it from the env at run
+// time, so the secret stays out of the process cmdline (ps / /proc/*/cmdline).
+// The command is double-quoted so $SK expands; every other field it carries is
+// a CP-generated identifier (access key id, validated bucket name), never
+// free-form input (SIGMA-79).
+func weedShellSecret(ctx context.Context, ex Execer, container, command, secret string) error {
+	full := fmt.Sprintf(`echo "%s" | weed shell -filer=localhost:8888`, command)
+	code, tail, err := ex.ContainerExecEnv(ctx, container, []string{"sh", "-c", full}, []string{"SK=" + secret}, io.Discard)
 	if err != nil {
 		return err
 	}
@@ -53,9 +75,11 @@ func shQuote(s string) string {
 func (r *Runner) createBucketKey(ctx context.Context, spec OpSpec, cred OpCredential) error {
 	switch spec.Engine {
 	case "seaweedfs":
-		cmd := fmt.Sprintf("s3.configure -user %s -access_key %s -secret_key %s -buckets %s -actions Read,Write -apply",
-			spec.AccessKey, spec.AccessKey, cred.NewSecretKey, spec.Bucket)
-		return weedShell(ctx, r.exec, spec.Container, cmd)
+		// $SK is expanded from the exec env by weedShellSecret — the secret is
+		// never interpolated into argv (SIGMA-79).
+		cmd := fmt.Sprintf("s3.configure -user %s -access_key %s -secret_key $SK -buckets %s -actions Read,Write -apply",
+			spec.AccessKey, spec.AccessKey, spec.Bucket)
+		return weedShellSecret(ctx, r.exec, spec.Container, cmd, cred.NewSecretKey)
 	case "minio":
 		return r.minioAddServiceAccount(ctx, spec, cred)
 	}

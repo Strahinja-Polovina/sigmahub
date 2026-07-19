@@ -71,7 +71,11 @@ export async function connectServer(input: {
   region: string;
   byoVpn?: boolean;
 }): Promise<ConnectServerResult> {
-  const { user, role } = await requireMembership(input.orgId);
+  // Registering a host issues a real one-time bootstrap token, so gate it at
+  // Project Admin+ like provisionServer/disconnectServer — not bare membership
+  // (SIGMA-82). The CP already enforces this; matching it here fails closed and
+  // keeps the three server-lifecycle actions consistent.
+  const { user, role } = await requireProjectAdmin(input.orgId);
   const name = input.name.trim();
   if (!name) throw new Error("Server name is required.");
 
@@ -228,8 +232,12 @@ export async function setServerHardening(input: {
 }
 
 /** Simulated agent check-in: flips provisioning → running and fills in the
- *  runtime details the agent would report (version, IP, CPU, memory). */
+ *  runtime details the agent would report (version, IP, CPU, memory). Demo-only
+ *  — in CP mode real agents report their own status, so fabricating mirror facts
+ *  here would be fake state. The button is hidden in CP mode, but the action can
+ *  be invoked directly, so guard it server-side too (SIGMA-82). */
 export async function agentCheckIn(input: { serverId: string }) {
+  if (cpEnabled()) return;
   const [server] = await db
     .select()
     .from(s.servers)
