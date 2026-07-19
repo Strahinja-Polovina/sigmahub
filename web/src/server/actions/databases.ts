@@ -1,6 +1,6 @@
 "use server";
 
-import { requireMembership, requireProjectAdminForResource } from "../active-org";
+import { requireProjectAdminForResource, requireResourceVisible } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -18,13 +18,14 @@ function ensureCp() {
   }
 }
 
-/** Non-secret connection metadata + backup policy. Any org member. */
+/** Non-secret connection metadata + backup policy. Visible to any member who can
+ *  see the resource's project (P2-7, SIGMA-84). */
 export async function getDatabaseInfo(input: {
   orgId: string;
   resourceId: string;
 }): Promise<CpDatabaseInfo | null> {
   ensureCp();
-  await requireMembership(input.orgId);
+  await requireResourceVisible(input.orgId, input.resourceId);
   return cpGetDatabase(input.orgId, input.resourceId);
 }
 

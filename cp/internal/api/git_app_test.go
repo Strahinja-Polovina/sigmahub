@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/gitdetect"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
 // recordingInspector captures the token detect/connect used to read the repo.
@@ -89,6 +90,39 @@ func TestGitDetectMintsInstallationToken(t *testing.T) {
 	}
 	if insp.lastToken != "" {
 		t.Fatalf("inspector token = %q, want empty after mint failure", insp.lastToken)
+	}
+}
+
+// TestGitInstallationOrgBinding is the SIGMA-87 guard: a detect that references
+// an installation bound to ANOTHER org is rejected before any token is minted;
+// a first-use installation is claimed for the acting org.
+func TestGitInstallationOrgBinding(t *testing.T) {
+	insp := &recordingInspector{det: gitdetect.Detected{Deployable: true}}
+	src := &fakeTokenSource{}
+
+	// Cross-org installation → the store's claim returns ErrNotFound (opaque 404);
+	// no token is minted.
+	sCross := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+		Git: &fakeGit{claimErr: store.ErrNotFound}, Inspector: insp,
+		InstallationTokens: src, DevServiceToken: testServiceToken,
+	})
+	if rec := postJSON(t, sCross, "/v1/orgs/org_1/git/detect", `{"repoFullName":"o/r","installationId":"999"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-org detect: status = %d, want 404; body %s", rec.Code, rec.Body)
+	}
+	if src.calls != 0 {
+		t.Fatalf("no token should be minted for a cross-org installation, got %d calls", src.calls)
+	}
+
+	// First-use installation → claimed for the acting org, token minted.
+	fgOK := &fakeGit{}
+	sOK := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+		Git: fgOK, Inspector: insp, InstallationTokens: src, DevServiceToken: testServiceToken,
+	})
+	if rec := postJSON(t, sOK, "/v1/orgs/org_1/git/detect", `{"repoFullName":"o/r","installationId":"42"}`); rec.Code != http.StatusOK {
+		t.Fatalf("first-use detect: status = %d, body %s", rec.Code, rec.Body)
+	}
+	if fgOK.claimedInstallation != "42" {
+		t.Fatalf("installation not claimed for the acting org, got %q", fgOK.claimedInstallation)
 	}
 }
 

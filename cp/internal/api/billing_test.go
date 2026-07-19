@@ -2,8 +2,8 @@ package api
 
 import (
 	"context"
-	"log/slog"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,6 +43,18 @@ func (f *fakeBilling) WebhookSeen(_ context.Context, deliveryID, _, _ string) (b
 	}
 	f.seen[deliveryID] = true
 	return false, nil
+}
+func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, _ string, in store.BillingStatus, _ string) (bool, error) {
+	f.seenCalls++
+	if f.seen == nil {
+		f.seen = map[string]bool{}
+	}
+	if f.seen[deliveryID] {
+		return false, nil
+	}
+	f.seen[deliveryID] = true
+	f.applied = append(f.applied, in)
+	return true, nil
 }
 
 func billingServer(t *testing.T, fb *fakeBilling, secret string) *Server {

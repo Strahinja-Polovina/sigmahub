@@ -59,15 +59,120 @@ func (s *Store) RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 			return 0, err
 		}
 	}
-	if len(deks) > 0 {
-		if err := auditTx(ctx, tx, orgID, actor, "KEK rotated", fmt.Sprintf("%d DEKs re-wrapped", len(deks))); err != nil {
+	// SIGMA-88: also re-wrap the org's DIRECTLY custody-wrapped envelopes (git
+	// provider tokens, per-server bootstrap keys) so a transit-key rotation +
+	// prune can't strand them. Each keeps its own purpose AAD.
+	gitN, err := s.rewrapColumnTx(ctx, tx,
+		`SELECT id, token_wrapped FROM git_connections WHERE org_id = $1 AND token_wrapped IS NOT NULL`,
+		`UPDATE git_connections SET token_wrapped = $2 WHERE id = $1`,
+		gitTokenPurpose(orgID), orgID)
+	if err != nil {
+		return 0, err
+	}
+	srvN, err := s.rewrapColumnTx(ctx, tx,
+		`SELECT id, bootstrap_key_wrapped FROM servers WHERE org_id = $1 AND bootstrap_key_wrapped IS NOT NULL`,
+		`UPDATE servers SET bootstrap_key_wrapped = $2 WHERE id = $1`,
+		"srv_bootstrap:"+orgID, orgID)
+	if err != nil {
+		return 0, err
+	}
+	total := len(deks) + gitN + srvN
+	if total > 0 {
+		if err := auditTx(ctx, tx, orgID, actor, "KEK rotated",
+			fmt.Sprintf("%d DEKs, %d git tokens, %d bootstrap keys re-wrapped", len(deks), gitN, srvN)); err != nil {
 			return 0, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return len(deks), nil
+	return total, nil
+}
+
+// rewrapColumnTx re-wraps every non-null envelope yielded by selectSQL (which
+// must return (id, wrapped) and take one string arg) under `purpose`, advancing
+// it to the current custody key, then writes each back via updateSQL(id,
+// wrapped). Rows are collected before any UPDATE so the read and writes don't
+// contend on the same connection. Returns the count re-wrapped (SIGMA-88).
+func (s *Store) rewrapColumnTx(ctx context.Context, tx pgx.Tx, selectSQL, updateSQL, purpose, arg string) (int, error) {
+	rows, err := tx.Query(ctx, selectSQL, arg)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id      string
+		wrapped []byte
+	}
+	var rs []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.wrapped); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		rs = append(rs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, r := range rs {
+		plain, err := s.custody.Unwrap(ctx, purpose, r.wrapped)
+		if err != nil {
+			return 0, fmt.Errorf("unwrap for rewrap (%s): %w", purpose, err)
+		}
+		w, err := s.custody.Wrap(ctx, purpose, plain)
+		if err != nil {
+			return 0, fmt.Errorf("rewrap (%s): %w", purpose, err)
+		}
+		if _, err := tx.Exec(ctx, updateSQL, r.id, w); err != nil {
+			return 0, err
+		}
+	}
+	return len(rs), nil
+}
+
+// RotateGlobalKEK re-wraps the CP-global custody-wrapped secrets (token pepper,
+// DSD signing key, GitHub App key) under the current custody key, so a
+// transit-key rotation + prune doesn't strand them. NOT org-scoped — call once,
+// out of band of any tenant. Returns the number re-wrapped. Audited under "*".
+// (SIGMA-88)
+func (s *Store) RotateGlobalKEK(ctx context.Context, actor string) (int, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	n := 0
+	for _, name := range []string{tokenPepperName, dsdSigningKeyName, githubAppKeyName} {
+		var wrapped []byte
+		err := tx.QueryRow(ctx, `SELECT wrapped FROM cp_secrets WHERE name = $1`, name).Scan(&wrapped)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		plain, err := s.custody.Unwrap(ctx, name, wrapped)
+		if err != nil {
+			return 0, fmt.Errorf("unwrap %s: %w", name, err)
+		}
+		rew, err := s.custody.Wrap(ctx, name, plain)
+		if err != nil {
+			return 0, fmt.Errorf("rewrap %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE cp_secrets SET wrapped = $2 WHERE name = $1`, name, rew); err != nil {
+			return 0, err
+		}
+		n++
+	}
+	if n > 0 {
+		if err := auditTx(ctx, tx, "*", actor, "Global KEK rotated", fmt.Sprintf("%d CP secrets re-wrapped", n)); err != nil {
+			return 0, err
+		}
+	}
+	return n, tx.Commit(ctx)
 }
 
 // RotateDEK starts a DEK rotation: it deactivates the org's current DEK and

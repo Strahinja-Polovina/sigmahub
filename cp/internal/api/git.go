@@ -26,6 +26,26 @@ type GitAPI interface {
 	ListPreviewEnvironments(ctx context.Context, orgID, connID string) ([]store.PreviewEnvironment, error)
 	// GitHub App (SIGMA-55): link an installation to an existing connection.
 	SetConnectionInstallation(ctx context.Context, orgID, connID, installationID, actor string) error
+	// GitHub App (SIGMA-87): bind an installation id to the acting org
+	// (first-writer-wins); errors if it belongs to another org.
+	ClaimInstallation(ctx context.Context, orgID, installationID string) error
+}
+
+// claimInstallation binds a client-supplied installation id to the acting org
+// (first-writer-wins) before it is used to mint a token or persisted, so it can
+// never reference an installation another org owns (SIGMA-87). Returns true when
+// the caller may proceed; on a cross-org / invalid id it writes the response and
+// returns false. A no-op (proceed) when no installation id is supplied or the
+// git store isn't wired.
+func (s *Server) claimInstallation(w http.ResponseWriter, r *http.Request, orgID, installationID string) bool {
+	if strings.TrimSpace(installationID) == "" || s.git == nil {
+		return true
+	}
+	if err := s.git.ClaimInstallation(r.Context(), orgID, installationID); err != nil {
+		s.writeStoreErr(w, err, "claim installation")
+		return false
+	}
+	return true
 }
 
 // InstallationTokenSource mints GitHub App installation access tokens.
@@ -106,6 +126,10 @@ func (s *Server) handleGitDetect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "repoFullName is required"})
 		return
 	}
+	// SIGMA-87: bind the installation to this org before minting a token with it.
+	if !s.claimInstallation(w, r, r.PathValue("orgId"), req.InstallationID) {
+		return
+	}
 	token := s.effectiveGitToken(r.Context(), req.Token, req.InstallationID)
 	detected, err := s.inspector.Inspect(r.Context(), req.RepoFullName, token)
 	if err != nil {
@@ -141,6 +165,10 @@ func (s *Server) handleGitConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SIGMA-87: bind the installation to this org before minting a token with it.
+	if !s.claimInstallation(w, r, orgID, req.InstallationID) {
+		return
+	}
 	// Deployability gate: only refuse when detection succeeds AND says the repo
 	// ships neither a Dockerfile nor a Compose file. A detection error (private
 	// repo, transient) is not a hard block — the connection is still allowed and
@@ -287,6 +315,10 @@ func (s *Server) handleSetInstallation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	// SIGMA-87: bind the installation to this org before linking it.
+	if !s.claimInstallation(w, r, r.PathValue("orgId"), req.InstallationID) {
 		return
 	}
 	err := s.git.SetConnectionInstallation(r.Context(), r.PathValue("orgId"), r.PathValue("connId"),

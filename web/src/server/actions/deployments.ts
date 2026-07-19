@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectAdminForResource } from "../active-org";
+import { requireMembership, requireProjectAdminForResource, requireResourceVisible } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -49,5 +49,10 @@ export async function fetchDeployLogs(input: {
 }): Promise<{ deployment: CpDeployment; logs: CpDeployLog[]; nextCursor: number; done: boolean }> {
   ensureCp();
   await requireMembership(input.orgId);
-  return cpDeployLogs(input.orgId, input.deploymentId, input.after ?? 0);
+  const out = await cpDeployLogs(input.orgId, input.deploymentId, input.after ?? 0);
+  // P2-7 (SIGMA-84): the deployment (addressed by an opaque id) belongs to a
+  // resource in a project a scoped user may not see. Resolve the project from
+  // the CP's own response and fail closed before relaying logs to the browser.
+  await requireResourceVisible(input.orgId, out.deployment.resourceId);
+  return out;
 }

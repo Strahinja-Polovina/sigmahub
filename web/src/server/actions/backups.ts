@@ -4,7 +4,12 @@ import { revalidatePath } from "next/cache";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership, requireProjectAdmin, requireProjectAdminForResource } from "../active-org";
+import {
+  requireMembership,
+  requireProjectAdmin,
+  requireProjectAdminForResource,
+  requireResourceVisible,
+} from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -129,7 +134,9 @@ export async function setBackupPolicy(input: {
 
 export async function listBackupRuns(input: { orgId: string; resourceId: string }): Promise<CpBackupRun[]> {
   ensureCp();
-  await requireMembership(input.orgId);
+  // P2-7: backup/restore history is per-resource; gate on project visibility
+  // (SIGMA-84), not bare org membership.
+  await requireResourceVisible(input.orgId, input.resourceId);
   return cpListBackupRuns(input.orgId, input.resourceId);
 }
 

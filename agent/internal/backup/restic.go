@@ -144,9 +144,16 @@ func resticForget(ctx context.Context, cred Credential, keepDaily, keepWeekly, k
 	return restic(ctx, cred, nil, io.Discard, args...)
 }
 
-// resticDumpLatest streams the latest snapshot's dump file to w.
+// resticDumpLatest streams the latest LOGICAL-DUMP snapshot's dump file to w.
+// The `--path /<filename>` filter constrains `latest` to snapshots that carry
+// the dump file: a PITR-enabled resource shares one repo across logical dumps,
+// base backups (tag "base") and WAL bundles (tag "wal", shipped continuously),
+// so an unfiltered `dump latest` would resolve to the newest snapshot — almost
+// always a WAL/base bundle that has no dump file — and error out, breaking
+// restore-verify and fire-drill restore for every PITR resource (SIGMA-83).
+// stdin backups record the path as "/<stdin-filename>".
 func resticDumpLatest(ctx context.Context, cred Credential, filename string, w io.Writer) error {
-	return restic(ctx, cred, nil, w, "dump", "latest", filename)
+	return restic(ctx, cred, nil, w, "dump", "--path", "/"+filename, "latest", filename)
 }
 
 // snapshotMeta is one restic snapshot's id + creation time (P2-5b PITR needs to

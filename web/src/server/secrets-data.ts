@@ -143,8 +143,32 @@ export async function putSecret(
   }
 }
 
+/** Confirm a secret belongs to `projectId` (P2-7 binding). The reveal/delete
+ *  actions authorize on the RESOURCE's project, but `secretId` is an independent
+ *  parameter — without this bind a Project Admin of one project could reveal or
+ *  destroy another project's secrets in the same org, which neither the local
+ *  query (org-scoped) nor the CP's org-scoped reveal route catches (SIGMA-85). */
+export async function assertSecretInProject(
+  orgId: string,
+  projectId: string,
+  secretId: string
+): Promise<void> {
+  if (cpEnabled()) {
+    const all = await cpListSecrets(orgId, projectId);
+    if (!all.some((sec) => sec.id === secretId)) throw new Error("Secret not found.");
+    return;
+  }
+  await ensureDemoSecretsTable();
+  const res = await client.query(
+    `SELECT 1 FROM demo_secrets WHERE org_id = $1 AND project_id = $2 AND id = $3`,
+    [orgId, projectId, secretId]
+  );
+  if (res.rows.length === 0) throw new Error("Secret not found.");
+}
+
 /** Reveal a secret's plaintext value. Caller has already authorized (Project
- *  Admin+); the CP additionally audits the read against the forwarded actor. */
+ *  Admin+) AND bound the secret to the project (assertSecretInProject); the CP
+ *  additionally audits the read against the forwarded actor. */
 export async function readSecretValue(
   orgId: string,
   secretId: string,
