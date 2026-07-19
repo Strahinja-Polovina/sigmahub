@@ -20,7 +20,7 @@ import (
 type DSDStore interface {
 	GetDSD(ctx context.Context, serverID string) (dsd.Signed, error)
 	CurrentDSDVersion(ctx context.Context, serverID string) (int64, error)
-	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage) (bool, error)
+	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool) (bool, error)
 	MarkDestructiveOpApplied(ctx context.Context, serverID, id string) error
 }
 
@@ -161,12 +161,20 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		Error string `json:"error,omitempty"`
 	}
 	composeAgg := map[string][]opStatus{}
+	// Whole-document convergence (SIGMA-117): the version is converged only if
+	// EVERY reported op applied. Computed from the full req.Ops set — including
+	// host:*, proxy, and volrm: ops that never enter byResource — so a failed
+	// non-resource op still clears apply_ok and triggers the SIGMA-104 re-drive.
+	converged := true
 	for opID, st := range req.Ops {
 		var os struct {
 			State string `json:"state"`
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(st, &os)
+		if os.State == "failed" || os.State == "skipped" {
+			converged = false
+		}
 		if phase, resID, service, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
 			advances = append(advances, deployAdvance{phase: phase, resID: resID, service: service, ok: os.State == "applied", errText: os.Error})
 		}
@@ -247,7 +255,7 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 			byResource[resID] = b
 		}
 	}
-	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource)
+	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource, converged)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no DSD for this server"})
 		return

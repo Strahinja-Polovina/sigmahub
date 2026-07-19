@@ -225,11 +225,13 @@ func TestVerifyChecksAgainstRecordedShaAndScratchLoads(t *testing.T) {
 	if !rep.ok || rep.sha != recorded || !strings.Contains(rep.detail, "checksum ok") {
 		t.Fatalf("reported = %+v", rep)
 	}
-	// Scratch container was created and removed; the dump was staged into it.
+	// Scratch container was created and removed; the dump was staged into it. Two
+	// removes: a best-effort pre-clear by name (SIGMA-124) plus the deferred
+	// teardown by id.
 	if len(fd.created) != 1 || !strings.HasPrefix(fd.created[0], "sigmahub-verify-") {
 		t.Fatalf("scratch containers = %v", fd.created)
 	}
-	if len(fd.removed) != 1 || len(fd.putPaths) != 1 {
+	if len(fd.removed) != 2 || len(fd.putPaths) != 1 {
 		t.Fatalf("teardown/staging = removed %v put %v", fd.removed, fd.putPaths)
 	}
 	// The work file is wiped after the run.
@@ -461,11 +463,12 @@ func TestPITRRestoreRecoversAndLoadsIntoTarget(t *testing.T) {
 	if !rep.ok {
 		t.Fatalf("expected success, detail=%q", rep.detail)
 	}
-	// A throwaway recovery container was created and torn down.
+	// A throwaway recovery container was created and torn down. Two removes: a
+	// best-effort pre-clear by name (SIGMA-124) plus the deferred teardown by id.
 	if len(fd.created) != 1 || !strings.HasPrefix(fd.created[0], "sigmahub-pitr-") {
 		t.Fatalf("recovery container = %v", fd.created)
 	}
-	if len(fd.removed) != 1 {
+	if len(fd.removed) != 2 {
 		t.Fatalf("recovery container must be removed, removed=%v", fd.removed)
 	}
 	// pg_dump ran (inside the recovery container), then a psql load into the target.

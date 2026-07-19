@@ -286,7 +286,7 @@ func (s *Store) AttachServer(ctx context.Context, orgID, envID, serverID, actor 
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`SELECT name FROM servers WHERE org_id = $1 AND id = $2`, orgID, serverID,
+		`SELECT name FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`, orgID, serverID,
 	).Scan(&srvName); errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
@@ -401,7 +401,7 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 
 	var serverType string
 	if err := tx.QueryRow(ctx,
-		`SELECT type FROM servers WHERE org_id = $1 AND id = $2`,
+		`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`,
 		orgID, in.ServerID).Scan(&serverType); errors.Is(err, pgx.ErrNoRows) {
 		return Resource{}, ErrNotFound
 	} else if err != nil {
@@ -554,7 +554,7 @@ func (s *Store) SetProxyRole(ctx context.Context, orgID, serverID string, proxy 
 	var name string
 	err = tx.QueryRow(ctx, `
 		UPDATE servers SET proxy_role = $3
-		 WHERE org_id = $1 AND id = $2
+		 WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL
 		 RETURNING name`, orgID, serverID, proxy).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound

@@ -418,7 +418,8 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 		log.Warn("no pinned DSD key; DSD sync disabled (re-bootstrap to enrol)")
 		return
 	}
-	backoff := time.Second
+	backoff := time.Second      // fetch-error backoff (reset on a successful fetch)
+	applyBackoff := time.Second // apply-error backoff (reset on a successful apply)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -427,6 +428,20 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 		if err != nil {
 			log.Error("dsd: read journal", "err", err)
 			return
+		}
+		// Re-report a version whose status POST was dropped (SIGMA-123). The poll
+		// cursor (after) has already advanced past it, so GetDSD would never
+		// re-deliver it — without this its op results (especially a FAILURE that
+		// must trigger the CP's re-drive) are lost forever. Re-derive from the
+		// durable journal so it survives a restart too.
+		if reported, rerr := journal.LastReportedVersion(); rerr == nil && reported < after {
+			if res, derr := journal.ResultsForVersion(after); derr == nil && len(res) > 0 {
+				if perr := c.PostDSDStatus(ctx, st.AgentToken, after, apply.StatusPayload(res)); perr == nil {
+					_ = journal.SetLastReportedVersion(after)
+				} else {
+					log.Warn("dsd: re-report dropped status failed", "version", after, "err", perr)
+				}
+			}
 		}
 		signed, got, err := c.GetDSD(ctx, st.AgentToken, after)
 		if err != nil {
@@ -488,12 +503,27 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 		}
 		results, err := registry.Apply(ctx, log, journal, signed.Document)
 		if err != nil {
-			log.Error("dsd: apply", "err", err, "version", signed.Document.Version)
+			// A journal write failed (e.g. disk full / bbolt error) so
+			// LastAppliedVersion did NOT advance: the next fetch returns this same
+			// version immediately (no long-poll block), so back off rather than
+			// hot-loop hammering the CP and pegging CPU (SIGMA-122).
+			log.Error("dsd: apply; backing off", "err", err, "version", signed.Document.Version, "retry_in", applyBackoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(applyBackoff):
+			}
+			if applyBackoff < 30*time.Second {
+				applyBackoff *= 2
+			}
 			continue
 		}
+		applyBackoff = time.Second // a successful apply clears the apply-error backoff
 		log.Info("dsd applied", "version", signed.Document.Version, "ops", len(results))
 		if err := c.PostDSDStatus(ctx, st.AgentToken, signed.Document.Version, apply.StatusPayload(results)); err != nil {
 			log.Warn("dsd: status report failed", "err", err)
+		} else {
+			_ = journal.SetLastReportedVersion(signed.Document.Version)
 		}
 	}
 }

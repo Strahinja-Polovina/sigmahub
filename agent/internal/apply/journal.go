@@ -4,6 +4,7 @@
 package apply
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -73,6 +74,52 @@ func (j *Journal) SetLastAppliedVersion(v int64) error {
 		b, _ := json.Marshal(v)
 		return tx.Bucket(bucketMeta).Put([]byte("lastAppliedVersion"), b)
 	})
+}
+
+// LastReportedVersion returns the highest DSD version whose status POST the CP
+// has acknowledged (0 if none). It trails LastAppliedVersion until the status
+// report lands; the gap is what runDSDLoop re-reports (SIGMA-123).
+func (j *Journal) LastReportedVersion() (int64, error) {
+	var v int64
+	err := j.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta).Get([]byte("lastReportedVersion"))
+		if b != nil {
+			return json.Unmarshal(b, &v)
+		}
+		return nil
+	})
+	return v, err
+}
+
+// SetLastReportedVersion records that version's op results were delivered.
+func (j *Journal) SetLastReportedVersion(v int64) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		b, _ := json.Marshal(v)
+		return tx.Bucket(bucketMeta).Put([]byte("lastReportedVersion"), b)
+	})
+}
+
+// ResultsForVersion returns every recorded op result for a DSD version, keyed by
+// op id — used to re-derive a dropped status report from the durable journal
+// (SIGMA-123) so it survives an agent restart.
+func (j *Journal) ResultsForVersion(version int64) (map[string]OpResult, error) {
+	out := map[string]OpResult{}
+	prefix := []byte(fmt.Sprintf("%020d:", version))
+	err := j.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketJournal).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			var res OpResult
+			if err := json.Unmarshal(v, &res); err != nil {
+				return err
+			}
+			out[res.OpID] = res
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func key(version int64, opID string) []byte {

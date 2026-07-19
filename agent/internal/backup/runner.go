@@ -449,6 +449,12 @@ func (r *Runner) opBackupVerify(ctx context.Context, op dsd.Op) error {
 			"RestartPolicy": map[string]any{"Name": "no"},
 		},
 	}
+	// Clear any leftover scratch container of this deterministic name (e.g. from a
+	// prior run the agent restarted mid-op, whose deferred remove never ran). It
+	// carries no managed label, so GC/reconcile never reap it; without this
+	// ContainerCreate would 409 on the name collision and every retry would wedge
+	// (SIGMA-124). Best-effort: a 404 (nothing there) is fine.
+	_ = r.docker.ContainerRemove(ctx, name, true)
 	id, err := r.docker.ContainerCreate(ctx, name, body)
 	if err != nil {
 		return r.fail(ctx, spec.RunID, fmt.Errorf("create scratch container: %w", err))
@@ -671,6 +677,9 @@ func (r *Runner) opBackupRestorePITR(ctx context.Context, op dsd.Op) error {
 			"RestartPolicy": map[string]any{"Name": "no"},
 		},
 	}
+	// Clear any leftover recovery container of this deterministic name (SIGMA-124),
+	// so a mid-op restart can't wedge every retry on a 409 name collision.
+	_ = r.docker.ContainerRemove(ctx, name, true)
 	id, err := r.docker.ContainerCreate(ctx, name, body)
 	if err != nil {
 		return r.fail(ctx, spec.RunID, fmt.Errorf("create recovery container: %w", err))

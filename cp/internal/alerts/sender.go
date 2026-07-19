@@ -9,10 +9,12 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/smtp"
 	"net/url"
@@ -25,12 +27,19 @@ import (
 // TelegramAPIBase is overridable in tests.
 const TelegramAPIBase = "https://api.telegram.org"
 
+// emailSendTimeout bounds the whole SMTP exchange (dial + conversation). The
+// stdlib smtp.SendMail net.Dials with no deadline, so a channel pointed at an
+// unreachable host would block the (serial, cross-org) dispatcher for the full
+// OS connect timeout — head-of-line-blocking every other org's alerts
+// (SIGMA-119). Matches the 10s HTTP transport ceiling.
+const emailSendTimeout = 10 * time.Second
+
 // Sender delivers one alert on one channel. Safe for concurrent use.
 type Sender struct {
 	HTTP *http.Client
 	// telegramBase overrides the Telegram API root in tests.
 	telegramBase string
-	// sendMail is swapped in tests; production uses smtp.SendMail.
+	// sendMail is swapped in tests; production uses a timeout-bounded SMTP send.
 	sendMail func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
 }
 
@@ -39,7 +48,59 @@ func NewSender() *Sender {
 	return &Sender{
 		HTTP:         &http.Client{Timeout: 10 * time.Second},
 		telegramBase: TelegramAPIBase,
-		sendMail:     smtp.SendMail,
+		sendMail:     sendMailTimeout(emailSendTimeout),
+	}
+}
+
+// sendMailTimeout mirrors net/smtp.SendMail but dials with a deadline and sets a
+// connection deadline for the whole SMTP conversation, so a dead/unreachable
+// host can never block longer than `timeout` (SIGMA-119). smtp.SendMail itself
+// takes no timeout and net.Dials unbounded.
+func sendMailTimeout(timeout time.Duration) func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
+	return func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
+		conn, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", addr)
+		if err != nil {
+			return err
+		}
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		host, _, _ := net.SplitHostPort(addr)
+		c, err := smtp.NewClient(conn, host)
+		if err != nil {
+			_ = conn.Close()
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+				return err
+			}
+		}
+		if a != nil {
+			if ok, _ := c.Extension("AUTH"); ok {
+				if err := c.Auth(a); err != nil {
+					return err
+				}
+			}
+		}
+		if err := c.Mail(from); err != nil {
+			return err
+		}
+		for _, rcpt := range to {
+			if err := c.Rcpt(rcpt); err != nil {
+				return err
+			}
+		}
+		w, err := c.Data()
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(msg); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return c.Quit()
 	}
 }
 
