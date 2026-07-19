@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -136,60 +137,131 @@ func (s *Store) ReencryptSecrets(ctx context.Context, orgID string) (int, error)
 		return 0, err
 	}
 
-	rows, err := tx.Query(ctx, `
-		SELECT id, project_id, ciphertext, nonce, dek_id
-		  FROM secrets WHERE org_id = $1 AND dek_id <> $2`, orgID, activeDEKID)
-	if err != nil {
-		return 0, err
-	}
-	type stale struct {
-		id, projectID, dekID string
-		ct, nonce            []byte
-	}
-	var stales []stale
-	for rows.Next() {
-		var st stale
-		if err := rows.Scan(&st.id, &st.projectID, &st.ct, &st.nonce, &st.dekID); err != nil {
-			rows.Close()
+	// Re-encrypt EVERY table that stores ciphertext under the org DEK — not just
+	// `secrets`. Missing a table here would (a) leave those credentials on the
+	// old DEK (rotation gives them no protection) and (b) let the retirement
+	// check below drop a DEK that still backs live ciphertexts — a latent
+	// data-loss trap if a DEK is ever hard-deleted/revoked (SIGMA-68).
+	total := 0
+	for _, t := range dekReencTargets {
+		n, err := s.reencTableTx(ctx, tx, orgID, activeDEKID, activeDEK, t)
+		if err != nil {
 			return 0, err
 		}
-		stales = append(stales, st)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
+		total += n
 	}
 
-	for _, st := range stales {
-		oldDEK, err := s.dekPlaintext(ctx, tx, st.dekID)
-		if err != nil {
-			return 0, err
-		}
-		aad := secretAAD(orgID, st.projectID, st.id)
-		plain, err := gcmOpen(oldDEK, aad, st.nonce, st.ct)
-		if err != nil {
-			return 0, fmt.Errorf("re-encrypt: decrypt %s: %w", st.id, err)
-		}
-		newNonce, newCT, err := gcmSeal(activeDEK, aad, plain)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE secrets SET ciphertext = $2, nonce = $3, dek_id = $4, updated_at = now() WHERE id = $1`,
-			st.id, newCT, newNonce, activeDEKID); err != nil {
-			return 0, err
-		}
-	}
-
-	// Retire any inactive DEK that no longer backs a secret.
+	// Retire an inactive DEK ONLY when no table references it anymore — the
+	// "retired ⇒ backs nothing" invariant must hold across every DEK-bearing
+	// table, or a later hard-delete makes those ciphertexts undecryptable.
 	if _, err := tx.Exec(ctx, `
 		UPDATE org_deks d SET retired_at = now()
 		 WHERE d.org_id = $1 AND NOT d.active AND d.retired_at IS NULL
-		   AND NOT EXISTS (SELECT 1 FROM secrets s WHERE s.dek_id = d.id)`, orgID); err != nil {
+		   AND NOT EXISTS (SELECT 1 FROM secrets         WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM db_credentials  WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM s3_credentials  WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM backup_targets  WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM backup_policies WHERE repo_dek_id       = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM alert_channels  WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM s3_buckets      WHERE key_dek_id        = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM pending_s3_ops  WHERE new_secret_dek_id = d.id)`, orgID); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return len(stales), nil
+	return total, nil
+}
+
+// dekReencTarget describes one DEK-bearing table for rotation re-encryption:
+// its primary key, ciphertext/nonce/dek columns, the extra identity columns the
+// AAD needs, and how to build that AAD (ids[0] is the pk value, ids[1:] the
+// extra id columns in order).
+type dekReencTarget struct {
+	table, pkCol, ctCol, nonceCol, dekCol string
+	idCols                                []string
+	aad                                   func(orgID string, ids []string) []byte
+}
+
+// dekReencTargets is the exhaustive list of tables encrypted under the org DEK.
+// Keep it in sync with every `REFERENCES org_deks(id)` column.
+var dekReencTargets = []dekReencTarget{
+	{"secrets", "id", "ciphertext", "nonce", "dek_id", []string{"project_id"},
+		func(o string, id []string) []byte { return secretAAD(o, id[1], id[0]) }},
+	{"db_credentials", "resource_id", "ciphertext", "nonce", "dek_id", nil,
+		func(o string, id []string) []byte { return dbAAD(o, id[0]) }},
+	{"s3_credentials", "resource_id", "ciphertext", "nonce", "dek_id", nil,
+		func(o string, id []string) []byte { return s3AAD(o, id[0]) }},
+	{"backup_targets", "id", "secret_ciphertext", "secret_nonce", "dek_id", nil,
+		func(o string, id []string) []byte { return targetAAD(o, id[0]) }},
+	{"backup_policies", "id", "repo_key_ciphertext", "repo_key_nonce", "repo_dek_id", nil,
+		func(o string, id []string) []byte { return repoKeyAAD(o, id[0]) }},
+	{"alert_channels", "id", "secret_ciphertext", "secret_nonce", "dek_id", nil,
+		func(o string, id []string) []byte { return alertChannelAAD(o, id[0]) }},
+	{"s3_buckets", "id", "key_ciphertext", "key_nonce", "key_dek_id", []string{"resource_id"},
+		func(o string, id []string) []byte { return s3AAD(o, id[1]) }},
+	{"pending_s3_ops", "id", "new_secret_ciphertext", "new_secret_nonce", "new_secret_dek_id", []string{"resource_id"},
+		func(o string, id []string) []byte { return s3AAD(o, id[1]) }},
+}
+
+// reencTableTx re-encrypts every row of one DEK-bearing table not already on the
+// active DEK: decrypt with the row's old DEK + its identity-bound AAD, re-seal
+// under the active DEK with the SAME AAD, update in place. Column names come
+// from the static target list (never user input). Returns rows rewritten.
+func (s *Store) reencTableTx(ctx context.Context, tx pgx.Tx, orgID, activeDEKID string, activeDEK []byte, t dekReencTarget) (int, error) {
+	cols := append([]string{t.pkCol}, t.idCols...)
+	cols = append(cols, t.ctCol, t.nonceCol, t.dekCol)
+	sel := fmt.Sprintf("SELECT %s FROM %s WHERE org_id = $1 AND %s IS NOT NULL AND %s <> $2",
+		strings.Join(cols, ", "), t.table, t.dekCol, t.dekCol)
+	rows, err := tx.Query(ctx, sel, orgID, activeDEKID)
+	if err != nil {
+		return 0, err
+	}
+	type rec struct {
+		ids       []string
+		ct, nonce []byte
+		dekID     string
+	}
+	nIDs := 1 + len(t.idCols)
+	var recs []rec
+	for rows.Next() {
+		ids := make([]string, nIDs)
+		var ct, nonce []byte
+		var dekID string
+		dest := make([]any, 0, nIDs+3)
+		for i := range ids {
+			dest = append(dest, &ids[i])
+		}
+		dest = append(dest, &ct, &nonce, &dekID)
+		if err := rows.Scan(dest...); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		recs = append(recs, rec{ids: ids, ct: ct, nonce: nonce, dekID: dekID})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	upd := fmt.Sprintf("UPDATE %s SET %s = $1, %s = $2, %s = $3 WHERE %s = $4",
+		t.table, t.ctCol, t.nonceCol, t.dekCol, t.pkCol)
+	for _, r := range recs {
+		oldDEK, err := s.dekPlaintext(ctx, tx, r.dekID)
+		if err != nil {
+			return 0, err
+		}
+		aad := t.aad(orgID, r.ids)
+		plain, err := gcmOpen(oldDEK, aad, r.nonce, r.ct)
+		if err != nil {
+			return 0, fmt.Errorf("re-encrypt %s %s: %w", t.table, r.ids[0], err)
+		}
+		newNonce, newCT, err := gcmSeal(activeDEK, aad, plain)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(ctx, upd, newCT, newNonce, activeDEKID, r.ids[0]); err != nil {
+			return 0, err
+		}
+	}
+	return len(recs), nil
 }

@@ -139,6 +139,18 @@ export async function requireProjectRole(
   min: "Project Admin" | "Developer"
 ) {
   const { user, role: orgRole } = await requireMembership(orgId);
+  // Bind the project to the org BEFORE trusting any role. Without this, an Org
+  // Admin of org A (every user is Org Admin of their personal org) passes the
+  // Org-Admin short-circuit in effectiveProjectRole for a projectId that lives
+  // in org B — and the local grant tables (project_memberships) have no CP
+  // backstop, so a cross-tenant grant mutation would go through (SIGMA-70).
+  const [proj] = await db
+    .select({ orgId: s.projects.orgId })
+    .from(s.projects)
+    .where(eq(s.projects.id, projectId));
+  if (!proj || proj.orgId !== orgId) {
+    throw new Error("You do not have access to this project.");
+  }
   const grants = await projectGrants(user.id, orgId);
   const effective = effectiveProjectRole(orgRole, grants.get(projectId), grants.size > 0);
   if (!effective) {

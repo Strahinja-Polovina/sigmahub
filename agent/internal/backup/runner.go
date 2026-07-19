@@ -163,6 +163,11 @@ func (r *Runner) opBackupRun(ctx context.Context, op dsd.Op) error {
 	}()
 
 	snapshotID, backupErr := resticBackupStdin(ctx, cred, pr, dumpFilename(spec.Engine))
+	// Unblock the dump goroutine if restic exited early: os/exec won't close pr,
+	// so a pending pw.Write would hang the handler (and the DSD apply loop)
+	// forever on <-execDone (SIGMA-69). ctx cancellation can't interrupt a
+	// blocked io.Pipe write; closing pr can.
+	_ = pr.Close()
 	dumpErr := <-execDone
 	if dumpErr != nil {
 		return r.fail(ctx, spec.RunID, dumpErr)
@@ -233,6 +238,9 @@ func (r *Runner) opBackupBase(ctx context.Context, op dsd.Op) error {
 	}()
 
 	snapshotID, backupErr := resticBackupStdinTagged(ctx, cred, pr, "base.tar", "base")
+	// See opBackupRun: close pr so an early restic exit can't deadlock the
+	// basebackup goroutine on <-execDone (SIGMA-69).
+	_ = pr.Close()
 	baseErr := <-execDone
 	if baseErr != nil {
 		return r.fail(ctx, spec.RunID, baseErr)
