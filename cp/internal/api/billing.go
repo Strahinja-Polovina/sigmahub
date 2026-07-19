@@ -22,6 +22,7 @@ type BillingStore interface {
 	GetBillingStatus(ctx context.Context, orgID string) (store.BillingStatus, error)
 	UpsertSubscription(ctx context.Context, orgID string, in store.BillingStatus, actor string) error
 	WebhookSeen(ctx context.Context, deliveryID, provider, eventType string) (bool, error)
+	ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in store.BillingStatus, actor string) (bool, error)
 }
 
 const paddleWebhookMaxBytes = 5 << 20
@@ -139,17 +140,6 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotency: a redelivered event id is acknowledged without re-applying.
-	seen, err := s.billing.WebhookSeen(r.Context(), ev.EventID, "paddle", ev.EventType)
-	if err != nil {
-		s.writeStoreErr(w, err, "paddle webhook dedup")
-		return
-	}
-	if seen {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "duplicate"})
-		return
-	}
-
 	orgID := paddleOrgID(ev.Data.CustomData)
 	if orgID == "" {
 		// Not correlated to an org (e.g. a customer-level event) — ack and drop.
@@ -165,14 +155,22 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 	if len(ev.Data.Items) > 0 {
 		qty = ev.Data.Items[0].Quantity
 	}
-	if err := s.billing.UpsertSubscription(r.Context(), orgID, store.BillingStatus{
+	// Dedup AND apply atomically: if the apply fails, the dedup marker rolls back
+	// so Paddle's retry re-applies instead of being dropped as a duplicate
+	// (SIGMA-90).
+	applied, err := s.billing.ApplyPaddleWebhook(r.Context(), ev.EventID, "paddle", ev.EventType, orgID, store.BillingStatus{
 		OrgID:          orgID,
 		CustomerID:     ev.Data.CustomerID,
 		SubscriptionID: ev.Data.ID,
 		Status:         status,
 		Quantity:       qty,
-	}, "paddle-webhook"); err != nil {
+	}, "paddle-webhook")
+	if err != nil {
 		s.writeStoreErr(w, err, "paddle webhook apply")
+		return
+	}
+	if !applied {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "duplicate"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

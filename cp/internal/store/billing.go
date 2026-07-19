@@ -145,9 +145,47 @@ func (s *Store) UpsertSubscription(ctx context.Context, orgID string, in Billing
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// ApplyPaddleWebhook dedups AND applies a Paddle subscription webhook in ONE
+// transaction: the delivery is recorded seen and the subscription state updated
+// atomically. If the apply fails the whole tx (including the dedup marker) rolls
+// back, so Paddle's retry re-applies the event instead of it being permanently
+// dropped as a "duplicate" (SIGMA-90). Returns applied=false for a delivery that
+// was already recorded (a genuine redelivery).
+func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in BillingStatus, actor string) (bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO webhook_deliveries (delivery_id, provider, event_type)
+		VALUES ($1, $2, $3) ON CONFLICT (delivery_id) DO NOTHING`,
+		deliveryID, provider, eventType)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// Already recorded — commit the (no-op) tx and report duplicate.
+		return false, tx.Commit(ctx)
+	}
+	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+// upsertSubscriptionTx applies subscription state within the caller's tx (shared
+// by UpsertSubscription and ApplyPaddleWebhook).
+func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID string, in BillingStatus, actor string) error {
 	var prevStatus string
-	err = tx.QueryRow(ctx, `SELECT status FROM org_billing WHERE org_id = $1`, orgID).Scan(&prevStatus)
+	err := tx.QueryRow(ctx, `SELECT status FROM org_billing WHERE org_id = $1`, orgID).Scan(&prevStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		prevStatus = "none"
 	} else if err != nil {
@@ -177,5 +215,5 @@ func (s *Store) UpsertSubscription(ctx context.Context, orgID string, in Billing
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }

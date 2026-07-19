@@ -178,5 +178,59 @@ export async function requireProjectAdminForResource(orgId: string, resourceId: 
   if (res) {
     return requireProjectRole(orgId, res.projectId, "Project Admin");
   }
+  // Mirror row missing (e.g. a CP-created resource before the SIGMA-56 sync).
+  // Fail closed for PROJECT-SCOPED users — the bare org gate below would ignore
+  // their per-project grants and let a Project-Admin-org-role user act on a
+  // project they were never granted (SIGMA-89). Unscoped users (org admins /
+  // zero-grant legacy users, who see everything anyway) still fall back to the
+  // org gate; the CP re-enforces org+role regardless.
+  const { user, role } = await requireMembership(orgId);
+  if ((await visibleProjects(user.id, orgId, role)) !== null) {
+    throw new Error("You do not have access to this resource.");
+  }
   return requireProjectAdmin(orgId);
+}
+
+/** Assert the session user can SEE `projectId` under P2-7 (org admins and
+ *  zero-grant legacy users see all). Throws otherwise. */
+async function assertProjectVisible(orgId: string, projectId: string) {
+  const { user, role } = await requireMembership(orgId);
+  const visible = await visibleProjects(user.id, orgId, role);
+  if (visible && !visible.has(projectId)) {
+    throw new Error("You do not have access to this project.");
+  }
+}
+
+/** Read-visibility gate (P2-7) for a read action addressed by resource id: the
+ *  caller must be able to see the resource's project. Fails closed when the
+ *  resource can't be resolved in-org (SIGMA-84). The CP enforces only the org
+ *  tenant on these reads, so per-project scoping is web-only — apply this on the
+ *  info/log/list READ actions that forward a client resourceId to the CP. */
+export async function requireResourceVisible(orgId: string, resourceId: string) {
+  const [res] = await db
+    .select({ projectId: s.resources.projectId })
+    .from(s.resources)
+    .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
+    .where(and(eq(s.resources.id, resourceId), eq(s.projects.orgId, orgId)));
+  if (!res) throw new Error("You do not have access to this resource.");
+  await assertProjectVisible(orgId, res.projectId);
+}
+
+/** Read-visibility gate (P2-7) addressed by environment id (SIGMA-84). */
+export async function requireEnvironmentVisible(orgId: string, environmentId: string) {
+  const [env] = await db
+    .select({ projectId: s.environments.projectId })
+    .from(s.environments)
+    .innerJoin(s.projects, eq(s.environments.projectId, s.projects.id))
+    .where(and(eq(s.environments.id, environmentId), eq(s.projects.orgId, orgId)));
+  if (!env) throw new Error("You do not have access to this environment.");
+  await assertProjectVisible(orgId, env.projectId);
+}
+
+/** True when the session user sees every project in the org (org admin or a
+ *  legacy user with no per-project grants) — the only case an org-wide read
+ *  (e.g. an unscoped log search) is allowed for (SIGMA-84). */
+export async function hasFullOrgVisibility(orgId: string): Promise<boolean> {
+  const { user, role } = await requireMembership(orgId);
+  return (await visibleProjects(user.id, orgId, role)) === null;
 }

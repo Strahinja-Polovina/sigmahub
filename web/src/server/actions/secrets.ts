@@ -4,7 +4,13 @@ import { revalidatePath } from "next/cache";
 import { requireMembership, requireProjectRole } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
-import { putSecret, readSecretValue, removeSecret, secretName } from "../secrets-data";
+import {
+  assertSecretInProject,
+  putSecret,
+  readSecretValue,
+  removeSecret,
+  secretName,
+} from "../secrets-data";
 
 /** Resolve a resource to its org/project/environment, asserting the caller is a
  *  member of the owning org. Returns the membership so callers can escalate the
@@ -67,6 +73,9 @@ export async function revealSecretAction(input: { resourceId: string; secretId: 
   // Reveal is Project Admin+ on THIS project (P2-7); a Developer 403s here (and
   // again at the CP, which caps the effective role by the forwarded actor).
   const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
+  // Bind the secret to the authorized project so a Project Admin of one project
+  // can't reveal another project's secret in the same org (SIGMA-85).
+  await assertSecretInProject(orgId, projectId, input.secretId);
   const value = await readSecretValue(orgId, input.secretId, { name: user.name, role });
   // In demo mode the CP isn't the one auditing, so record the read locally.
   const name = await secretName(orgId, input.secretId);
@@ -82,6 +91,8 @@ export async function revealSecretAction(input: { resourceId: string; secretId: 
 export async function deleteSecretAction(input: { resourceId: string; secretId: string }) {
   const { orgId, projectId, resourceName } = await resourceScope(input.resourceId);
   const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
+  // Bind the secret to the authorized project (SIGMA-85) before deleting it.
+  await assertSecretInProject(orgId, projectId, input.secretId);
   const name = await secretName(orgId, input.secretId);
   await removeSecret(orgId, input.secretId, { name: user.name, role });
   await writeAudit({

@@ -205,6 +205,31 @@ func (s *Store) SetConnectionInstallation(ctx context.Context, orgID, connID, in
 	return tx.Commit(ctx)
 }
 
+// ClaimInstallation binds a GitHub App installation id to the org that first
+// presents it (first-writer-wins). Returns ErrNotFound if the installation is
+// already bound to a DIFFERENT org, so a client-supplied installationId can't
+// drive the CP to mint a token for an installation another org owns (SIGMA-87).
+// Opaque (surfaces as 404, not 403) so it never confirms another org's
+// installation exists. Idempotent for the owning org.
+func (s *Store) ClaimInstallation(ctx context.Context, orgID, installationID string) error {
+	installationID = strings.TrimSpace(installationID)
+	if installationID == "" || !isDigits(installationID) {
+		return ErrInvalid{Msg: "installationId must be a numeric GitHub installation id"}
+	}
+	var owner string
+	if err := s.Pool.QueryRow(ctx, `
+		INSERT INTO github_installations (installation_id, org_id) VALUES ($1, $2)
+		ON CONFLICT (installation_id)
+		  DO UPDATE SET installation_id = github_installations.installation_id
+		RETURNING org_id`, installationID, orgID).Scan(&owner); err != nil {
+		return err
+	}
+	if owner != orgID {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func isDigits(s string) bool {
 	for _, r := range s {
 		if r < '0' || r > '9' {

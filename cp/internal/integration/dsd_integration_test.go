@@ -674,6 +674,79 @@ func TestSecretsEnvelopeRotationAAD(t *testing.T) {
 	}
 }
 
+// TestKEKRotationRewrapsDirectEnvelopes is the SIGMA-88 guard: RotateKEK also
+// re-wraps the org's DIRECTLY custody-wrapped envelopes (git provider tokens),
+// and RotateGlobalKEK re-wraps the CP-global secrets — so a transit-key prune
+// can't strand them. A wrong purpose would fail the unwrap-for-rewrap and error
+// the rotation, so a rotation that SUCCEEDS and CHANGES the stored envelope
+// proves both the coverage and the purpose.
+func TestKEKRotationRewrapsDirectEnvelopes(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_rewrap"
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "o/r", Token: "ghp_secret",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before []byte
+	if err := st.Pool.QueryRow(ctx, `SELECT token_wrapped FROM git_connections WHERE id=$1`, conn.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if len(before) == 0 {
+		t.Fatal("git provider token not wrapped at rest")
+	}
+
+	// A wrong purpose would fail the unwrap-for-rewrap here.
+	if _, err := st.RotateKEK(ctx, orgID, "admin"); err != nil {
+		t.Fatalf("RotateKEK: %v", err)
+	}
+	var after []byte
+	if err := st.Pool.QueryRow(ctx, `SELECT token_wrapped FROM git_connections WHERE id=$1`, conn.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) {
+		t.Fatal("git token envelope was not re-wrapped by RotateKEK (SIGMA-88)")
+	}
+
+	// Global CP secrets re-wrap too: any custody-wrapped cp_secrets present must
+	// re-wrap without error (a wrong purpose would fail the unwrap-for-rewrap),
+	// and each re-wrapped envelope changes.
+	var names []string
+	rows, _ := st.Pool.Query(ctx, `SELECT name FROM cp_secrets`)
+	for rows.Next() {
+		var n string
+		_ = rows.Scan(&n)
+		names = append(names, n)
+	}
+	rows.Close()
+	pre := map[string][]byte{}
+	for _, n := range names {
+		var w []byte
+		_ = st.Pool.QueryRow(ctx, `SELECT wrapped FROM cp_secrets WHERE name=$1`, n).Scan(&w)
+		pre[n] = w
+	}
+	got, err := st.RotateGlobalKEK(ctx, "admin")
+	if err != nil {
+		t.Fatalf("RotateGlobalKEK: %v", err)
+	}
+	if got != len(names) {
+		t.Fatalf("RotateGlobalKEK re-wrapped %d secrets, want %d", got, len(names))
+	}
+	for _, n := range names {
+		var w []byte
+		_ = st.Pool.QueryRow(ctx, `SELECT wrapped FROM cp_secrets WHERE name=$1`, n).Scan(&w)
+		if len(pre[n]) > 0 && bytes.Equal(pre[n], w) {
+			t.Fatalf("global CP secret %q was not re-wrapped by RotateGlobalKEK (SIGMA-88)", n)
+		}
+	}
+}
+
 func createResourceViaAPI(t *testing.T, base, svcTok, orgID, envID, serverID, name, kind string) string {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"environmentId": envID, "serverId": serverID, "name": name, "kind": kind})

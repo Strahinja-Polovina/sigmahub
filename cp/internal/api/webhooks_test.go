@@ -27,6 +27,10 @@ type fakeGit struct {
 	// call (SIGMA-55 handler tests).
 	linkedConn         string
 	linkedInstallation string
+	// claimErr scripts a cross-org rejection; claimedInstallation records the
+	// last ClaimInstallation call (SIGMA-87 handler tests).
+	claimErr            error
+	claimedInstallation string
 }
 
 func (f *fakeGit) HandleGitWebhook(_ context.Context, ev store.GitWebhookEvent) (store.WebhookOutcome, error) {
@@ -67,6 +71,13 @@ func (f *fakeGit) SetConnectionInstallation(_ context.Context, _, connID, instal
 		return store.ErrInvalid{Msg: "installationId must be a numeric GitHub installation id"}
 	}
 	f.linkedConn, f.linkedInstallation = connID, installationID
+	return nil
+}
+func (f *fakeGit) ClaimInstallation(_ context.Context, _, installationID string) error {
+	if f.claimErr != nil {
+		return f.claimErr
+	}
+	f.claimedInstallation = installationID
 	return nil
 }
 

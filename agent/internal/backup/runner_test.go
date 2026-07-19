@@ -30,7 +30,15 @@ case "$cmd" in
   backup) cat > "$state/stored.bin"; echo '{"message_type":"summary","snapshot_id":"snap123"}' ;;
   check) exit 0 ;;
   forget) exit 0 ;;
-  dump) cat "$state/stored.bin" ;;
+  dump)
+    # emulate ` + "`dump [--path /f] latest <file>`" + `: only the logical-dump
+    # snapshot carries the dump file. Without a --path filter, ` + "`latest`" + ` would
+    # resolve to the newest (WAL/base) snapshot in a PITR repo, which lacks it —
+    # model that as a hard failure so dropping the filter is caught (SIGMA-83).
+    case "$*" in
+      *--path*) cat "$state/stored.bin" ;;
+      *) echo "file not found in snapshot" >&2; exit 1 ;;
+    esac ;;
   snapshots) tag="$3"; if [ -f "$state/snapshots-$tag.json" ]; then cat "$state/snapshots-$tag.json"; else echo "[]"; fi ;;
   restore) snap="$2"; target="$4"; mkdir -p "$target"; case "$snap" in base*) echo basedata > "$target/base.tar" ;; *) echo waldata > "$target/wal-$snap.tar" ;; esac ;;
   *) echo "unknown cmd $cmd" >&2; exit 1 ;;
@@ -341,6 +349,46 @@ func TestShortShaNeverPanics(t *testing.T) {
 		if len(s) >= 12 && len(got) != 12 {
 			t.Fatalf("shortSha(%q) = %q, want 12 chars", s, got)
 		}
+	}
+}
+
+// TestVerifyDumpFiltersByPath is the SIGMA-83 guard: verify/restore must select
+// the logical-dump snapshot by --path, not the newest snapshot repo-wide (which
+// for a PITR resource is a continuously-shipped WAL bundle with no dump file).
+func TestVerifyDumpFiltersByPath(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	fd := &fakeDocker{dumpData: []byte("payload")}
+	rep := &reported{}
+	r := NewRunner(fd,
+		func(context.Context, string) (Credential, error) {
+			return Credential{Repository: "s3:s3.example/bucket/sigmahub/res_db", RepoKey: "k", AccessKey: "a", SecretKey: "s"}, nil
+		},
+		func(_ context.Context, _ string, ok bool, snapshotID, sha, detail string) {
+			rep.ok, rep.snapshot, rep.sha, rep.detail = ok, snapshotID, sha, detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := r.opBackupRun(context.Background(), backupOp(t, KindBackupRun, opSpec{
+		RunID: "run_pp1", ResourceID: "res_db", Container: "sigmahub-res_db",
+		Engine: "postgres", Database: "shop", Username: "sigma",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.opBackupVerify(context.Background(), backupOp(t, KindBackupVerify, opSpec{
+		RunID: "run_pp2", ResourceID: "res_db", Engine: "postgres", Image: "postgres:16.6",
+		Database: "shop", Username: "sigma",
+	})); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	calls, err := os.ReadFile(filepath.Join(dir, "calls.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "dump --path /dump.sql latest dump.sql") {
+		t.Fatalf("dump must filter to the logical-dump snapshot by path:\n%s", calls)
 	}
 }
 
