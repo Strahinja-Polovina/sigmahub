@@ -530,7 +530,7 @@ function ConnectionCard({
   function promote(mapId: string, branch: string) {
     startTransition(async () => {
       try {
-        await promoteBranch({ orgId, projectId, mapId, branch });
+        await promoteBranch({ orgId, projectId, connectionId: panel.connection.id, mapId, branch });
         toast.success(`Promoted ${branch}`);
       } catch (err) {
         toast.error("Couldn’t promote", { description: errMsg(err) });
@@ -541,7 +541,7 @@ function ConnectionCard({
   function unmap(mapId: string) {
     startTransition(async () => {
       try {
-        await removeBranchMapping({ orgId, projectId, mapId });
+        await removeBranchMapping({ orgId, projectId, connectionId: panel.connection.id, mapId });
         toast.success("Mapping removed");
       } catch (err) {
         toast.error("Couldn’t remove mapping", { description: errMsg(err) });

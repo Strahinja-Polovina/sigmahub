@@ -41,6 +41,7 @@ export function SettingsView({
   members,
   pendingInvites = [],
   audit,
+  canViewAudit = true,
   currentUserId,
   currentUserRole,
   cpMode = false,
@@ -51,6 +52,9 @@ export function SettingsView({
   members: SettingsMember[];
   pendingInvites?: PendingInvite[];
   audit: AuditEntry[];
+  /** The org-wide audit exposes cross-project resource ids, so it's shown only
+   *  to users who can see every project in the org (SIGMA-97). */
+  canViewAudit?: boolean;
   currentUserId: string;
   currentUserRole: string;
   /** CP mode adds the beta-metrics tab (P1-13 M1 instrumentation). */
@@ -75,7 +79,7 @@ export function SettingsView({
           <TabsTrigger value="members">Members</TabsTrigger>
           <TabsTrigger value="tokens">Tokens</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
-          <TabsTrigger value="audit">Audit log</TabsTrigger>
+          {canViewAudit && <TabsTrigger value="audit">Audit log</TabsTrigger>}
           {cpMode && <TabsTrigger value="alerts">Alerts</TabsTrigger>}
           {cpMode && <TabsTrigger value="beta">Beta metrics</TabsTrigger>}
         </TabsList>
@@ -98,9 +102,11 @@ export function SettingsView({
         <TabsContent value="security">
           <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} />
         </TabsContent>
-        <TabsContent value="audit">
-          <AuditTab entries={audit} />
-        </TabsContent>
+        {canViewAudit && (
+          <TabsContent value="audit">
+            <AuditTab entries={audit} />
+          </TabsContent>
+        )}
         {cpMode && (
           <TabsContent value="alerts">
             <AlertsTab orgId={org.id} isAdmin={isAdmin} />

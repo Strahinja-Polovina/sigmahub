@@ -22,7 +22,7 @@ type BillingStore interface {
 	GetBillingStatus(ctx context.Context, orgID string) (store.BillingStatus, error)
 	UpsertSubscription(ctx context.Context, orgID string, in store.BillingStatus, actor string) error
 	WebhookSeen(ctx context.Context, deliveryID, provider, eventType string) (bool, error)
-	ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in store.BillingStatus, actor string) (bool, error)
+	ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in store.BillingStatus, actor string, occurredAt time.Time) (bool, error)
 }
 
 const paddleWebhookMaxBytes = 5 << 20
@@ -103,9 +103,10 @@ func (s *Server) handleBillingPortal(w http.ResponseWriter, r *http.Request) {
 
 // paddleEvent is the slice of a Paddle webhook envelope we act on.
 type paddleEvent struct {
-	EventID   string          `json:"event_id"`
-	EventType string          `json:"event_type"`
-	Data      paddleEventData `json:"data"`
+	EventID    string          `json:"event_id"`
+	EventType  string          `json:"event_type"`
+	OccurredAt string          `json:"occurred_at"`
+	Data       paddleEventData `json:"data"`
 }
 
 type paddleEventData struct {
@@ -158,13 +159,22 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Dedup AND apply atomically: if the apply fails, the dedup marker rolls back
 	// so Paddle's retry re-applies instead of being dropped as a duplicate
 	// (SIGMA-90).
+	// SIGMA-99: order by the event's occurred_at so a delayed/retried older
+	// delivery can't clobber newer state. A missing/unparseable timestamp falls
+	// back to now (treated as newest — applies).
+	occurredAt := time.Now()
+	if ev.OccurredAt != "" {
+		if t, perr := time.Parse(time.RFC3339, ev.OccurredAt); perr == nil {
+			occurredAt = t
+		}
+	}
 	applied, err := s.billing.ApplyPaddleWebhook(r.Context(), ev.EventID, "paddle", ev.EventType, orgID, store.BillingStatus{
 		OrgID:          orgID,
 		CustomerID:     ev.Data.CustomerID,
 		SubscriptionID: ev.Data.ID,
 		Status:         status,
 		Quantity:       qty,
-	}, "paddle-webhook")
+	}, "paddle-webhook", occurredAt)
 	if err != nil {
 		s.writeStoreErr(w, err, "paddle webhook apply")
 		return

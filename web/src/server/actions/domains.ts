@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { requireProjectAdminForResource } from "../active-org";
 import { writeAudit } from "../audit";
-import { cpEnabled, cpAttachDomain, cpDetachDomain, type CpDomain } from "../cp";
+import { cpEnabled, cpAttachDomain, cpDetachDomain, cpListDomains, type CpDomain } from "../cp";
 
 /** Custom domains are a control-plane feature (Traefik + ACME live there). */
 function ensureCp() {
@@ -42,6 +42,13 @@ export async function detachDomain(input: {
 }): Promise<void> {
   ensureCp();
   const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
+  // Bind the domain to the authorized resource (SIGMA-93): domainId is an
+  // independent parameter, so a Project Admin of one resource's project can't
+  // detach another project's domain. Confirm it belongs to this resource first.
+  const domains = await cpListDomains(input.orgId, input.resourceId);
+  if (!domains.some((d) => d.id === input.domainId)) {
+    throw new Error("Domain not found.");
+  }
   await cpDetachDomain(input.orgId, input.domainId, { name: user.name, role });
   await writeAudit({ orgId: input.orgId, actor: user.name, action: `Detached domain ${input.domain}`, target: input.resourceId });
   revalidatePath(`/dashboard/resources/${input.resourceId}`);

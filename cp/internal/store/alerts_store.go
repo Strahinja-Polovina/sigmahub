@@ -334,6 +334,17 @@ func (s *Store) AlertChannelForSend(ctx context.Context, orgID, channelID string
 // window <= 0 means "at most once ever" (per-deployment / per-run alerts);
 // a positive window is a flap cooldown.
 func enqueueAlertTx(ctx context.Context, tx pgx.Tx, orgID, event, dedupKey string, window time.Duration, title, body string) error {
+	// Serialize concurrent enqueues of the SAME logical alert (overlapping sweeps
+	// or multiple replicas) so the NOT EXISTS check-then-insert below is atomic
+	// and can't double-enqueue under READ COMMITTED — the alert_outbox dedup index
+	// is non-unique, and windowed keys (cert-failed, server-recovered) legitimately
+	// re-fire, so a plain UNIQUE index can't be used (SIGMA-95). Xact-scoped; the
+	// lock releases on commit/rollback, and the window filter still governs
+	// re-fires after the lock is released.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('alert:' || $1 || ':' || $2))`, orgID, dedupKey); err != nil {
+		return fmt.Errorf("alert dedup lock: %w", err)
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO alert_outbox (org_id, channel_id, event, dedup_key, title, body)
 		SELECT r.org_id, r.channel_id, $2, $3, $4, $5

@@ -162,3 +162,87 @@ func TestBillingSubscriptionWebhookFlow(t *testing.T) {
 		t.Fatalf("re-past_due must not re-alert, got %d", alerts)
 	}
 }
+
+// TestBillingIgnoresOutOfOrderEvent is the SIGMA-99 guard: a delayed/retried
+// OLDER Paddle delivery (distinct id, so not deduped) must not clobber newer
+// subscription state.
+func TestBillingIgnoresOutOfOrderEvent(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_order"
+	t2 := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	t1 := t2.Add(-time.Hour)
+
+	applied, err := st.ApplyPaddleWebhook(ctx, "evt_new", "paddle", "subscription.activated", orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm", SubscriptionID: "sub", Status: "active", Quantity: 1,
+	}, "paddle-webhook", t2)
+	if err != nil || !applied {
+		t.Fatalf("apply newer event: applied=%v err=%v", applied, err)
+	}
+	// Older event arrives last — acknowledged (not a dup) but must NOT change state.
+	if _, err := st.ApplyPaddleWebhook(ctx, "evt_old", "paddle", "subscription.past_due", orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm", SubscriptionID: "sub", Status: "past_due", Quantity: 1,
+	}, "paddle-webhook", t1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.GetBillingStatus(ctx, orgID)
+	if got.Status != "active" {
+		t.Fatalf("out-of-order older event clobbered state: status=%q, want active", got.Status)
+	}
+}
+
+// TestIdempotencyClaimSemantics is the SIGMA-92 guard: a claim reserves the key
+// before execution, a concurrent duplicate sees a pending (not-done) row, a
+// finalized row replays, and a released pending row can be re-claimed.
+func TestIdempotencyClaimSemantics(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	org, key := "org_idem", "k1"
+	hashA := []byte("hashA")
+
+	claimed, _, err := st.IdempotencyClaim(ctx, org, key, hashA)
+	if err != nil || !claimed {
+		t.Fatalf("first claim must win: claimed=%v err=%v", claimed, err)
+	}
+	// Concurrent duplicate loses and sees a PENDING row.
+	claimed2, existing, err := st.IdempotencyClaim(ctx, org, key, hashA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed2 || existing.Done {
+		t.Fatalf("duplicate must lose and be pending: claimed=%v done=%v", claimed2, existing.Done)
+	}
+	// Finalize → a subsequent claim replays.
+	if err := st.IdempotencyFinalize(ctx, org, key, 201, []byte(`{"ok":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	claimed3, done, err := st.IdempotencyClaim(ctx, org, key, hashA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]bool
+	// response is a JSONB column, so the bytes are re-canonicalised on read —
+	// compare on the parsed value, not byte-for-byte.
+	if claimed3 || !done.Done || done.StatusCode != 201 ||
+		json.Unmarshal(done.Response, &payload) != nil || !payload["ok"] {
+		t.Fatalf("after finalize expected replay of {ok:true}: claimed=%v resp=%s", claimed3, done.Response)
+	}
+	// Release must NOT delete a finalized row.
+	if err := st.IdempotencyRelease(ctx, org, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.IdempotencyLookup(ctx, org, key); err != nil {
+		t.Fatalf("release deleted a finalized row: %v", err)
+	}
+	// A pending claim that is released can be re-claimed (retry after a 5xx).
+	org2, key2 := "org_idem2", "k2"
+	if c, _, _ := st.IdempotencyClaim(ctx, org2, key2, hashA); !c {
+		t.Fatal("claim k2")
+	}
+	if err := st.IdempotencyRelease(ctx, org2, key2); err != nil {
+		t.Fatal(err)
+	}
+	if c, _, _ := st.IdempotencyClaim(ctx, org2, key2, hashA); !c {
+		t.Fatal("after release a retry must be able to re-claim")
+	}
+}

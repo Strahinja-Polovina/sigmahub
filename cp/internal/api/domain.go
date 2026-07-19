@@ -38,7 +38,9 @@ type DomainAPI interface {
 	SetHardeningConfig(ctx context.Context, orgID, serverID string, keepPublicSSH, cisEnabled bool, extraPorts []store.PortException, actor string) error
 	ListAudit(ctx context.Context, orgID string, limit int) ([]store.AuditEntry, error)
 	IdempotencyLookup(ctx context.Context, orgID, key string) (store.IdempotentResponse, error)
-	IdempotencySave(ctx context.Context, orgID, key string, in store.IdempotentResponse) (store.IdempotentResponse, error)
+	IdempotencyClaim(ctx context.Context, orgID, key string, reqHash []byte) (bool, store.IdempotentResponse, error)
+	IdempotencyFinalize(ctx context.Context, orgID, key string, statusCode int, response []byte) error
+	IdempotencyRelease(ctx context.Context, orgID, key string) error
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
 	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
 	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)

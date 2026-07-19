@@ -44,7 +44,7 @@ func (f *fakeBilling) WebhookSeen(_ context.Context, deliveryID, _, _ string) (b
 	f.seen[deliveryID] = true
 	return false, nil
 }
-func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, _ string, in store.BillingStatus, _ string) (bool, error) {
+func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, _ string, in store.BillingStatus, _ string, _ time.Time) (bool, error) {
 	f.seenCalls++
 	if f.seen == nil {
 		f.seen = map[string]bool{}

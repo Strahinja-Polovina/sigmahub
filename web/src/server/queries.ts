@@ -176,15 +176,19 @@ export async function getDeployments(resourceId: string) {
 }
 export async function getBillingSummary(orgId: string) {
   const all = await getServers(orgId).catch(() => []);
-  const connected = all.filter((x) => x.status !== "provisioning").length;
-  const isFree = connected <= FREE_TIER_SERVERS;
+  // Match the CP/Paddle charge basis exactly (SIGMA-91): "connected" = running
+  // servers (the CP's ConnectedServerCount uses status='running'), and the
+  // charge is only for servers ABOVE the free tier (subtract), NOT every
+  // connected server once the tier is exceeded (the old cliff overstated it ~4x).
+  const connected = all.filter((x) => x.status === "running").length;
+  const billable = Math.max(0, connected - FREE_TIER_SERVERS);
   return {
     connected,
     freeTier: FREE_TIER_SERVERS,
     unitPrice: UNIT_PRICE,
     currency: CURRENCY,
-    amount: isFree ? 0 : connected * UNIT_PRICE,
-    isFree,
+    amount: billable * UNIT_PRICE,
+    isFree: billable === 0,
   };
 }
 

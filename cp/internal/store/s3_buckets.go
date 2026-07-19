@@ -478,12 +478,19 @@ func (s *Store) RecordStorageBytes(ctx context.Context, serverID, opID string, b
 	// lets a genuinely-empty (0-byte) bucket still record its daily row instead
 	// of leaving a metering gap (SIGMA-81). A 0-row result therefore means "not a
 	// measure op" (or an already-gone op), which is expected, not a fault.
+	// Stamp `day` from the op's own created_at in UTC (SIGMA-96), NOT the agent's
+	// report time: a measure scheduled late on UTC day D but reported after
+	// midnight must still land on D, and the boundary must be UTC (matching the
+	// sweep's dedup key `(created_at AT TIME ZONE 'UTC')::date`, migration 0030)
+	// rather than the session TZ. now is retained for signature stability.
+	_ = now
 	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO s3_storage_bytes (resource_id, org_id, bucket, day, bytes)
-		SELECT resource_id, org_id, bucket, date_trunc('day', $3::timestamptz), $4
+		SELECT resource_id, org_id, bucket,
+		       (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'), $3
 		  FROM pending_s3_ops WHERE id = $1 AND server_id = $2 AND action = 'measure'
 		ON CONFLICT (resource_id, bucket, day) DO UPDATE SET bytes = EXCLUDED.bytes`,
-		opID, serverID, now.UTC(), bytes)
+		opID, serverID, bytes)
 	return err
 }
 

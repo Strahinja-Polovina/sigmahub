@@ -193,7 +193,7 @@ export async function requireProjectAdminForResource(orgId: string, resourceId: 
 
 /** Assert the session user can SEE `projectId` under P2-7 (org admins and
  *  zero-grant legacy users see all). Throws otherwise. */
-async function assertProjectVisible(orgId: string, projectId: string) {
+export async function assertProjectVisible(orgId: string, projectId: string) {
   const { user, role } = await requireMembership(orgId);
   const visible = await visibleProjects(user.id, orgId, role);
   if (visible && !visible.has(projectId)) {
