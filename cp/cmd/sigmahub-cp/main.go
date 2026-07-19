@@ -339,6 +339,7 @@ func run() error {
 			Paddle:              paddleClient,
 			PaddleWebhookSecret: cfg.PaddleWebhookSecret,
 			PaddlePriceID:       cfg.PaddlePriceID,
+			RequireActor:        cfg.RequireActor,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

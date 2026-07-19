@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -57,9 +56,7 @@ func (s *Store) dbEngineEnabled(kind string) bool {
 
 // randomDBSecret returns a URL- and shell-safe 32-char credential.
 func randomDBSecret() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(randBytes(16))
 }
 
 // dbSafeName derives an identifier-safe database name from a resource name:
@@ -102,10 +99,17 @@ func allocateDBPort(ctx context.Context, tx pgx.Tx, serverID string) (int, error
 		`SELECT pg_advisory_xact_lock(hashtext('dbport:' || $1))`, serverID); err != nil {
 		return 0, fmt.Errorf("db port lock: %w", err)
 	}
+	// GREATEST over BOTH port-owning tables, symmetric with allocateS3Port: the
+	// availability matrix keeps S3 and DB engines off the same server today, but
+	// scanning only db_credentials would collide the moment that ever widens
+	// (SIGMA-81). The shared advisory lock + (server_id, port) unique index back
+	// this up.
 	var port int
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(MAX(port) + 1, $2)
-		  FROM db_credentials WHERE server_id = $1`, serverID, dbPortBase).Scan(&port)
+		SELECT GREATEST(
+			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
+			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1)
+		) + 1`, serverID, dbPortBase).Scan(&port)
 	if err != nil {
 		return 0, fmt.Errorf("db port max: %w", err)
 	}

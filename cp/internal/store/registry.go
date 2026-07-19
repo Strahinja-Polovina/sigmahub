@@ -82,18 +82,28 @@ const readinessExpr = `(
 	)
 )`
 
+// randBytes returns n cryptographically-secure random bytes, panicking if the
+// system CSPRNG fails. A broken RNG is unrecoverable, and every caller mints a
+// credential or a row id — failing closed (a recovered 500) is strictly safer
+// than silently minting a partially-predictable id/token, which is what
+// `_, _ = rand.Read(b)` did (SIGMA-80). crypto/rand.Read never fails on Linux
+// in practice, so this panics only on a genuinely broken host.
+func randBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return b
+}
+
 func newID(prefix string) string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return prefix + "_" + hex.EncodeToString(b)
+	return prefix + "_" + hex.EncodeToString(randBytes(8))
 }
 
 // newToken returns (plaintext, digest). Plaintext is shown exactly once; only
 // the keyed digest is persisted.
 func (s *Store) newToken(prefix string) (string, []byte) {
-	b := make([]byte, 24)
-	_, _ = rand.Read(b)
-	tok := prefix + "_" + hex.EncodeToString(b)
+	tok := prefix + "_" + hex.EncodeToString(randBytes(24))
 	return tok, s.hashToken(tok)
 }
 

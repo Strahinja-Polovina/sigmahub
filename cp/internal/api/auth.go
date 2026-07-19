@@ -71,7 +71,15 @@ func (s *Server) requireService(minRole store.Role, next http.HandlerFunc) http.
 		// already share). The actor can only narrow the token's role, never
 		// exceed it — so per-user Developer/Project Admin gates are enforced
 		// here, not per deployment.
-		if actorB64 := r.Header.Get("X-Sigmahub-Actor"); actorB64 != "" {
+		actorB64 := r.Header.Get("X-Sigmahub-Actor")
+		// SIGMA-82: in strict mode an org-scoped token MUST carry an actor, so a
+		// stolen/misused user-facing token can't act with its full (unnarrowed)
+		// role. The dev wildcard token (OrgID "*") is a system bypass and exempt.
+		if s.requireActor && actorB64 == "" && p.OrgID != "*" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "actor header required"})
+			return
+		}
+		if actorB64 != "" {
 			actor, err := verifyActor(actorB64, r.Header.Get("X-Sigmahub-Actor-Signature"), tok)
 			if err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid actor header"})

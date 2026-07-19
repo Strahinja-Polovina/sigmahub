@@ -132,6 +132,15 @@ func (c *VaultCustody) transit(ctx context.Context, op string, body map[string]s
 // Vault's versioned ciphertext string ("vault:vN:..."), so transit key
 // rotation transparently applies to new wraps while old envelopes stay
 // decryptable.
+//
+// purpose is intentionally NOT bound as a transit `context` here (SIGMA-80):
+// transit convergent/derived encryption requires the key to be created with
+// `derived=true`, and sending a context to a non-derived key errors — so
+// binding it unconditionally would break Wrap on every existing deployment and
+// leave already-stored envelopes (encrypted without context) undecryptable.
+// The cross-row swap this would defend against is already defeated upstream by
+// secretAAD; binding at the Vault layer is a derived-key provisioning change
+// tracked separately, not a silent behaviour change in a bug-fix.
 func (c *VaultCustody) Wrap(ctx context.Context, _ string, plaintext []byte) ([]byte, error) {
 	ct, err := c.transit(ctx, "encrypt", map[string]string{
 		"plaintext": base64.StdEncoding.EncodeToString(plaintext),

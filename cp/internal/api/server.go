@@ -91,7 +91,10 @@ type Server struct {
 	paddle              PaddleClient
 	paddleWebhookSecret string
 	paddlePriceID       string
-	mux                 *http.ServeMux
+	// requireActor rejects org-scoped tokens presented with no actor header
+	// (SIGMA-82); off by default. The dev wildcard token is exempt.
+	requireActor bool
+	mux          *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
@@ -138,6 +141,9 @@ type Options struct {
 	Paddle              PaddleClient
 	PaddleWebhookSecret string
 	PaddlePriceID       string
+	// RequireActor makes a valid actor header mandatory on org-scoped tokens
+	// (SIGMA-82); off by default (the dev wildcard token is always exempt).
+	RequireActor bool
 }
 
 // New builds the HTTP surface.
@@ -162,6 +168,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		paddle:              opts.Paddle,
 		paddleWebhookSecret: opts.PaddleWebhookSecret,
 		paddlePriceID:       opts.PaddlePriceID,
+		requireActor:        opts.RequireActor,
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()

@@ -13,14 +13,27 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
 
-// fakeExec records weed-shell invocations (the SeaweedFS admin path).
+// fakeExec records weed-shell invocations (the SeaweedFS admin path). envs[i]
+// holds the exec environment passed alongside calls[i] (nil for a plain
+// ContainerExec).
 type fakeExec struct {
 	calls [][]string
+	envs  [][]string
 	fail  bool
 }
 
 func (f *fakeExec) ContainerExec(_ context.Context, _ string, cmd []string, _ io.Writer) (int, string, error) {
 	f.calls = append(f.calls, cmd)
+	f.envs = append(f.envs, nil)
+	if f.fail {
+		return 1, "boom", nil
+	}
+	return 0, "", nil
+}
+
+func (f *fakeExec) ContainerExecEnv(_ context.Context, _ string, cmd, env []string, _ io.Writer) (int, string, error) {
+	f.calls = append(f.calls, cmd)
+	f.envs = append(f.envs, env)
 	if f.fail {
 		return 1, "boom", nil
 	}
@@ -110,8 +123,9 @@ func TestMeasureBucketSumsObjectSizes(t *testing.T) {
 }
 
 // TestSeaweedKeyUsesWeedShell asserts the SeaweedFS per-bucket key path execs a
-// weed-shell s3.configure command carrying the scoped bucket + actions, and the
-// new secret never appears in the DSD (it rides the per-op credential).
+// weed-shell s3.configure command carrying the scoped bucket + actions, and that
+// the new secret rides the exec ENVIRONMENT (as $SK), never the process argv
+// (SIGMA-79) — nor the DSD (it comes from the per-op credential).
 func TestSeaweedKeyUsesWeedShell(t *testing.T) {
 	ex := &fakeExec{}
 	r, rep := newRunner(t, ex, OpCredential{RootAccessKey: "sigma", RootSecretKey: "sk", NewSecretKey: "newsecret"})
@@ -125,10 +139,18 @@ func TestSeaweedKeyUsesWeedShell(t *testing.T) {
 		t.Fatalf("report=%+v calls=%v", rep, ex.calls)
 	}
 	joined := strings.Join(ex.calls[0], " ")
-	for _, want := range []string{"weed shell", "s3.configure", "-buckets media", "-access_key bk_abc", "newsecret", "Read,Write"} {
+	for _, want := range []string{"weed shell", "s3.configure", "-buckets media", "-access_key bk_abc", "$SK", "Read,Write"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("weed shell cmd %q missing %q", joined, want)
 		}
+	}
+	// The freshly minted secret must NOT be in argv (ps / /proc/cmdline) — it is
+	// handed to the exec via the environment instead.
+	if strings.Contains(joined, "newsecret") {
+		t.Fatalf("secret leaked into argv: %q", joined)
+	}
+	if env := strings.Join(ex.envs[0], " "); !strings.Contains(env, "SK=newsecret") {
+		t.Fatalf("secret not passed via exec env, got %q", env)
 	}
 }
 

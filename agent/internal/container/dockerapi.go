@@ -643,15 +643,32 @@ func (d *DockerClient) ContainerRemove(ctx context.Context, id string, force boo
 // the agent's engine catalog, never from the DSD, preserving the
 // no-generic-run-shell invariant.
 func (d *DockerClient) ContainerExec(ctx context.Context, containerID string, cmd []string, out io.Writer) (exitCode int, stderrTail string, err error) {
+	return d.containerExec(ctx, containerID, cmd, nil, out)
+}
+
+// ContainerExecEnv is ContainerExec with extra process environment for the exec
+// ("KEY=value" entries). It lets a caller hand a secret to the command via the
+// environment instead of argv, so the value never lands in the container's
+// process cmdline (ps / /proc/*/cmdline) — only /proc/<pid>/environ, which ps
+// does not surface (SIGMA-79).
+func (d *DockerClient) ContainerExecEnv(ctx context.Context, containerID string, cmd, env []string, out io.Writer) (exitCode int, stderrTail string, err error) {
+	return d.containerExec(ctx, containerID, cmd, env, out)
+}
+
+func (d *DockerClient) containerExec(ctx context.Context, containerID string, cmd, env []string, out io.Writer) (exitCode int, stderrTail string, err error) {
 	var created struct {
 		ID string `json:"Id"`
 	}
-	if err := d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/exec", map[string]any{
+	execBody := map[string]any{
 		"AttachStdout": true,
 		"AttachStderr": true,
 		"Tty":          false,
 		"Cmd":          cmd,
-	}, &created); err != nil {
+	}
+	if len(env) > 0 {
+		execBody["Env"] = env
+	}
+	if err := d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/exec", execBody, &created); err != nil {
 		return -1, "", err
 	}
 	body, _ := json.Marshal(map[string]any{"Detach": false, "Tty": false})

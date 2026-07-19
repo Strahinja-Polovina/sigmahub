@@ -270,9 +270,12 @@ func TestRestoreLoadsIntoTargetContainer(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
+	// A restore carries the recorded digest of the snapshot it loads (SIGMA-78);
+	// here it matches the dump the fake restic serves.
+	sum := sha256.Sum256(dump)
 	err := r.opBackupRestore(context.Background(), backupOp(t, KindBackupRestore, opSpec{
 		RunID: "run_8", ResourceID: "res_db", Engine: "postgres", Image: "postgres:16.6",
-		Database: "shop", Username: "sigma",
+		Database: "shop", Username: "sigma", ExpectedSha: hex.EncodeToString(sum[:]),
 		TargetContainer: "sigmahub-res_new", TargetDatabase: "shop_restore", TargetUsername: "sigma",
 	}))
 	if err != nil {
@@ -292,6 +295,52 @@ func TestRestoreLoadsIntoTargetContainer(t *testing.T) {
 	}
 	if !strings.Contains(joined, "shop_restore") {
 		t.Fatalf("load must target the new database:\n%s", joined)
+	}
+}
+
+// TestRestoreRefusesEmptyRecordedDigest is the SIGMA-78 gate: a restore whose
+// run carries no recorded checksum is refused rather than silently loading an
+// unverifiable snapshot into the freshly provisioned target.
+func TestRestoreRefusesEmptyRecordedDigest(t *testing.T) {
+	fd := &fakeDocker{dumpData: []byte("restore payload")}
+	r, rep := testRunner(t, fd)
+	if err := r.opBackupRun(context.Background(), backupOp(t, KindBackupRun, opSpec{
+		RunID: "run_9", ResourceID: "res_db", Container: "sigmahub-res_db",
+		Engine: "postgres", Database: "shop", Username: "sigma",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	err := r.opBackupRestore(context.Background(), backupOp(t, KindBackupRestore, opSpec{
+		RunID: "run_10", ResourceID: "res_db", Engine: "postgres", Image: "postgres:16.6",
+		Database: "shop", Username: "sigma", // ExpectedSha deliberately empty
+		TargetContainer: "sigmahub-res_new", TargetDatabase: "shop_restore", TargetUsername: "sigma",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "no recorded checksum") {
+		t.Fatalf("want refusal on empty digest, got %v", err)
+	}
+	if rep.ok {
+		t.Fatal("empty-digest restore must report failure")
+	}
+	// It must bail before loading into the target: no exec references the target
+	// database (only the earlier backup run's pg_dump of the source is present).
+	for _, c := range fd.execCalls {
+		if strings.Contains(strings.Join(c, " "), "shop_restore") {
+			t.Fatalf("refused restore still touched the target: %v", fd.execCalls)
+		}
+	}
+}
+
+// TestShortShaNeverPanics guards the digest formatter against a malformed (too
+// short) digest, which a raw slice would panic on (SIGMA-78).
+func TestShortShaNeverPanics(t *testing.T) {
+	for _, s := range []string{"", "abc", "0123456789ab", "0123456789abcdef"} {
+		got := shortSha(s)
+		if len(s) < 12 && got != s {
+			t.Fatalf("shortSha(%q) = %q, want %q", s, got, s)
+		}
+		if len(s) >= 12 && len(got) != 12 {
+			t.Fatalf("shortSha(%q) = %q, want 12 chars", s, got)
+		}
 	}
 }
 

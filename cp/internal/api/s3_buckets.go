@@ -131,13 +131,12 @@ func (s *Server) handleAgentS3OpStatus(w http.ResponseWriter, r *http.Request) {
 			s.writeStoreErr(w, err, "s3 op status")
 			return
 		}
-		// A measure op carries its result; record it before the op drops out of
-		// the open set. RecordStorageBytes is a no-op for non-measure ops with
-		// zero measured bytes.
-		if req.MeasuredBytes > 0 {
-			if err := s.store.RecordStorageBytes(r.Context(), srv.ID, req.OpID, req.MeasuredBytes, time.Now()); err != nil {
-				s.log.Error("record storage bytes", "err", err, "op", req.OpID)
-			}
+		// A measure op carries its result; record it — including 0 bytes for a
+		// genuinely empty bucket, so metering sees an explicit daily row rather
+		// than a gap (SIGMA-81). RecordStorageBytes filters to measure ops, so
+		// calling it for every applied op is a no-op for create/quota/delete ops.
+		if err := s.store.RecordStorageBytes(r.Context(), srv.ID, req.OpID, req.MeasuredBytes, time.Now()); err != nil {
+			s.log.Error("record storage bytes", "err", err, "op", req.OpID)
 		}
 	} else {
 		if err := s.store.MarkS3OpFailed(r.Context(), srv.ID, req.OpID, req.Detail); err != nil {
