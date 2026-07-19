@@ -30,8 +30,11 @@ type s3ConfigureSpec struct {
 
 // renderS3ConfigureOps renders a server's open s3 ops. Each op is one DSD op
 // with id "s3cfg:<opId>" so status ingest and the dedicated result report map
-// back to the pending_s3_ops row.
-func renderS3ConfigureOps(ops []store.S3OpSpec) []dsd.Op {
+// back to the pending_s3_ops row. Every s3.configure op talks to the resource's
+// running S3 container over the mesh, so it depends on that container's op when
+// it is rendered in the same document (SIGMA-73) — otherwise the agent could
+// apply a create-bucket before the engine is up and the op fails permanently.
+func renderS3ConfigureOps(ops []store.S3OpSpec, rendered map[string]bool) []dsd.Op {
 	out := make([]dsd.Op, 0, len(ops))
 	for _, o := range ops {
 		spec := s3ConfigureSpec{
@@ -46,7 +49,11 @@ func renderS3ConfigureOps(ops []store.S3OpSpec) []dsd.Op {
 			QuotaBytes: o.QuotaBytes,
 		}
 		b, _ := json.Marshal(spec)
-		out = append(out, dsd.Op{ID: "s3cfg:" + o.OpID, Kind: dsd.KindS3Configure, Spec: b})
+		var deps []string
+		if rendered["res:"+o.ResourceID] {
+			deps = append(deps, "res:"+o.ResourceID)
+		}
+		out = append(out, dsd.Op{ID: "s3cfg:" + o.OpID, Kind: dsd.KindS3Configure, DependsOn: deps, Spec: b})
 	}
 	return out
 }

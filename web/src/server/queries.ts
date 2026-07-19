@@ -364,9 +364,11 @@ export type OrgResource = typeof s.resources.$inferSelect & {
   latestDeploy: typeof s.deployments.$inferSelect | null;
 };
 
-/** Nested project → environment → server tree for the deploy wizard target step. */
-export async function getDeployTargets(orgId: string) {
-  const projs = await getProjects(orgId);
+/** Nested project → environment → server tree for the deploy wizard target step.
+ *  `visible` applies the P2-7 project scoping (null = everything) so a
+ *  project-scoped user's target picker only offers granted projects (SIGMA-75). */
+export async function getDeployTargets(orgId: string, visible?: Set<string> | null) {
+  const projs = await getProjects(orgId, visible);
   const orgServers = await getServers(orgId);
   const byId = new Map(orgServers.map((sv) => [sv.id, sv]));
   return Promise.all(
@@ -442,8 +444,14 @@ export async function getResourceDetail(resourceId: string) {
 }
 
 /** Every resource in the org, with project/environment names and its most
- *  recent deployment. Powers the Overview + Resources pages. */
-export async function getOrgResources(orgId: string): Promise<OrgResource[]> {
+ *  recent deployment. Powers the Overview + Resources pages. `visible` applies
+ *  the P2-7 project scoping (null = everything): a project-scoped user must not
+ *  see resources — DB/S3 metadata, deploy history, logs — in projects they were
+ *  never granted, even inside their own org (SIGMA-75). */
+export async function getOrgResources(
+  orgId: string,
+  visible?: Set<string> | null
+): Promise<OrgResource[]> {
   const rows = await db
     .select({
       resource: s.resources,
@@ -454,8 +462,9 @@ export async function getOrgResources(orgId: string): Promise<OrgResource[]> {
     .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
     .innerJoin(s.environments, eq(s.resources.environmentId, s.environments.id))
     .where(eq(s.projects.orgId, orgId));
+  const scoped = visible ? rows.filter((row) => visible.has(row.resource.projectId)) : rows;
   return Promise.all(
-    rows.map(async (row) => {
+    scoped.map(async (row) => {
       const [latest] = await db
         .select()
         .from(s.deployments)

@@ -21,7 +21,7 @@ type DSDStore interface {
 	GetDSD(ctx context.Context, serverID string) (dsd.Signed, error)
 	CurrentDSDVersion(ctx context.Context, serverID string) (int64, error)
 	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage) (bool, error)
-	MarkDestructiveOpApplied(ctx context.Context, id string) error
+	MarkDestructiveOpApplied(ctx context.Context, serverID, id string) error
 }
 
 // DSDWaiter lets the long-poll handler block until a server's DSD changes.
@@ -186,7 +186,7 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 				State string `json:"state"`
 			}
 			if json.Unmarshal(st, &os) == nil && os.State == "applied" {
-				if err := s.dsdStore.MarkDestructiveOpApplied(r.Context(), strings.TrimPrefix(opID, "volrm:")); err != nil {
+				if err := s.dsdStore.MarkDestructiveOpApplied(r.Context(), srv.ID, strings.TrimPrefix(opID, "volrm:")); err != nil {
 					s.log.Error("mark destructive op applied", "err", err, "op", opID)
 				}
 			}

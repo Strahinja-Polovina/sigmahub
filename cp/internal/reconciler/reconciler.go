@@ -134,19 +134,21 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 		}
 		ops = append(ops, renderTraefikOp(serverID, acme, serverDomains))
 	}
+	// The set of op ids rendered so far (the resource graph), so backup and
+	// s3.configure ops can depend on their resource's container op by id when it
+	// is present in the same document.
+	renderedIDs := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		renderedIDs[op.ID] = true
+	}
 	// Backups (P1-11): open runs render as typed ops after the resource graph
 	// so a backup op can depend on its database container op by id.
 	if len(backupRuns) > 0 {
-		renderedIDs := make(map[string]bool, len(ops))
-		for _, op := range ops {
-			renderedIDs[op.ID] = true
-		}
 		ops = append(ops, renderBackupOps(backupRuns, renderedIDs)...)
 	}
-	// SIGMA-65: on-demand S3 bucket/key/quota/measure ops. Identifier-only,
-	// no container dependency (they act on an already-running engine), so they
-	// render after the resource graph in a stable oldest-first order.
-	ops = append(ops, renderS3ConfigureOps(s3Ops)...)
+	// SIGMA-65: on-demand S3 bucket/key/quota/measure ops. Each depends on the
+	// resource's container op (SIGMA-73) so it never runs before the engine is up.
+	ops = append(ops, renderS3ConfigureOps(s3Ops, renderedIDs)...)
 	for _, p := range pending {
 		ops = append(ops, renderVolumeRemoveOp(p))
 	}

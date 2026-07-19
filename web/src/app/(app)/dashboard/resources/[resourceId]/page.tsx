@@ -1,5 +1,5 @@
 import { notFound, redirect } from "next/navigation";
-import { getActiveOrgId, requireMembership } from "@/server/active-org";
+import { getActiveOrgId, requireMembership, visibleProjects } from "@/server/active-org";
 import { getResourceDetail } from "@/server/queries";
 import { effectiveSecrets } from "@/server/secrets-data";
 import {
@@ -160,7 +160,12 @@ export default async function ResourceDetailPage({
 
   // Managing secrets (create/reveal/delete) is Project Admin+, matching the CP
   // route gates; a Developer sees masked metadata only.
-  const { role } = await requireMembership(orgId);
+  const { user, role } = await requireMembership(orgId);
+  // P2-7 read scoping: a project-scoped user must not open a resource in a
+  // project they were never granted, even inside their own org — this page
+  // exposes DB/S3 metadata, deploy history and container logs (SIGMA-75).
+  const visible = await visibleProjects(user.id, orgId, role);
+  if (visible && !visible.has(detail.resource.projectId)) notFound();
   const canManage = role === "Org Admin" || role === "Project Admin";
   const secrets = await effectiveSecrets(
     orgId,

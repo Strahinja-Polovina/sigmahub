@@ -13,6 +13,9 @@ import (
 // becomes one s3.configure op with id "s3cfg:<opId>" and the exact wire fields
 // the agent unmarshals — and NO secret ever appears in the rendered JSON.
 func TestRenderS3ConfigureOps(t *testing.T) {
+	// The resource's container op is present in this document, so every
+	// s3.configure op must depend on it (SIGMA-73).
+	rendered := map[string]bool{"res:res_s3": true}
 	ops := renderS3ConfigureOps([]store.S3OpSpec{
 		{
 			OpID: "s3op_1", ResourceID: "res_s3", Engine: "minio",
@@ -29,7 +32,7 @@ func TestRenderS3ConfigureOps(t *testing.T) {
 			Container: dsd.ContainerName("res_s3"), Endpoint: "http://10.8.0.5:15001",
 			Action: "set-quota", Bucket: "media", QuotaBytes: 1 << 30,
 		},
-	})
+	}, rendered)
 	if len(ops) != 3 {
 		t.Fatalf("got %d ops, want 3", len(ops))
 	}
@@ -37,6 +40,10 @@ func TestRenderS3ConfigureOps(t *testing.T) {
 	create, ok := opByID(ops, "s3cfg:s3op_1")
 	if !ok {
 		t.Fatal("missing create-bucket op (id must be s3cfg:<opId>)")
+	}
+	// Depends on the resource's container op so it never runs before the engine.
+	if len(create.DependsOn) != 1 || create.DependsOn[0] != "res:res_s3" {
+		t.Fatalf("create op deps = %v, want [res:res_s3]", create.DependsOn)
 	}
 	if create.Kind != dsd.KindS3Configure {
 		t.Fatalf("kind = %q, want %q", create.Kind, dsd.KindS3Configure)

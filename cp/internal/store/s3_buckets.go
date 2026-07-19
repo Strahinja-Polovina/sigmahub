@@ -426,17 +426,37 @@ func (s *Store) MarkS3OpApplied(ctx context.Context, serverID, opID, detail stri
 // BOLA-scoped to the op's server. ErrNotFound when the op is missing or already
 // settled.
 func (s *Store) MarkS3OpFailed(ctx context.Context, serverID, opID, detail string) error {
-	ct, err := s.Pool.Exec(ctx, `
-		UPDATE pending_s3_ops SET failed_at = now(), detail = left($3, 4000)
-		 WHERE id = $1 AND server_id = $2 AND applied_at IS NULL AND failed_at IS NULL`,
-		opID, serverID, detail)
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if ct.RowsAffected() == 0 {
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var orgID, resourceID, action, bucket string
+	err = tx.QueryRow(ctx, `
+		UPDATE pending_s3_ops SET failed_at = now(), detail = left($3, 4000)
+		 WHERE id = $1 AND server_id = $2 AND applied_at IS NULL AND failed_at IS NULL
+		 RETURNING org_id, resource_id, action, bucket`,
+		opID, serverID, detail).Scan(&orgID, &resourceID, &action, &bucket)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	// Unstick the bucket (SIGMA-73): a failed create leaves the row in
+	// 'provisioning' forever with no retry, so surface it as 'failed' — the UI
+	// can then show the error and the user can delete + recreate. A failed
+	// key/quota op leaves the (already-created) bucket untouched.
+	if action == "create-bucket" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE s3_buckets SET status = 'failed'
+			 WHERE org_id = $1 AND resource_id = $2 AND name = $3 AND status = 'provisioning'`,
+			orgID, resourceID, bucket); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // FailS3OpFromOpStatus is the DSD status-ingest fallback: an op-level failure
@@ -514,7 +534,8 @@ func (s *Store) SweepS3Measure(ctx context.Context, now time.Time) (int, error) 
 	for _, m := range work {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO pending_s3_ops (id, org_id, server_id, resource_id, engine, action, bucket, created_by)
-			VALUES ($1, $2, $3, $4, $5, 'measure', $6, 'system')`,
+			VALUES ($1, $2, $3, $4, $5, 'measure', $6, 'system')
+			ON CONFLICT (resource_id, bucket, ((created_at AT TIME ZONE 'UTC')::date)) WHERE action = 'measure' DO NOTHING`,
 			newID("s3op"), m.orgID, m.serverID, m.resourceID, m.engine, m.bucket); err != nil {
 			return 0, err
 		}
