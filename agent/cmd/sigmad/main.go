@@ -473,17 +473,25 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 			continue
 		}
 
+		// Converge actual state to the document BEFORE applying its ops: reap
+		// managed containers this DSD no longer describes (e.g. a deleted
+		// resource). A resource deletion renders a bare volume.remove with no
+		// container-removal op, and Docker refuses to remove a volume still held by
+		// a running container — so reaping the container first is what lets the
+		// pending volume.remove in this same document succeed instead of failing
+		// 409 and being orphaned until an unrelated change re-renders the DSD
+		// (SIGMA-113). GC never touches a live rollout/recreate generation (those
+		// (resource,service) groups are protected), so reaping first cannot cut a
+		// blue-green swap.
+		if driver != nil {
+			driver.GC(ctx, signed.Document)
+		}
 		results, err := registry.Apply(ctx, log, journal, signed.Document)
 		if err != nil {
 			log.Error("dsd: apply", "err", err, "version", signed.Document.Version)
 			continue
 		}
 		log.Info("dsd applied", "version", signed.Document.Version, "ops", len(results))
-		// Converge actual state to the document: remove managed containers this
-		// DSD no longer describes (e.g. a deleted resource).
-		if driver != nil {
-			driver.GC(ctx, signed.Document)
-		}
 		if err := c.PostDSDStatus(ctx, st.AgentToken, signed.Document.Version, apply.StatusPayload(results)); err != nil {
 			log.Warn("dsd: status report failed", "err", err)
 		}

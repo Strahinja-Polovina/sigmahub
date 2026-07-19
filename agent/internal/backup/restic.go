@@ -144,6 +144,24 @@ func resticForget(ctx context.Context, cred Credential, keepDaily, keepWeekly, k
 	return restic(ctx, cred, nil, io.Discard, args...)
 }
 
+// resticForgetWAL bounds WAL-bundle retention (SIGMA-108). Every WAL bundle is a
+// stdin backup with a UNIQUE stored path (/wal-<ts>.tar), so the repo-wide
+// resticForget — which groups by "host,paths" and keeps at least one snapshot
+// per group — never forgets a single WAL snapshot, growing the repo without
+// bound. Regrouping the "wal"-tagged snapshots by tag collapses them into one
+// group, so --keep-within can drop WAL older than the window. The window is the
+// base-backup keep-daily span, so any base still retained at daily granularity
+// can still roll forward. No --prune here: the caller's resticForget prune
+// reclaims the newly-unreferenced data in a single pass.
+func resticForgetWAL(ctx context.Context, cred Credential, keepDays int) error {
+	if keepDays <= 0 {
+		return nil
+	}
+	return restic(ctx, cred, nil, io.Discard,
+		"forget", "--tag", "wal", "--group-by", "tags",
+		"--keep-within", fmt.Sprintf("%dd", keepDays))
+}
+
 // resticDumpLatest streams the latest LOGICAL-DUMP snapshot's dump file to w.
 // The `--path /<filename>` filter constrains `latest` to snapshots that carry
 // the dump file: a PITR-enabled resource shares one repo across logical dumps,

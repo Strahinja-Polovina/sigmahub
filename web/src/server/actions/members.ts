@@ -27,6 +27,13 @@ function rid(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
 
+/** True for a Postgres unique-violation (SQLSTATE 23505), raised by both
+ *  node-postgres and PGlite. Used to turn a raced insert against a unique
+ *  constraint/index into a friendly domain error. */
+function isUniqueViolation(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: string }).code === "23505";
+}
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /** The org's display name, for the invite email/link copy. */
@@ -78,17 +85,28 @@ export async function inviteMember(input: {
   }
 
   const { raw, hash } = newInviteToken();
-  await db.insert(s.invitations).values({
-    id: rid("inv"),
-    orgId: input.orgId,
-    email,
-    role,
-    projectGrants: serializeProjectGrants(input.projectGrants ?? []),
-    tokenHash: hash,
-    invitedBy: actor.name,
-    status: "pending",
-    expiresAt: new Date(Date.now() + INVITE_TTL_MS),
-  });
+  try {
+    await db.insert(s.invitations).values({
+      id: rid("inv"),
+      orgId: input.orgId,
+      email,
+      role,
+      projectGrants: serializeProjectGrants(input.projectGrants ?? []),
+      tokenHash: hash,
+      invitedBy: actor.name,
+      status: "pending",
+      expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+    });
+  } catch (e) {
+    // The partial unique index (SIGMA-115) rejects a second pending invite for
+    // the same (org, email) that raced past the check above. Surface the same
+    // friendly error and, crucially, do NOT send an email for a row that was
+    // never inserted.
+    if (isUniqueViolation(e)) {
+      throw new Error("An invite is already pending for that email — resend or revoke it first.");
+    }
+    throw e;
+  }
 
   const url = inviteUrl(appBaseUrl(), raw);
   const { delivered } = await sendInviteEmail({ to: email, orgName: await orgName(input.orgId), role, url });
@@ -171,19 +189,24 @@ export async function acceptInvite(input: { token: string }): Promise<{ orgId: s
     }
 
     // Membership first (idempotent) so any project grant has an org membership
-    // to narrow — a project grant is never a backdoor into the org.
-    const [existing] = await tx
-      .select({ id: s.memberships.id })
-      .from(s.memberships)
-      .where(and(eq(s.memberships.orgId, inv.orgId), eq(s.memberships.userId, sessionUser.id)));
-    if (!existing) {
-      await tx.insert(s.memberships).values({
+    // to narrow — a project grant is never a backdoor into the org. The
+    // per-invitation FOR UPDATE lock above only serializes accepts of the SAME
+    // invitation, so two DIFFERENT invitations for the same (org, user) could
+    // both pass a check-then-insert and create duplicate memberships with
+    // divergent roles (SIGMA-111). onConflictDoNothing on the (org_id, user_id)
+    // unique constraint makes the DB the authority: the first accept wins, a
+    // concurrent second is a no-op that keeps the already-materialized role.
+    await tx
+      .insert(s.memberships)
+      .values({
         id: rid("mem"),
         orgId: inv.orgId,
         userId: sessionUser.id,
         role: normalizeOrgRole(inv.role),
+      })
+      .onConflictDoNothing({
+        target: [s.memberships.orgId, s.memberships.userId],
       });
-    }
 
     // Materialize grants, skipping any project that has since been deleted or
     // moved orgs — a stale grant must never block joining the org.

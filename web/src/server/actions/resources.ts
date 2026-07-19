@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { and, eq, ne } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
-import { requireMembership, requireProjectAdminForResource, requireProjectRole } from "../active-org";
+import { requireProjectAdminForResource, requireProjectRole } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import {
@@ -23,14 +23,6 @@ function rid(prefix: string) {
 }
 function sha7() {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 7);
-}
-
-async function assertResourceMembership(resourceId: string) {
-  const resource = await getResource(resourceId);
-  if (!resource) throw new Error("Resource not found.");
-  const project = await getProject(resource.projectId);
-  const membership = project ? await requireMembership(project.orgId) : null;
-  return { resource, orgId: project?.orgId ?? null, actor: membership?.user ?? null };
 }
 
 /** Deploy-from-Git result: create a resource and its first (running) deployment. */
@@ -131,13 +123,21 @@ export async function createResource(input: {
 
 /** Kick off a redeploy: a new deployment enters the pipeline as `queued`. */
 export async function deployResource(input: { resourceId: string }) {
-  const { resource, orgId, actor } = await assertResourceMembership(input.resourceId);
+  const resource = await getResource(input.resourceId);
+  if (!resource) throw new Error("Resource not found.");
+  const project = await getProject(resource.projectId);
+  if (!project) throw new Error("Resource not found.");
+  const orgId = project.orgId;
+  // Require effective Project Admin on the resource's project in BOTH modes
+  // (SIGMA-114). Previously this gate lived only inside the cpEnabled branch, so
+  // the demo fall-through queued a redeploy after nothing more than an org
+  // membership check — a project-scoped user with no grant could drive it.
+  const { user, role } = await requireProjectAdminForResource(orgId, input.resourceId);
   // CP mode: queue a real manual redeploy (fresh clone→build→rollout). The CP
   // drives the pipeline status, so there's no client-side simulation to advance.
-  if (cpEnabled() && orgId && actor) {
-    const { role } = await requireProjectAdminForResource(orgId, input.resourceId);
-    const dep = await cpRedeploy(orgId, input.resourceId, { name: actor.name, role });
-    await writeAudit({ orgId, actor: actor.name, action: "Redeployed resource", target: resource.name });
+  if (cpEnabled()) {
+    const dep = await cpRedeploy(orgId, input.resourceId, { name: user.name, role });
+    await writeAudit({ orgId, actor: user.name, action: "Redeployed resource", target: resource.name });
     revalidatePath("/dashboard", "layout");
     revalidatePath(`/dashboard/resources/${input.resourceId}`);
     return { deploymentId: dep.id, cp: true as const };
@@ -159,9 +159,7 @@ export async function deployResource(input: { resourceId: string }) {
     .where(eq(s.resources.id, input.resourceId));
   // Audit only after the redeploy is actually enqueued, so a failed insert
   // can't leave a phantom "Redeployed" row (matches every sibling action).
-  if (orgId && actor) {
-    await writeAudit({ orgId, actor: actor.name, action: "Redeployed resource", target: resource.name });
-  }
+  await writeAudit({ orgId, actor: user.name, action: "Redeployed resource", target: resource.name });
   revalidatePath("/dashboard", "layout");
   revalidatePath(`/dashboard/resources/${input.resourceId}`);
   return { deploymentId: id };
@@ -175,7 +173,15 @@ export async function advanceDeployment(input: { deploymentId: string }) {
     .from(s.deployments)
     .where(eq(s.deployments.id, input.deploymentId));
   if (!dep) return { status: null };
-  await assertResourceMembership(dep.resourceId);
+  // Authorize on the resource's PROJECT, not bare org membership (SIGMA-110):
+  // this drives the deploy state machine (supersedes running builds, flips the
+  // resource to running), so a user scoped away from the resource's project must
+  // not advance it. Mirrors the Project-Admin gate deployResource applies.
+  const resource = await getResource(dep.resourceId);
+  if (!resource) return { status: null };
+  const project = await getProject(resource.projectId);
+  if (!project) return { status: null };
+  await requireProjectAdminForResource(project.orgId, dep.resourceId);
 
   let next: string;
   if (dep.status === "queued") next = "building";

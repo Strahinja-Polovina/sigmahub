@@ -190,6 +190,14 @@ func (r *Runner) opBackupRun(ctx context.Context, op dsd.Op) error {
 		return r.fail(ctx, spec.RunID, fmt.Errorf("post-backup check: %w", err))
 	}
 	if spec.KeepDaily > 0 {
+		// Forget out-of-window WAL bundles first (no prune) so the single prune in
+		// resticForget reclaims their data too — the repo-wide forget can never
+		// prune WAL on its own because each bundle has a unique path (SIGMA-108).
+		if err := resticForgetWAL(ctx, cred, spec.KeepDaily); err != nil {
+			sha := hex.EncodeToString(hasher.Sum(nil))
+			r.report(ctx, spec.RunID, true, snapshotID, sha, "backup ok; WAL retention failed: "+err.Error())
+			return nil
+		}
 		if err := resticForget(ctx, cred, spec.KeepDaily, spec.KeepWeekly, spec.KeepMonthly); err != nil {
 			// Retention failure must not undo a good backup: report success with
 			// the forget error in the detail so the operator sees it.
@@ -404,7 +412,16 @@ func (r *Runner) opBackupVerify(ctx context.Context, op dsd.Op) error {
 	if err != nil {
 		return r.fail(ctx, spec.RunID, err)
 	}
-	if spec.ExpectedSha != "" && sha != spec.ExpectedSha {
+	// Byte-level half. When a digest was recorded, a mismatch is a hard failure.
+	// When none was recorded (SIGMA-109) — the first-day case where verify is
+	// rendered before the backup's dump_sha256 has landed, or a transient window
+	// before the async sha report — we cannot compare, so we run the serving half
+	// but must NOT claim the checksum passed; the detail says so plainly rather
+	// than mislabelling an unverified run "checksum ok".
+	checksumDetail := "checksum ok"
+	if spec.ExpectedSha == "" {
+		checksumDetail = "checksum NOT verified (no recorded digest)"
+	} else if sha != spec.ExpectedSha {
 		return r.fail(ctx, spec.RunID, fmt.Errorf("checksum mismatch: restored %s, recorded %s", shortSha(sha), shortSha(spec.ExpectedSha)))
 	}
 
@@ -462,12 +479,12 @@ func (r *Runner) opBackupVerify(ctx context.Context, op dsd.Op) error {
 	if err != nil {
 		return r.fail(ctx, spec.RunID, err)
 	}
-	detail := "checksum ok; scratch load ok"
+	detail := checksumDetail + "; scratch load ok"
 	if probe != "" {
 		detail += "; probe=" + probe
 	}
 	r.report(ctx, spec.RunID, true, "", sha, detail)
-	r.log.Info("restore-verify passed", "run", spec.RunID, "resource", spec.ResourceID)
+	r.log.Info("restore-verify passed", "run", spec.RunID, "resource", spec.ResourceID, "checksum", checksumDetail)
 	return nil
 }
 

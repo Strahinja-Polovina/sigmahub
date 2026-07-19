@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
@@ -114,9 +115,24 @@ type paddleEventData struct {
 	CustomerID string          `json:"customer_id"`
 	Status     string          `json:"status"`
 	CustomData json.RawMessage `json:"custom_data"`
-	Items      []struct {
+	// SubscriptionID is set on transaction.* events, where `id` is the
+	// transaction id (txn_…) rather than the subscription id (sub_…) — SIGMA-103.
+	SubscriptionID string `json:"subscription_id"`
+	Items          []struct {
 		Quantity int `json:"quantity"`
 	} `json:"items"`
+}
+
+// paddleSubscriptionID returns the subscription id (sub_…) for an event. For
+// subscription.* events the subscription IS the data object, so `id` is correct;
+// for transaction.* events `id` is the transaction id and the subscription id
+// lives in `subscription_id`. Using `id` blindly (SIGMA-103) would overwrite the
+// org's stored subscription id with a txn_… on every payment-failed event.
+func paddleSubscriptionID(ev paddleEvent) string {
+	if strings.HasPrefix(ev.EventType, "transaction.") {
+		return ev.Data.SubscriptionID
+	}
+	return ev.Data.ID
 }
 
 // handlePaddleWebhook verifies the Paddle-Signature and applies subscription
@@ -171,7 +187,7 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 	applied, err := s.billing.ApplyPaddleWebhook(r.Context(), ev.EventID, "paddle", ev.EventType, orgID, store.BillingStatus{
 		OrgID:          orgID,
 		CustomerID:     ev.Data.CustomerID,
-		SubscriptionID: ev.Data.ID,
+		SubscriptionID: paddleSubscriptionID(ev),
 		Status:         status,
 		Quantity:       qty,
 	}, "paddle-webhook", occurredAt)

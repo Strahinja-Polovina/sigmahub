@@ -128,18 +128,28 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 
 	// Lock the row so concurrent reconciles (event + resync) serialize and the
 	// version never regresses or duplicates.
-	var curVersion int64
+	var curVersion, appliedVersion int64
 	var curHash string
+	var applyOK bool
 	err = tx.QueryRow(ctx, `
 		INSERT INTO server_dsd (server_id, org_id, version, doc_hash)
 		VALUES ($1, $2, 0, '')
 		ON CONFLICT (server_id) DO UPDATE SET server_id = server_dsd.server_id
-		RETURNING version, doc_hash`,
-		serverID, orgID).Scan(&curVersion, &curHash)
+		RETURNING version, doc_hash, applied_version, apply_ok`,
+		serverID, orgID).Scan(&curVersion, &curHash, &appliedVersion, &applyOK)
 	if err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("lock dsd row: %w", err)
 	}
-	if curHash == docHash && curVersion > 0 {
+	// Suppress re-issue when the desired ops are unchanged — UNLESS the last
+	// applied version did not fully converge (SIGMA-104). A failed/skipped op
+	// leaves apply_ok false; re-issuing the same ops as a new version is what
+	// makes the agent retry, since it only applies versions greater than the one
+	// it last saw. We re-issue only once the agent has CAUGHT UP to the current
+	// version (applied_version == curVersion) and reported a failure for it — if
+	// an apply is still in flight (applied_version < curVersion) the ops may yet
+	// succeed, so re-issuing then would churn the version mid-apply.
+	converged := applyOK || appliedVersion < curVersion
+	if curHash == docHash && curVersion > 0 && converged {
 		return dsd.Signed{}, false, tx.Commit(ctx)
 	}
 
@@ -153,9 +163,11 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	if err != nil {
 		return dsd.Signed{}, false, err
 	}
+	// apply_ok resets to true for the freshly issued version (it is not yet known
+	// to have failed); the agent's next status report sets it authoritatively.
 	if _, err := tx.Exec(ctx, `
 		UPDATE server_dsd
-		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, updated_at = now()
+		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, apply_ok = true, updated_at = now()
 		 WHERE server_id = $1`,
 		serverID, next, docJSON, sig, docHash); err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("update dsd: %w", err)
@@ -243,9 +255,13 @@ func (s *Store) MarkDestructiveOpApplied(ctx context.Context, serverID, id strin
 	return err
 }
 
-// AllServerIDs lists every non-deleted server id, for the periodic resync.
+// AllServerIDs lists every non-deleted server id, for the periodic resync. The
+// deleted_at filter is load-bearing (SIGMA-107): DeleteServer is a soft-delete
+// tombstone and there is no hard delete, so without it the resync would
+// reconcile every server ever deleted on each cycle — each failing at
+// HostHardeningForServer (which filters deleted_at) and logging an error.
 func (s *Store) AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, org_id FROM servers ORDER BY created_at`)
+	rows, err := s.Pool.Query(ctx, `SELECT id, org_id FROM servers WHERE deleted_at IS NULL ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -289,8 +305,21 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 	if version < applied || version > issued {
 		return false, tx.Commit(ctx)
 	}
+	// Convergence signal for the resync re-drive (SIGMA-104): the version is fully
+	// applied only if every reported op is "applied". A "failed" or "skipped" op
+	// clears apply_ok so StoreDSD re-issues the same ops (a retry) on the next
+	// reconcile instead of treating the server as converged forever.
+	applyOK := true
+	for _, st := range opStatus {
+		var s struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(st, &s); err == nil && (s.State == "failed" || s.State == "skipped") {
+			applyOK = false
+		}
+	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE server_dsd SET applied_version = $2 WHERE server_id = $1`, serverID, version); err != nil {
+		`UPDATE server_dsd SET applied_version = $2, apply_ok = $3 WHERE server_id = $1`, serverID, version, applyOK); err != nil {
 		return false, err
 	}
 	for resourceID, st := range opStatus {
