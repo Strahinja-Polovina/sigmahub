@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectRole } from "../active-org";
+import { requireMembership, requireProjectRole, assertProjectVisible } from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -13,6 +13,7 @@ import {
   cpDisconnectRepo,
   cpSetPreviews,
   cpListPreviews,
+  cpGetGitConnection,
   cpGitAppInfo,
   cpLinkInstallation,
   type CpGitAppInfo,
@@ -28,6 +29,17 @@ function ensureCp() {
   if (!cpEnabled()) {
     throw new Error("Git integration requires the control plane (set SIGMAHUB_CP_URL).");
   }
+}
+
+/** Resolve a git connection to its REAL project (from the CP, not the
+ *  client-supplied projectId) and require Project Admin there — closing the
+ *  cross-project IDOR where a scoped Project Admin of project A passed A's
+ *  projectId but B's connectionId (SIGMA-93). Returns the actor, the resolved
+ *  project, and the connection's branch maps (for map-addressed callers). */
+async function requireConnectionAdmin(orgId: string, connectionId: string) {
+  const { connection, branchMaps } = await cpGetGitConnection(orgId, connectionId);
+  const { user, role } = await requireProjectRole(orgId, connection.projectId, "Project Admin");
+  return { user, role, projectId: connection.projectId, branchMaps };
 }
 
 /** Preview the deploy config sigmahub detects for a repo. Read-only; any member
@@ -80,7 +92,8 @@ export async function setBranchMapping(input: {
   policy: "auto" | "manual";
 }): Promise<CpBranchMap> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  // Authorize on the connection's real project (SIGMA-93), not the client's.
+  const { user, role } = await requireConnectionAdmin(input.orgId, input.connectionId);
   const branch = input.branch.trim();
   if (!branch) throw new Error("Branch is required.");
   const m = await cpSetBranchMap(
@@ -103,11 +116,17 @@ export async function setBranchMapping(input: {
 export async function promoteBranch(input: {
   orgId: string;
   projectId: string;
+  connectionId: string;
   mapId: string;
   branch: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  // Authorize on the connection's real project and confirm the map belongs to
+  // that connection, so a map from another project can't be promoted (SIGMA-93).
+  const { user, role, branchMaps } = await requireConnectionAdmin(input.orgId, input.connectionId);
+  if (!branchMaps.some((m) => m.id === input.mapId)) {
+    throw new Error("Branch mapping not found.");
+  }
   await cpPromoteBranch(input.orgId, input.mapId, { name: user.name, role });
   await writeAudit({
     orgId: input.orgId,
@@ -121,10 +140,14 @@ export async function promoteBranch(input: {
 export async function removeBranchMapping(input: {
   orgId: string;
   projectId: string;
+  connectionId: string;
   mapId: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const { user, role, branchMaps } = await requireConnectionAdmin(input.orgId, input.connectionId);
+  if (!branchMaps.some((m) => m.id === input.mapId)) {
+    throw new Error("Branch mapping not found.");
+  }
   await cpDeleteBranchMap(input.orgId, input.mapId, { name: user.name, role });
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Removed branch mapping", target: input.mapId });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
@@ -137,7 +160,7 @@ export async function disconnectRepo(input: {
   repoFullName: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const { user, role } = await requireConnectionAdmin(input.orgId, input.connectionId);
   await cpDisconnectRepo(input.orgId, input.connectionId, { name: user.name, role });
   await writeAudit({
     orgId: input.orgId,
@@ -158,7 +181,7 @@ export async function setPreviews(input: {
   serverId?: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const { user, role } = await requireConnectionAdmin(input.orgId, input.connectionId);
   await cpSetPreviews(
     input.orgId,
     input.connectionId,
@@ -180,7 +203,11 @@ export async function listPreviews(input: {
   connectionId: string;
 }): Promise<CpPreviewEnvironment[]> {
   ensureCp();
-  await requireMembership(input.orgId);
+  // P2-7 read scoping (SIGMA-93): resolve the connection's project and require
+  // the caller can see it, so a scoped user can't read another project's preview
+  // environments by connection id.
+  const { connection } = await cpGetGitConnection(input.orgId, input.connectionId);
+  await assertProjectVisible(input.orgId, connection.projectId);
   return cpListPreviews(input.orgId, input.connectionId);
 }
 
@@ -200,7 +227,7 @@ export async function linkInstallation(input: {
   installationId: string;
 }): Promise<void> {
   ensureCp();
-  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const { user, role } = await requireConnectionAdmin(input.orgId, input.connectionId);
   await cpLinkInstallation(input.orgId, input.connectionId, input.installationId, {
     name: user.name,
     role,

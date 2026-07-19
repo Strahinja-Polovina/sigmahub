@@ -188,12 +188,25 @@ func (f *fakeDomain) IdempotencyLookup(_ context.Context, orgID, key string) (st
 	}
 	return store.IdempotentResponse{}, store.ErrNotFound
 }
-func (f *fakeDomain) IdempotencySave(_ context.Context, orgID, key string, in store.IdempotentResponse) (store.IdempotentResponse, error) {
+func (f *fakeDomain) IdempotencyClaim(_ context.Context, orgID, key string, reqHash []byte) (bool, store.IdempotentResponse, error) {
 	if f.idem == nil {
 		f.idem = map[string]store.IdempotentResponse{}
 	}
-	f.idem[orgID+"/"+key] = in
-	return in, nil
+	k := orgID + "/" + key
+	if r, ok := f.idem[k]; ok {
+		return false, r, nil
+	}
+	f.idem[k] = store.IdempotentResponse{RequestHash: reqHash} // pending (Done=false)
+	return true, store.IdempotentResponse{}, nil
+}
+func (f *fakeDomain) IdempotencyFinalize(_ context.Context, orgID, key string, statusCode int, response []byte) error {
+	k := orgID + "/" + key
+	f.idem[k] = store.IdempotentResponse{RequestHash: f.idem[k].RequestHash, StatusCode: statusCode, Response: response, Done: true}
+	return nil
+}
+func (f *fakeDomain) IdempotencyRelease(_ context.Context, orgID, key string) error {
+	delete(f.idem, orgID+"/"+key)
+	return nil
 }
 func (f *fakeDomain) IssueServiceToken(_ context.Context, orgID, name string, role store.Role, _ string) (string, store.ServicePrincipal, error) {
 	return "sst_provisioned", store.ServicePrincipal{ID: "st_p", OrgID: orgID, Name: name, Role: role}, nil

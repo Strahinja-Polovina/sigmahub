@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"io"
 	"net/http"
 
@@ -34,35 +33,60 @@ func (s *Server) idempotent(next http.HandlerFunc) http.HandlerFunc {
 		sum := sha256.Sum256(append([]byte(r.Method+" "+r.URL.Path+"\n"), body...))
 		reqHash := sum[:]
 
-		if stored, err := s.domain.IdempotencyLookup(r.Context(), orgID, key); err == nil {
-			replayStored(w, stored, reqHash)
-			return
-		} else if !errors.Is(err, store.ErrNotFound) {
-			s.log.Error("idempotency lookup", "err", err)
+		// Claim the key BEFORE executing (SIGMA-92): without an up-front claim,
+		// two CONCURRENT requests with the same key both pass the lookup and both
+		// run the mutation. Claiming atomically reserves the key so only the winner
+		// executes; a concurrent duplicate replays (if finished) or is told to
+		// retry (if still in flight).
+		claimed, existing, err := s.domain.IdempotencyClaim(r.Context(), orgID, key, reqHash)
+		if err != nil {
+			s.log.Error("idempotency claim", "err", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
+		if !claimed {
+			if !bytes.Equal(existing.RequestHash, reqHash) {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": "Idempotency-Key was already used with a different request",
+				})
+				return
+			}
+			if existing.Done {
+				replayStored(w, existing, reqHash)
+				return
+			}
+			// The same request is still in flight under this key — don't execute
+			// it a second time; tell the client to retry for the stored response.
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "a request with this Idempotency-Key is already in progress; retry shortly",
+			})
+			return
+		}
+
+		// This caller owns the claim. Release it if the handler doesn't finalize
+		// (a 5xx or a panic) so a retry can re-execute instead of being wedged
+		// "in progress".
+		finalized := false
+		defer func() {
+			if !finalized {
+				_ = s.domain.IdempotencyRelease(context.WithoutCancel(r.Context()), orgID, key)
+			}
+		}()
 
 		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 		next(rec, r)
 
-		// Persist only definitive outcomes; 5xx should be retryable.
+		// Persist only definitive outcomes; 5xx should be retryable (→ released).
 		if rec.status < 500 {
-			// WithoutCancel: a client disconnect/timeout mid-handler — the
-			// exact case idempotency guards — must not skip persisting the
-			// key, or the retry re-executes the mutation.
-			stored, err := s.domain.IdempotencySave(context.WithoutCancel(r.Context()), orgID, key, store.IdempotentResponse{
-				RequestHash: reqHash,
-				StatusCode:  rec.status,
-				Response:    rec.buf.Bytes(),
-			})
-			if err != nil {
-				s.log.Error("idempotency save", "err", err)
+			// WithoutCancel: a client disconnect/timeout mid-handler — the exact
+			// case idempotency guards — must not skip persisting the response, or
+			// the retry re-executes the mutation.
+			if err := s.domain.IdempotencyFinalize(context.WithoutCancel(r.Context()), orgID, key, rec.status, rec.buf.Bytes()); err != nil {
+				s.log.Error("idempotency finalize", "err", err)
 				return
 			}
-			// A concurrent duplicate may have won the insert; both callers
-			// still converge on one stored response (already written here).
-			_ = stored
+			finalized = true
 		}
 	}
 }

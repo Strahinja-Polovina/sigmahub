@@ -203,11 +203,14 @@ export function BillingView({
   const { unitPrice, freeTier, currency } = billing;
   const fc = (a: number, cents = false) => money(a, currency, cents);
 
-  const connectedServers = servers.filter((s) => s.status !== "provisioning");
+  // Billing counts RUNNING servers only — the CP/Paddle charge basis (SIGMA-91).
+  // gross (invoiceTotal) − free-tier credit == billing.amount (Total due), so the
+  // preview stays internally consistent above the free tier.
+  const connectedServers = servers.filter((s) => s.status === "running");
   const provisioningCount = servers.length - connectedServers.length;
   const freeUsed = Math.min(billing.connected, freeTier);
   const freeRemaining = Math.max(0, freeTier - billing.connected);
-  const billableCount = billing.isFree ? 0 : billing.connected;
+  const billableCount = Math.max(0, billing.connected - freeTier);
   const invoiceTotal = connectedServers.length * unitPrice;
 
   return (
@@ -399,7 +402,7 @@ export function BillingView({
                   {fc(invoiceTotal, true)}
                 </TableCell>
               </TableRow>
-              {billing.isFree && invoiceTotal > 0 && (
+              {freeUsed > 0 && invoiceTotal > 0 && (
                 <TableRow>
                   <TableCell colSpan={4} className="pl-4 text-muted-foreground">
                     Free tier credit ({freeUsed} × {fc(unitPrice)})

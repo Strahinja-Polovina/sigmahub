@@ -145,7 +145,8 @@ func (s *Store) UpsertSubscription(ctx context.Context, orgID string, in Billing
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor); err != nil {
+	// Direct (non-webhook) callers are always the newest word, so stamp now.
+	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor, time.Now()); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -157,7 +158,7 @@ func (s *Store) UpsertSubscription(ctx context.Context, orgID string, in Billing
 // back, so Paddle's retry re-applies the event instead of it being permanently
 // dropped as a "duplicate" (SIGMA-90). Returns applied=false for a delivery that
 // was already recorded (a genuine redelivery).
-func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in BillingStatus, actor string) (bool, error) {
+func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in BillingStatus, actor string, occurredAt time.Time) (bool, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -175,7 +176,7 @@ func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, ev
 		// Already recorded — commit the (no-op) tx and report duplicate.
 		return false, tx.Commit(ctx)
 	}
-	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor); err != nil {
+	if err := s.upsertSubscriptionTx(ctx, tx, orgID, in, actor, occurredAt); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
@@ -183,25 +184,33 @@ func (s *Store) ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, ev
 
 // upsertSubscriptionTx applies subscription state within the caller's tx (shared
 // by UpsertSubscription and ApplyPaddleWebhook).
-func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID string, in BillingStatus, actor string) error {
+func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID string, in BillingStatus, actor string, occurredAt time.Time) error {
 	var prevStatus string
-	err := tx.QueryRow(ctx, `SELECT status FROM org_billing WHERE org_id = $1`, orgID).Scan(&prevStatus)
+	var prevEventAt *time.Time
+	err := tx.QueryRow(ctx, `SELECT status, last_event_at FROM org_billing WHERE org_id = $1`, orgID).Scan(&prevStatus, &prevEventAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		prevStatus = "none"
 	} else if err != nil {
 		return err
 	}
+	// SIGMA-99: ignore an out-of-order (older) delivery — a delayed/retried event
+	// has a distinct delivery id (so it isn't deduped), and applying it would
+	// overwrite newer subscription state and re-fire a stale alert.
+	if prevEventAt != nil && occurredAt.Before(*prevEventAt) {
+		return nil
+	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO org_billing (org_id, paddle_customer_id, paddle_subscription_id, status, quantity, updated_at)
-		VALUES ($1, $2, $3, $4, $5, now())
+		INSERT INTO org_billing (org_id, paddle_customer_id, paddle_subscription_id, status, quantity, last_event_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now())
 		ON CONFLICT (org_id) DO UPDATE SET
 			paddle_customer_id     = EXCLUDED.paddle_customer_id,
 			paddle_subscription_id = EXCLUDED.paddle_subscription_id,
 			status                 = EXCLUDED.status,
 			quantity               = EXCLUDED.quantity,
+			last_event_at          = EXCLUDED.last_event_at,
 			updated_at             = now()`,
-		orgID, in.CustomerID, in.SubscriptionID, in.Status, in.Quantity); err != nil {
+		orgID, in.CustomerID, in.SubscriptionID, in.Status, in.Quantity, occurredAt); err != nil {
 		return err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Subscription "+in.Status, in.SubscriptionID); err != nil {

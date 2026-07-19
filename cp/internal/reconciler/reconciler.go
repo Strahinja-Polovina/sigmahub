@@ -32,6 +32,8 @@ type Store interface {
 	BackupRunsForServer(ctx context.Context, serverID string) ([]store.BackupRunSpec, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
+	// LockServerReconcile serializes reconciles for one server (SIGMA-94).
+	LockServerReconcile(ctx context.Context, serverID string) (func(), error)
 }
 
 // Reconciler renders and versions DSDs and notifies long-poll waiters.
@@ -158,6 +160,13 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 // Reconcile renders a server's DSD; on a real change it bumps the version,
 // signs, persists and wakes any long-poll waiter for that server.
 func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) error {
+	// Serialize reconciles for this server so an older snapshot can't overwrite a
+	// newer DSD (SIGMA-94). Held across the reads AND the StoreDSD write.
+	unlock, err := r.st.LockServerReconcile(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	specs, err := r.st.ResourceSpecsForServer(ctx, serverID)
 	if err != nil {
 		return err

@@ -6,12 +6,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 )
+
+// LockServerReconcile takes a cluster-wide advisory lock that serializes DSD
+// reconciles for one server, so two overlapping reconciles (a nudge racing the
+// 60s resync, or multiple replicas) can't lost-update the document to a stale
+// snapshot — the later-committing reconcile might otherwise hold an OLDER read
+// (SIGMA-94). Returns an unlock func that releases the lock and the held
+// connection; call it (deferred) when the reconcile finishes.
+func (s *Store) LockServerReconcile(ctx context.Context, serverID string) (func(), error) {
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('reconcile:' || $1))`, serverID); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		// Best-effort unlock on a fresh context (the reconcile ctx may be done).
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext('reconcile:' || $1))`, serverID)
+		conn.Release()
+	}, nil
+}
 
 const dsdSigningKeyName = "dsd_signing_key"
 
@@ -178,9 +203,9 @@ func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]
 // PendingDestructiveOp is a confirmed destructive action awaiting agent
 // application, rendered into the server's DSD until applied.
 type PendingDestructiveOp struct {
-	ID      string
-	OpKind  string
-	Target  string
+	ID     string
+	OpKind string
+	Target string
 }
 
 // PendingDestructiveOpsForServer returns a server's still-unapplied destructive

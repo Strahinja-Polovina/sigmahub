@@ -250,6 +250,15 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 			w.sink(w.ctx, w.deploymentID, "build", line)
 		}
 	}
+	// Backstop: a very long line with no newline (a hostile/broken Dockerfile can
+	// emit gigabytes) is flushed in chunks rather than growing the buffer without
+	// bound and OOM-ing the agent — mirrors logLineSplitter (SIGMA-98).
+	if len(w.buf) > 64*1024 {
+		if line := strings.TrimRight(string(w.buf), "\r"); line != "" {
+			w.sink(w.ctx, w.deploymentID, "build", line)
+		}
+		w.buf = nil
+	}
 	return len(p), nil
 }
 
