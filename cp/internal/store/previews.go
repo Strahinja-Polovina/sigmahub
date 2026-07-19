@@ -129,6 +129,29 @@ func ensurePreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumbe
 	if conn.PreviewServerID == "" {
 		return "", "", ErrInvalid{Msg: "previews enabled but no preview server designated"}
 	}
+	// The preview server must still be LIVE and able to run an app resource — the
+	// same invariants CreateResource enforces. Without this an ephemeral app is
+	// scheduled onto a tombstoned server (deleted_at set, agent token revoked → it
+	// never deploys) — SIGMA-127 — or onto a wrong-type host (a dedicated
+	// database/storage server), bypassing the availability matrix — SIGMA-128.
+	var previewType string
+	if err := tx.QueryRow(ctx,
+		`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`,
+		conn.OrgID, conn.PreviewServerID).Scan(&previewType); errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrInvalid{Msg: "preview server is unavailable (deleted or not found)"}
+	} else if err != nil {
+		return "", "", err
+	}
+	allowedApp := false
+	for _, t := range AllowedServerTypes("app") {
+		if t == previewType {
+			allowedApp = true
+			break
+		}
+	}
+	if !allowedApp {
+		return "", "", ErrInvalid{Msg: fmt.Sprintf("preview server type %q cannot run app resources", previewType)}
+	}
 	envID = newID("env")
 	envName := fmt.Sprintf("pr-%d", prNumber)
 	if _, err := tx.Exec(ctx, `

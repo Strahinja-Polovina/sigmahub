@@ -5,9 +5,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
+	"github.com/jackc/pgx/v5"
 )
 
 const tokenPepperName = "token_pepper"
@@ -16,10 +17,28 @@ const tokenPepperName = "token_pepper"
 // audit log. KMS operations are system-scoped, so they land under org 'system'.
 func (s *Store) AuditUnwrapSink() kms.AuditSink {
 	return func(ctx context.Context, ev kms.AuditEvent) error {
-		_, err := s.Pool.Exec(ctx, `
-			INSERT INTO cp_audit_log (org_id, actor, action, target)
-			VALUES ('system', 'kms', 'Key unwrapped', $1)`, ev.Purpose)
-		return err
+		// Write the audit row ASYNCHRONOUSLY (SIGMA-126). custody.Unwrap runs inside
+		// callers that hold an open transaction (e.g. ResolveSecretsForResource holds
+		// a read tx across every DEK unwrap), and this insert needs its OWN pool
+		// connection. A synchronous insert here would acquire a second connection
+		// while the caller still holds the first, so a cold-cache DEK-unwrap
+		// thundering herd (CP restart, many agents resolving the same org's secrets)
+		// would pin every pool connection on held txs while each waits for one more
+		// for its audit write — a pool-exhaustion deadlock. Firing it in the
+		// background lets the unwrap return immediately (the caller's tx commits and
+		// frees its connection), and the audit insert acquires a connection once one
+		// is free. Audit here is a best-effort log, not a barrier to the unwrap.
+		purpose := ev.Purpose
+		go func() {
+			wctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			// Best-effort: the unwrap has already succeeded; a failed audit insert
+			// must not surface as an error (there is no caller to return it to).
+			_, _ = s.Pool.Exec(wctx, `
+				INSERT INTO cp_audit_log (org_id, actor, action, target)
+				VALUES ('system', 'kms', 'Key unwrapped', $1)`, purpose)
+		}()
+		return nil
 	}
 }
 
