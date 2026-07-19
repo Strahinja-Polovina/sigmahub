@@ -28,6 +28,7 @@ type Store interface {
 	DeployTargetsForServer(ctx context.Context, serverID string) (map[string]store.DeployTarget, error)
 	DBTargetsForServer(ctx context.Context, serverID string) (map[string]store.DBTarget, error)
 	S3TargetsForServer(ctx context.Context, serverID string) (map[string]store.S3Target, error)
+	PendingS3OpsForServer(ctx context.Context, serverID string) ([]store.S3OpSpec, error)
 	BackupRunsForServer(ctx context.Context, serverID string) ([]store.BackupRunSpec, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
@@ -59,7 +60,7 @@ func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
 // address; the remaining kinds (s3/llm) keep the P1-2 no-op "resource.sync"
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, backupRuns []store.BackupRunSpec, acme ACMEConfig) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
@@ -142,6 +143,10 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 		}
 		ops = append(ops, renderBackupOps(backupRuns, renderedIDs)...)
 	}
+	// SIGMA-65: on-demand S3 bucket/key/quota/measure ops. Identifier-only,
+	// no container dependency (they act on an already-running engine), so they
+	// render after the resource graph in a stable oldest-first order.
+	ops = append(ops, renderS3ConfigureOps(s3Ops)...)
 	for _, p := range pending {
 		ops = append(ops, renderVolumeRemoveOp(p))
 	}
@@ -187,7 +192,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, backupRuns, r.acme)
+	s3Ops, err := r.st.PendingS3OpsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, backupRuns, s3Ops, r.acme)
 	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

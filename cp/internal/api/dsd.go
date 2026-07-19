@@ -200,6 +200,16 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 					s.log.Error("fail backup run from op status", "err", err, "op", opID)
 				}
 			}
+		case strings.HasPrefix(opID, "s3cfg:"):
+			// S3 ops (SIGMA-65): the dedicated /v1/agent/s3-op-status report is the
+			// authoritative success path (it carries measured bytes). This is the
+			// honest fallback for op-level failures (dependency skip, unknown
+			// action) so an op whose handler never executed lands terminal-failed.
+			if os.State == "failed" {
+				if err := s.store.FailS3OpFromOpStatus(r.Context(), srv.ID, strings.TrimPrefix(opID, "s3cfg:"), os.Error); err != nil {
+					s.log.Error("fail s3 op from op status", "err", err, "op", opID)
+				}
+			}
 		}
 	}
 	sort.SliceStable(advances, func(i, j int) bool {

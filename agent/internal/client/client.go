@@ -230,6 +230,35 @@ func (c *Client) PostBackupResult(ctx context.Context, agentToken, runID string,
 	}, nil)
 }
 
+// S3OpCredentialResponse is the per-op material for an s3.configure op (P2-1b):
+// the root credential to authenticate against the resource's S3 container, plus
+// (for create-key) the new per-bucket secret to provision. In-memory only; the
+// CP audits every fetch.
+type S3OpCredentialResponse struct {
+	RootAccessKey string `json:"rootAccessKey"`
+	RootSecretKey string `json:"rootSecretKey"`
+	NewSecretKey  string `json:"newSecretKey"`
+}
+
+// FetchS3OpCredential resolves one open s3.configure op's credential. Scope is
+// derived server-side from the agent token.
+func (c *Client) FetchS3OpCredential(ctx context.Context, agentToken, opID string) (S3OpCredentialResponse, error) {
+	var res S3OpCredentialResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/s3-op-credential?opId="+url.QueryEscape(opID), agentToken, nil, &res)
+	return res, err
+}
+
+// PostS3OpStatus reports an s3.configure op's terminal outcome (measuredBytes is
+// set only for measure ops, feeding storage metering).
+func (c *Client) PostS3OpStatus(ctx context.Context, agentToken, opID string, ok bool, detail string, measuredBytes int64) error {
+	return c.post(ctx, "/v1/agent/s3-op-status", agentToken, map[string]any{
+		"opId":          opID,
+		"ok":            ok,
+		"detail":        detail,
+		"measuredBytes": measuredBytes,
+	}, nil)
+}
+
 // WALTarget is a PITR-enabled resource whose WAL this server ships (P2-5).
 type WALTarget struct {
 	ResourceID string `json:"resourceId"`

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/host"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/s3ops"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/telemetry"
 )
@@ -205,6 +207,35 @@ func run() error {
 		log,
 	)
 	backupRunner.Register(registry)
+	// P2-1b: on-demand S3 bucket/key/quota/measure ops. The root credential is
+	// fetched per-op over the audited channel; bucket CRUD + measurement use the
+	// engine-agnostic S3 API (SigV4), engine-specific admin dispatches per engine.
+	s3Runner := s3ops.NewRunner(
+		&http.Client{Timeout: 60 * time.Second},
+		docker,
+		func(ctx context.Context, opID string) (s3ops.OpCredential, error) {
+			res, err := c.FetchS3OpCredential(ctx, st.AgentToken, opID)
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return s3ops.OpCredential{}, s3ops.ErrOpSettled
+			}
+			if err != nil {
+				return s3ops.OpCredential{}, err
+			}
+			return s3ops.OpCredential{
+				RootAccessKey: res.RootAccessKey,
+				RootSecretKey: res.RootSecretKey,
+				NewSecretKey:  res.NewSecretKey,
+			}, nil
+		},
+		func(ctx context.Context, opID string, ok bool, detail string, measuredBytes int64) {
+			if err := c.PostS3OpStatus(ctx, st.AgentToken, opID, ok, detail, measuredBytes); err != nil {
+				log.Warn("s3 op status post failed", "err", err, "op", opID)
+			}
+		},
+		log,
+	)
+	s3Runner.Register(registry)
 	// Host-hardening ops (P1-5): nftables / sshd / CIS. These mutate the host
 	// itself and require root; the handlers fail cleanly (reported as a failed op)
 	// when sigmad is not root. Registered behind the same apply registry, so an

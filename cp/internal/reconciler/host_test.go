@@ -23,8 +23,8 @@ func TestRenderHostOpsDefault(t *testing.T) {
 		t.Fatal("missing host.nftables op")
 	}
 	var nftSpec struct {
-		AllowPublicSSH bool `json:"allowPublicSSH"`
-		ProxyRole      bool `json:"proxyRole"`
+		AllowPublicSSH bool   `json:"allowPublicSSH"`
+		ProxyRole      bool   `json:"proxyRole"`
 		MeshInterface  string `json:"meshInterface"`
 		ExtraPorts     []struct {
 			Port  int    `json:"port"`

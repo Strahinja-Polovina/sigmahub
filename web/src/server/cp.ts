@@ -1056,6 +1056,59 @@ export async function cpRevealS3Connection(
     undefined, { orgId, actor });
 }
 
+// ── S3 buckets / keys / quotas (P2-1b, SIGMA-65) ────────────────────────────
+
+export type CpBucket = {
+  id: string;
+  resourceId: string;
+  name: string;
+  quotaBytes: number;
+  accessKey: string;
+  status: string;
+};
+
+const bucketsBase = (orgId: string, resourceId: string) =>
+  `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/buckets`;
+
+export async function cpListBuckets(orgId: string, resourceId: string): Promise<CpBucket[]> {
+  const res = await cpFetch<{ buckets: CpBucket[] }>(bucketsBase(orgId, resourceId), undefined, { orgId });
+  return res.buckets ?? [];
+}
+
+export async function cpCreateBucket(
+  orgId: string, resourceId: string, name: string, actor: CpActor
+): Promise<CpBucket> {
+  return cpFetch(bucketsBase(orgId, resourceId), {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  }, { orgId, actor });
+}
+
+export async function cpDeleteBucket(
+  orgId: string, resourceId: string, bucket: string, actor: CpActor
+): Promise<{ status: string }> {
+  return cpFetch(`${bucketsBase(orgId, resourceId)}/${encodeURIComponent(bucket)}`, {
+    method: "DELETE",
+  }, { orgId, actor });
+}
+
+export async function cpSetBucketQuota(
+  orgId: string, resourceId: string, bucket: string, quotaBytes: number, actor: CpActor
+): Promise<{ status: string; quotaBytes: number }> {
+  return cpFetch(`${bucketsBase(orgId, resourceId)}/${encodeURIComponent(bucket)}/quota`, {
+    method: "PUT",
+    body: JSON.stringify({ quotaBytes }),
+  }, { orgId, actor });
+}
+
+export async function cpCreateBucketKey(
+  orgId: string, resourceId: string, bucket: string, actor: CpActor
+): Promise<{ accessKey: string }> {
+  return cpFetch(`${bucketsBase(orgId, resourceId)}/${encodeURIComponent(bucket)}/key`, {
+    method: "POST",
+  }, { orgId, actor });
+}
+
 // ── Alerting (P2-6) ─────────────────────────────────────────────────────────
 
 export type CpAlertChannel = {
