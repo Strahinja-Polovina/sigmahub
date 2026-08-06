@@ -193,9 +193,12 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
 const DB_KINDS = ["postgres", "mysql", "redis", "mongo", "mongodb"];
 
 /** Delete is confirm-gated and typed: it cascades the resource's entire
- *  deployment history, and for a database it also destroys the only copy of its
- *  restic repo key — every sibling destructive action on this page already
- *  confirms, this one used to fire straight from onClick (SIGMA-185). */
+ *  deployment history — every sibling destructive action on this page already
+ *  confirms, this one used to fire straight from onClick (SIGMA-185).
+ *
+ *  A database's restic repo key is no longer destroyed with it: the control
+ *  plane archives the wrapped key before the cascade (SIGMA-170), so the
+ *  snapshots left in the customer's bucket stay openable. */
 function DeleteResourceButton({
   resourceId,
   name,
@@ -240,7 +243,7 @@ function DeleteResourceButton({
           <DialogDescription>
             This removes the resource and its entire deployment history.
             {isDatabase
-              ? " Its backup repository key is destroyed with it, so any snapshots still in your bucket become permanently unreadable."
+              ? " Data volumes and any snapshots already in your bucket are left in place, and the backup encryption key is retained so those snapshots can still be restored."
               : " Data volumes are left in place and must be removed separately."}
           </DialogDescription>
         </DialogHeader>

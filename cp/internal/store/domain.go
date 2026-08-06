@@ -178,6 +178,13 @@ func (s *Store) DeleteProject(ctx context.Context, orgID, projectID, actor strin
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Retain the restic repo keys of every database in this project BEFORE the
+	// cascade removes their backup policies — otherwise the customer's offsite
+	// snapshots survive in their bucket as undecryptable ciphertext (SIGMA-170).
+	if err := archiveRepoKeysTx(ctx, tx, orgID, "project", projectID); err != nil {
+		return fmt.Errorf("archive repo keys: %w", err)
+	}
+
 	var name string
 	err = tx.QueryRow(ctx,
 		`DELETE FROM projects WHERE org_id = $1 AND id = $2 RETURNING name`,
@@ -254,6 +261,12 @@ func (s *Store) DeleteEnvironment(ctx context.Context, orgID, envID, actor strin
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Same key retention as DeleteProject (SIGMA-170) — an environment cascade
+	// takes its resources' backup policies with it.
+	if err := archiveRepoKeysTx(ctx, tx, orgID, "environment", envID); err != nil {
+		return fmt.Errorf("archive repo keys: %w", err)
+	}
 
 	var name string
 	err = tx.QueryRow(ctx,
@@ -511,6 +524,15 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Retain this database's restic repo key before the cascade drops its backup
+	// policy (SIGMA-170). Deleting a resource deliberately leaves its Docker
+	// volumes in place — destroying live bytes needs the two-phase confirm flow —
+	// so destroying the key to its offsite copies with the same unguarded DELETE
+	// was the odd one out.
+	if err := archiveRepoKeysTx(ctx, tx, orgID, "resource", resourceID); err != nil {
+		return "", fmt.Errorf("archive repo keys: %w", err)
+	}
 
 	var (
 		name      string

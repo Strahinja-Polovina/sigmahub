@@ -253,3 +253,77 @@ func TestDailySweepIsIdempotentAcrossRuns(t *testing.T) {
 		t.Fatal("the owning server should mark its own destructive op applied")
 	}
 }
+
+// TestRepoKeySurvivesDelete is the SIGMA-170 regression. The restic repo
+// password lived only on the backup_policies row, which cascades from
+// resources (and thus from projects/environments). Deleting a database — or the
+// project it sat in — destroyed the only key to that customer's offsite
+// snapshots, while the snapshots themselves stayed in their bucket, still
+// billing and now permanently undecryptable. The key must outlive the cascade,
+// and an operator must be able to export it.
+func TestRepoKeySurvivesDelete(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_rk"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "ledger", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://minio.internal:9000", Bucket: "backups",
+		AccessKey: "AKIA123", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := target.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, res.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+		t.Fatal(err)
+	}
+	// A sweep materialises the repo key (ensureRepoKeyTx runs on first schedule).
+	if _, err := st.CreateDueBackupRuns(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := st.ExportRepoKey(ctx, orgID, res.ID, "admin")
+	if err != nil {
+		t.Fatalf("export while live: %v", err)
+	}
+	if before == "" {
+		t.Fatal("exported repo key is empty")
+	}
+
+	if _, err := st.DeleteResource(ctx, orgID, res.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The whole point: the same password still opens the snapshots afterwards.
+	after, err := st.ExportRepoKey(ctx, orgID, res.ID, "admin")
+	if err != nil {
+		t.Fatalf("export after delete: %v", err)
+	}
+	if after != before {
+		t.Fatalf("repo key changed across delete: %q → %q", before, after)
+	}
+
+	archived, err := st.ListArchivedRepoKeys(ctx, orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived) != 1 || archived[0].ResourceID != res.ID {
+		t.Fatalf("archived keys = %+v, want one for %s", archived, res.ID)
+	}
+	if archived[0].ResourceName != "ledger" {
+		t.Errorf("archived resource name = %q, want ledger", archived[0].ResourceName)
+	}
+
+	// A resource that never had a policy has nothing to export — 404, not a
+	// zero-value key that would look like a valid password.
+	if _, err := st.ExportRepoKey(ctx, orgID, "res_nonexistent", "admin"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("export for unknown resource = %v, want ErrNotFound", err)
+	}
+}

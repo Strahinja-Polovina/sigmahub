@@ -267,6 +267,9 @@ func (s *Store) ReencryptSecrets(ctx context.Context, orgID string) (int, error)
 		   AND NOT EXISTS (SELECT 1 FROM s3_credentials  WHERE dek_id            = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM backup_targets  WHERE dek_id            = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM backup_policies WHERE repo_dek_id       = d.id)
+		   -- Archived repo keys outlive their resource by design (SIGMA-170), so
+		   -- they hold their DEK open exactly like a live policy does.
+		   AND NOT EXISTS (SELECT 1 FROM backup_repo_key_archive WHERE repo_dek_id = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM alert_channels  WHERE dek_id            = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM s3_buckets      WHERE key_dek_id        = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM pending_s3_ops  WHERE new_secret_dek_id = d.id)`, orgID); err != nil {
@@ -300,6 +303,10 @@ var dekReencTargets = []dekReencTarget{
 	{"backup_targets", "id", "secret_ciphertext", "secret_nonce", "dek_id", nil,
 		func(o string, id []string) []byte { return targetAAD(o, id[0]) }},
 	{"backup_policies", "id", "repo_key_ciphertext", "repo_key_nonce", "repo_dek_id", nil,
+		func(o string, id []string) []byte { return repoKeyAAD(o, id[0]) }},
+	// Archived repo keys keep their original policy id, so the same AAD opens
+	// them and rotation re-wraps them alongside the live policies (SIGMA-170).
+	{"backup_repo_key_archive", "policy_id", "repo_key_ciphertext", "repo_key_nonce", "repo_dek_id", nil,
 		func(o string, id []string) []byte { return repoKeyAAD(o, id[0]) }},
 	{"alert_channels", "id", "secret_ciphertext", "secret_nonce", "dek_id", nil,
 		func(o string, id []string) []byte { return alertChannelAAD(o, id[0]) }},

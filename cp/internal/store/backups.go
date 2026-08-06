@@ -899,3 +899,127 @@ func (s *Store) FailBackupRunFromOpStatus(ctx context.Context, serverID, runID, 
 	}
 	return err
 }
+
+// archiveRepoKeysTx copies the wrapped restic repo key of every backup policy
+// about to be cascaded away into backup_repo_key_archive, so the customer's
+// offsite snapshots stay decryptable after the resource, project or environment
+// that owned them is deleted (SIGMA-170).
+//
+// scope selects which policies to archive; it is a fragment appended to the
+// WHERE clause and comes from the three call sites below, never from user input.
+// Rows already archived are left alone (ON CONFLICT DO NOTHING): the first
+// archive wins, and a policy id is never reused.
+//
+// Callers MUST run this BEFORE the DELETE that triggers the cascade — afterwards
+// there is nothing left to read.
+func archiveRepoKeysTx(ctx context.Context, tx pgx.Tx, orgID, scope, scopeID string) error {
+	var join string
+	switch scope {
+	case "resource":
+		join = `p.resource_id = $2`
+	case "project":
+		join = `r.project_id = $2`
+	case "environment":
+		join = `r.environment_id = $2`
+	default:
+		return fmt.Errorf("archiveRepoKeys: unknown scope %q", scope)
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO backup_repo_key_archive
+		       (policy_id, org_id, resource_id, resource_name, repo_key_ciphertext, repo_key_nonce, repo_dek_id)
+		SELECT p.id, p.org_id, p.resource_id, r.name, p.repo_key_ciphertext, p.repo_key_nonce, p.repo_dek_id
+		  FROM backup_policies p
+		  JOIN resources r ON r.id = p.resource_id
+		 WHERE p.org_id = $1 AND p.repo_key_ciphertext IS NOT NULL AND `+join+`
+		ON CONFLICT (policy_id) DO NOTHING`, orgID, scopeID)
+	return err
+}
+
+// ArchivedRepoKey is a retained restic repo password for a deleted resource.
+type ArchivedRepoKey struct {
+	PolicyID     string    `json:"policyId"`
+	ResourceID   string    `json:"resourceId"`
+	ResourceName string    `json:"resourceName"`
+	ArchivedAt   time.Time `json:"archivedAt"`
+}
+
+// ListArchivedRepoKeys returns the org's retained repo keys — the deleted
+// databases whose snapshots can still be opened. Metadata only: the password
+// itself comes from ExportRepoKey, which is separately authorized and audited.
+func (s *Store) ListArchivedRepoKeys(ctx context.Context, orgID string) ([]ArchivedRepoKey, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT policy_id, resource_id, resource_name, archived_at
+		  FROM backup_repo_key_archive WHERE org_id = $1
+		 ORDER BY archived_at DESC`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ArchivedRepoKey{}
+	for rows.Next() {
+		var k ArchivedRepoKey
+		if err := rows.Scan(&k.PolicyID, &k.ResourceID, &k.ResourceName, &k.ArchivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// ExportRepoKey returns the PLAINTEXT restic repository password for a
+// resource — the live policy's key if the resource still exists, otherwise the
+// archived one. This is the operator's escape hatch: without it a repo key is
+// only ever handed to an agent for a scheduled run, so an org that lost its
+// control plane (or deleted the resource) had no way to open snapshots it is
+// still paying to store.
+//
+// Every export is audited by resource, because handing out a decryption key is
+// exactly the event an auditor needs to see. Callers must gate it on Org Admin.
+func (s *Store) ExportRepoKey(ctx context.Context, orgID, resourceID, actor string) (string, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		policyID string
+		ct       []byte
+		nonce    []byte
+		dekID    string
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT id, repo_key_ciphertext, repo_key_nonce, repo_dek_id
+		  FROM backup_policies
+		 WHERE org_id = $1 AND resource_id = $2 AND repo_key_ciphertext IS NOT NULL`,
+		orgID, resourceID).Scan(&policyID, &ct, &nonce, &dekID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			SELECT policy_id, repo_key_ciphertext, repo_key_nonce, repo_dek_id
+			  FROM backup_repo_key_archive
+			 WHERE org_id = $1 AND resource_id = $2
+			 ORDER BY archived_at DESC LIMIT 1`,
+			orgID, resourceID).Scan(&policyID, &ct, &nonce, &dekID)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	dek, err := s.dekPlaintext(ctx, tx, dekID)
+	if err != nil {
+		return "", err
+	}
+	key, err := gcmOpen(dek, repoKeyAAD(orgID, policyID), nonce, ct)
+	if err != nil {
+		return "", fmt.Errorf("unwrap repo key: %w", err)
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Backup repo key exported", resourceID); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return string(key), nil
+}
