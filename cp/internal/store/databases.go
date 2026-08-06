@@ -187,7 +187,7 @@ type DBTarget struct {
 func (s *Store) DBTargetsForServer(ctx context.Context, serverID string) (map[string]DBTarget, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT dc.resource_id, dc.engine, dc.username, dc.dbname, dc.port, sv.type,
-		       COALESCE(bp.pitr_enabled, FALSE)
+		       COALESCE(bp.pitr_enabled AND bp.enabled AND bp.target_id IS NOT NULL, FALSE)
 		  FROM db_credentials dc
 		  JOIN servers sv ON sv.id = dc.server_id
 		  LEFT JOIN backup_policies bp ON bp.resource_id = dc.resource_id

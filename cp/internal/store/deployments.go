@@ -94,6 +94,17 @@ func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resour
 	if serverID == "" {
 		return nil
 	}
+	// Serialize concurrent creators of a new deployment for this (server,
+	// resource). Without this, a git-drain and a manual redeploy can each run
+	// their supersede BEFORE the other's insert is visible, both pass, and two
+	// in-flight deployments survive — breaking the at-most-one-in-flight
+	// invariant the op-status path relies on (SIGMA-131). The lock is
+	// transaction-scoped, released only after the caller's INSERT commits, so
+	// the next creator blocks until it can see the freshly-queued row.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		"deploy:"+serverID+":"+resourceID); err != nil {
+		return err
+	}
 	_, err := tx.Exec(ctx, `
 		UPDATE deployments SET
 			status = 'superseded',
@@ -102,6 +113,22 @@ func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resour
 		 WHERE org_id = $1 AND server_id = $2 AND resource_id = $3
 		   AND status IN ('queued','building','deploying')`,
 		orgID, serverID, resourceID)
+	return err
+}
+
+// StampDeploymentDSDVersion records the DSD version that first rendered each of
+// the given in-flight deployments (SIGMA-134). It stamps only rows still in
+// flight and not yet stamped (dsd_version = 0), so a deployment keeps the
+// version it FIRST appeared at even as the DSD re-renders for unrelated changes —
+// which is exactly what lets a late op-status report be recognized as stale.
+func (s *Store) StampDeploymentDSDVersion(ctx context.Context, deploymentIDs []string, version int64) error {
+	if len(deploymentIDs) == 0 || version <= 0 {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `
+		UPDATE deployments SET dsd_version = $2
+		 WHERE id = ANY($1) AND dsd_version = 0
+		   AND status IN ('queued','building','deploying')`, deploymentIDs, version)
 	return err
 }
 
@@ -646,6 +673,7 @@ type DeployTarget struct {
 	ConfigHash   string
 	ImageDigest  string // set for a rollback (reuse a retained image; skip clone/build)
 	Trigger      string
+	Status       string // queued|building|deploying|success (the filtered set below)
 }
 
 // DeployTargetsForServer returns the current deploy target per app resource on a
@@ -656,7 +684,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	rows, err := s.Pool.Query(ctx, `
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger, d.status
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
@@ -671,7 +699,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		var t DeployTarget
 		var ref, sha, cfg, digest *string
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
-			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger); err != nil {
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger, &t.Status); err != nil {
 			return nil, err
 		}
 		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)
@@ -710,17 +738,26 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 // "rollout"; a failure fails the deployment. No-op (ErrNotFound) when there is no
 // in-flight deployment — so it is safe to call for every res:<id> op status,
 // including non-git container.apply resources.
-func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error {
+func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error {
 	var depID, curStatus, gitSHA string
+	var depVersion int64
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, status, COALESCE(git_sha,'') FROM deployments
+		SELECT id, status, COALESCE(git_sha,''), dsd_version FROM deployments
 		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA)
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA, &depVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // no in-flight deployment (supersede keeps this to at most one)
 	}
 	if err != nil {
 		return err
+	}
+	// Drop a stale report: it was produced from an older DSD version than the one
+	// that rendered this in-flight deployment, so its clone/build/rollout ops
+	// belong to a now-superseded deployment — applying them here would fabricate
+	// this deployment's status (SIGMA-134). A zero on either side means "unknown"
+	// (a legacy/unstamped row, or an unversioned caller); fall through unchanged.
+	if reportVersion > 0 && depVersion > 0 && reportVersion < depVersion {
+		return nil
 	}
 	up := DeploymentStatusUpdate{}
 	if !ok {
@@ -768,7 +805,7 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 // service (service_count of them) succeeds, otherwise 'deploying'. Isolated from
 // the single-container AdvanceDeploymentForResource path. A no-op when there is no
 // in-flight deployment.
-func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string) error {
+func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string, reportVersion int64) error {
 	svcStatus := ""
 	if !ok {
 		svcStatus = "failed"
@@ -791,15 +828,22 @@ func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resource
 
 	var depID, gitSHA string
 	var serviceCount int
+	var depVersion int64
 	err = tx.QueryRow(ctx, `
-		SELECT id, COALESCE(git_sha,''), service_count FROM deployments
+		SELECT id, COALESCE(git_sha,''), service_count, dsd_version FROM deployments
 		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &gitSHA, &serviceCount)
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &gitSHA, &serviceCount, &depVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	// Drop a stale per-service report from a superseded deployment (older DSD
+	// version than the in-flight one) so it can't fabricate the new deployment's
+	// status (SIGMA-134). Zero on either side = unknown → fall through.
+	if reportVersion > 0 && depVersion > 0 && reportVersion < depVersion {
+		return nil
 	}
 
 	// Record this service's status, but never regress a service already 'success'

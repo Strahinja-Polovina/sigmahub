@@ -25,8 +25,12 @@ func (s *Store) DeleteServer(ctx context.Context, orgID, serverID, actor string)
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var name string
+	// FOR UPDATE locks the server row for the whole tx so a concurrent
+	// CreateResource (which takes FOR SHARE on the same row) cannot slip a new
+	// resource past the bound-resources check below and orphan it on a
+	// tombstoned host (SIGMA-132).
 	err = tx.QueryRow(ctx,
-		`SELECT name FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`,
+		`SELECT name FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR UPDATE`,
 		orgID, serverID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound

@@ -148,6 +148,17 @@ func Apply(ctx context.Context, log *slog.Logger, configPath string) {
 	log.Info("mesh: WireGuard interface applied", "config", configPath)
 }
 
+// InterfaceUp reports whether the mesh tunnel is actually up. On non-Linux the
+// agent runs config-only (nothing to bring up), so it is "up" by definition;
+// on Linux it checks the real WireGuard device. Callers use this to report an
+// honest MeshApplied to the CP instead of assuming success (SIGMA-144).
+func InterfaceUp(ctx context.Context) bool {
+	if runtime.GOOS != "linux" {
+		return true
+	}
+	return interfaceExists(ctx, ifaceName())
+}
+
 // interfaceExists reports whether the WireGuard device is already up (`wg show`
 // exits non-zero for an absent device).
 func interfaceExists(ctx context.Context, iface string) bool {

@@ -29,12 +29,19 @@ export function OtpInput({
   const refs = React.useRef<Array<HTMLInputElement | null>>([]);
 
   const setDigit = (index: number, digit: string) => {
-    const next = value.split("");
-    next[index] = digit;
-    const joined = next.join("").slice(0, LENGTH);
+    // Work on a fixed-length buffer so clearing a middle box leaves a hole in
+    // place instead of collapsing the string and shifting later digits left.
+    // Trailing blanks are trimmed so a compact code round-trips unchanged.
+    const slots = value.split("");
+    while (slots.length < LENGTH) slots.push(" ");
+    slots[index] = digit || " ";
+    const joined = slots.join("").replace(/\s+$/, "").slice(0, LENGTH);
     onChange(joined);
     return joined;
   };
+
+  // Complete only when all LENGTH boxes hold a digit (no interior holes).
+  const isComplete = (joined: string) => /^\d+$/.test(joined) && joined.length === LENGTH;
 
   const focusAt = (index: number) => {
     const el = refs.current[Math.max(0, Math.min(LENGTH - 1, index))];
@@ -47,7 +54,7 @@ export function OtpInput({
     if (!digit) return;
     const joined = setDigit(index, digit);
     if (index < LENGTH - 1) focusAt(index + 1);
-    if (joined.length === LENGTH && !joined.includes("")) {
+    if (isComplete(joined)) {
       onComplete?.(joined);
     }
   };
@@ -88,7 +95,7 @@ export function OtpInput({
     onChange(joined);
     const nextIndex = Math.min(index + pasted.length, LENGTH - 1);
     focusAt(nextIndex);
-    if (joined.length === LENGTH && !joined.includes("")) {
+    if (isComplete(joined)) {
       onComplete?.(joined);
     }
   };

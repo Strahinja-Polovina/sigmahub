@@ -1,5 +1,5 @@
 import { notFound, redirect } from "next/navigation";
-import { getActiveOrgId } from "@/server/active-org";
+import { getActiveOrgId, requireMembership, visibleProjects } from "@/server/active-org";
 import { getEnvironment, getProject, getResource, getServer, getServerHosted } from "@/server/queries";
 import {
   cpEnabled,
@@ -20,6 +20,11 @@ export default async function ServerDetailPage({
   const orgId = await getActiveOrgId();
   if (!orgId) redirect("/login");
 
+  // P2-7: servers are org-wide, but the per-resource + project/env metadata
+  // hosted on them must be scoped to the caller's visible projects (SIGMA-149).
+  const { user, role } = await requireMembership(orgId);
+  const visible = await visibleProjects(user.id, orgId, role);
+
   if (cpEnabled()) {
     const cpServer = await cpGetServer(orgId, serverId);
     if (!cpServer) notFound();
@@ -31,7 +36,7 @@ export default async function ServerDetailPage({
     // local mirror rows (same ids), falling back to raw ids.
     const hosted = await Promise.all(
       cpResources
-        .filter((r) => r.serverId === serverId)
+        .filter((r) => r.serverId === serverId && (!visible || visible.has(r.projectId)))
         .map(async (r) => {
           const [project, env, mirror] = await Promise.all([
             getProject(r.projectId),
@@ -74,6 +79,6 @@ export default async function ServerDetailPage({
   const server = await getServer(serverId);
   if (!server || server.orgId !== orgId) notFound();
 
-  const hosted = await getServerHosted(serverId);
+  const hosted = await getServerHosted(serverId, visible);
   return <ServerDetailView server={server} hosted={hosted} />;
 }

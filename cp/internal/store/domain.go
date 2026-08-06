@@ -77,6 +77,11 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "23505")
 }
 
+func isForeignKeyViolation(err error) bool {
+	// 23503 = foreign_key_violation.
+	return err != nil && strings.Contains(err.Error(), "23503")
+}
+
 // ── Projects ────────────────────────────────────────────────────────────────
 
 func (s *Store) CreateProject(ctx context.Context, orgID, name, description, actor string) (Project, error) {
@@ -400,8 +405,12 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 
 	var serverType string
+	// FOR SHARE locks the server row so a concurrent DeleteServer (FOR UPDATE)
+	// cannot tombstone it between this liveness check and the resource insert —
+	// the two serialize, so the resource either blocks the delete or is rejected
+	// against an already-tombstoned server (SIGMA-132).
 	if err := tx.QueryRow(ctx,
-		`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL`,
+		`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
 		orgID, in.ServerID).Scan(&serverType); errors.Is(err, pgx.ErrNoRows) {
 		return Resource{}, ErrNotFound
 	} else if err != nil {

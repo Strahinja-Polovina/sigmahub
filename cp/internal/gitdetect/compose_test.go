@@ -151,6 +151,51 @@ services:
 	}
 }
 
+func TestParseComposeLongVolumeForm(t *testing.T) {
+	// A stateless service whose only mount is a long-form (map) bind mount must
+	// NOT record a phantom named volume ("type"/"target") and must stay
+	// blue-green (SIGMA-141). A long-form named volume must still be detected.
+	compose := []byte(`
+services:
+  bindonly:
+    build: .
+    volumes:
+      - type: bind
+        source: ./static
+        target: /srv/static
+        read_only: true
+  stateful:
+    image: postgres:16
+    volumes:
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql/data
+`)
+	svcs := ParseComposeServices(compose)
+
+	bind := svcByName(svcs, "bindonly")
+	if bind == nil {
+		t.Fatal("bindonly missing")
+	}
+	if len(bind.NamedVolumes) != 0 {
+		t.Fatalf("bind-only long-form mount must record no named volume, got %v", bind.NamedVolumes)
+	}
+	if bind.Rollout != RolloutBlueGreen {
+		t.Fatalf("bind-only service must be blue-green, got %q", bind.Rollout)
+	}
+
+	stateful := svcByName(svcs, "stateful")
+	if stateful == nil {
+		t.Fatal("stateful missing")
+	}
+	if !reflect.DeepEqual(stateful.NamedVolumes, []string{"pgdata"}) {
+		t.Fatalf("stateful long-form named volume = %v", stateful.NamedVolumes)
+	}
+	if stateful.Rollout != RolloutRecreate {
+		t.Fatalf("stateful with a named volume must be recreate, got %q", stateful.Rollout)
+	}
+}
+
 func TestParseComposeIPPrefixedPort(t *testing.T) {
 	compose := []byte(`
 services:

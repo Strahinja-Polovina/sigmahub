@@ -138,6 +138,13 @@ func (s *Store) DeleteBackupTarget(ctx context.Context, orgID, targetID, actor s
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
+	// The FK backstop (SIGMA-135) rejects deleting a target a policy still
+	// references, even when the EXISTS check above raced a concurrent
+	// UpdateBackupPolicy. Surface the same friendly conflict instead of a raw
+	// SQLSTATE.
+	if isForeignKeyViolation(err) {
+		return ErrInvalid{Msg: "backup target is in use by a backup policy; point the policy elsewhere first"}
+	}
 	if err != nil {
 		return err
 	}
@@ -249,6 +256,11 @@ func (s *Store) UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor
 		   SET target_id = $3, schedule = $4, keep_daily = $5, keep_weekly = $6, keep_monthly = $7, enabled = $8, pitr_enabled = $9, updated_at = now()
 		 WHERE org_id = $1 AND resource_id = $2`,
 		orgID, resourceID, bp.TargetID, bp.Schedule, bp.KeepDaily, bp.KeepWeekly, bp.KeepMonthly, bp.Enabled, bp.PitrEnabled); err != nil {
+		// The FK backstop (SIGMA-135) rejects pointing a policy at a target that
+		// a concurrent DeleteBackupTarget removed after the validation read above.
+		if isForeignKeyViolation(err) {
+			return BackupPolicy{}, ErrInvalid{Msg: "unknown backup target"}
+		}
 		return BackupPolicy{}, fmt.Errorf("update backup policy: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Backup policy updated", resourceID); err != nil {
@@ -446,8 +458,13 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 	rows, err := s.Pool.Query(ctx, `
 		SELECT r.id, r.kind, r.resource_id, r.server_id, dc.engine, dc.dbname, dc.username,
 		       p.keep_daily, p.keep_weekly, p.keep_monthly,
+		       -- The verify must check THIS day's backup, not the previous day's:
+		       -- correlate the expected sha to the same UTC day's successful backup.
+		       -- Empty until that backup succeeds, which the reconciler uses to hold
+		       -- the verify until its dump exists (SIGMA-137).
 		       COALESCE((SELECT b.dump_sha256 FROM backup_runs b
 		                  WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
+		                    AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
 		                  ORDER BY b.finished_at DESC LIMIT 1), '') AS expected_sha,
 		       COALESCE(r.restore_resource_id, ''),
 		       COALESCE(rdc.dbname, ''), COALESCE(rdc.username, ''),

@@ -102,14 +102,14 @@ export function OrgSwitcher() {
                 Billing
               </DropdownMenuItem>
               <DropdownMenuItem
-                render={<Link href="/dashboard/members" />}
+                render={<Link href="/dashboard/settings?tab=members" />}
                 className="gap-2"
               >
                 <Users className="size-4 text-muted-foreground" />
                 Members
               </DropdownMenuItem>
               <DropdownMenuItem
-                render={<Link href="/dashboard/audit" />}
+                render={<Link href="/dashboard/settings?tab=audit" />}
                 className="gap-2"
               >
                 <ScrollText className="size-4 text-muted-foreground" />

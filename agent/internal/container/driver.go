@@ -261,6 +261,28 @@ func (d *Driver) converge(ctx context.Context, spec ContainerSpec) error {
 	return nil
 }
 
+// persistRolloutGeneration records a just-deployed rollout/recreate generation
+// as desired so the reconcile loop can repair it after an out-of-band stop or
+// removal (SIGMA-146), and drops the desired records of older generations of the
+// same (resource, service) so a drained generation is never resurrected. The
+// stored spec's Name is the generation-suffixed container name and its SpecHash
+// matches the label stamped at create time, so a healthy running generation is
+// seen as converged rather than needlessly recreated.
+func (d *Driver) persistRolloutGeneration(genSpec ContainerSpec) error {
+	if all, err := d.store.AllDesired(); err != nil {
+		d.log.Warn("rollout: read desired for prune", "err", err)
+	} else {
+		for name, s := range all {
+			if name != genSpec.Name && s.ResourceID == genSpec.ResourceID && s.Service == genSpec.Service {
+				if err := d.store.DeleteDesired(name); err != nil {
+					d.log.Warn("rollout: prune old generation desired", "container", name, "err", err)
+				}
+			}
+		}
+	}
+	return d.store.PutDesired(genSpec.Name, genSpec)
+}
+
 // removeQuietly force-removes a container ignoring errors, used to roll back a
 // partially-provisioned container so a later reconcile can recreate it.
 func (d *Driver) removeQuietly(ctx context.Context, id string) {

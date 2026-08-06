@@ -86,10 +86,10 @@ func (f *fakeStore) SetDomainCertStatus(context.Context, string, string, string,
 func (f *fakeStore) DeploymentCloneCredential(context.Context, string, string) (string, string, string, error) {
 	return "", "", "", nil
 }
-func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string, string, bool, string) error {
+func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string, string, bool, string, int64) error {
 	return nil
 }
-func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, string, string, bool, string) error {
+func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, string, string, bool, string, int64) error {
 	return nil
 }
 func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
@@ -470,4 +470,16 @@ func TestRegister(t *testing.T) {
 			t.Fatalf("register = %d, want 400", rec.Code)
 		}
 	})
+}
+
+// TestLoggingRecordersExposeFlusher pins SIGMA-133: the middleware wrappers must
+// keep the underlying writer's http.Flusher reachable, or the deploy-log SSE
+// path returns 500 "streaming unsupported" on every request.
+func TestLoggingRecordersExposeFlusher(t *testing.T) {
+	if _, ok := any(&statusRecorder{ResponseWriter: httptest.NewRecorder()}).(http.Flusher); !ok {
+		t.Error("statusRecorder must expose http.Flusher")
+	}
+	if _, ok := any(&responseRecorder{ResponseWriter: httptest.NewRecorder()}).(http.Flusher); !ok {
+		t.Error("responseRecorder must expose http.Flusher")
+	}
 }

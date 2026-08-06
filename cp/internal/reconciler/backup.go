@@ -88,6 +88,16 @@ func renderBackupOps(runs []store.BackupRunSpec, rendered map[string]bool) []dsd
 				deps = append(deps, "res:"+r.ResourceID)
 			}
 		case "verify":
+			// Hold the verify until THIS day's backup has succeeded and its dump
+			// sha is known (BackupRunsForServer resolves ExpectedSha from the same
+			// UTC day's successful backup). Rendering it alongside a still-pending
+			// backup pinned the PREVIOUS day's sha and then hashed `latest` (this
+			// day's fresh dump), a guaranteed checksum mismatch whenever the data
+			// changed (SIGMA-137). Once the backup succeeds, a resync renders the
+			// verify against the correct sha.
+			if r.ExpectedSha == "" {
+				continue
+			}
 			kind = dsd.KindBackupVerify
 			spec.ExpectedSha = r.ExpectedSha
 			if dep, ok := backupOp[r.ResourceID]; ok {

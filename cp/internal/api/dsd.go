@@ -226,14 +226,17 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 	for _, a := range advances {
 		if a.service == "" {
 			// Single-container app (or the shared clone of a Compose deploy).
-			if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, a.resID, a.phase, a.ok, a.errText); err != nil {
+			// req.Version lets the store reject a report from a superseded
+			// deployment (older DSD version) instead of advancing the newer one
+			// (SIGMA-134).
+			if err := s.store.AdvanceDeploymentForResource(r.Context(), srv.ID, a.resID, a.phase, a.ok, a.errText, req.Version); err != nil {
 				s.log.Error("advance deployment", "err", err, "phase", a.phase, "resource", a.resID)
 			}
 			continue
 		}
 		// A Compose service op: track per-service status; the deployment flips to
 		// success only when every service succeeds (failed the moment one does).
-		if err := s.store.AdvanceDeploymentService(r.Context(), srv.ID, a.resID, a.service, a.phase, a.ok, a.errText); err != nil {
+		if err := s.store.AdvanceDeploymentService(r.Context(), srv.ID, a.resID, a.service, a.phase, a.ok, a.errText, req.Version); err != nil {
 			s.log.Error("advance deployment service", "err", err, "phase", a.phase, "resource", a.resID, "service", a.service)
 		}
 	}

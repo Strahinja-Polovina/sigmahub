@@ -86,7 +86,16 @@ services:
         condition: service_started
     environment:
       DATABASE_URL: postgres://sigmahub:${CP_DB_PASSWORD}@db:5432/sigmahub_web
+      # In-cluster URL the dashboard uses to call the control plane.
       SIGMAHUB_CP_URL: http://cp:8080
+      # Public URL a BYO host dials to reach the CP — must be reachable from
+      # outside the compose network (http://cp:8080 is not). Rendered into the
+      # agent install command; without it onboarding prints an unusable endpoint
+      # (SIGMA-157).
+      SIGMAHUB_CP_PUBLIC_URL: ${SIGMAHUB_CP_PUBLIC_URL:?set SIGMAHUB_CP_PUBLIC_URL in .env}
+      # Released agent tag the installer pins (e.g. v0.3.0). Must be a real
+      # release — install.sh 404s on "latest".
+      SIGMAHUB_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:?set SIGMAHUB_AGENT_VERSION in .env}
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}

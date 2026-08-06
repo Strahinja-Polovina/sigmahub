@@ -37,8 +37,10 @@ func fakeVault(t *testing.T) *httptest.Server {
 			Plaintext string `json:"plaintext"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Mirror real Vault: the encrypt response carries a numeric key_version
+		// next to the ciphertext string (SIGMA-140 regression guard).
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]string{"ciphertext": "vault:v1:" + body.Plaintext},
+			"data": map[string]any{"ciphertext": "vault:v1:" + body.Plaintext, "key_version": 1},
 		})
 	})
 	mux.HandleFunc("POST /v1/transit/decrypt/sigmahub-cp", func(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,7 @@
 "use client";
 
+import { useSearchParams } from "next/navigation";
+
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { GeneralTab } from "./general-tab";
 import { MembersTab } from "./members-tab";
@@ -64,6 +66,22 @@ export function SettingsView({
 }) {
   const isAdmin = currentUserRole === "Org Admin";
 
+  // Deep-linkable tabs: the org switcher (and other surfaces) link to
+  // /dashboard/settings?tab=members|audit|..., so honor a valid ?tab param as
+  // the initial tab and fall back to "general" for anything unknown/hidden.
+  const searchParams = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const availableTabs = [
+    "general",
+    "members",
+    "tokens",
+    "security",
+    ...(canViewAudit ? ["audit"] : []),
+    ...(cpMode ? ["alerts", "beta"] : []),
+  ];
+  const initialTab =
+    requestedTab && availableTabs.includes(requestedTab) ? requestedTab : "general";
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-1">
@@ -73,7 +91,7 @@ export function SettingsView({
         </p>
       </div>
 
-      <Tabs defaultValue="general" className="gap-4">
+      <Tabs defaultValue={initialTab} className="gap-4">
         <TabsList>
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>

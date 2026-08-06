@@ -110,6 +110,15 @@ const MOCK_REPOS: Repo[] = [
 
 type EnvVar = { id: string; key: string; value: string };
 
+// Must match createSecretAction's server-side validation (secrets.ts): a
+// rejected key would otherwise throw mid-create and surface as a misleading
+// "Create failed" after the resource already exists (SIGMA-151).
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const envKeyValid = (key: string) => {
+  const k = key.trim();
+  return k === "" || ENV_KEY_RE.test(k);
+};
+
 const STEPS = [
   { id: 1, label: "Repository" },
   { id: 2, label: "Build" },
@@ -309,25 +318,37 @@ export function DeployWizard({
             kind: repo?.detectedKind ?? "app",
             repo: repo?.fullName,
           });
-          // Persist the wizard's env vars as env-scoped secrets (encrypted at
-          // rest; injected on deploy).
+          // The resource now exists. Persist env vars as secrets separately: a
+          // secret failure must NOT be reported as a failed create (SIGMA-151),
+          // so collect per-key failures and keep going instead of aborting.
+          const failedKeys: string[] = [];
           for (const ev of envVars) {
             if (!ev.key.trim() || !ev.value) continue;
-            await createSecretAction({
-              resourceId: id,
-              name: ev.key.trim(),
-              value: ev.value,
-              scope: "environment",
-              envVar: true,
-            });
+            try {
+              await createSecretAction({
+                resourceId: id,
+                name: ev.key.trim(),
+                value: ev.value,
+                scope: "environment",
+                envVar: true,
+              });
+            } catch {
+              failedKeys.push(ev.key.trim());
+            }
           }
           setCreatedId(id);
           setCreateState("done");
           setDeploying(false);
           router.refresh();
-          toast.success(`${repo?.fullName ?? "Resource"} created`, {
-            description: "Connect the repository in the project's Git panel to enable push-to-deploy.",
-          });
+          if (failedKeys.length > 0) {
+            toast.warning(`${repo?.fullName ?? "Resource"} created — some variables need attention`, {
+              description: `Couldn't save ${failedKeys.length} variable(s): ${failedKeys.join(", ")}. Add them from the resource's Secrets panel.`,
+            });
+          } else {
+            toast.success(`${repo?.fullName ?? "Resource"} created`, {
+              description: "Connect the repository in the project's Git panel to enable push-to-deploy.",
+            });
+          }
         } catch (err) {
           setCreateState("error");
           setDeploying(false);
@@ -388,11 +409,13 @@ export function DeployWizard({
           !incompatibility
         );
       case 4:
-        return true;
+        // Block Deploy while any env-var key is malformed — the server rejects
+        // it, and by then the resource is already created (SIGMA-151).
+        return envVars.every((ev) => envKeyValid(ev.key));
       default:
         return false;
     }
-  }, [step, repo, projectId, environmentId, serverId, incompatibility]);
+  }, [step, repo, projectId, environmentId, serverId, incompatibility, envVars]);
 
   function next() {
     if (step < 5 && canNext) {
@@ -784,6 +807,7 @@ export function DeployWizard({
                       }
                       placeholder="KEY"
                       className="font-mono"
+                      aria-invalid={!envKeyValid(ev.key) || undefined}
                     />
                     <Input
                       value={ev.value}
@@ -802,6 +826,12 @@ export function DeployWizard({
                   </div>
                 ))}
               </div>
+              {envVars.some((ev) => !envKeyValid(ev.key)) && (
+                <p className="text-xs text-destructive">
+                  Keys must start with a letter or underscore and contain only
+                  letters, digits, and underscores (e.g. API_KEY).
+                </p>
+              )}
               <Button
                 variant="outline"
                 size="sm"

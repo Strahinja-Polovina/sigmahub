@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -419,5 +421,67 @@ func TestPerformRecreateRemovesOldFirst(t *testing.T) {
 		if strings.Contains(e, "web") {
 			t.Fatalf("recreate touched a sibling service: %s", e)
 		}
+	}
+}
+
+// TestPerformRecreateReGatesHealthOnResume proves a resumed apply re-runs the
+// health gate on an already-running matching generation instead of reporting
+// success blindly — else an unhealthy recreate is recorded as a good deploy
+// (SIGMA-147).
+func TestPerformRecreateReGatesHealthOnResume(t *testing.T) {
+	spec, body := recreateSpec("res_a", "db", "g2", "newhash")
+
+	// Unhealthy: the new gen is running with a matching hash but never became
+	// healthy; the short-circuit must re-gate and fail.
+	fBad := newFakeRollout()
+	fBad.seedSvc("sigmahub-res_a-db-g2", "res_a", "db", "newhash", true)
+	if err := performRecreate(context.Background(), fBad, unhealthyProbe, spec, body, "newhash", nil, noLog); err == nil {
+		t.Fatal("resumed recreate of an unhealthy running generation must fail, not report success")
+	}
+
+	// Healthy: the same short-circuit converges and returns nil.
+	fOK := newFakeRollout()
+	fOK.seedSvc("sigmahub-res_a-db-g2", "res_a", "db", "newhash", true)
+	if err := performRecreate(context.Background(), fOK, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+		t.Fatalf("resumed recreate of a healthy running generation should converge: %v", err)
+	}
+}
+
+// TestPersistRolloutGeneration proves a deployed generation is recorded as
+// desired (so reconcile can repair it), an older generation of the same
+// (resource, service) is pruned (so a drained one is not resurrected), and an
+// unrelated resource is left alone (SIGMA-146).
+func TestPersistRolloutGeneration(t *testing.T) {
+	st, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	d := &Driver{store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	if err := st.PutDesired("sigmahub-res_a-g1", ContainerSpec{ResourceID: "res_a", Name: "sigmahub-res_a-g1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutDesired("sigmahub-res_b", ContainerSpec{ResourceID: "res_b", Name: "sigmahub-res_b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	genSpec := ContainerSpec{ResourceID: "res_a", Name: "sigmahub-res_a-g2"}
+	if err := d.persistRolloutGeneration(genSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := st.AllDesired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := all["sigmahub-res_a-g2"]; !ok {
+		t.Error("new generation must be recorded as desired")
+	}
+	if _, ok := all["sigmahub-res_a-g1"]; ok {
+		t.Error("the older generation of the same resource must be pruned")
+	}
+	if _, ok := all["sigmahub-res_b"]; !ok {
+		t.Error("an unrelated resource must be left alone")
 	}
 }

@@ -31,6 +31,7 @@ type Store interface {
 	PendingS3OpsForServer(ctx context.Context, serverID string) ([]store.S3OpSpec, error)
 	BackupRunsForServer(ctx context.Context, serverID string) ([]store.BackupRunSpec, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
+	StampDeploymentDSDVersion(ctx context.Context, deploymentIDs []string, version int64) error
 	AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID string }, error)
 	// LockServerReconcile serializes reconciles for one server (SIGMA-94). The
 	// bool is false when the lock is already held elsewhere (SIGMA-120) — skip.
@@ -214,11 +215,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 		return err
 	}
 	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, backupRuns, s3Ops, r.acme)
-	_, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
+	signed, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err
 	}
 	if changed {
+		// Bind each in-flight deploy target to the version that first rendered it,
+		// so a late op-status report from a superseded deployment (an older
+		// version) is rejected instead of advancing the newer one (SIGMA-134).
+		depIDs := make([]string, 0, len(deployTargets))
+		for _, t := range deployTargets {
+			if t.DeploymentID != "" {
+				depIDs = append(depIDs, t.DeploymentID)
+			}
+		}
+		if err := r.st.StampDeploymentDSDVersion(ctx, depIDs, signed.Document.Version); err != nil {
+			r.log.Warn("stamp deployment dsd version", "server", serverID, "err", err)
+		}
 		r.log.Info("dsd rendered", "server", serverID, "ops", len(ops))
 		r.notify(serverID)
 	}

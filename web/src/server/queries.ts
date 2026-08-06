@@ -346,13 +346,18 @@ export async function getServersWithCounts(
 }
 
 /** Resources scheduled on a server, with their project + environment names. */
-export async function getServerHosted(serverId: string) {
-  return db
+/** Resources scheduled on a server, with project/env names. `visible` applies
+ *  P2-7 project scoping (null = everything): servers are org-wide, but a
+ *  project-scoped user must not see the resource names/kinds/statuses or owning
+ *  project/env names of projects they were never granted (SIGMA-149). */
+export async function getServerHosted(serverId: string, visible?: Set<string> | null) {
+  const rows = await db
     .select({
       id: s.resources.id,
       name: s.resources.name,
       kind: s.resources.kind,
       status: s.resources.status,
+      projectId: s.resources.projectId,
       projectName: s.projects.name,
       envName: s.environments.name,
     })
@@ -360,6 +365,16 @@ export async function getServerHosted(serverId: string) {
     .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
     .innerJoin(s.environments, eq(s.resources.environmentId, s.environments.id))
     .where(eq(s.resources.serverId, serverId));
+  const scoped = visible ? rows.filter((r) => visible.has(r.projectId)) : rows;
+  // Return the view shape without the internal projectId used only for scoping.
+  return scoped.map((r) => ({
+    id: r.id,
+    name: r.name,
+    kind: r.kind,
+    status: r.status,
+    projectName: r.projectName,
+    envName: r.envName,
+  }));
 }
 
 export type OrgResource = typeof s.resources.$inferSelect & {
