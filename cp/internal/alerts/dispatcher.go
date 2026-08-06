@@ -17,6 +17,7 @@ const deliverySendTimeout = 20 * time.Second
 type Store interface {
 	DueAlertDeliveries(ctx context.Context, limit int) ([]store.AlertDelivery, error)
 	AlertChannelForSend(ctx context.Context, orgID, channelID string) (store.AlertChannelSend, error)
+	RenewAlertDeliveryLease(ctx context.Context, deliveryID int64) (bool, error)
 	SetAlertDeliveryResult(ctx context.Context, deliveryID int64, ok bool, errText string, maxAttempts int) error
 	EnqueueCertExpiringAlerts(ctx context.Context, within time.Duration) error
 }
@@ -94,6 +95,17 @@ func drain(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Con
 		if err != nil {
 			sendErr = err
 		} else {
+			// Refresh the claim lease right before sending. A slow batch (many
+			// channels each timing out near deliverySendTimeout) can outlast the
+			// once-per-batch lease, letting a sibling replica reclaim and re-send
+			// the still-'sending' tail (SIGMA-130). If the row is no longer ours —
+			// a sibling already finalized it — skip to avoid a duplicate delivery.
+			held, rerr := st.RenewAlertDeliveryLease(ctx, d.ID)
+			if rerr != nil {
+				log.Warn("alerts: renew delivery lease", "delivery", d.ID, "err", rerr)
+			} else if !held {
+				continue
+			}
 			// Bound each delivery so one slow/unreachable channel can't stall the
 			// serial, cross-org drain (SIGMA-119). The transports honour ctx; the
 			// SMTP path additionally dials with its own deadline.

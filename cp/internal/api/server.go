@@ -35,8 +35,8 @@ type StoreAPI interface {
 	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
 	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error
 	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
-	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string) error
-	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string) error
+	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error
+	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string, reportVersion int64) error
 	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
 	// Backups (P1-11): the audited per-run credential release and the agent's
 	// terminal result report, plus the op-status failure fallback.
@@ -394,6 +394,19 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.NewResponseController reach the underlying writer, and Flush
+// forwards to it when it supports flushing. Without these, wrapping the mux in
+// withLogging hid the http.Flusher of the real writer (interface embedding
+// promotes only ResponseWriter's methods), so the deploy-log SSE handler's
+// `w.(http.Flusher)` assertion always failed and returned 500 (SIGMA-133).
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

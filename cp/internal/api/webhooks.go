@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -65,6 +66,9 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			Ref        string `json:"ref"`
 			After      string `json:"after"`
 			Deleted    bool   `json:"deleted"`
+			HeadCommit *struct {
+				Timestamp time.Time `json:"timestamp"`
+			} `json:"head_commit"`
 			Repository struct {
 				FullName string `json:"full_name"`
 			} `json:"repository"`
@@ -77,6 +81,12 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		ev.SHA = p.After
 		ev.RepoFullName = p.Repository.FullName
 		ev.Deleted = p.Deleted || p.After == zeroSHA
+		// Head-commit time orders deliveries so a late-arriving older push can't
+		// overwrite a newer one (SIGMA-136); nil when absent (e.g. a deletion).
+		if p.HeadCommit != nil && !p.HeadCommit.Timestamp.IsZero() {
+			ts := p.HeadCommit.Timestamp
+			ev.PushedAt = &ts
+		}
 	case "pull_request":
 		var p struct {
 			Action      string `json:"action"`

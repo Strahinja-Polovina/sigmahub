@@ -187,7 +187,7 @@ func TestComposeDeploymentPerServiceStatus(t *testing.T) {
 	}
 
 	// web's rollout succeeds — the deployment is still deploying (db pending).
-	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, ""); err != nil {
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	d, _ := st.GetDeployment(ctx, orgID, dep.ID)
@@ -196,7 +196,7 @@ func TestComposeDeploymentPerServiceStatus(t *testing.T) {
 	}
 
 	// db's rollout succeeds — now ALL services are done → success.
-	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", true, ""); err != nil {
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	d, _ = st.GetDeployment(ctx, orgID, dep.ID)
@@ -209,10 +209,10 @@ func TestComposeDeploymentPerServiceStatus(t *testing.T) {
 		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: serverID, Trigger: "git", GitSHA: "sha2",
 	}, "test")
 	_, _ = st.Pool.Exec(ctx, `UPDATE deployments SET service_count = 2 WHERE id = $1`, dep2.ID)
-	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, ""); err != nil {
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "web", "rollout", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", false, "db image build failed"); err != nil {
+	if err := st.AdvanceDeploymentService(ctx, serverID, res.ID, "db", "rollout", false, "db image build failed", 0); err != nil {
 		t.Fatal(err)
 	}
 	d2, _ := st.GetDeployment(ctx, orgID, dep2.ID)
@@ -249,7 +249,7 @@ func TestDeploymentSupersedeAndAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, ""); err != nil {
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	d1, _ := st.GetDeployment(ctx, orgID, dep1.ID)
@@ -272,11 +272,11 @@ func TestDeploymentSupersedeAndAdvance(t *testing.T) {
 
 	// Out-of-order status report (rollout before clone/build) still advances the
 	// single in-flight deployment monotonically to success and records the image.
-	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "rollout", true, ""); err != nil {
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "rollout", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	// A late 'clone' report must NOT regress a terminal success.
-	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, ""); err != nil {
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "clone", true, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	d2, _ := st.GetDeployment(ctx, orgID, dep2.ID)

@@ -82,6 +82,9 @@ type GitWebhookEvent struct {
 	Action       string // pull_request action (opened|synchronize|closed|...)
 	PRNumber     int    // pull_request number (0 for non-PR events)
 	Deleted      bool   // push that deleted the branch — never deploys
+	// PushedAt is the head commit's timestamp for a push (nil if unavailable).
+	// Used to reject out-of-order webhook deliveries (SIGMA-136).
+	PushedAt *time.Time
 }
 
 // WebhookOutcome reports what a delivery did, so the HTTP layer can shape its
@@ -511,20 +514,41 @@ func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (Webho
 				return WebhookOutcome{}, err
 			default:
 				// Remember the commit on the branch map for both policies, so a
-				// manual branch can be promoted later to exactly this sha.
-				if _, err := tx.Exec(ctx,
-					`UPDATE git_branch_map SET last_ref = $1, last_sha = $2, last_pushed_at = now() WHERE id = $3`,
-					ev.Ref, ev.SHA, m.ID); err != nil {
-					return WebhookOutcome{}, err
+				// manual branch can be promoted later to exactly this sha. Guard
+				// against out-of-order webhook deliveries: when the push carries a
+				// head-commit time, only advance the map (and enqueue a deploy) if
+				// this push is at least as new as the recorded one. Otherwise an
+				// older commit arriving late would overwrite last_sha and its deploy
+				// would supersede the newer commit's (SIGMA-136).
+				var advanced bool
+				if ev.PushedAt != nil {
+					tag, err := tx.Exec(ctx,
+						`UPDATE git_branch_map SET last_ref = $1, last_sha = $2, last_pushed_at = $4
+						  WHERE id = $3 AND (last_pushed_at IS NULL OR $4 >= last_pushed_at)`,
+						ev.Ref, ev.SHA, m.ID, ev.PushedAt)
+					if err != nil {
+						return WebhookOutcome{}, err
+					}
+					advanced = tag.RowsAffected() > 0
+				} else {
+					if _, err := tx.Exec(ctx,
+						`UPDATE git_branch_map SET last_ref = $1, last_sha = $2, last_pushed_at = now() WHERE id = $3`,
+						ev.Ref, ev.SHA, m.ID); err != nil {
+						return WebhookOutcome{}, err
+					}
+					advanced = true
 				}
-				if m.Policy == "auto" {
+				switch {
+				case !advanced:
+					action = "Git push " + branch + " (stale delivery ignored)"
+				case m.Policy == "auto":
 					dr, err := enqueueDeployTx(ctx, tx, conn.OrgID, conn.ID, m.EnvironmentID, ev.Ref, ev.SHA, branch)
 					if err != nil {
 						return WebhookOutcome{}, err
 					}
 					out.Enqueued = &dr
 					action = "Git push " + branch + " → deploy enqueued"
-				} else {
+				default:
 					action = "Git push " + branch + " (manual — awaiting promotion)"
 				}
 			}

@@ -138,6 +138,13 @@ func (s *Store) DeleteBackupTarget(ctx context.Context, orgID, targetID, actor s
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
+	// The FK backstop (SIGMA-135) rejects deleting a target a policy still
+	// references, even when the EXISTS check above raced a concurrent
+	// UpdateBackupPolicy. Surface the same friendly conflict instead of a raw
+	// SQLSTATE.
+	if isForeignKeyViolation(err) {
+		return ErrInvalid{Msg: "backup target is in use by a backup policy; point the policy elsewhere first"}
+	}
 	if err != nil {
 		return err
 	}
@@ -249,6 +256,11 @@ func (s *Store) UpdateBackupPolicy(ctx context.Context, orgID, resourceID, actor
 		   SET target_id = $3, schedule = $4, keep_daily = $5, keep_weekly = $6, keep_monthly = $7, enabled = $8, pitr_enabled = $9, updated_at = now()
 		 WHERE org_id = $1 AND resource_id = $2`,
 		orgID, resourceID, bp.TargetID, bp.Schedule, bp.KeepDaily, bp.KeepWeekly, bp.KeepMonthly, bp.Enabled, bp.PitrEnabled); err != nil {
+		// The FK backstop (SIGMA-135) rejects pointing a policy at a target that
+		// a concurrent DeleteBackupTarget removed after the validation read above.
+		if isForeignKeyViolation(err) {
+			return BackupPolicy{}, ErrInvalid{Msg: "unknown backup target"}
+		}
 		return BackupPolicy{}, fmt.Errorf("update backup policy: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Backup policy updated", resourceID); err != nil {

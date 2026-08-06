@@ -120,3 +120,13 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	r.buf.Write(b)
 	return r.ResponseWriter.Write(b)
 }
+
+// Unwrap/Flush keep the wrapped writer's streaming ability reachable through
+// http.NewResponseController and a direct http.Flusher assertion (SIGMA-133).
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}

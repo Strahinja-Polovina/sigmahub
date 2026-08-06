@@ -422,6 +422,24 @@ func (s *Store) DueAlertDeliveries(ctx context.Context, limit int) ([]AlertDeliv
 	return out, rows.Err()
 }
 
+// RenewAlertDeliveryLease refreshes the claim lease on a row the dispatcher is
+// about to send, and reports whether the row is still this dispatcher's to send
+// (status still 'sending'). A slow drain (a batch of channels each timing out
+// near deliverySendTimeout) can exceed the once-per-batch lease, after which a
+// sibling replica reclaims the still-'sending' tail and re-sends it — the exact
+// duplicate SIGMA-106 targeted. Renewing right before the send closes that
+// window; a false result means a sibling already finalized the row (sent/failed)
+// or backed it off, so the caller must skip the send (SIGMA-130).
+func (s *Store) RenewAlertDeliveryLease(ctx context.Context, deliveryID int64) (bool, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE alert_outbox SET next_attempt_at = now() + make_interval(secs => $2)
+		 WHERE id = $1 AND status = 'sending'`, deliveryID, deliveryLease.Seconds())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // SetAlertDeliveryResult records a send attempt: success marks the row sent
 // and the channel healthy; failure backs off exponentially (30s·2^attempts,
 // capped at 1h) and gives up for good after maxAttempts, leaving the failure
