@@ -30,6 +30,8 @@ Fill in `.env` (all required unless noted):
 | `CP_PROVISION_TOKEN` | Gates org provisioning — `openssl rand -hex 32`. |
 | `BETTER_AUTH_SECRET` | Dashboard session key — `openssl rand -base64 32`. |
 | `WEB_PUBLIC_URL` | `https://staging.sigmahub.example` (cookies/redirects). |
+| `SIGMAHUB_CP_PUBLIC_URL` | Public URL a BYO host dials to reach the CP (e.g. `https://cp.staging.sigmahub.example`) — the in-cluster `http://cp:8080` is not reachable from a host. Rendered into the install command. |
+| `SIGMAHUB_AGENT_VERSION` | Released agent tag to install (e.g. `v0.3.0`) — the installer 404s on `latest`. |
 | `CP_ACME_EMAIL` | Let's Encrypt contact for managed-domain TLS. |
 | `CP_KMS_BACKEND` | `file` is fine for staging; `vault` for prod custody. |
 | `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave default to exercise every engine. |
@@ -79,9 +81,11 @@ provisions a uniquely-named throwaway org each run.
 
 In the dashboard (or via `POST /v1/orgs/{org}/servers/provision`), add a server;
 drop the returned bootstrap public key onto the host's `authorized_keys` and run
-the printed one-liner to install `sigmad`. The agent enrolls, joins the
-WireGuard mesh, and appears under **Servers**. Attach it to the `prod`
-environment to schedule resources on it.
+the printed one-liner to install `sigmad`. The one-liner fetches `install.sh`
+from the pinned GitHub release (`SIGMAHUB_AGENT_VERSION`) and points the agent at
+`SIGMAHUB_CP_PUBLIC_URL`, so both must be set correctly in `.env` for it to run.
+The agent enrolls, joins the WireGuard mesh, and appears under **Servers**.
+Attach it to the `prod` environment to schedule resources on it.
 
 ## 5. Acceptance checks (SIGMA-54)
 

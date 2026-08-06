@@ -15,16 +15,35 @@ import {
   cpDeleteServer,
 } from "../cp";
 
-/** Release version the installer pins (installer requires an explicit tag). */
-const AGENT_VERSION = process.env.SIGMAHUB_AGENT_VERSION ?? "latest";
+/** GitHub repo whose releases host install.sh + the pinned sigmad assets. */
+const RELEASE_REPO = process.env.SIGMAHUB_RELEASE_REPO ?? "Strahinja-Polovina/sigmahub";
 
-/** The one-line, cosign-verified install command the wizard hands the operator. */
+/** The released tag the installer pins. The installer needs a concrete release
+ *  (its assets embed the version), so a missing value or "latest" is rejected
+ *  loudly rather than rendered into a command that 404s at download time
+ *  (SIGMA-157). */
+function agentVersion(): string {
+  const v = process.env.SIGMAHUB_AGENT_VERSION;
+  if (!v || v === "latest") {
+    throw new Error(
+      "SIGMAHUB_AGENT_VERSION must be set to a released tag (e.g. v0.3.0) to onboard a server; " +
+        `"latest" has no release asset. Set it in the control-plane deployment's environment.`
+    );
+  }
+  return v;
+}
+
+/** The one-line, cosign-verified install command the wizard hands the operator.
+ *  install.sh is fetched from the pinned GitHub release (the CP does not serve
+ *  it), while SIGMAHUB_ENDPOINT points at the CP's public URL. */
 function installCommand(token: string): string {
   const ep = cpPublicUrl();
+  const version = agentVersion();
+  const scriptUrl = `https://github.com/${RELEASE_REPO}/releases/download/${version}/install.sh`;
   return (
-    `curl -fsSL ${ep}/install.sh | ` +
+    `curl -fsSL ${scriptUrl} | ` +
     `SIGMAHUB_ENDPOINT=${ep} SIGMAHUB_BOOTSTRAP_TOKEN=${token} ` +
-    `SIGMAHUB_VERSION=${AGENT_VERSION} sudo -E bash`
+    `SIGMAHUB_VERSION=${version} sudo -E bash`
   );
 }
 

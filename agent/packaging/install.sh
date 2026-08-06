@@ -38,6 +38,11 @@ remove_bootstrap_key() {
     fi
   done
 }
+# Register the EXIT trap NOW, before any die-able step, so an abort in the
+# distro/arch gate, an apt install, the cosign download, or the Docker install
+# still strips the CP-held one-time bootstrap key (SIGMA-158). The workdir
+# cleanup is added to the trap once $work exists.
+trap remove_bootstrap_key EXIT
 
 # --- Distro gate: only the hardened-onboarding targets are supported ----------
 . /etc/os-release 2>/dev/null || die "cannot read /etc/os-release"
@@ -112,7 +117,19 @@ SIGMAD_ENDPOINT=${SIGMAHUB_ENDPOINT}
 SIGMAD_BOOTSTRAP_TOKEN=${SIGMAHUB_BOOTSTRAP_TOKEN}
 EOF
 
-curl -fsSL "${SIGMAHUB_DOWNLOAD_BASE}/sigmad.service" -o /etc/systemd/system/sigmad.service 2>/dev/null || \
+# The systemd unit is a signed release artifact (goreleaser checksum.extra_files
+# lists sigmad.service in the cosign-verified checksums.txt), and it runs as root,
+# so verify it against that checksum before installing — otherwise a tampered
+# release asset yields a root ExecStart despite the signed-binary machinery
+# (SIGMA-155). Fall back to the embedded unit ONLY when the asset is genuinely
+# absent (curl fails), never on a checksum mismatch.
+if curl -fsSL "${SIGMAHUB_DOWNLOAD_BASE}/sigmad.service" -o "${work}/sigmad.service" 2>/dev/null; then
+  unit_line="$(grep " sigmad.service\$" "${work}/checksums.txt" || true)"
+  [ -n "${unit_line}" ] || die "sigmad.service is not in the signed checksums.txt — refusing to install an unverifiable unit"
+  printf '%s\n' "${unit_line}" | ( cd "${work}" && sha256sum -c - ) \
+    || die "sigmad.service checksum mismatch — refusing to install a tampered unit"
+  install -m 0644 "${work}/sigmad.service" /etc/systemd/system/sigmad.service
+else
   install -m 0644 /dev/stdin /etc/systemd/system/sigmad.service <<'UNIT'
 [Unit]
 Description=sigmahub agent (sigmad)
@@ -128,6 +145,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
 
 if [ "${SIGMAHUB_WG_UP}" != "1" ]; then
   sed -i 's| -wg-up||' /etc/systemd/system/sigmad.service

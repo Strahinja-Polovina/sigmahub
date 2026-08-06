@@ -86,5 +86,16 @@ jobs:
             checksums.txt
           echo "::endgroup::"
           echo "::group::sha256sum -c checksums.txt"
+          # checksum.extra_files (install.sh, sigmad.service, sigmahub-cp.service)
+          # are hashed at their source paths and listed in checksums.txt by
+          # basename, but goreleaser does not copy them into dist/ — so
+          # `sha256sum -c` here could not read them and the step failed on every
+          # tag, making the integrity gate a no-op (SIGMA-156). Stage them next
+          # to the archives so the FULL checksums.txt (archives + packaging
+          # files) actually verifies.
+          cp ../agent/packaging/install.sh \
+             ../agent/packaging/sigmad.service \
+             ../cp/packaging/sigmahub-cp.service \
+             .
           sha256sum -c checksums.txt
           echo "::endgroup::"
