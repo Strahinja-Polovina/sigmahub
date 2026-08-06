@@ -312,7 +312,11 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 				ContextSubdir: s.Build,
 				ImageTag:      imageTag,
 				DeploymentID:  target.DeploymentID,
-				Force:         target.Trigger == "manual",
+				// Same in-flight gate as the single-container path: the standing
+				// target keeps its 'manual' trigger after the deploy succeeds, so a
+				// bare Trigger check stays true forever and re-forces a rebuild of
+				// EVERY service on unrelated DSD bumps (SIGMA-175).
+				Force: manualForce(target),
 			})
 			ops = append(ops, dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build})
 			imageDep = buildID

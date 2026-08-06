@@ -114,15 +114,42 @@ func ensurePreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumbe
 		 WHERE connection_id = $1 AND pr_number = $2 AND status = 'open'`,
 		conn.ID, prNumber).Scan(&pv.ID, &pv.EnvironmentID, &resourceID)
 	if err == nil {
-		// Existing preview: refresh head metadata; the caller enqueues the deploy.
-		if _, err := tx.Exec(ctx,
-			`UPDATE preview_environments SET branch = $2, sha = $3 WHERE id = $1`,
-			pv.ID, branch, sha); err != nil {
+		// The stored pointers are NOT protected: environment_id is deliberately not
+		// a foreign key and resource_id is ON DELETE SET NULL, while both targets
+		// are user-deletable from the dashboard (a `pr-<n>` env renders with an
+		// ordinary Remove button). Returning a dangling environment_id makes the
+		// caller's enqueueDeployTx violate deploy_requests' FK, which aborts the
+		// whole webhook transaction — including the dedup insert — so the CP 500s
+		// on every later push to that PR and redeliveries repeat it forever
+		// (SIGMA-165). Verify both pointers and self-heal by recreating instead.
+		var live bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM environments WHERE id = $1)`, pv.EnvironmentID).Scan(&live); err != nil {
 			return "", "", err
 		}
-		return pv.EnvironmentID, resourceID, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+		if live && resourceID != "" {
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM resources WHERE id = $1)`, resourceID).Scan(&live); err != nil {
+				return "", "", err
+			}
+		}
+		if live && resourceID != "" {
+			// Existing preview: refresh head metadata; the caller enqueues the deploy.
+			if _, err := tx.Exec(ctx,
+				`UPDATE preview_environments SET branch = $2, sha = $3 WHERE id = $1`,
+				pv.ID, branch, sha); err != nil {
+				return "", "", err
+			}
+			return pv.EnvironmentID, resourceID, nil
+		}
+		// Orphaned: close the stale row and fall through to the create path. The
+		// partial unique index is on (connection_id, pr_number) WHERE status='open',
+		// so closing it first leaves room for the replacement.
+		if _, err := tx.Exec(ctx,
+			`UPDATE preview_environments SET status = 'closed', closed_at = now() WHERE id = $1`, pv.ID); err != nil {
+			return "", "", err
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return "", "", err
 	}
 
