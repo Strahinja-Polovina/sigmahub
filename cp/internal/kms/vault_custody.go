@@ -115,13 +115,24 @@ func (c *VaultCustody) transit(ctx context.Context, op string, body map[string]s
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("vault custody: %s failed (HTTP %d): %s", op, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
+	// Decode the data envelope leniently: real Vault transit encrypt responses
+	// include a numeric key_version alongside the string ciphertext, so a
+	// map[string]string here fails to unmarshal and breaks every Wrap
+	// (SIGMA-140). Use RawMessage and read only the one string field we need.
 	var out struct {
-		Data map[string]string `json:"data"`
+		Data map[string]json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return "", fmt.Errorf("vault custody: %s: bad response: %w", op, err)
 	}
-	v := out.Data[field]
+	rawField, ok := out.Data[field]
+	if !ok {
+		return "", fmt.Errorf("vault custody: %s: response missing %q", op, field)
+	}
+	var v string
+	if err := json.Unmarshal(rawField, &v); err != nil {
+		return "", fmt.Errorf("vault custody: %s: field %q is not a string: %w", op, field, err)
+	}
 	if v == "" {
 		return "", fmt.Errorf("vault custody: %s: response missing %q", op, field)
 	}

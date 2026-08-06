@@ -178,7 +178,24 @@ func ParseComposeServices(b []byte) []ComposeService {
 			}
 		case "volumes":
 			if strings.HasPrefix(trimmed, "-") {
-				composeServiceVolume(strings.TrimSpace(trimmed[1:]), svc)
+				item := strings.TrimSpace(trimmed[1:])
+				// A sequence item can be the short form ("./src:/dst[:mode]" or
+				// "name:/dst") OR the first line of the long (map) form
+				// ("- type: bind"). Dispatch on long-form keys like the ports
+				// block does: only `source:` names a volume; type/target/etc. are
+				// not sources. Passing them to composeServiceVolume recorded a
+				// phantom named volume ("type") and forced recreate on bind-only
+				// services (SIGMA-141).
+				if k, val, ok := composeLongFormVolumeKey(item); ok {
+					if k == "source" {
+						src := unquote(val)
+						if isNamedVolume(src) {
+							svc.NamedVolumes = appendUniqueStr(svc.NamedVolumes, src)
+						}
+					}
+				} else {
+					composeServiceVolume(item, svc)
+				}
 			} else if strings.HasPrefix(trimmed, "source:") {
 				src := unquote(strings.TrimSpace(strings.TrimPrefix(trimmed, "source:")))
 				if isNamedVolume(src) {
@@ -239,6 +256,26 @@ func composeServicePort(item string, svc *ComposeService) {
 			svc.PublishedPorts = appendUnique(svc.PublishedPorts, p)
 		}
 	}
+}
+
+// composeLongFormVolumeKey reports whether item is a long-form (map) volume
+// entry key such as `type: bind` or `source: data`, returning the key and its
+// scalar value. It matches only when the colon is followed by end-of-line or
+// whitespace, so short-syntax mounts like `data:/var/lib` (no space) are NOT
+// misread as a key even if the name collides with a keyword.
+func composeLongFormVolumeKey(item string) (key, val string, ok bool) {
+	for _, k := range []string{"type", "source", "target", "read_only", "bind", "volume", "tmpfs", "consistency"} {
+		if item == k+":" {
+			return k, "", true
+		}
+		if strings.HasPrefix(item, k+":") {
+			rest := item[len(k)+1:]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+				return k, strings.TrimSpace(rest), true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // composeServiceVolume records a named-volume mount (source is a bare name, not a

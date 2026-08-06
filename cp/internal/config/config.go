@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -99,11 +100,20 @@ func FromEnv() (Config, error) {
 		PaddleWebhookSecret:     os.Getenv("CP_PADDLE_WEBHOOK_SECRET"),
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
-		RequireActor:            os.Getenv("CP_REQUIRE_ACTOR") == "true",
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
 	}
+	// Parse CP_REQUIRE_ACTOR strictly. The old `== "true"` check left every
+	// other truthy spelling ("1", "True", "TRUE") silently false, so a
+	// misconfigured operator ran with the SIGMA-82 strict-mode security control
+	// off while believing it was on (fail-open). Mirror the fail-loud contract
+	// the rest of this function enforces: unknown values fail boot.
+	requireActor, err := parseBoolEnv("CP_REQUIRE_ACTOR", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RequireActor = requireActor
 	// Validate Env explicitly: a typo (e.g. "production") must not silently
 	// fall through to the dev defaults below (fail-open on auth).
 	switch cfg.Env {
@@ -169,4 +179,19 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseBoolEnv reads a boolean env var, returning def when unset/empty and an
+// error on any value strconv.ParseBool rejects. Security-relevant flags use
+// this so a typo fails boot instead of silently disabling the control.
+func parseBoolEnv(key string, def bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, os.Getenv(key))
+	}
+	return b, nil
 }

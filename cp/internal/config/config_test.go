@@ -44,6 +44,48 @@ func TestFromEnv(t *testing.T) {
 	}
 }
 
+// TestRequireActorFromEnv covers the SIGMA-142 strict boolean parsing: truthy
+// spellings enable it, "false"/empty leave it off, and a typo fails boot rather
+// than silently leaving the SIGMA-82 strict-mode control disabled (fail-open).
+func TestRequireActorFromEnv(t *testing.T) {
+	const db = "postgres://x"
+	for _, tc := range []struct {
+		val     string
+		want    bool
+		wantErr bool
+	}{
+		{"", false, false},
+		{"true", true, false},
+		{"1", true, false},
+		{"True", true, false},
+		{"false", false, false},
+		{"0", false, false},
+		{"yes", false, true},
+		{"enabled", false, true},
+	} {
+		t.Run("val="+tc.val, func(t *testing.T) {
+			for _, k := range []string{"CP_ENV", "CP_SERVICE_TOKEN", "CP_ADDR", "CP_REQUIRE_ACTOR"} {
+				t.Setenv(k, "")
+			}
+			t.Setenv("CP_DATABASE_URL", db)
+			t.Setenv("CP_REQUIRE_ACTOR", tc.val)
+			cfg, err := FromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got cfg=%+v", tc.val, cfg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.val, err)
+			}
+			if cfg.RequireActor != tc.want {
+				t.Fatalf("RequireActor = %v, want %v", cfg.RequireActor, tc.want)
+			}
+		})
+	}
+}
+
 // TestS3EnginesFromEnv covers the P2-2 CP_S3_ENGINES allowlist: default enables
 // both engines, a subset narrows, and a typo fails boot rather than silently
 // disabling an engine (mirrors CP_DB_ENGINES).
