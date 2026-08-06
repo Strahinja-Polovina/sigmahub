@@ -163,7 +163,10 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	for _, op := range signed.Document.Ops {
 		opIDs[op.ID] = true
 	}
-	if !opIDs["res:"+res] {
+	// An app with no image is not containerised yet, so it renders the
+	// resource.sync stub under the "sync:" prefix rather than "res:" — the stub
+	// must not claim a state for a resource with nothing running (SIGMA-172).
+	if !opIDs["sync:"+res] {
 		t.Fatalf("resource op missing: %+v", signed.Document.Ops)
 	}
 	for _, want := range []string{"host:nftables:" + serverID, "host:sshd:" + serverID, "host:cis:" + serverID} {
@@ -173,7 +176,9 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	}
 	_ = pubB64
 
-	// Agent reports status → CP writes resources.status.
+	// Agent reports status → CP writes resources.status. A real container op
+	// carries the "res:<id>" id (see renderAppOps/renderContainerOps), which is
+	// what handleDSDStatus routes into resources.status; report under that id.
 	statusOps := map[string]json.RawMessage{
 		"res:" + res: json.RawMessage(`{"state":"applied"}`),
 	}
