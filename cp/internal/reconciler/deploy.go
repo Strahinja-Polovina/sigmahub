@@ -398,5 +398,13 @@ func deployHealth(spec appResourceSpec, raw json.RawMessage) healthProbe {
 	} else if h.Type == "tcp" && h.Port > 0 {
 		out.Port = h.Port
 	}
+	// Never emit a port-less TCP probe: the agent rewrites port 0 to 80
+	// (defaultProbe), so an app that listens anywhere else — the normal case —
+	// would burn the full gate timeout and be reported as an unhealthy deploy
+	// (SIGMA-160). With no known port there is nothing to probe, so gate on
+	// "running" instead of on a port we invented.
+	if out.Type == "tcp" && out.Port == 0 {
+		out.Type = "none"
+	}
 	return out
 }

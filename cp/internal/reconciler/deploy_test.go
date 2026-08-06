@@ -170,6 +170,33 @@ func TestManualForceOnlyWhileInFlight(t *testing.T) {
 	}
 }
 
+// TestDeployHealthNeverProbesUnknownPort pins SIGMA-160: with no declared port
+// the probe must be "none" (gate on running), never a TCP probe on port 0 —
+// the agent rewrites 0 to 80, so that would fail the gate for every app that
+// listens anywhere else, which is the normal case.
+func TestDeployHealthNeverProbesUnknownPort(t *testing.T) {
+	// No ports, no healthCheck → nothing to probe.
+	if got := deployHealth(appResourceSpec{}, json.RawMessage(`{}`)); got.Type != "none" {
+		t.Fatalf("portless probe = %+v, want type none", got)
+	}
+	// A declared port is probed over TCP as before.
+	spec := appResourceSpec{}
+	spec.Ports = append(spec.Ports, struct {
+		Container int    `json:"container"`
+		Host      int    `json:"host"`
+		Protocol  string `json:"protocol"`
+	}{Container: 3000})
+	got := deployHealth(spec, json.RawMessage(`{}`))
+	if got.Type != "tcp" || got.Port != 3000 {
+		t.Fatalf("declared port probe = %+v, want tcp/3000", got)
+	}
+	// A detected http health check still wins.
+	got = deployHealth(spec, json.RawMessage(`{"healthCheck":{"type":"http","path":"/healthz","port":8080}}`))
+	if got.Type != "http" || got.Path != "/healthz" || got.Port != 8080 {
+		t.Fatalf("http probe = %+v", got)
+	}
+}
+
 func opIDs(ops []dsd.Op) []string {
 	out := make([]string, len(ops))
 	for i, op := range ops {
