@@ -64,8 +64,25 @@ func ServiceContainerName(resourceID, service string) string {
 }
 
 // TraefikRouterName is the deterministic Traefik router/service name for a
-// resource, so a resync renders byte-identical labels.
+// resource, so a resync renders byte-identical labels. Used by resources that
+// are replaced in place (a registry-image app): only one container ever carries
+// these labels, so the name needs no generation.
 func TraefikRouterName(resourceID string) string { return "sigmahub-" + resourceID }
+
+// TraefikGenerationRouterName is the router/service name for ONE generation of a
+// blue-green deployed app. Two generations coexist during a swap; sharing a
+// router+service name made Traefik merge them into a single weighted service and
+// send live traffic to the new container the instant it started — before the
+// health gate ran (SIGMA-164). Scoping the name to the generation gives each its
+// own router and its own single-server service, so which one serves is decided
+// by router priority (see reconciler.generationRouterPriority) rather than by a
+// round-robin over both.
+func TraefikGenerationRouterName(resourceID, generation string) string {
+	if generation == "" {
+		return TraefikRouterName(resourceID)
+	}
+	return "sigmahub-" + resourceID + "-" + generation
+}
 
 // Docker object naming. The control plane is the sole authority for these
 // names; it renders them into DSD ops and the agent uses them verbatim, so the

@@ -153,25 +153,32 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
 	}
 	health := deployHealth(spec, rs.Spec)
+	generation := deployGeneration(target.SHA, target.DeploymentID)
 	if len(domains) > 0 {
 		lbPort := 0
 		if len(spec.Ports) > 0 {
 			lbPort = spec.Ports[0].Container
 		}
-		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
-		// Gated attach: two generations of a git-deployed app share the same
-		// Traefik router labels, so the LB must withhold traffic from the new
-		// generation until it is healthy. A service-level health check makes Traefik
-		// probe each backend and route only to ready ones — closing the window
-		// between "new container started" and "agent health gate passed".
-		for k, v := range traefikHealthLabels(rs.ResourceID, health) {
+		// Gated attach: the two generations of a blue-green swap each get their own
+		// router and single-server service, and the incoming one is rendered at a
+		// lower priority so it cannot match a request until the agent has drained
+		// its predecessor. Before SIGMA-164 both generations declared the SAME
+		// router and service, which Traefik merged into one weighted service —
+		// half of live traffic hit the new container from the moment it started,
+		// throughout the health gate.
+		bg := blueGreenRouting{Generation: generation, Priority: generationRouterPriority(target.CreatedAt)}
+		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort, bg)
+		// A service-level health check on top of that, when the app declares an
+		// HTTP probe: it keeps a container that is up but not yet serving out of
+		// its own service too, so the flip after the drain is clean.
+		for k, v := range traefikHealthLabels(dsd.TraefikGenerationRouterName(rs.ResourceID, generation), health) {
 			cs.Labels[k] = v
 		}
 	}
 
 	rollout := rolloutOpSpec{
 		Container:    cs,
-		Generation:   deployGeneration(target.SHA, target.DeploymentID),
+		Generation:   generation,
 		Health:       health,
 		DeploymentID: target.DeploymentID,
 	}
@@ -296,7 +303,15 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 			if len(s.Ports) > 0 {
 				lbPort = s.Ports[0]
 			}
-			cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
+			// Generation-scoped router + priority, exactly as the single-container
+			// path (SIGMA-164) — a Compose web service is blue-green too unless it
+			// opted into recreate, and a recreate service has no second generation
+			// to be confused with, so the same labels are correct either way.
+			cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort,
+				blueGreenRouting{Generation: gen, Priority: generationRouterPriority(target.CreatedAt)})
+			for k, v := range traefikHealthLabels(dsd.TraefikGenerationRouterName(rs.ResourceID, gen), composeServiceHealth(s)) {
+				cs.Labels[k] = v
+			}
 		}
 
 		// Image source: build the service's context, or pull a prebuilt image.

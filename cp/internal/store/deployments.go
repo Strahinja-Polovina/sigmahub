@@ -743,6 +743,11 @@ type DeployTarget struct {
 	ImageDigest  string // set for a rollback (reuse a retained image; skip clone/build)
 	Trigger      string
 	Status       string // queued|building|deploying|success (the filtered set below)
+	// CreatedAt orders a resource's deployments. The reconciler derives the
+	// blue-green Traefik router priority from it (SIGMA-164), so it must come
+	// from stored data rather than render-time wall-clock: a resync has to
+	// re-render byte-identical labels.
+	CreatedAt time.Time
 }
 
 // DeployTargetsForServer returns the current deploy target per app resource on a
@@ -753,7 +758,8 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	rows, err := s.Pool.Query(ctx, `
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger, d.status
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger, d.status,
+		       d.created_at
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
@@ -768,7 +774,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		var t DeployTarget
 		var ref, sha, cfg, digest *string
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
-			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger, &t.Status); err != nil {
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger, &t.Status, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)

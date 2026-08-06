@@ -184,7 +184,10 @@ func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []s
 		if len(spec.Ports) > 0 {
 			lbPort = spec.Ports[0].Container
 		}
-		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort)
+		// No generation: a registry-image app is replaced in place, so only ever
+		// one container carries these labels and the blue-green router scoping
+		// (SIGMA-164) does not apply.
+		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort, blueGreenRouting{})
 	}
 	csBytes, _ := json.Marshal(cs)
 	ops = append(ops, dsd.Op{ID: containerID, Kind: dsd.KindContainerApply, DependsOn: deps, Spec: csBytes})
