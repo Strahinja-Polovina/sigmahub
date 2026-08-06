@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { user } from "../db/auth-schema";
@@ -316,6 +316,23 @@ export async function removeMember(input: { orgId: string; userId: string }) {
       .where(
         and(eq(s.memberships.orgId, input.orgId), eq(s.memberships.userId, input.userId))
       );
+    // Also drop the user's project grants for this org. project_memberships has
+    // no FK/cascade to memberships, so leaving them makes the grants inert-but-
+    // resurrectable: a later re-invite recreates the membership and the stale
+    // grants silently reactivate, restoring project access that was never
+    // re-granted (SIGMA-148). Scope the delete to this org's projects.
+    await tx.delete(s.projectMemberships).where(
+      and(
+        eq(s.projectMemberships.userId, input.userId),
+        inArray(
+          s.projectMemberships.projectId,
+          tx
+            .select({ id: s.projects.id })
+            .from(s.projects)
+            .where(eq(s.projects.orgId, input.orgId))
+        )
+      )
+    );
     return t;
   });
   await writeAudit({

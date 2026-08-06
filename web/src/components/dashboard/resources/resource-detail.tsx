@@ -451,7 +451,9 @@ export function ResourceDetail({
                         </span>
                         <span className="inline-flex items-center gap-1.5">
                           <MemoryStick className="size-4 text-muted-foreground" />
-                          <span className="tabular-nums text-foreground">{latest.mem}%</span>
+                          <span className="tabular-nums text-foreground">
+                            {isCp ? `${latest.mem} MiB` : `${latest.mem}%`}
+                          </span>
                         </span>
                       </div>
                     )}
@@ -464,6 +466,7 @@ export function ResourceDetail({
                     <MetricsChart
                       data={metrics}
                       keys={isCp ? ["cpu", "mem"] : ["cpu", "mem", "net"]}
+                      memUnit={isCp ? "MiB" : "%"}
                       className="aspect-[16/7] w-full"
                     />
                   )}
@@ -506,7 +509,7 @@ export function ResourceDetail({
                 {isCp && metrics.length === 0 ? (
                   telemetryEmptyState
                 ) : (
-                  <MetricsChart data={metrics} keys={["cpu", "mem"]} className="aspect-[16/6] w-full" />
+                  <MetricsChart data={metrics} keys={["cpu", "mem"]} memUnit={isCp ? "MiB" : "%"} className="aspect-[16/6] w-full" />
                 )}
               </CardContent>
             </Card>

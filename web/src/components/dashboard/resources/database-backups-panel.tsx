@@ -382,6 +382,21 @@ export function DatabaseBackupsPanel({
   const router = useRouter();
   const [targets, setTargets] = React.useState(initialTargets);
   const [runs, setRuns] = React.useState(initialRuns);
+  // The mutations below call router.refresh(), which re-renders the server page
+  // and delivers fresh props — but useState keeps the initial snapshot, so the
+  // run history would go stale after a restore/policy change (SIGMA-154). Sync
+  // local state to props when the props themselves change (render-time prev-prop
+  // pattern), while still allowing refreshRuns() to override between refreshes.
+  const [prevRuns, setPrevRuns] = React.useState(initialRuns);
+  if (initialRuns !== prevRuns) {
+    setPrevRuns(initialRuns);
+    setRuns(initialRuns);
+  }
+  const [prevTargets, setPrevTargets] = React.useState(initialTargets);
+  if (initialTargets !== prevTargets) {
+    setPrevTargets(initialTargets);
+    setTargets(initialTargets);
+  }
   const [pending, startTransition] = React.useTransition();
 
   function updatePolicy(input: {
