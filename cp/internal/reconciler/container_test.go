@@ -105,10 +105,19 @@ func TestRenderStubFallback(t *testing.T) {
 		{ResourceID: "res_app", ProjectID: "proj_x", Kind: "app", Spec: noImage},
 	}
 	ops, _ := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{})
-	for _, id := range []string{"res:res_db", "res:res_app"} {
+	for _, id := range []string{"sync:res_db", "sync:res_app"} {
 		op, ok := opByID(ops, id)
 		if !ok || op.Kind != dsd.KindResourceSync {
 			t.Fatalf("expected resource.sync stub for %s, got %+v (ok=%v)", id, op, ok)
+		}
+	}
+	// The stub must NOT claim a resource status: a bare res:<id> op-status is
+	// written straight into resources.status, and the agent reports the stub as
+	// applied — which painted a green "Running" badge on a resource with nothing
+	// running (SIGMA-172).
+	for _, id := range []string{"res:res_db", "res:res_app"} {
+		if _, ok := opByID(ops, id); ok {
+			t.Fatalf("stub must not use the status-bearing %s op id", id)
 		}
 	}
 }

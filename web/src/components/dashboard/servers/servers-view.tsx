@@ -147,7 +147,10 @@ export function ServersView({
 
   const filtered =
     filter === "all" ? servers : servers.filter((sv) => sv.type === filter);
-  const connected = servers.filter((sv) => sv.status !== "provisioning").length;
+  // "Connected" means actually reporting — matching the CP's ConnectedServerCount
+  // and the billing read model. Counting everything that isn't `provisioning`
+  // also counted servers the CP had already flipped to unreachable (SIGMA-184).
+  const connected = servers.filter((sv) => sv.status === "running").length;
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">

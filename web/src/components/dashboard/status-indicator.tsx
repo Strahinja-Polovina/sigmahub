@@ -1,5 +1,6 @@
 import { cn } from "@/lib/utils";
 import type { Status } from "@/lib/mock";
+import { normalizeStatus } from "@/lib/status";
 
 // Maps a resource/server Status to a small colored dot + label.
 // running=emerald, degraded=amber, error/stopped=red, provisioning=blue.
@@ -13,29 +14,31 @@ const STATUS_META: Record<Status, { label: string; dot: string; text: string }> 
 
 const FALLBACK_META = { label: "Unknown", dot: "bg-muted-foreground", text: "text-muted-foreground" };
 
-// The control plane reports a resource status as an object ({ state: "applied" }),
-// and both resources and servers use CP state vocabulary that doesn't line up 1:1
-// with the UI's Status enum. Normalize both shapes here so an unmapped value
-// degrades to a neutral badge instead of crashing the whole page.
-const STATE_ALIASES: Record<string, Status> = {
-  applied: "running",
-  ready: "running",
-  active: "running",
-  pending: "provisioning",
-  creating: "provisioning",
-  deploying: "provisioning",
-  building: "provisioning",
-  failed: "error",
+// Some CP states share a UI Status but deserve their own wording: an
+// unreachable server is red like `stopped`, but "Stopped" implies someone
+// stopped it, while this means the agent went silent (SIGMA-184). A `skipped`
+// op means the deploy never ran because a prerequisite failed (SIGMA-189).
+const RAW_LABELS: Record<string, string> = {
+  unreachable: "Unreachable",
+  skipped: "Not deployed",
 };
 
-function resolveMeta(status: unknown) {
-  let key = "";
-  if (typeof status === "string") key = status;
-  else if (status && typeof status === "object" && "state" in status) {
-    key = String((status as { state: unknown }).state ?? "");
+function rawKey(status: unknown): string {
+  if (typeof status === "string") return status;
+  if (status && typeof status === "object" && "state" in status) {
+    return String((status as { state: unknown }).state ?? "");
   }
-  const norm = STATE_ALIASES[key] ?? (key as Status);
-  return STATUS_META[norm] ?? FALLBACK_META;
+  return "";
+}
+
+// Translation lives in @/lib/status so the mirror writer and this renderer share
+// one vocabulary — see the comment there for why a render-only map was a bug.
+function resolveMeta(status: unknown) {
+  const norm = normalizeStatus(status);
+  if (!norm) return FALLBACK_META;
+  const meta = STATUS_META[norm];
+  const override = RAW_LABELS[rawKey(status)];
+  return override ? { ...meta, label: override } : meta;
 }
 
 export function StatusDot({

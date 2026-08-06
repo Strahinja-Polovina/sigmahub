@@ -107,8 +107,18 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 		}
 		// Not yet containerised (or an app with no image): a no-op stub keeps the
 		// resource represented in the DSD.
+		//
+		// The stub is deliberately NOT a `res:<id>` op. The agent registers
+		// resource.sync as an unconditional success, and handleDSDStatus routes a
+		// bare `res:<id>` status straight into resources.status — so the stub was
+		// reporting "applied" for a resource with nothing running, painting a
+		// green "Running" badge on undeployed resources and even OVERWRITING the
+		// real failed status of a resource whose only deployment failed
+		// (SIGMA-172). Under its own prefix it still keeps the resource in the
+		// document (and in whole-document convergence, which reads every op
+		// regardless of prefix) without claiming anything about its state.
 		stub, _ := json.Marshal(map[string]any{"resourceId": rs.ResourceID, "kind": rs.Kind, "spec": rs.Spec})
-		resourceOps = append(resourceOps, dsd.Op{ID: "res:" + rs.ResourceID, Kind: dsd.KindResourceSync, Spec: stub})
+		resourceOps = append(resourceOps, dsd.Op{ID: "sync:" + rs.ResourceID, Kind: dsd.KindResourceSync, Spec: stub})
 	}
 
 	// One network.ensure op per distinct project, emitted first in a stable

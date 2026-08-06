@@ -51,6 +51,19 @@ describe("resource mapping", () => {
     expect(resourceStatusText({ state: "" }, "running")).toBe("running");
   });
 
+  // The CP/agent speak their own vocabulary; the mirror must store UI states so
+  // aggregates that compare against them (running counts, project status chips)
+  // don't silently miss (SIGMA-176/189).
+  it("translates CP/agent state vocabulary into UI status", () => {
+    expect(resourceStatusText({ state: "applied" }, null)).toBe("running");
+    expect(resourceStatusText({ state: "failed" }, null)).toBe("error");
+    // A dependent of a failed op — "did not deploy", not "unknown".
+    expect(resourceStatusText({ state: "skipped" }, null)).toBe("error");
+    expect(resourceStatusText({ state: "building" }, null)).toBe("provisioning");
+    // An unrecognized state keeps the previous value rather than storing junk.
+    expect(resourceStatusText({ state: "wat" }, "running")).toBe("running");
+  });
+
   it("builds a full local row, riding spec.repo/domain when present", () => {
     const row = resourceMirrorRow(
       cpResource({
