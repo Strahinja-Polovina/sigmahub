@@ -105,7 +105,7 @@ export const PILLARS: Pillar[] = [
     icon: Server,
     title: "Server onboarding",
     description:
-      "Bring any Linux server over SSH — or provision from your own Hetzner/OVH account. One-line agent install, deploy-ready in minutes, even behind NAT.",
+      "Bring any Linux server over SSH — Hetzner, OVH, bare metal or on-prem. One-line agent install, deploy-ready in minutes, even behind NAT.",
   },
   {
     icon: GitBranch,
@@ -404,7 +404,7 @@ export const FAQ = {
     },
     {
       q: "Which providers and stacks are supported?",
-      a: "Any Linux server (Ubuntu/Debian at beta). Optional provider integrations for Hetzner, OVH and Latitude.sh use your own API key. Deploy from GitHub or GitLab, build from Dockerfile or compose, and flip DNS via Cloudflare.",
+      a: "Any Linux server (Ubuntu/Debian at beta) — onboarding is a one-line SSH bootstrap, wherever the box runs (Hetzner, OVH, Latitude.sh, bare metal). Deploy from GitHub or GitLab, build from Dockerfile or compose, and flip DNS via Cloudflare.",
     },
     {
       q: "Do I still need a DevOps or SRE hire?",
