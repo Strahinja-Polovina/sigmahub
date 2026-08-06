@@ -6,12 +6,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -205,6 +207,77 @@ func TestGitWebhookRouting(t *testing.T) {
 }
 
 // TestGitConnectionUniqueRepo proves a repo drives at most one connection.
+// TestDeleteGitConnectionRefusesWhileDeployed pins SIGMA-159: disconnecting a
+// repo that still has deployed resources must be refused. Allowing it nulls the
+// deployments' connection_id, which removes their deploy targets, downgrades
+// them to the resource.sync stub, and makes the agent's GC force-remove the
+// running production containers — with no working redeploy path back.
+func TestDeleteGitConnectionRefusesWhileDeployed(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_disconnect"
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host-disc", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host-disc", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvID := reg.Server.ID
+	if err := st.AttachServer(ctx, orgID, env.ID, srvID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: srvID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:alpine"}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, RepoFullName: "Acme/Disc",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With no deployments the disconnect is allowed.
+	if err := st.DeleteGitConnection(ctx, orgID, conn.ID, "test"); err != nil {
+		t.Fatalf("disconnect with no deployments: %v", err)
+	}
+
+	// Reconnect and deploy from it — now the disconnect must be refused.
+	conn2, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, RepoFullName: "Acme/Disc",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: srvID,
+		ConnectionID: conn2.ID, Trigger: "git", GitSHA: "abc1234",
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	err = st.DeleteGitConnection(ctx, orgID, conn2.ID, "test")
+	if err == nil {
+		t.Fatal("expected disconnect to be refused while a resource is deployed from the repo")
+	}
+	if !strings.Contains(err.Error(), "api") {
+		t.Fatalf("refusal should name the blocking resource, got: %v", err)
+	}
+}
+
 func TestGitConnectionUniqueRepo(t *testing.T) {
 	st, _ := testStore(t)
 	ctx := context.Background()

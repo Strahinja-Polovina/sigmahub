@@ -279,12 +279,54 @@ func (s *Store) GetGitConnection(ctx context.Context, orgID, connID string) (Git
 }
 
 // DeleteGitConnection removes a connection (cascading its branch maps).
+//
+// It REFUSES while any resource is still deployed from this connection.
+// deployments.connection_id is ON DELETE SET NULL and DeployTargetsForServer
+// INNER JOINs git_connections, so dropping the row silently removes those
+// resources' deploy targets; the reconciler then renders them as the no-op
+// resource.sync stub, and the agent's GC — whose keep-set is built from the
+// document's container/rollout ops — force-removes the RUNNING production
+// container. Redeploy can't recover it either, because CreateManualRedeploy
+// copies the now-NULL connection_id forward (SIGMA-159). Disconnecting is meant
+// to stop future deploys, not to tear down running apps, so the caller must
+// remove or re-home the resources first.
 func (s *Store) DeleteGitConnection(ctx context.Context, orgID, connID, actor string) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Resources whose current (non-superseded) deployment came from this
+	// connection are the ones that would be reaped.
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT r.name
+		  FROM deployments d
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.connection_id = $1
+		   AND d.status IN ('queued','building','deploying','success')
+		 ORDER BY r.name`, connID)
+	if err != nil {
+		return fmt.Errorf("list deployed resources: %w", err)
+	}
+	var deployed []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		deployed = append(deployed, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(deployed) > 0 {
+		return fmt.Errorf("%w: %d resource(s) are still deployed from this repo: %s — remove them first",
+			ErrConflict, len(deployed), strings.Join(deployed, ", "))
+	}
+
 	var repo string
 	err = tx.QueryRow(ctx,
 		`DELETE FROM git_connections WHERE org_id = $1 AND id = $2 RETURNING repo_full_name`,

@@ -594,16 +594,49 @@ function ConnectionCard({
               Link GitHub App
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground hover:text-destructive"
-            onClick={disconnect}
-            disabled={pending}
-          >
-            <Unplug className="size-3.5" />
-            Disconnect
-          </Button>
+          {/* Disconnecting stops push-to-deploy for this repo. The CP refuses
+              while resources are still deployed from it (SIGMA-159), so confirm
+              rather than firing a one-click action whose failure — or success —
+              the user did not ask for. */}
+          <Dialog>
+            <DialogTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-destructive"
+                  disabled={pending}
+                >
+                  <Unplug className="size-3.5" />
+                  Disconnect
+                </Button>
+              }
+            />
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>Disconnect {panel.connection.repoFullName}?</DialogTitle>
+                <DialogDescription>
+                  Push-to-deploy stops for this repo and its branch routes are
+                  removed. Resources already deployed from it keep running, but
+                  they can no longer be redeployed or rolled back until you
+                  reconnect — so SigmaHub will refuse while any are still
+                  deployed.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+                  Cancel
+                </DialogClose>
+                <DialogClose
+                  render={
+                    <Button variant="destructive" type="button" disabled={pending} onClick={disconnect} />
+                  }
+                >
+                  Disconnect
+                </DialogClose>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </span>
       </div>
       <div className="px-4 py-3">
