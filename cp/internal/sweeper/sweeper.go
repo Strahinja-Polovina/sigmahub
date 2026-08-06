@@ -11,6 +11,7 @@ import (
 type Store interface {
 	MarkStaleUnreachable(ctx context.Context, threshold time.Duration) (int64, error)
 	PruneMetrics(ctx context.Context, retention time.Duration) (int64, error)
+	TimeoutStaleDeployments(ctx context.Context, timeout time.Duration) (int64, error)
 }
 
 type Config struct {
@@ -21,6 +22,13 @@ type Config struct {
 	StaleAfter time.Duration
 	// Retention keeps this much metric history.
 	Retention time.Duration
+	// DeployTimeout fails a deployment that has been in flight this long without
+	// reaching a terminal state. Without it a deploy whose agent dies mid-flight
+	// stays "building" forever: nothing else ever transitions it, so no
+	// deploy_failed alert fires and the log pane streams indefinitely
+	// (SIGMA-182). Backup runs have had this safety net since P1-11; deployments
+	// did not. Keep it comfortably above the agent's own op timeouts.
+	DeployTimeout time.Duration
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run it in a goroutine.
@@ -41,6 +49,13 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 				log.Error("sweeper: prune metrics", "err", err)
 			} else if n > 0 {
 				log.Info("sweeper: metrics pruned", "count", n)
+			}
+			if cfg.DeployTimeout > 0 {
+				if n, err := st.TimeoutStaleDeployments(ctx, cfg.DeployTimeout); err != nil {
+					log.Error("sweeper: timeout stale deployments", "err", err)
+				} else if n > 0 {
+					log.Info("sweeper: deployments timed out", "count", n)
+				}
 			}
 		}
 	}

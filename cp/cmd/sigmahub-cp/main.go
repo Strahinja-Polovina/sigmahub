@@ -271,11 +271,15 @@ func run() error {
 	go alerts.Run(ctx, log, st, alertSender, alerts.Config{})
 
 	// Background maintenance: flip silent servers to unreachable, prune old
-	// metrics. StaleAfter ≈ 3× the agent's default 30s heartbeat.
+	// metrics, and fail deployments whose agent stopped reporting. StaleAfter ≈
+	// 3× the agent's default 30s heartbeat. DeployTimeout sits above the agent's
+	// own per-op ceilings (a build plus a 120s health gate) so only a genuinely
+	// dead apply is failed (SIGMA-182).
 	go sweeper.Run(ctx, log, st, sweeper.Config{
-		Interval:   30 * time.Second,
-		StaleAfter: 90 * time.Second,
-		Retention:  24 * time.Hour,
+		Interval:      30 * time.Second,
+		StaleAfter:    90 * time.Second,
+		Retention:     24 * time.Hour,
+		DeployTimeout: 45 * time.Minute,
 	})
 
 	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates

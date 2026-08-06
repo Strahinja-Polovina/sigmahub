@@ -116,6 +116,75 @@ func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resour
 	return err
 }
 
+// TimeoutStaleDeployments fails deployments that have been in flight past
+// `timeout` without reaching a terminal state, returning how many were failed.
+//
+// Nothing else ever transitions them: the only exits are an agent op-status
+// report and 'superseded' (when a NEWER deployment is created for the same
+// server+resource). So an agent that dies, loses power, or is disconnected
+// mid-deploy left the row "building" forever — no deploy_failed alert (that
+// only fires on a transition TO failed), a duration stuck on "…", and a log
+// pane that streams indefinitely because `done` is derived from the status
+// (SIGMA-182). Backup runs have had this net since P1-11.
+//
+// Each row goes through setDeploymentStatusTx so it gets the same terminal
+// stamping and the same deploy_failed alert as any other failure — that
+// function's own comment already names "timeout" as one of its callers.
+func (s *Store) TimeoutStaleDeployments(ctx context.Context, timeout time.Duration) (int64, error) {
+	if timeout <= 0 {
+		return 0, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Measure from the last sign of life: started_at once the agent reports its
+	// first phase, else the row's creation.
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM deployments
+		 WHERE status IN ('queued','building','deploying')
+		   AND COALESCE(started_at, created_at) < now() - $1::interval
+		 ORDER BY created_at`, timeout.String())
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var n int64
+	for _, id := range ids {
+		err := setDeploymentStatusTx(ctx, tx, id, DeploymentStatusUpdate{
+			Status:       "failed",
+			Detail:       "timed out — the agent stopped reporting progress",
+			MarkFinished: true,
+		})
+		if errors.Is(err, ErrConflict) {
+			continue // raced to terminal in the meantime
+		}
+		if err != nil {
+			return 0, err
+		}
+		n++
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // StampDeploymentDSDVersion records the DSD version that first rendered each of
 // the given in-flight deployments (SIGMA-134). It stamps only rows still in
 // flight and not yet stamped (dsd_version = 0), so a deployment keeps the
