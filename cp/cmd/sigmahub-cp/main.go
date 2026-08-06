@@ -18,6 +18,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/alerts"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/backup"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/billingsync"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
@@ -289,6 +290,24 @@ func run() error {
 		VMReadURL:  cfg.VMReadURL,
 		LokiURL:    cfg.LokiURL,
 	})
+	// Paddle billing (P2-4): nil client when no API key → billing endpoints
+	// answer honest not-configured. The typed-nil guard matters — a nil
+	// *paddle.Client must not become a non-nil interface.
+	var paddleClient api.PaddleClient
+	// Held separately (and assigned from the same concrete client) so a nil
+	// *paddle.Client never becomes a non-nil interface on either side.
+	var paddleQuantity billingsync.PaddleClient
+	if pc := paddle.NewClient(cfg.PaddleEnv, cfg.PaddleAPIKey); pc != nil {
+		paddleClient, paddleQuantity = pc, pc
+		log.Info("paddle billing configured", "env", cfg.PaddleEnv)
+	}
+	// SIGMA-171: the billed quantity used to be sent to Paddle once, at
+	// checkout, and never again — every org that grew or shrank after
+	// subscribing was invoiced for its subscribe-time server count while the
+	// dashboard showed the live figure. Nil client / no price id → no-op.
+	quantitySync := &billingsync.Syncer{
+		Store: st, Paddle: paddleQuantity, PriceID: cfg.PaddlePriceID, Log: log,
+	}
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -309,18 +328,16 @@ func run() error {
 				if _, err := st.SweepS3Measure(ctx, time.Now()); err != nil {
 					log.Error("s3 measure sweep", "err", err)
 				}
+				// SIGMA-171: turn the meter into an invoice — push the current
+				// billable-server count to any subscription that has drifted.
+				if n, err := quantitySync.Sync(ctx, time.Now()); err != nil {
+					log.Error("billing quantity sync", "err", err)
+				} else if n > 0 {
+					log.Info("billing quantity synced", "subscriptions", n)
+				}
 			}
 		}
 	}()
-
-	// Paddle billing (P2-4): nil client when no API key → billing endpoints
-	// answer honest not-configured. The typed-nil guard matters — a nil
-	// *paddle.Client must not become a non-nil interface.
-	var paddleClient api.PaddleClient
-	if pc := paddle.NewClient(cfg.PaddleEnv, cfg.PaddleAPIKey); pc != nil {
-		paddleClient = pc
-		log.Info("paddle billing configured", "env", cfg.PaddleEnv)
-	}
 
 	srv := &http.Server{
 		Addr: cfg.Addr,
