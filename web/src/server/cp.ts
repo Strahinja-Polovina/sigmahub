@@ -47,6 +47,12 @@ export type CpServer = {
   hardeningScore?: number | null;
   diskEncrypted?: boolean | null;
   sshLocked?: boolean | null;
+  /** Configured hardening intent + edge role, so both are visible and editable
+   *  after provisioning rather than write-once at connect time (SIGMA-178/179).
+   *  `sshLocked` above is the agent's REPORTED posture; `keepPublicSsh` is what
+   *  the operator asked for. */
+  keepPublicSsh?: boolean;
+  proxyRole?: boolean;
 };
 
 export type CpMetricPoint = {
@@ -236,6 +242,21 @@ export async function cpProvisionServer(
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/provision`, {
     method: "POST",
     body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+/** Set a server's proxy/edge role. Opens 80/443 in the firewall and makes the
+ *  reconciler render Traefik on this host — the precondition for any custom
+ *  domain to route. Project Admin+ on the CP; audited (SIGMA-178). */
+export async function cpSetProxyRole(
+  orgId: string,
+  serverId: string,
+  proxy: boolean,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/proxy-role`, {
+    method: "POST",
+    body: JSON.stringify({ proxy }),
   }, { orgId, actor });
 }
 

@@ -874,23 +874,26 @@ func TestHostHardening(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Default posture: SSH locked down, CIS on, proxy role carried, mesh iface set.
+	// Default posture: public SSH KEPT (fail-safe — the mesh carries no operator
+	// device, so an unrequested lockdown is a lockout, SIGMA-179), CIS on, proxy
+	// role carried, mesh iface set.
 	hh, err := st.HostHardeningForServer(ctx, res.ServerID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hh.KeepPublicSSH || !hh.CISEnabled || !hh.ProxyRole || hh.MeshInterface != "sigma0" || hh.MeshIP == "" {
+	if !hh.KeepPublicSSH || !hh.CISEnabled || !hh.ProxyRole || hh.MeshInterface != "sigma0" || hh.MeshIP == "" {
 		t.Fatalf("default hardening = %+v", hh)
 	}
 
-	// Opt out of SSH lockdown + add an exception; the render input reflects it.
-	if err := st.SetHardeningConfig(ctx, orgID, res.ServerID, true, true,
+	// Explicitly opt IN to the SSH lockdown + add an exception; the render input
+	// reflects both.
+	if err := st.SetHardeningConfig(ctx, orgID, res.ServerID, false, true,
 		[]store.PortException{{Port: 8443, Proto: "tcp"}}, "admin"); err != nil {
 		t.Fatal(err)
 	}
 	hh, _ = st.HostHardeningForServer(ctx, res.ServerID)
-	if !hh.KeepPublicSSH || len(hh.ExtraPorts) != 1 || hh.ExtraPorts[0].Port != 8443 {
-		t.Fatalf("after opt-out = %+v", hh)
+	if hh.KeepPublicSSH || len(hh.ExtraPorts) != 1 || hh.ExtraPorts[0].Port != 8443 {
+		t.Fatalf("after lockdown opt-in = %+v", hh)
 	}
 
 	// Cross-tenant guard: another org cannot change this server's hardening.

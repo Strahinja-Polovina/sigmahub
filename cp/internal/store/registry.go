@@ -65,6 +65,12 @@ type Server struct {
 	HardeningScore *int    `json:"hardeningScore"`
 	DiskEncrypted  *bool   `json:"diskEncrypted"`
 	SSHLocked      *bool   `json:"sshLocked"`
+	// KeepPublicSSH is the CONFIGURED hardening intent (as opposed to SSHLocked,
+	// which is the agent's reported posture). Surfaced so the dashboard can show
+	// and change it after provisioning instead of it being write-once at connect
+	// time (SIGMA-179). Defaults TRUE when no hardening row exists, matching
+	// HostHardeningForServer's fail-safe.
+	KeepPublicSSH bool `json:"keepPublicSsh"`
 }
 
 // readinessExpr is the derived Ready predicate: the server is live (running),
@@ -405,13 +411,16 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 const serverSelect = `
 	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
 	       s.agent_version, s.facts, s.mesh_ip, s.pubkey, s.last_seen_at, s.created_at,
-	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked, ` + readinessExpr + ` AS ready
-	  FROM servers s`
+	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked,
+	       COALESCE(h.keep_public_ssh, TRUE), ` + readinessExpr + ` AS ready
+	  FROM servers s
+	  LEFT JOIN server_hardening h ON h.server_id = s.id`
 
 func scanServerRow(row pgx.Row, srv *Server) error {
 	return row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
-		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked, &srv.Ready)
+		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked,
+		&srv.KeepPublicSSH, &srv.Ready)
 }
 
 func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error) {

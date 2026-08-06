@@ -45,9 +45,10 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
-import { disconnectServer } from "@/server/actions/servers";
+import { disconnectServer, setServerHardening, setServerProxyRole } from "@/server/actions/servers";
 import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
 import {
@@ -201,12 +202,101 @@ function HostedResourceRow({ resource }: { resource: HostedRow }) {
   );
 }
 
+/** Post-provision hardening controls: the SSH lockdown opt-out and the
+ *  proxy/edge role. Both drive real CP endpoints that were previously
+ *  unreachable from the dashboard (SIGMA-178/179). */
+function HardeningControls({
+  orgId,
+  serverId,
+  keepPublicSsh,
+  proxyRole,
+}: {
+  orgId: string;
+  serverId: string;
+  keepPublicSsh: boolean;
+  proxyRole: boolean;
+}) {
+  const router = useRouter();
+  const [pending, startTransition] = React.useTransition();
+  const [ssh, setSsh] = React.useState(keepPublicSsh);
+  const [proxy, setProxy] = React.useState(proxyRole);
+
+  // Re-sync when the server props change (a refresh delivers fresh values).
+  const [prev, setPrev] = React.useState({ keepPublicSsh, proxyRole });
+  if (prev.keepPublicSsh !== keepPublicSsh || prev.proxyRole !== proxyRole) {
+    setPrev({ keepPublicSsh, proxyRole });
+    setSsh(keepPublicSsh);
+    setProxy(proxyRole);
+  }
+
+  function apply(next: { ssh?: boolean; proxy?: boolean }) {
+    startTransition(async () => {
+      try {
+        if (next.ssh !== undefined) {
+          await setServerHardening({ orgId, serverId, keepPublicSsh: next.ssh, cisEnabled: true });
+          setSsh(next.ssh);
+          toast.success(next.ssh ? "Public SSH kept open" : "SSH lockdown applied");
+        }
+        if (next.proxy !== undefined) {
+          await setServerProxyRole({ orgId, serverId, proxy: next.proxy });
+          setProxy(next.proxy);
+          toast.success(next.proxy ? "Proxy role enabled" : "Proxy role disabled");
+        }
+        router.refresh();
+      } catch (err) {
+        toast.error("Couldn’t update hardening", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium text-foreground">Keep public SSH open</span>
+          <p className="text-xs text-muted-foreground">
+            Turning this off firewalls port 22. SigmaHub does not put your
+            workstation on the mesh, so keep a bastion or console first.
+          </p>
+        </div>
+        <Switch
+          checked={ssh}
+          disabled={pending}
+          onCheckedChange={(v) => apply({ ssh: Boolean(v) })}
+          aria-label="Keep public SSH open"
+        />
+      </div>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium text-foreground">Proxy / edge role</span>
+          <p className="text-xs text-muted-foreground">
+            Opens 80/443 and runs the ingress proxy here — required before a
+            custom domain on this server can get a certificate.
+          </p>
+        </div>
+        <Switch
+          checked={proxy}
+          disabled={pending}
+          onCheckedChange={(v) => apply({ proxy: Boolean(v) })}
+          aria-label="Proxy role"
+        />
+      </div>
+    </div>
+  );
+}
+
 export type HardeningInfo = {
   ready: boolean;
   score: number | null;
   diskEncrypted: boolean | null;
   sshLocked: boolean | null;
   distro: string | null;
+  /** Configured intent (vs sshLocked, the agent's reported posture) and the
+   *  edge role, both editable here rather than only at provision time. */
+  keepPublicSsh?: boolean;
+  proxyRole?: boolean;
 };
 
 export function ServerDetailView({
@@ -215,12 +305,16 @@ export function ServerDetailView({
   cpMode,
   metricsPoints,
   hardening,
+  orgId,
+  canManage = false,
 }: {
   server: ServerRowT;
   hosted: HostedRow[];
   cpMode?: boolean;
   metricsPoints?: MetricsPoint[];
   hardening?: HardeningInfo | null;
+  orgId?: string;
+  canManage?: boolean;
 }) {
   const provisioning = server.status === "provisioning";
 
@@ -380,6 +474,22 @@ export function ServerDetailView({
               }
             />
             {hardening.distro && <SpecItem icon={Network} label="OS" value={hardening.distro} />}
+
+            {/* Editable hardening intent. Before this, both settings were
+                write-once in the connect dialog: a locked-out host or a
+                non-proxy server with a domain attached had no in-product
+                remedy (SIGMA-178/179). */}
+            {cpMode && orgId && canManage && (
+              <>
+                <Separator />
+                <HardeningControls
+                  orgId={orgId}
+                  serverId={server.id}
+                  keepPublicSsh={hardening.keepPublicSsh ?? true}
+                  proxyRole={hardening.proxyRole ?? false}
+                />
+              </>
+            )}
           </CardContent>
         </Card>
       )}
