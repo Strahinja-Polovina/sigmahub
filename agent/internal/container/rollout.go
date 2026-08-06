@@ -326,10 +326,18 @@ func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec R
 	service := spec.Container.Service
 	newName := rolloutName(spec.Container.Name, spec.Generation)
 
-	// Idempotency: the target generation already running and unchanged is converged.
+	// Idempotency: the target generation already running and unchanged is
+	// converged — BUT re-run the health gate first. On a prior gate failure the
+	// recreate path leaves the unhealthy new container running (there is no old
+	// generation to fall back to), so a resumed/re-applied op that trusted
+	// "running + matching hash" alone would report an unhealthy service as a
+	// successful deploy with no auto-revert (SIGMA-147).
 	if cur, ok, err := dk.ContainerInspect(ctx, newName); err != nil {
 		return err
 	} else if ok && cur.Running && cur.Labels[LabelSpecHash] == hash {
+		if err := gateHealthy(ctx, dk, probe, newName, spec.Health); err != nil {
+			return fmt.Errorf("recreated service unhealthy: %w", err)
+		}
 		return drainOld(ctx, dk, resourceID, service, newName, log)
 	}
 
@@ -381,7 +389,14 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 	if err != nil {
 		return err
 	}
-	hash := spec.Container.SpecHash()
+	// The live container carries the generation-suffixed name, so its desired
+	// record and drift-detection hash must be keyed on that name too (SIGMA-146).
+	// buildCreateBody ignores spec.Name, so the create body is unchanged; only
+	// the SpecHash differs, and it is compared only against the container's own
+	// label, so this stays internally consistent.
+	genSpec := spec.Container
+	genSpec.Name = rolloutName(spec.Container.Name, spec.Generation)
+	hash := genSpec.SpecHash()
 	body := d.buildCreateBody(effective, hash)
 
 	postStart := func(ctx context.Context, id string) error {
@@ -400,6 +415,12 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 
 	if err := performRollout(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
 		return err
+	}
+	// Record the live generation as desired so the reconcile loop repairs it if
+	// it is stopped/removed out of band, and drop older generations so a drained
+	// one is never resurrected (SIGMA-146).
+	if err := d.persistRolloutGeneration(genSpec); err != nil {
+		d.log.Warn("rollout: persist desired generation", "container", genSpec.Name, "err", err)
 	}
 	// Keep the last-N built images so a rebuild-free rollback always has a target;
 	// prune older ones. Best-effort — never fails the deploy.
@@ -425,7 +446,11 @@ func (d *Driver) opRecreate(ctx context.Context, op dsd.Op) error {
 	if err != nil {
 		return err
 	}
-	hash := spec.Container.SpecHash()
+	// Key the hash + desired record on the generation-suffixed name (SIGMA-146),
+	// exactly as opRollout does.
+	genSpec := spec.Container
+	genSpec.Name = rolloutName(spec.Container.Name, spec.Generation)
+	hash := genSpec.SpecHash()
 	body := d.buildCreateBody(effective, hash)
 
 	postStart := func(ctx context.Context, id string) error {
@@ -444,6 +469,9 @@ func (d *Driver) opRecreate(ctx context.Context, op dsd.Op) error {
 
 	if err := performRecreate(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
 		return err
+	}
+	if err := d.persistRolloutGeneration(genSpec); err != nil {
+		d.log.Warn("recreate: persist desired generation", "container", genSpec.Name, "err", err)
 	}
 	retainImages(ctx, d.docker, imageRepoPrefix(spec.Container.Image), defaultImageRetention,
 		inUseImages(ctx, d.docker, spec.Container.ResourceID, spec.Container.Image), d.log.Warn)

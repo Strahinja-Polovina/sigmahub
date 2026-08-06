@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -48,8 +49,8 @@ type NftablesSpec struct {
 // SSHDSpec is the post-enrollment SSH lockdown. By default password + root login
 // are off and sshd binds to the mesh IP only; keeping public SSH is the opt-out.
 type SSHDSpec struct {
-	MeshIP        string `json:"meshIp"`
-	ListenMeshOnly bool  `json:"listenMeshOnly"`
+	MeshIP         string `json:"meshIp"`
+	ListenMeshOnly bool   `json:"listenMeshOnly"`
 }
 
 // CISSpec selects the CIS benchmark level (only 1 in Phase 1).
@@ -60,9 +61,10 @@ type CISSpec struct {
 // Driver applies host-hardening ops. runner is swapped in tests; euid gates the
 // real host mutations so a non-root agent fails cleanly rather than silently.
 type Driver struct {
-	runner func(ctx context.Context, name string, args ...string) ([]byte, error)
+	runner    func(ctx context.Context, name string, args ...string) ([]byte, error)
 	writeFile func(path string, data []byte, perm os.FileMode) error
-	euid   int
+	mkdirAll  func(path string, perm os.FileMode) error
+	euid      int
 }
 
 // NewDriver builds a host driver bound to the real OS.
@@ -72,8 +74,18 @@ func NewDriver() *Driver {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
 		writeFile: os.WriteFile,
+		mkdirAll:  os.MkdirAll,
 		euid:      os.Geteuid(),
 	}
+}
+
+// ensureDir creates path (and parents) if missing, via the injected mkdirAll
+// when set (tests) or os.MkdirAll otherwise.
+func (d *Driver) ensureDir(path string, perm os.FileMode) error {
+	if d.mkdirAll != nil {
+		return d.mkdirAll(path, perm)
+	}
+	return os.MkdirAll(path, perm)
 }
 
 // Register wires the host op kinds into the apply registry. Like the container
@@ -107,6 +119,13 @@ func (d *Driver) opNftables(ctx context.Context, op dsd.Op) error {
 		return err
 	}
 	ruleset := RenderNftables(spec)
+	// os.WriteFile does not create parent dirs and nothing else ever creates
+	// /etc/sigmahub, so on a fresh host this write failed with ENOENT on every
+	// apply — the firewall (and the mesh-only-SSH guarantee that depends on it)
+	// never loaded (SIGMA-143). Create the dir first.
+	if err := d.ensureDir(filepath.Dir(nftRulesetPath), 0o755); err != nil {
+		return fmt.Errorf("create nft ruleset dir: %w", err)
+	}
 	if err := d.writeFile(nftRulesetPath, []byte(ruleset), 0o600); err != nil {
 		return fmt.Errorf("write nft ruleset: %w", err)
 	}
@@ -203,7 +222,7 @@ func RenderNftables(spec NftablesSpec) string {
 	b.WriteString("\t\tiif \"lo\" accept\n")
 	b.WriteString("\t\tip protocol icmp accept\n")
 	b.WriteString("\t\tip6 nexthdr ipv6-icmp accept\n")
-	fmt.Fprintf(&b, "\t\tudp dport %d accept\n", wg) // WireGuard mesh — always
+	fmt.Fprintf(&b, "\t\tudp dport %d accept\n", wg)     // WireGuard mesh — always
 	fmt.Fprintf(&b, "\t\tiifname \"%s\" accept\n", mesh) // intra-fleet + mesh SSH
 	if spec.AllowPublicSSH {
 		b.WriteString("\t\ttcp dport 22 accept\n")
@@ -274,7 +293,7 @@ var cisSysctls = map[string]string{
 	"net.ipv4.conf.all.rp_filter":            "1",
 	"net.ipv4.conf.default.rp_filter":        "1",
 	"net.ipv4.conf.all.accept_redirects":     "0",
-	"net.ipv4.conf.default.accept_redirects":  "0",
+	"net.ipv4.conf.default.accept_redirects": "0",
 	"net.ipv4.conf.all.secure_redirects":     "0",
 	"net.ipv4.conf.all.send_redirects":       "0",
 	"net.ipv4.conf.default.send_redirects":   "0",

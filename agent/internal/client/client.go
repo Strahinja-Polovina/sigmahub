@@ -15,15 +15,26 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 )
 
+// dsdLongPollTimeout bounds a single DSD long-poll. It must exceed the CP's
+// long-poll window (25s) so an idle poll returns a clean 204 instead of the
+// client's own timeout firing first (SIGMA-145).
+const dsdLongPollTimeout = 35 * time.Second
+
 type Client struct {
 	endpoint string
 	http     *http.Client
+	// poll has no global Timeout: the DSD long-poll legitimately blocks up to
+	// the CP's window, so its bound comes from a per-request context deadline
+	// (dsdLongPollTimeout) rather than http.Client.Timeout, which would abort
+	// every idle poll at 10s and wedge the loop in a permanent error+backoff.
+	poll *http.Client
 }
 
 func New(endpoint string) *Client {
 	return &Client{
 		endpoint: endpoint,
 		http:     &http.Client{Timeout: 10 * time.Second},
+		poll:     &http.Client{},
 	}
 }
 
@@ -114,13 +125,18 @@ func (c *Client) MeshPeers(ctx context.Context, agentToken string) (MeshPeersRes
 // server returned 204 (no newer DSD within the poll window) — the caller
 // simply polls again.
 func (c *Client) GetDSD(ctx context.Context, agentToken string, after int64) (dsd.Signed, bool, error) {
+	// Bound the poll with a context deadline just above the CP window, and issue
+	// it on the no-global-timeout `poll` client so an idle long-poll can run the
+	// full window and return 204 cleanly.
+	ctx, cancel := context.WithTimeout(ctx, dsdLongPollTimeout)
+	defer cancel()
 	path := fmt.Sprintf("/v1/agent/dsd?after=%d", after)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+path, nil)
 	if err != nil {
 		return dsd.Signed{}, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+agentToken)
-	resp, err := c.http.Do(req)
+	resp, err := c.poll.Do(req)
 	if err != nil {
 		return dsd.Signed{}, false, err
 	}

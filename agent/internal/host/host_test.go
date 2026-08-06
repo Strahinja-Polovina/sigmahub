@@ -86,8 +86,8 @@ func TestRenderCISSysctlDeterministic(t *testing.T) {
 func TestOpsFailCleanlyWithoutRoot(t *testing.T) {
 	var wrote bool
 	d := &Driver{
-		euid:   1000, // non-root
-		runner: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		euid:      1000, // non-root
+		runner:    func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
 		writeFile: func(string, []byte, os.FileMode) error { wrote = true; return nil },
 	}
 	spec, _ := json.Marshal(NftablesSpec{})
@@ -96,6 +96,36 @@ func TestOpsFailCleanlyWithoutRoot(t *testing.T) {
 	}
 	if wrote {
 		t.Error("a non-root host op must not write to the host filesystem")
+	}
+}
+
+// TestNftablesCreatesRulesetDir proves the ruleset's parent dir is created
+// before the write, so a fresh host (where /etc/sigmahub does not exist) can
+// load the firewall instead of failing with ENOENT every apply (SIGMA-143).
+func TestNftablesCreatesRulesetDir(t *testing.T) {
+	var madeDir, wroteBeforeMkdir bool
+	var wrote bool
+	d := &Driver{
+		euid:     0,
+		mkdirAll: func(string, os.FileMode) error { madeDir = true; return nil },
+		writeFile: func(string, []byte, os.FileMode) error {
+			if !madeDir {
+				wroteBeforeMkdir = true
+			}
+			wrote = true
+			return nil
+		},
+		runner: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+	}
+	spec, _ := json.Marshal(NftablesSpec{})
+	if err := d.opNftables(context.Background(), dsd.Op{Kind: KindHostNftables, Spec: spec}); err != nil {
+		t.Fatalf("opNftables: %v", err)
+	}
+	if !madeDir {
+		t.Error("opNftables must create the ruleset parent dir")
+	}
+	if !wrote || wroteBeforeMkdir {
+		t.Error("the ruleset must be written after its parent dir is created")
 	}
 }
 

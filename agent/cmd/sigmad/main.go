@@ -585,8 +585,19 @@ func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToke
 	}
 	if changed {
 		log.Info("mesh: peer config updated", "config", path, "peers", len(res.Peers), "mesh_ip", *res.Self.MeshIP)
-		if wgUp {
-			mesh.Apply(ctx, log, path)
+	}
+	if wgUp {
+		// Apply unconditionally, not only when the config changed. After a reboot
+		// the persisted config re-renders identical (changed=false), so gating
+		// Apply on `changed` meant the interface was never brought back up and
+		// the tunnel stayed down while we still reported applied=true — a silent
+		// stuck outage (SIGMA-144). Apply is idempotent (syncconf on an existing
+		// iface, wg-quick up otherwise), so calling it every heartbeat is cheap.
+		mesh.Apply(ctx, log, path)
+		// Report applied honestly so the CP's mesh-gated Ready reflects reality.
+		if !mesh.InterfaceUp(ctx) {
+			log.Warn("mesh: interface not up after apply", "config", path)
+			return false, len(res.Peers)
 		}
 	}
 	return true, len(res.Peers)
