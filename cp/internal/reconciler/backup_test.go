@@ -49,6 +49,40 @@ func TestRenderBackupOpsOrderingAndSecretFreedom(t *testing.T) {
 	}
 }
 
+// TestRenderBackupVerifyHeldUntilBackupSha pins SIGMA-137: a verify whose
+// same-day backup has not yet produced a sha (ExpectedSha empty) is NOT
+// rendered — rendering it would pin a stale sha and fail against this day's
+// fresh dump. It renders once the sha is known.
+func TestRenderBackupVerifyHeldUntilBackupSha(t *testing.T) {
+	held := []store.BackupRunSpec{
+		{RunID: "run_b", Kind: "backup", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", KeepDaily: 7},
+		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: ""},
+	}
+	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, held, nil, ACMEConfig{})
+	if _, ok := opByID(ops, "bkr:run_v"); ok {
+		t.Fatal("verify with an empty (unresolved) same-day sha must not be rendered")
+	}
+	// The backup itself is still rendered.
+	if _, ok := opByID(ops, "bkr:run_b"); !ok {
+		t.Fatal("the backup op must still render")
+	}
+
+	// Once the sha is resolved, the verify renders.
+	ready := []store.BackupRunSpec{
+		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: "sha-today"},
+	}
+	ops2, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, ready, nil, ACMEConfig{})
+	vf, ok := opByID(ops2, "bkr:run_v")
+	if !ok || vf.Kind != dsd.KindBackupVerify {
+		t.Fatalf("verify should render once the sha is known: %+v", vf)
+	}
+	if !strings.Contains(string(vf.Spec), `"expectedSha":"sha-today"`) {
+		t.Fatalf("verify spec sha = %s", vf.Spec)
+	}
+}
+
 func TestRenderRestorePITROpCarriesTargetTime(t *testing.T) {
 	target := time.Date(2027, 3, 1, 12, 0, 0, 0, time.UTC)
 	runs := []store.BackupRunSpec{

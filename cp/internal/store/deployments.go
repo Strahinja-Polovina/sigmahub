@@ -646,6 +646,7 @@ type DeployTarget struct {
 	ConfigHash   string
 	ImageDigest  string // set for a rollback (reuse a retained image; skip clone/build)
 	Trigger      string
+	Status       string // queued|building|deploying|success (the filtered set below)
 }
 
 // DeployTargetsForServer returns the current deploy target per app resource on a
@@ -656,7 +657,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	rows, err := s.Pool.Query(ctx, `
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger, d.status
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
@@ -671,7 +672,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		var t DeployTarget
 		var ref, sha, cfg, digest *string
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
-			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger); err != nil {
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger, &t.Status); err != nil {
 			return nil, err
 		}
 		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)

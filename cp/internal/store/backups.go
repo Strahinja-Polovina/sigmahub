@@ -446,8 +446,13 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 	rows, err := s.Pool.Query(ctx, `
 		SELECT r.id, r.kind, r.resource_id, r.server_id, dc.engine, dc.dbname, dc.username,
 		       p.keep_daily, p.keep_weekly, p.keep_monthly,
+		       -- The verify must check THIS day's backup, not the previous day's:
+		       -- correlate the expected sha to the same UTC day's successful backup.
+		       -- Empty until that backup succeeds, which the reconciler uses to hold
+		       -- the verify until its dump exists (SIGMA-137).
 		       COALESCE((SELECT b.dump_sha256 FROM backup_runs b
 		                  WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
+		                    AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
 		                  ORDER BY b.finished_at DESC LIMIT 1), '') AS expected_sha,
 		       COALESCE(r.restore_resource_id, ''),
 		       COALESCE(rdc.dbname, ''), COALESCE(rdc.username, ''),

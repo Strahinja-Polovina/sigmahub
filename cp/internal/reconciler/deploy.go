@@ -8,6 +8,23 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
+// manualForce reports whether a build op should force a rebuild. Only a MANUAL
+// deploy that is still IN FLIGHT forces one: once it succeeds the target lingers
+// (DeployTargetsForServer keeps the latest 'success' row), and a persistently
+// set Force would re-run the docker build on every unrelated DSD version bump —
+// e.g. a daily backup run entering/leaving the document (SIGMA-139).
+func manualForce(target store.DeployTarget) bool {
+	if target.Trigger != "manual" {
+		return false
+	}
+	switch target.Status {
+	case "queued", "building", "deploying":
+		return true
+	default:
+		return false
+	}
+}
+
 // gitCloneOpSpec / buildImageOpSpec / rolloutOpSpec mirror the agent's build +
 // container package JSON exactly — the wire contract for the deploy pipeline.
 
@@ -178,7 +195,7 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		ImageTag: imageTag, DeploymentID: target.DeploymentID,
 		// A manual redeploy forces a rebuild of the same commit; git-triggered
 		// deploys keep the warm-cache dedup.
-		Force: target.Trigger == "manual",
+		Force: manualForce(target),
 	})
 	ops = append(ops,
 		dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},

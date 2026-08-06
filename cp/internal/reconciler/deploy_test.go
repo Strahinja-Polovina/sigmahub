@@ -130,6 +130,46 @@ func TestRenderComposePortlessAndInvalid(t *testing.T) {
 	}
 }
 
+// TestManualForceOnlyWhileInFlight pins SIGMA-139: a manual deploy forces a
+// rebuild only while in flight; once it has succeeded the lingering deploy
+// target must not keep forcing a docker rebuild on every unrelated DSD version
+// bump.
+func TestManualForceOnlyWhileInFlight(t *testing.T) {
+	spec := appResourceSpec{Env: map[string]string{"FOO": "bar"}}
+	raw, _ := json.Marshal(spec)
+	rs := store.ResourceSpec{ResourceID: "res_a", ProjectID: "proj_a", Kind: "app", Spec: raw}
+
+	buildForce := func(status string) bool {
+		target := store.DeployTarget{
+			DeploymentID: "dep_1", ResourceID: "res_a", ProjectID: "proj_a", Provider: "github",
+			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg",
+			Trigger: "manual", Status: status,
+		}
+		ops, _, ok := renderDeployOps(rs, nil, nil, target)
+		if !ok {
+			t.Fatal("render should succeed")
+		}
+		for _, op := range ops {
+			if op.ID == "build:res_a" {
+				var b struct {
+					Force bool `json:"force"`
+				}
+				_ = json.Unmarshal(op.Spec, &b)
+				return b.Force
+			}
+		}
+		t.Fatal("no build op rendered")
+		return false
+	}
+
+	if !buildForce("deploying") {
+		t.Error("a manual deploy in flight must force a rebuild")
+	}
+	if buildForce("success") {
+		t.Error("a succeeded manual deploy must NOT keep forcing a rebuild (SIGMA-139)")
+	}
+}
+
 func opIDs(ops []dsd.Op) []string {
 	out := make([]string, len(ops))
 	for i, op := range ops {
