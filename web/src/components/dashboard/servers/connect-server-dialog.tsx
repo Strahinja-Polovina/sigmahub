@@ -4,7 +4,6 @@ import * as React from "react";
 import { toast } from "sonner";
 import {
   Terminal,
-  KeyRound,
   Check,
   Copy,
   ShieldCheck,
@@ -24,7 +23,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -48,7 +46,9 @@ const DISTROS = [
 ];
 
 function bootstrapCommand(orgSlug: string) {
-  return `curl -fsSL https://get.sigmahub.io/agent | sh -s -- --org ${orgSlug} --token sk_boot_${orgSlug}_x92f`;
+  // The real one-time token is minted server-side on connect; never render a
+  // literal secret (even a fake one) into the client bundle.
+  return `curl -fsSL https://get.sigmahub.io/agent | sh -s -- --org ${orgSlug} --token <one-time-token>`;
 }
 
 function CopyField({ value, ariaLabel }: { value: string; ariaLabel: string }) {
@@ -102,7 +102,6 @@ export function ConnectServerDialog({
   trigger?: React.ReactNode;
 }) {
   const [open, setOpen] = React.useState(false);
-  const [tab, setTab] = React.useState("ssh");
   const [name, setName] = React.useState("");
   const [ip, setIp] = React.useState("");
   const [type, setType] = React.useState<string>("general");
@@ -117,7 +116,6 @@ export function ConnectServerDialog({
   const [pending, startTransition] = React.useTransition();
 
   function reset() {
-    setTab("ssh");
     setName("");
     setIp("");
     setType("general");
@@ -199,24 +197,11 @@ export function ConnectServerDialog({
           <DialogTitle>Connect a server</DialogTitle>
           <DialogDescription>
             Attach any Linux host to SigmaHub. Register it here, then run the
-            one-line SSH bootstrap (or a provider integration) so its agent
-            checks in.
+            one-line SSH bootstrap so its agent checks in.
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs value={tab} onValueChange={setTab}>
-          <TabsList className="w-full">
-            <TabsTrigger value="ssh" className="gap-1.5">
-              <Terminal className="size-3.5" />
-              SSH bootstrap
-            </TabsTrigger>
-            <TabsTrigger value="provider" className="gap-1.5">
-              <Lock className="size-3.5" />
-              Provider integration
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="ssh" className="flex flex-col gap-4 pt-4">
+        <div className="flex flex-col gap-4 pt-2">
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="srv-name" className="text-xs text-muted-foreground">
@@ -399,30 +384,7 @@ export function ConnectServerDialog({
             </div>
 
             <TrustNote />
-          </TabsContent>
-
-          <TabsContent value="provider" className="flex flex-col gap-4 pt-4">
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              Bring your own provider API key and SigmaHub discovers reachable
-              hosts and installs the agent for you. We only read your inventory —
-              we never resell capacity or bill you for the underlying server.
-            </p>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="provider-key" className="text-xs text-muted-foreground">
-                Provider API token
-              </Label>
-              <div className="relative">
-                <KeyRound className="absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input id="provider-key" type="password" placeholder="••••••••••••••••••••" className="pl-8 font-mono text-xs" disabled />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Provider auto-discovery is coming soon. Use the SSH bootstrap tab
-                to register a host today.
-              </p>
-            </div>
-            <TrustNote />
-          </TabsContent>
-        </Tabs>
+        </div>
 
         <DialogFooter>
           <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
@@ -430,7 +392,7 @@ export function ConnectServerDialog({
           </DialogClose>
           <Button
             onClick={connect}
-            disabled={tab !== "ssh" || !name.trim() || pending || Boolean(issued)}
+            disabled={!name.trim() || pending || Boolean(issued)}
           >
             {pending && <Loader2 className="size-4 animate-spin" />}
             Connect server
