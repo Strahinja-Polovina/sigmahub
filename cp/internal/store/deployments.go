@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -208,6 +209,30 @@ func deployImageTag(resourceID, sha string) string {
 	return "sigmahub/" + resourceID + ":" + sha
 }
 
+// deployPin mirrors dsd.DeployPin (same no-import rule as deployImageTag): the
+// short unique suffix under which a deployment's images are tagged, so no tag
+// is ever rebuilt in place and a rollback can re-ship a release's exact bytes
+// (SIGMA-173). Rollback/config rows COPY their source release's pin instead of
+// deriving their own — they ship existing images, they don't build.
+func deployPin(deploymentID string) string {
+	pin := deploymentID
+	if i := strings.LastIndex(pin, "_"); i >= 0 {
+		pin = pin[i+1:]
+	}
+	if len(pin) > 6 {
+		pin = pin[len(pin)-6:]
+	}
+	return pin
+}
+
+// pinnedImageTag mirrors dsd.PinnedImageTag.
+func pinnedImageTag(resourceID, sha, pin string) string {
+	if pin == "" {
+		return deployImageTag(resourceID, sha)
+	}
+	return deployImageTag(resourceID, sha) + "-" + pin
+}
+
 // CreateDeploymentInput queues a new deploy.
 type CreateDeploymentInput struct {
 	ResourceID    string
@@ -255,13 +280,19 @@ func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDep
 		GitSHA: in.GitSHA, ConfigHash: in.ConfigHash, ImageDigest: in.ImageDigest,
 		RollbackOf: in.RollbackOf, Status: "queued", CreatedBy: actor,
 	}
+	// A building trigger gets its own pin (its images are tagged under it); a
+	// rollback ships an existing image and derives nothing (SIGMA-173).
+	pin := deployPin(d.ID)
+	if trigger == "rollback" {
+		pin = ""
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, config_hash, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,$8,$9,NULLIF($10,''),$11,NULLIF($12,''),'queued',$13)
+		                         git_ref, git_sha, image_digest, image_pin, config_hash, rollback_of, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,$8,$9,NULLIF($10,''),$11,$12,NULLIF($13,''),'queued',$14)
 		RETURNING created_at`,
 		d.ID, orgID, in.ResourceID, in.EnvironmentID, serverID, in.ConnectionID, trigger,
-		in.GitRef, in.GitSHA, in.ImageDigest, in.ConfigHash, in.RollbackOf, actor).Scan(&d.CreatedAt)
+		in.GitRef, in.GitSHA, in.ImageDigest, pin, in.ConfigHash, in.RollbackOf, actor).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -381,9 +412,58 @@ func (s *Store) ListDeployments(ctx context.Context, orgID, resourceID string, l
 	return scanDeployments(rows)
 }
 
-// RollbackTargets returns a resource's last N SUCCESSFUL releases (each with a
-// built image digest), newest-first — the candidates a &lt;30s rebuild-free
-// rollback can pick from.
+// OrgDeployments is the dashboard's org-wide deploy feed: the most recent
+// deployments (the activity stream) plus the latest deployment per resource —
+// however old — so "Last deploy" / "Version" / "Active deploys" don't depend
+// on a recency window. Before this endpoint the web's CP mode had no org-wide
+// deploy source at all and rendered a permanently empty feed with columns
+// frozen at resource-creation time (SIGMA-161).
+type OrgDeployments struct {
+	Recent []Deployment `json:"recent"`
+	Latest []Deployment `json:"latest"`
+}
+
+const deploymentCols = `id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
+	       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
+	       created_by, created_at, started_at, finished_at, service_count, service_status`
+
+// ListOrgDeployments returns the org's deploy feed (see OrgDeployments).
+func (s *Store) ListOrgDeployments(ctx context.Context, orgID string, recentLimit int) (OrgDeployments, error) {
+	if recentLimit <= 0 || recentLimit > 100 {
+		recentLimit = 50
+	}
+	var out OrgDeployments
+	rows, err := s.Pool.Query(ctx, `
+		SELECT `+deploymentCols+` FROM deployments
+		 WHERE org_id = $1 ORDER BY created_at DESC LIMIT $2`, orgID, recentLimit)
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	out.Recent, err = scanDeployments(rows)
+	rows.Close()
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	rows, err = s.Pool.Query(ctx, `
+		SELECT DISTINCT ON (resource_id) `+deploymentCols+` FROM deployments
+		 WHERE org_id = $1 ORDER BY resource_id, created_at DESC`, orgID)
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	out.Latest, err = scanDeployments(rows)
+	rows.Close()
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	return out, nil
+}
+
+// RollbackTargets returns a resource's last N SUCCESSFUL releases whose exact
+// images can be re-shipped, newest-first — the candidates a &lt;30s rebuild-free
+// rollback can pick from. Eligible: pinned releases (image_pin — per-deployment
+// immutable tags, SIGMA-173), or legacy single-container releases whose
+// recorded tag was really built. Legacy Compose releases are excluded — their
+// image_digest was a tag no Compose build ever produced (SIGMA-168).
 func (s *Store) RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]Deployment, error) {
 	if limit <= 0 || limit > 10 {
 		limit = 10
@@ -393,7 +473,9 @@ func (s *Store) RollbackTargets(ctx context.Context, orgID, resourceID string, l
 		       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
 		       created_by, created_at, started_at, finished_at, service_count, service_status
 		  FROM deployments
-		 WHERE org_id = $1 AND resource_id = $2 AND status = 'success' AND image_digest IS NOT NULL
+		 WHERE org_id = $1 AND resource_id = $2 AND status = 'success'
+		   AND (COALESCE(image_pin,'') <> ''
+		        OR (image_digest IS NOT NULL AND COALESCE(service_count,0) = 0))
 		 ORDER BY created_at DESC LIMIT $3`, orgID, resourceID, limit)
 	if err != nil {
 		return nil, err
@@ -475,18 +557,27 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 
 	var t Deployment
 	var env, srv, conn, ref, sha, digest, cfg *string
+	var srcPin string
+	var srcSvcCount int
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest, config_hash, status
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
+		       COALESCE(image_pin,''), COALESCE(service_count,0), config_hash, status
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
-		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &cfg, &t.Status)
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &srcPin, &srcSvcCount, &cfg, &t.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrNotFound
 	}
 	if err != nil {
 		return Deployment{}, "", err
 	}
-	if t.Status != "success" || digest == nil || *digest == "" {
-		return Deployment{}, "", ErrInvalid{Msg: "rollback target must be a successful release with a built image"}
+	// Eligible: a pinned release (its exact images are re-derivable), or a legacy
+	// single-container release whose recorded tag was at least really built. A
+	// legacy Compose release is NEITHER — its image_digest is the single-container
+	// tag no Compose build ever produced (SIGMA-168) — so it never qualifies.
+	pinned := srcPin != ""
+	legacySingle := digest != nil && *digest != "" && srcSvcCount == 0
+	if t.Status != "success" || (!pinned && !legacySingle) {
+		return Deployment{}, "", ErrInvalid{Msg: "rollback target must be a successful release with a retained image"}
 	}
 	// The per-service denominator comes from the CURRENT resource spec (what the
 	// reconciler will render), not the prior deployment's stale copy.
@@ -505,13 +596,15 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// COPY the source's pin — a rollback of a rollback keeps pointing at the
+	// original build's images, however long the chain (SIGMA-173).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, config_hash, service_count, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),NULLIF($10,''),$11,$12,'queued',$13)
+		                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, rollback_of, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,$13,'queued',$14)
 		RETURNING created_at`,
 		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID,
-		d.GitRef, d.GitSHA, d.ImageDigest, d.ConfigHash, svcCount, targetDeploymentID, actor).Scan(&d.CreatedAt)
+		d.GitRef, d.GitSHA, d.ImageDigest, srcPin, d.ConfigHash, svcCount, targetDeploymentID, actor).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -563,12 +656,15 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// Its own pin: the forced rebuild lands on fresh per-deployment tags instead
+	// of overwriting the prior release's (SIGMA-173 — the overwrite is what made
+	// rollback silently re-ship the current image).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, config_hash, service_count, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,'queued',$11)
+		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,''),$11,'queued',$12)
 		RETURNING created_at`,
-		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, d.ConfigHash, svcCount, actor).Scan(&d.CreatedAt)
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, deployPin(d.ID), d.ConfigHash, svcCount, actor).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -579,6 +675,85 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 		return Deployment{}, "", err
 	}
 	return d, d.ServerID, nil
+}
+
+// CreateConfigDeployments mints a queued 'config' deployment for each given app
+// resource whose standing deploy target is a SUCCESSFUL release (SIGMA-166).
+//
+// Why it exists: the rollout generation is a function of (sha, deployment id),
+// and after a success the same deployment lingers as the standing target — so a
+// domain attach or secret change re-rendered a DIFFERENT container spec under
+// the SAME generation name, which the agent's never-cut guard refuses. The app
+// showed "Error" while still serving the old config, and an attached domain
+// never routed. A config deployment gives the change its own deployment id —
+// hence a fresh generation and a normal blue-green swap — while copying the
+// source release's image pin so the render re-ships the running release's
+// exact image with no clone and no build.
+//
+// Resources that were never deployed, or whose latest deployment is in flight
+// or failed, are skipped: the next real deploy renders the new config anyway.
+// Returns the distinct servers to re-render. Audited per resource.
+func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resourceIDs []string, actor, reason string) ([]ServerRef, error) {
+	if len(resourceIDs) == 0 {
+		return nil, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	seen := map[string]ServerRef{}
+	for _, resID := range resourceIDs {
+		var env, srv, conn, ref, sha, digest, cfg *string
+		var pin, status string
+		err := tx.QueryRow(ctx, `
+			SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
+			       COALESCE(image_pin,''), config_hash, status
+			  FROM deployments WHERE org_id = $1 AND resource_id = $2
+			 ORDER BY created_at DESC LIMIT 1`, orgID, resID).
+			Scan(&env, &srv, &conn, &ref, &sha, &digest, &pin, &cfg, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if status != "success" {
+			continue
+		}
+		svcCount, err := resourceServiceCountTx(ctx, tx, orgID, resID)
+		if err != nil {
+			return nil, err
+		}
+		depID := newID("dep")
+		// The source's pin comes along so the render ships the exact running
+		// image. A legacy source without a pin still gets a config row: the
+		// render falls back to the full clone→build→rollout pipeline, which is
+		// slower but equally un-wedges the generation.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
+			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by)
+			VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'config',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,'queued',$13)`,
+			depID, orgID, resID, deref(env), deref(srv), deref(conn),
+			deref(ref), deref(sha), deref(digest), pin, deref(cfg), svcCount, actor); err != nil {
+			return nil, err
+		}
+		if err := auditTx(ctx, tx, orgID, actor, "Config deploy queued ("+reason+")", resID); err != nil {
+			return nil, err
+		}
+		if sid := deref(srv); sid != "" {
+			seen[sid] = ServerRef{ServerID: sid, OrgID: orgID}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	out := make([]ServerRef, 0, len(seen))
+	for _, sr := range seen {
+		out = append(out, sr)
+	}
+	return out, nil
 }
 
 // LookupBuild returns a resource's build for a dedup key, if one exists — the
@@ -694,11 +869,12 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 			if err := supersedeInFlightTx(ctx, tx, r.orgID, a.serverID, a.id); err != nil {
 				return nil, err
 			}
+			depID := newID("dep")
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
-				                         trigger, git_ref, git_sha, config_hash, service_count, status, created_by)
-				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,$10,'queued','github-webhook')`,
-				newID("dep"), r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, cfgHash, svcCount); err != nil {
+				                         trigger, git_ref, git_sha, image_pin, config_hash, service_count, status, created_by)
+				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,$10,$11,'queued','github-webhook')`,
+				depID, r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, deployPin(depID), cfgHash, svcCount); err != nil {
 				return nil, err
 			}
 			if a.serverID != "" {
@@ -741,8 +917,12 @@ type DeployTarget struct {
 	SHA          string
 	ConfigHash   string
 	ImageDigest  string // set for a rollback (reuse a retained image; skip clone/build)
-	Trigger      string
-	Status       string // queued|building|deploying|success (the filtered set below)
+	// ImagePin is the release's build pin (dsd.DeployPin): builds tag under it,
+	// rollback/config rows carry their SOURCE release's pin so the render
+	// re-ships that release's exact images (SIGMA-173/168). Empty on legacy rows.
+	ImagePin string
+	Trigger  string
+	Status   string // queued|building|deploying|success (the filtered set below)
 	// CreatedAt orders a resource's deployments. The reconciler derives the
 	// blue-green Traefik router priority from it (SIGMA-164), so it must come
 	// from stored data rather than render-time wall-clock: a resync has to
@@ -758,7 +938,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	rows, err := s.Pool.Query(ctx, `
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, d.trigger, d.status,
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
 		       d.created_at
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
@@ -774,7 +954,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		var t DeployTarget
 		var ref, sha, cfg, digest *string
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
-			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.Trigger, &t.Status, &t.CreatedAt); err != nil {
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.ImagePin, &t.Trigger, &t.Status, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)
@@ -814,12 +994,12 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 // in-flight deployment — so it is safe to call for every res:<id> op status,
 // including non-git container.apply resources.
 func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error {
-	var depID, curStatus, gitSHA string
+	var depID, curStatus, gitSHA, pin string
 	var depVersion int64
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, status, COALESCE(git_sha,''), dsd_version FROM deployments
+		SELECT id, status, COALESCE(git_sha,''), COALESCE(image_pin,''), dsd_version FROM deployments
 		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA, &depVersion)
+		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA, &pin, &depVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // no in-flight deployment (supersede keeps this to at most one)
 	}
@@ -861,9 +1041,12 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 		if target == "success" {
 			up.MarkFinished = true
 			// Record the deployable image reference so the release becomes a
-			// rebuild-free rollback target (RollbackTargets requires image_digest).
+			// rebuild-free rollback target. With a pin this is the immutable
+			// per-deployment tag the build actually produced (SIGMA-173); rollback
+			// and config rows carry their SOURCE's pin, so the recorded reference
+			// stays the exact image that shipped.
 			if gitSHA != "" {
-				up.ImageDigest = deployImageTag(resourceID, gitSHA)
+				up.ImageDigest = pinnedImageTag(resourceID, gitSHA, pin)
 			}
 		}
 	}
@@ -958,9 +1141,11 @@ func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resource
 		up.Status, up.Detail, up.MarkFinished = "failed", detail, true
 	case serviceCount > 0 && success >= serviceCount:
 		up.Status, up.MarkStarted, up.MarkFinished = "success", true, true
-		if gitSHA != "" {
-			up.ImageDigest = deployImageTag(resourceID, gitSHA) // rollback-target marker
-		}
+		// Deliberately NO image_digest stamp: the single-container tag was never
+		// built for a Compose resource (SIGMA-168 — the fabricated marker put
+		// un-reshippable releases into RollbackTargets). Compose eligibility now
+		// rides image_pin, stamped at creation, from which every service's
+		// pinned tag is re-derivable.
 	default:
 		up.Status, up.MarkStarted = "deploying", true
 	}

@@ -13,7 +13,7 @@ import (
 // Store is the slice of the persistence layer the scheduler needs.
 type Store interface {
 	CreateDueBackupRuns(ctx context.Context, now time.Time) ([]struct{ ServerID, OrgID string }, error)
-	TimeoutStaleBackupRuns(ctx context.Context, maxAge time.Duration) (int, error)
+	TimeoutStaleBackupRuns(ctx context.Context, execMaxAge, queueMaxAge time.Duration) (int, error)
 }
 
 // Reconciler is nudged for every server that received new runs.
@@ -26,9 +26,13 @@ type Config struct {
 	// Interval between due-work sweeps. The schedule granularity is daily, so
 	// a minute-level sweep is more than enough resolution.
 	Interval time.Duration
-	// RunTimeout fails a run stuck pending/running (crashed agent, lost
-	// report) so the day honestly reads not-green and tomorrow's run enqueues.
+	// RunTimeout fails a RUNNING run whose agent stopped reporting, measured
+	// from dispatch (started_at). Sized just above the agent's 25-minute op cap.
 	RunTimeout time.Duration
+	// QueueTimeout fails a PENDING run that was never dispatched. Queue time is
+	// unbounded by design — verify rows wait for their backup's sha and the
+	// agent applies ops serially (SIGMA-163) — so this is deliberately generous.
+	QueueTimeout time.Duration
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run in a goroutine.
@@ -38,6 +42,9 @@ func Run(ctx context.Context, log *slog.Logger, st Store, rec Reconciler, cfg Co
 	}
 	if cfg.RunTimeout <= 0 {
 		cfg.RunTimeout = 30 * time.Minute
+	}
+	if cfg.QueueTimeout <= 0 {
+		cfg.QueueTimeout = 6 * time.Hour
 	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -53,7 +60,7 @@ func Run(ctx context.Context, log *slog.Logger, st Store, rec Reconciler, cfg Co
 			for _, sv := range servers {
 				rec.ReconcileAsync(sv.OrgID, sv.ServerID)
 			}
-			if n, err := st.TimeoutStaleBackupRuns(ctx, cfg.RunTimeout); err != nil {
+			if n, err := st.TimeoutStaleBackupRuns(ctx, cfg.RunTimeout, cfg.QueueTimeout); err != nil {
 				log.Error("backup scheduler: timeout sweep", "err", err)
 			} else if n > 0 {
 				log.Warn("backup scheduler: timed out stale runs", "count", n)

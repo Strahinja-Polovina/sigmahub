@@ -203,10 +203,15 @@ function DeleteResourceButton({
   resourceId,
   name,
   kind,
+  ephemeral = false,
 }: {
   resourceId: string;
   name: string;
   kind: string;
+  /** PR-preview resource (SIGMA-194): deleting it permanently breaks the open
+   *  preview for its PR — the dialog says so instead of presenting it as an
+   *  ordinary resource. */
+  ephemeral?: boolean;
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
@@ -241,10 +246,13 @@ function DeleteResourceButton({
         <DialogHeader>
           <DialogTitle>Delete {name}?</DialogTitle>
           <DialogDescription>
-            This removes the resource and its entire deployment history.
-            {isDatabase
-              ? " Data volumes and any snapshots already in your bucket are left in place, and the backup encryption key is retained so those snapshots can still be restored."
-              : " Data volumes are left in place and must be removed separately."}
+            {ephemeral
+              ? "This is a PR preview resource. Deleting it permanently breaks the open preview for its pull request — the preview will not come back on the next push. To tear it down cleanly, close the PR instead."
+              : "This removes the resource and its entire deployment history."}
+            {!ephemeral &&
+              (isDatabase
+                ? " Data volumes and any snapshots already in your bucket are left in place, and the backup encryption key is retained so those snapshots can still be restored."
+                : " Data volumes are left in place and must be removed separately.")}
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-1.5">
@@ -370,6 +378,11 @@ export function ResourceDetail({
               <Badge variant="outline" className="font-mono">
                 {KIND_LABELS[resource.kind as ResourceKind]}
               </Badge>
+              {"ephemeral" in resource && Boolean(resource.ephemeral) && (
+                <Badge variant="secondary" className="text-[10px]">
+                  PR preview
+                </Badge>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
               <span className="inline-flex items-center gap-1.5">
@@ -747,6 +760,7 @@ export function ResourceDetail({
                       resourceId={resource.id}
                       name={resource.name}
                       kind={resource.kind}
+                      ephemeral={"ephemeral" in resource ? Boolean(resource.ephemeral) : false}
                     />
                   )}
                 </div>

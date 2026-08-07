@@ -2,7 +2,6 @@ package reconciler
 
 import (
 	"encoding/json"
-	"strings"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -85,22 +84,36 @@ func shortSHA(sha string) string {
 
 // deployGeneration is the per-deployment rollout generation: the short SHA plus a
 // slice of the deployment id. Making it unique PER DEPLOYMENT (not just per SHA)
-// means every deploy — including a manual redeploy or a config-only change on the
-// same commit — rolls out under a distinct container name, so the agent always
-// creates-and-health-gates the new generation BEFORE draining the old (never a
-// hard cut), and a rollout re-apply stays idempotent on that name.
+// means every deploy rolls out under a distinct container name, so the agent
+// always creates-and-health-gates the new generation BEFORE draining the old
+// (never a hard cut), and a rollout re-apply stays idempotent on that name.
+//
+// This only covers a config-only change (domain attach, secret add/remove/value
+// update) because the CP mints a 'config' deployment for it (SIGMA-166): the
+// standing SUCCESS target would otherwise re-render a DIFFERENT spec under the
+// SAME generation forever, and the agent's never-cut guard refuses that.
 func deployGeneration(sha, deploymentID string) string {
-	suffix := deploymentID
-	if i := strings.LastIndex(suffix, "_"); i >= 0 {
-		suffix = suffix[i+1:]
-	}
-	if len(suffix) > 6 {
-		suffix = suffix[len(suffix)-6:]
-	}
+	suffix := dsd.DeployPin(deploymentID)
 	if suffix == "" {
 		return shortSHA(sha)
 	}
 	return shortSHA(sha) + "-" + suffix
+}
+
+// reshipsRetainedImage reports whether the target re-ships an already-built
+// image, skipping clone+build: a rollback, or a config deploy (SIGMA-166)
+// whose source release is identifiable. requirePin is set on the Compose path,
+// where a legacy source's image_digest is a tag no Compose build ever produced
+// (SIGMA-168) — only the pin re-derives real per-service tags; a pinless
+// Compose config row falls back to the full pipeline instead.
+func reshipsRetainedImage(target store.DeployTarget, requirePin bool) bool {
+	if target.Trigger != "rollback" && target.Trigger != "config" {
+		return false
+	}
+	if requirePin {
+		return target.ImagePin != ""
+	}
+	return target.ImagePin != "" || target.ImageDigest != ""
 }
 
 // renderDeployOps expands a git-deployed app resource into its deploy pipeline:
@@ -121,7 +134,11 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 
 	networkName := dsd.NetworkName(rs.ProjectID)
 	networkID = "net:" + rs.ProjectID
-	imageTag := dsd.DeployImageTag(rs.ResourceID, target.SHA)
+	// Per-deployment pinned tag (SIGMA-173): a building trigger tags under its
+	// own pin, so no tag is ever rebuilt in place; rollback/config rows carry
+	// their SOURCE release's pin, so this resolves to the exact image that
+	// release built. Legacy rows (empty pin) keep the bare mutable SHA tag.
+	imageTag := dsd.PinnedImageTag(rs.ResourceID, target.SHA, target.ImagePin)
 
 	// Container spec for the rollout: the built image, no host-port publishing.
 	cs := containerOpSpec{
@@ -141,6 +158,22 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	// Expose (not publish) the declared ports so Traefik can reach the container.
 	for _, p := range spec.Ports {
 		cs.Ports = append(cs.Ports, portMapping{Container: p.Container})
+	}
+	// Declared volumes are ensured and mounted exactly as renderAppOps does —
+	// omitting them here silently unmounted an app's data the moment its first
+	// git deploy landed, stranding the old bytes in an orphan volume while the
+	// deployment reported success (SIGMA-169).
+	var volDeps []string
+	for _, v := range spec.Volumes {
+		if v.Name == "" {
+			continue
+		}
+		dockerVol := dsd.VolumeName(rs.ResourceID, v.Name)
+		volID := "vol:" + rs.ResourceID + ":" + v.Name
+		vs, _ := json.Marshal(map[string]string{"name": dockerVol, "resourceId": rs.ResourceID})
+		ops = append(ops, dsd.Op{ID: volID, Kind: dsd.KindVolumeEnsure, Spec: vs})
+		volDeps = append(volDeps, volID)
+		cs.Volumes = append(cs.Volumes, volumeMount{Name: dockerVol, MountPath: v.MountPath, ReadOnly: v.ReadOnly})
 	}
 	fileMode := false
 	for _, r := range refs {
@@ -185,9 +218,20 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	rolloutBytes, _ := json.Marshal(rollout)
 	rolloutID := "res:" + rs.ResourceID // keeps the res: id so status write-back maps to the resource
 
-	// A rollback reuses a retained image: skip clone + build.
-	if target.Trigger == "rollback" && target.ImageDigest != "" {
-		ops = append(ops, dsd.Op{ID: rolloutID, Kind: dsd.KindDeployRollout, DependsOn: []string{networkID}, Spec: rolloutBytes})
+	// A volume-holding app deploys via recreate, not blue-green rollout: the
+	// swap's overlap window would mount the same named volume into two live
+	// generations at once — the same exclusivity rule that classes a Compose
+	// service with named volumes as 'recreate' (SIGMA-169).
+	rolloutKind := dsd.KindDeployRollout
+	if len(cs.Volumes) > 0 {
+		rolloutKind = dsd.KindDeployRecreate
+	}
+	rolloutDeps := append([]string{networkID}, volDeps...)
+
+	// A rollback — or a config deploy re-shipping the running release
+	// (SIGMA-166) — reuses a retained image: skip clone + build.
+	if reshipsRetainedImage(target, false) {
+		ops = append(ops, dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: rolloutDeps, Spec: rolloutBytes})
 		return ops, networkID, true
 	}
 
@@ -207,7 +251,7 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	ops = append(ops,
 		dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},
 		dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build},
-		dsd.Op{ID: rolloutID, Kind: dsd.KindDeployRollout, DependsOn: []string{networkID, buildID}, Spec: rolloutBytes},
+		dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: append(rolloutDeps, buildID), Spec: rolloutBytes},
 	)
 	return ops, networkID, true
 }
@@ -246,13 +290,23 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		}
 	}
 
+	// A rollback or config deploy with a pinned source re-ships the retained
+	// per-service images: NO clone, NO builds. Before SIGMA-168 a Compose
+	// rollback unconditionally re-cloned at the target SHA, so the product's
+	// own escape hatch depended on a live git credential and a still-reachable
+	// commit — the two things most likely to be false mid-incident — while the
+	// UI promised "no rebuild".
+	reship := reshipsRetainedImage(target, true)
+
 	// Clone the whole repo once — the shared build-context root for all services.
 	cloneID := "clone:" + rs.ResourceID
-	clone, _ := json.Marshal(gitCloneOpSpec{
-		ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
-		Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
-	})
-	ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
+	if !reship {
+		clone, _ := json.Marshal(gitCloneOpSpec{
+			ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
+			Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
+		})
+		ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
+	}
 
 	// The web-facing service carries the Traefik router labels when a domain is
 	// attached: prefer the first source-built blue-green service with a port (the
@@ -315,26 +369,31 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		}
 
 		// Image source: build the service's context, or pull a prebuilt image.
+		// Built services run their per-deployment pinned tag (SIGMA-173); on a
+		// re-ship (rollback/config) the pin came from the source release, so the
+		// tag resolves to that release's exact bytes and no build op is emitted.
 		var imageDep string
 		if s.Build != "" {
-			imageTag := dsd.DeployServiceImageTag(rs.ResourceID, s.Name, target.SHA)
+			imageTag := dsd.PinnedServiceImageTag(rs.ResourceID, s.Name, target.SHA, target.ImagePin)
 			cs.Image = imageTag
-			buildID := "build:" + svcKey
-			build, _ := json.Marshal(buildImageOpSpec{
-				ResourceID: rs.ResourceID, SHA: target.SHA,
-				DedupKey:      target.ConfigHash + ":" + s.Name + ":" + target.SHA,
-				Dockerfile:    s.Dockerfile,
-				ContextSubdir: s.Build,
-				ImageTag:      imageTag,
-				DeploymentID:  target.DeploymentID,
-				// Same in-flight gate as the single-container path: the standing
-				// target keeps its 'manual' trigger after the deploy succeeds, so a
-				// bare Trigger check stays true forever and re-forces a rebuild of
-				// EVERY service on unrelated DSD bumps (SIGMA-175).
-				Force: manualForce(target),
-			})
-			ops = append(ops, dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build})
-			imageDep = buildID
+			if !reship {
+				buildID := "build:" + svcKey
+				build, _ := json.Marshal(buildImageOpSpec{
+					ResourceID: rs.ResourceID, SHA: target.SHA,
+					DedupKey:      target.ConfigHash + ":" + s.Name + ":" + target.SHA,
+					Dockerfile:    s.Dockerfile,
+					ContextSubdir: s.Build,
+					ImageTag:      imageTag,
+					DeploymentID:  target.DeploymentID,
+					// Same in-flight gate as the single-container path: the standing
+					// target keeps its 'manual' trigger after the deploy succeeds, so a
+					// bare Trigger check stays true forever and re-forces a rebuild of
+					// EVERY service on unrelated DSD bumps (SIGMA-175).
+					Force: manualForce(target),
+				})
+				ops = append(ops, dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build})
+				imageDep = buildID
+			}
 		} else if s.Image != "" {
 			cs.Image = s.Image
 			pullID := "pull:" + svcKey

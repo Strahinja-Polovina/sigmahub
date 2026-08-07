@@ -72,8 +72,25 @@ export function environmentMirrorRow(cp: CpEnvironment) {
     id: cp.id,
     projectId: cp.projectId,
     name: cp.name,
+    // Carried so the dashboard can display/edit the flag that seeds database
+    // backup retention (SIGMA-190 — previously dropped here, invisible).
+    production: cp.production ?? false,
     createdAt: new Date(cp.createdAt),
   };
+}
+
+/** The CP deploy status vocabulary → the local deployments table's. In-flight
+ *  CP states collapse to "running" (what the activity feed and the Active
+ *  deploys stat count); terminal states pass through. */
+export function localDeployStatus(cpStatus: string): string {
+  switch (cpStatus) {
+    case "queued":
+    case "building":
+    case "deploying":
+      return "running";
+    default:
+      return cpStatus; // success | failed | superseded | rolled_back
+  }
 }
 
 export function resourceMirrorRow(
@@ -84,10 +101,18 @@ export function resourceMirrorRow(
     domain: string | null;
     version: string | null;
     lastDeployAt: Date;
-  } | null
+  } | null,
+  /** The resource's latest CP deployment, when known (SIGMA-161): drives
+   *  version (the short SHA of the last successful release) and lastDeployAt
+   *  instead of freezing both at resource creation. */
+  latestDeploy?: { gitSha?: string; status: string; createdAt: string } | null
 ) {
   const spec = (cp.spec ?? {}) as { repo?: unknown; domain?: unknown };
   const specStr = (v: unknown) => (typeof v === "string" && v ? v : null);
+  const deployedVersion =
+    latestDeploy?.status === "success" && latestDeploy.gitSha
+      ? latestDeploy.gitSha.slice(0, 8)
+      : null;
   return {
     id: cp.id,
     projectId: cp.projectId,
@@ -100,7 +125,10 @@ export function resourceMirrorRow(
     // win when the spec doesn't carry them (e.g. database resources).
     repo: specStr(spec.repo) ?? existing?.repo ?? null,
     domain: specStr(spec.domain) ?? existing?.domain ?? null,
-    version: existing?.version ?? "v1",
-    lastDeployAt: existing?.lastDeployAt ?? new Date(cp.createdAt),
+    ephemeral: cp.ephemeral ?? false,
+    version: deployedVersion ?? existing?.version ?? "v1",
+    lastDeployAt: latestDeploy
+      ? new Date(latestDeploy.createdAt)
+      : (existing?.lastDeployAt ?? new Date(cp.createdAt)),
   };
 }

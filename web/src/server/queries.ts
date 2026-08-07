@@ -78,6 +78,7 @@ export async function getMembers(orgId: string) {
       name: user.name,
       email: user.email,
       role: s.memberships.role,
+      scoped: s.memberships.scoped,
     })
     .from(s.memberships)
     .innerJoin(user, eq(s.memberships.userId, user.id))

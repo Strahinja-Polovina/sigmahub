@@ -13,6 +13,7 @@ import {
   cpUpdateProject,
   cpDeleteProject,
   cpCreateEnvironment,
+  cpUpdateEnvironment,
   cpDeleteEnvironment,
   cpAttachServer,
   cpDetachServer,
@@ -123,26 +124,58 @@ export async function deleteProject(input: { projectId: string }) {
 export async function createEnvironment(input: {
   projectId: string;
   name: string;
+  /** Explicit production choice from the dialog (SIGMA-190). The name-based
+   *  heuristic remains only as the dialog's DEFAULT — the user decides. */
+  production?: boolean;
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
   const { user, role } = await requireProjectRole(project.orgId, project.id, "Project Admin");
   const name = input.name.trim();
   if (!name) throw new Error("Environment name is required.");
+  const production = input.production ?? isProductionName(name);
   let id = rid("env");
   if (cpEnabled()) {
     const created = await cpCreateEnvironment(
       project.orgId,
       input.projectId,
-      { name, production: isProductionName(name) },
+      { name, production },
       { name: user.name, role }
     );
     id = created.id;
   }
-  await db.insert(s.environments).values({ id, projectId: input.projectId, name });
+  await db.insert(s.environments).values({ id, projectId: input.projectId, name, production });
   await writeAudit({ orgId: project.orgId, actor: user.name, action: "Created environment", target: `${project.name} / ${name}` });
   revalidatePath("/dashboard", "layout");
   return { id };
+}
+
+/** Flip an environment's production flag (SIGMA-190) — the seed for new
+ *  databases' backup retention. Editable rather than write-once. */
+export async function setEnvironmentProduction(input: {
+  environmentId: string;
+  production: boolean;
+}) {
+  const { env, project, user, role } = await requireEnvMembership(input.environmentId);
+  if (cpEnabled()) {
+    await cpUpdateEnvironment(
+      project.orgId,
+      input.environmentId,
+      { production: input.production },
+      { name: user.name, role }
+    );
+  }
+  await db
+    .update(s.environments)
+    .set({ production: input.production })
+    .where(eq(s.environments.id, input.environmentId));
+  await writeAudit({
+    orgId: project.orgId,
+    actor: user.name,
+    action: input.production ? "Environment marked production" : "Environment unmarked production",
+    target: `${project.name} / ${env.name}`,
+  });
+  revalidatePath("/dashboard", "layout");
 }
 
 /** Resolve an environment to its project + assert the caller's membership.

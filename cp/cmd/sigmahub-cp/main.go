@@ -262,8 +262,12 @@ func run() error {
 	// Backup scheduler (P1-11): the wall-clock primitive that turns policies
 	// into due backup/verify runs and fails runs that stopped making progress.
 	go backup.Run(ctx, log, st, rec, backup.Config{
-		Interval:   time.Minute,
+		Interval: time.Minute,
+		// Execution budget, from dispatch — just above the agent's 25m op cap.
 		RunTimeout: 30 * time.Minute,
+		// Queue budget, from enqueue — verify rows legitimately wait for their
+		// backup's sha, and the agent applies ops serially (SIGMA-163).
+		QueueTimeout: 6 * time.Hour,
 	})
 
 	// Alert dispatcher (P2-6): drains the alert outbox that state-change

@@ -181,8 +181,92 @@ func TestBackupLifecycle(t *testing.T) {
 	}
 
 	// Timeout sweep fails a stuck run.
-	if n, err := st.TimeoutStaleBackupRuns(ctx, -time.Minute); err != nil || n != 1 {
+	if n, err := st.TimeoutStaleBackupRuns(ctx, -time.Minute, -time.Minute); err != nil || n != 1 {
 		t.Fatalf("timeout sweep n=%d err=%v", n, err)
+	}
+}
+
+// TestBackupSweepBudgetsSplitByDispatch is the SIGMA-163 regression: the
+// execution budget starts at DISPATCH (started_at), not enqueue, and a
+// never-dispatched pending run is only failed by the far larger queue budget.
+// Before the fix a single created_at ceiling covered queue + execution, so a
+// ~12-minute dump force-failed the day's verify before it was ever dispatched.
+func TestBackupSweepBudgetsSplitByDispatch(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_sweep_split"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	// Each fixture run gets its OWN resource (and hence its own auto-provisioned
+	// backup policy): backup_runs_daily_uniq is UNIQUE on (policy, kind, UTC day),
+	// so four same-day 'backup' rows on one policy can't exist.
+	//
+	// Ages ride make_interval(secs => float8): with a bare `now() - $n`,
+	// Postgres resolves the untyped parameter as timestamptz (preferring
+	// timestamptz - timestamptz over timestamptz - interval), which turns the
+	// whole expression into an interval that can't be inserted into created_at.
+	mkRun := func(id, status string, createdAgo time.Duration, startedAgo *time.Duration) {
+		t.Helper()
+		res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ServerID: serverID, Name: "db-" + id, Kind: "postgres", Spec: json.RawMessage(`{}`),
+		}, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var policyID string
+		if err := st.Pool.QueryRow(ctx,
+			`SELECT id FROM backup_policies WHERE resource_id = $1`, res.ID).Scan(&policyID); err != nil {
+			t.Fatal(err)
+		}
+		var startedSecs *float64
+		if startedAgo != nil {
+			secs := startedAgo.Seconds()
+			startedSecs = &secs
+		}
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, status, created_at, started_at)
+			VALUES ($1, $2, $3, $4, $5, 'backup', $6,
+			        now() - make_interval(secs => $7),
+			        now() - make_interval(secs => $8))`,
+			id, orgID, res.ID, policyID, serverID, status, createdAgo.Seconds(), startedSecs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ago := func(d time.Duration) *time.Duration { return &d }
+	// Queued 45m ago, dispatched 5m ago: within the exec budget → survives.
+	mkRun("bkr_live", "running", 45*time.Minute, ago(5*time.Minute))
+	// Dispatched 45m ago: exec budget blown → swept.
+	mkRun("bkr_dead", "running", 50*time.Minute, ago(45*time.Minute))
+	// Never dispatched, 45m in queue: within the queue budget → survives.
+	mkRun("bkr_queued", "pending", 45*time.Minute, nil)
+	// Never dispatched, 7h in queue: queue budget blown → swept.
+	mkRun("bkr_stuck", "pending", 7*time.Hour, nil)
+
+	n, err := st.TimeoutStaleBackupRuns(ctx, 30*time.Minute, 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("expected exactly 2 sweeps (bkr_dead, bkr_stuck), got %d", n)
+	}
+	status := map[string]string{}
+	rows, err := st.Pool.Query(ctx, `SELECT id, status FROM backup_runs WHERE org_id = $1`, orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, s string
+		if err := rows.Scan(&id, &s); err != nil {
+			t.Fatal(err)
+		}
+		status[id] = s
+	}
+	if status["bkr_live"] != "running" || status["bkr_queued"] != "pending" {
+		t.Fatalf("in-budget runs must survive the sweep: %+v", status)
+	}
+	if status["bkr_dead"] != "failed" || status["bkr_stuck"] != "failed" {
+		t.Fatalf("over-budget runs must be failed: %+v", status)
 	}
 }
 

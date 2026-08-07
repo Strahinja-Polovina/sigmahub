@@ -1,0 +1,19 @@
+-- SIGMA-173/168: releases were identified only by a MUTABLE tag re-derived from
+-- the git SHA. A manual redeploy of the same commit (the documented remedy for
+-- a bad base-image pull) force-rebuilt sigmahub/<res>:<sha> in place, so
+-- "roll back to release #1" re-ran the CURRENT image and reported success while
+-- shipping exactly what the operator was reverting. Compose releases were worse:
+-- their recorded image_digest was the single-container tag, which no Compose
+-- build ever produces, and their rollback re-cloned from git — making rollback
+-- depend on a live credential and a still-reachable commit, the two things most
+-- likely to be false mid-incident.
+--
+-- image_pin is the deployment's build pin: the short unique suffix under which
+-- THIS release's images were tagged (dsd.DeployPin). New builds tag as
+-- sigmahub/<res>:<sha>-<pin> (per-service: sigmahub/<res>-<svc>:<sha>-<pin>),
+-- so no tag is ever rebuilt in place. Rollback and config rows COPY the source
+-- release's pin, so the render re-ships that release's exact images with no
+-- clone and no build. Legacy rows keep pin '' and fall back to the old
+-- behavior; legacy Compose rows (fabricated digest) stop qualifying as
+-- rollback targets entirely.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS image_pin TEXT NOT NULL DEFAULT '';

@@ -99,34 +99,34 @@ func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, cha
 
 // DetachDomain removes a domain (org-scoped). Audited. Returns the host server id
 // so the caller can re-render its DSD.
-func (s *Store) DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error) {
+func (s *Store) DetachDomain(ctx context.Context, orgID, domainID, actor string) (serverID, resourceID string, err error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var domain, serverID string
+	var domain string
 	err = tx.QueryRow(ctx, `
-		SELECT d.domain, r.server_id
+		SELECT d.domain, r.server_id, r.id
 		  FROM domains d JOIN resources r ON r.id = d.resource_id
-		 WHERE d.org_id = $1 AND d.id = $2`, orgID, domainID).Scan(&domain, &serverID)
+		 WHERE d.org_id = $1 AND d.id = $2`, orgID, domainID).Scan(&domain, &serverID, &resourceID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM domains WHERE org_id = $1 AND id = $2`, orgID, domainID); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Domain detached ("+domain+")", domainID); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return serverID, nil
+	return serverID, resourceID, nil
 }
 
 // ListDomainsForResource returns an app resource's domains (org-scoped).

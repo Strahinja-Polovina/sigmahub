@@ -31,6 +31,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { changeMemberRole, removeMember, resendInvite, revokeInvite } from "@/server/actions/members";
+import { restoreOrgWideAccess } from "@/server/actions/project-members";
 import type { PendingInvite, SettingsMember } from "./settings-view";
 import { InviteMemberDialog } from "./invite-member-dialog";
 import { Mail, RefreshCw, X } from "lucide-react";
@@ -86,6 +87,17 @@ function MemberActions({
     });
   }
 
+  function unscope() {
+    startTransition(async () => {
+      try {
+        await restoreOrgWideAccess({ orgId, userId: member.id });
+        toast.success(`${member.name} now has org-wide access`);
+      } catch (err) {
+        toast.error("Couldn’t restore org-wide access", { description: msg(err) });
+      }
+    });
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -111,6 +123,17 @@ function MemberActions({
             {r === member.role && <span className="ml-auto text-xs text-muted-foreground">current</span>}
           </DropdownMenuItem>
         ))}
+        {member.scoped && (
+          <>
+            <DropdownMenuSeparator />
+            {/* SIGMA-167: the ONLY path that widens a scoped member back to
+                org-wide — explicit, admin-initiated, audited. */}
+            <DropdownMenuItem className="gap-2" onClick={unscope}>
+              <UserCog className="size-4" />
+              Restore org-wide access
+            </DropdownMenuItem>
+          </>
+        )}
         <DropdownMenuSeparator />
         <DropdownMenuItem
           variant="destructive"
@@ -256,7 +279,14 @@ export function MembersTab({
                   </TableCell>
                   <TableCell className="text-muted-foreground">{m.email}</TableCell>
                   <TableCell className={isAdmin ? "" : "pr-4 text-right"}>
-                    <Badge variant={ROLE_VARIANT[m.role] ?? "outline"}>{m.role}</Badge>
+                    <span className="inline-flex items-center gap-1.5">
+                      <Badge variant={ROLE_VARIANT[m.role] ?? "outline"}>{m.role}</Badge>
+                      {m.scoped && (
+                        <Badge variant="outline" className="text-[10px] text-muted-foreground">
+                          project-scoped
+                        </Badge>
+                      )}
+                    </span>
                   </TableCell>
                   {isAdmin && (
                     <TableCell className="pr-4 text-right">

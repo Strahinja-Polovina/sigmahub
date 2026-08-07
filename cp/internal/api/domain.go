@@ -24,10 +24,11 @@ type DomainAPI interface {
 	ListProjects(ctx context.Context, orgID string) ([]store.Project, error)
 	GetProject(ctx context.Context, orgID, projectID string) (store.Project, error)
 	UpdateProject(ctx context.Context, orgID, projectID, name, description, actor string) (store.Project, error)
-	DeleteProject(ctx context.Context, orgID, projectID, actor string) error
+	DeleteProject(ctx context.Context, orgID, projectID, actor string) ([]string, error)
 	CreateEnvironment(ctx context.Context, orgID, projectID, name string, production bool, actor string) (store.Environment, error)
 	ListEnvironments(ctx context.Context, orgID, projectID string) ([]store.Environment, error)
-	DeleteEnvironment(ctx context.Context, orgID, envID, actor string) error
+	UpdateEnvironmentProduction(ctx context.Context, orgID, envID string, production bool, actor string) (store.Environment, error)
+	DeleteEnvironment(ctx context.Context, orgID, envID, actor string) ([]string, error)
 	AttachServer(ctx context.Context, orgID, envID, serverID, actor string) error
 	DetachServer(ctx context.Context, orgID, envID, serverID, actor string) error
 	EnvServerIDs(ctx context.Context, orgID, envID string) ([]string, error)
@@ -52,7 +53,14 @@ type DomainAPI interface {
 	CreateSecret(ctx context.Context, orgID, actor string, in store.CreateSecretInput) (store.Secret, error)
 	ListSecrets(ctx context.Context, orgID, projectID, envID string) ([]store.Secret, error)
 	RevealSecret(ctx context.Context, orgID, secretID, actor string) (string, error)
-	DeleteSecret(ctx context.Context, orgID, secretID, actor string) error
+	DeleteSecret(ctx context.Context, orgID, secretID, actor string) (store.Secret, error)
+	// Config deployments (SIGMA-166): a secret or domain change alters the
+	// rendered container spec, and the standing SUCCESS target would re-render
+	// it under the same rollout generation — which the agent's never-cut guard
+	// refuses. Minting a 'config' deployment gives the change its own
+	// generation and re-ships the running release's pinned image.
+	AppResourcesForSecretScope(ctx context.Context, orgID, projectID, envID string) ([]string, error)
+	CreateConfigDeployments(ctx context.Context, orgID string, resourceIDs []string, actor, reason string) ([]store.ServerRef, error)
 	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
 	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
@@ -90,13 +98,14 @@ type DomainAPI interface {
 	// Custom domains (P1-8). Attach/Detach return the host server id so the
 	// handler can re-render its DSD.
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)
-	DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error)
+	DetachDomain(ctx context.Context, orgID, domainID, actor string) (serverID, resourceID string, err error)
 	ListDomainsForResource(ctx context.Context, orgID, resourceID string) ([]store.Domain, error)
 	// Deployments (P1-9). List is the release history; RollbackTargets are the
 	// retained-image candidates; CreateRollback queues a rebuild-free rollback and
 	// returns the server to re-render; GetDeployment + DeployLogsSince back the
 	// build-log stream.
 	ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
+	ListOrgDeployments(ctx context.Context, orgID string, recentLimit int) (store.OrgDeployments, error)
 	RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (store.Deployment, string, error)
 	CreateManualRedeploy(ctx context.Context, orgID, resourceID, actor string) (store.Deployment, string, error)
@@ -186,10 +195,18 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	err := s.domain.DeleteProject(r.Context(), r.PathValue("orgId"), r.PathValue("projectId"), principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	servers, err := s.domain.DeleteProject(r.Context(), orgID, r.PathValue("projectId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "delete project")
 		return
+	}
+	// Re-render every affected server now — without the nudge the cascaded
+	// resources kept running until the 60s fleet resync (SIGMA-193).
+	if s.reconcile != nil {
+		for _, sid := range servers {
+			s.reconcile.ReconcileAsync(orgID, sid)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -223,11 +240,37 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"environments": envs})
 }
 
+// handleUpdateEnvironment edits an environment's production flag (SIGMA-190 —
+// previously write-once at creation, inferred web-side from a magic name).
+func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Production *bool `json:"production"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.Production == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "production (boolean) is required"})
+		return
+	}
+	env, err := s.domain.UpdateEnvironmentProduction(r.Context(),
+		r.PathValue("orgId"), r.PathValue("envId"), *req.Production, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "update environment")
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
 func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request) {
-	err := s.domain.DeleteEnvironment(r.Context(), r.PathValue("orgId"), r.PathValue("envId"), principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	servers, err := s.domain.DeleteEnvironment(r.Context(), orgID, r.PathValue("envId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "delete environment")
 		return
+	}
+	// Same nudge as project delete (SIGMA-193).
+	if s.reconcile != nil {
+		for _, sid := range servers {
+			s.reconcile.ReconcileAsync(orgID, sid)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -359,13 +402,19 @@ func (s *Server) handleAttachDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
-	d, serverID, err := s.domain.AttachDomain(r.Context(), orgID, r.PathValue("resourceId"),
+	resourceID := r.PathValue("resourceId")
+	d, serverID, err := s.domain.AttachDomain(r.Context(), orgID, resourceID,
 		req.Domain, req.ChallengeType, principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "attach domain")
 		return
 	}
-	// A new domain adds Traefik router labels to the resource's container — re-render.
+	// A new domain adds Traefik router labels to the resource's container. The
+	// labels only reach a LIVE container through a fresh rollout generation, so
+	// mint a config deployment (SIGMA-166) before the re-render — without it the
+	// agent's never-cut guard refused the changed spec and the hostname never
+	// routed.
+	s.mintConfigDeploys(r, orgID, []string{resourceID}, "domain attached")
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
@@ -383,10 +432,15 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDetachDomain(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
-	serverID, err := s.domain.DetachDomain(r.Context(), orgID, r.PathValue("domainId"), principalFrom(r).Name)
+	serverID, resourceID, err := s.domain.DetachDomain(r.Context(), orgID, r.PathValue("domainId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "detach domain")
 		return
+	}
+	// Removing router labels changes the rendered spec — same generation rule
+	// as attach (SIGMA-166).
+	if resourceID != "" {
+		s.mintConfigDeploys(r, orgID, []string{resourceID}, "domain detached")
 	}
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)

@@ -259,6 +259,11 @@ export function DeploymentsPanel({
                       rollback
                     </Badge>
                   )}
+                  {d.trigger === "config" && (
+                    <Badge variant="secondary" className="text-[10px]">
+                      config
+                    </Badge>
+                  )}
                   {d.trigger === "git" && d.gitRef && (
                     <span className="hidden truncate text-xs text-muted-foreground sm:inline">
                       {d.gitRef.replace("refs/heads/", "")}

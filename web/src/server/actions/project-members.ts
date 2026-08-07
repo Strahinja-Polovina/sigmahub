@@ -6,8 +6,8 @@
 // (see lib/rbac.ts); the grant's real power is scoping and narrowing.
 
 import { revalidatePath } from "next/cache";
-import { and, eq } from "drizzle-orm";
-import { requireProjectRole } from "../active-org";
+import { and, eq, inArray } from "drizzle-orm";
+import { requireOrgAdmin, requireProjectRole } from "../active-org";
 import { writeAudit } from "../audit";
 import { db } from "../db";
 import * as s from "../db/schema";
@@ -44,6 +44,14 @@ export async function setProjectRole(input: {
       target: [s.projectMemberships.projectId, s.projectMemberships.userId],
       set: { role: input.role },
     });
+  // The first grant scopes the member EXPLICITLY (SIGMA-167). The flag — not a
+  // live grant count — is what the visibility rules read, so later revoking
+  // this grant narrows them to nothing instead of silently re-widening them to
+  // every project in the org.
+  await db
+    .update(s.memberships)
+    .set({ scoped: true })
+    .where(and(eq(s.memberships.orgId, input.orgId), eq(s.memberships.userId, input.userId)));
   await writeAudit({
     orgId: input.orgId,
     actor: user.name,
@@ -53,8 +61,10 @@ export async function setProjectRole(input: {
   revalidatePath(`/dashboard/projects/${input.projectId}`);
 }
 
-/** Remove a member's grant — they fall back to the scoping rules (org-wide if
- *  they hold no other grants, invisible here if they do). */
+/** Remove a member's grant. The member STAYS scoped (SIGMA-167): revoking the
+ *  last grant leaves them with access to nothing, matching the admin's intent
+ *  to narrow — it never silently restores org-wide access. Org-wide access is
+ *  restored only by the explicit restoreOrgWideAccess action. */
 export async function revokeProjectRole(input: {
   orgId: string;
   projectId: string;
@@ -76,4 +86,38 @@ export async function revokeProjectRole(input: {
     target: `${input.projectId} · ${input.userId}`,
   });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+/** Explicitly clear a member's project scoping, restoring their org-wide role
+ *  on every project (SIGMA-167 — the ONLY path that widens; Org Admin gate
+ *  because the effect is org-wide, not per-project). Their remaining grants
+ *  are removed too: org-wide access and per-project narrowing don't compose. */
+export async function restoreOrgWideAccess(input: {
+  orgId: string;
+  userId: string;
+}): Promise<void> {
+  const admin = await requireOrgAdmin(input.orgId);
+  await db
+    .update(s.memberships)
+    .set({ scoped: false })
+    .where(and(eq(s.memberships.orgId, input.orgId), eq(s.memberships.userId, input.userId)));
+  const orgProjects = db
+    .select({ id: s.projects.id })
+    .from(s.projects)
+    .where(eq(s.projects.orgId, input.orgId));
+  await db
+    .delete(s.projectMemberships)
+    .where(
+      and(
+        eq(s.projectMemberships.userId, input.userId),
+        inArray(s.projectMemberships.projectId, orgProjects)
+      )
+    );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: admin.name,
+    action: "Org-wide access restored",
+    target: input.userId,
+  });
+  revalidatePath("/dashboard/settings");
 }

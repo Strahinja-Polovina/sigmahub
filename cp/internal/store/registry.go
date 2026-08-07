@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -53,9 +54,14 @@ type Server struct {
 	AgentVersion string          `json:"agentVersion"`
 	Facts        json.RawMessage `json:"facts"`
 	MeshIP       *string         `json:"meshIp"`
-	Pubkey       *string         `json:"pubkey"`
-	LastSeenAt   *time.Time      `json:"lastSeenAt"`
-	CreatedAt    time.Time       `json:"createdAt"`
+	// Endpoint is the server's PUBLIC address (ip:port), from the connect
+	// wizard initially and refreshed by the agent's STUN probe on heartbeat.
+	// Surfaced so the dashboard can label it distinctly from the 10.8.x.x mesh
+	// IP it previously presented as "IP" (SIGMA-187).
+	Endpoint   *string    `json:"endpoint"`
+	Pubkey     *string    `json:"pubkey"`
+	LastSeenAt *time.Time `json:"lastSeenAt"`
+	CreatedAt  time.Time  `json:"createdAt"`
 	// P1-5 dashboard fields. Ready is DERIVED on read (running + mesh applied +
 	// a formable same-org peer); the rest are the reported hardening posture and
 	// declared distro. Populated by ListServers/GetServer only.
@@ -145,6 +151,11 @@ type ProvisionInput struct {
 	Region    string
 	ProxyRole bool
 	Distro    string // "" for the manual/NAT path; validated when set
+	// HostIP is the public address the operator typed into the connect wizard.
+	// Stored as the server's initial endpoint so the dashboard can show a real
+	// public IP from day one; the agent's STUN probe refines it on heartbeat
+	// (SIGMA-187 — previously this input was collected and silently discarded).
+	HostIP string
 }
 
 // precreateServerTx inserts a provisioning server row and allocates its mesh IP,
@@ -169,9 +180,9 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	}
 	id := newID("srv")
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO servers (id, org_id, name, type, source, proxy_role, provider, region, mesh_ip, distro, status)
-		VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, NULLIF($9, ''), 'provisioning')`,
-		id, orgID, name, typ, in.ProxyRole, in.Provider, in.Region, meshIP, in.Distro); err != nil {
+		INSERT INTO servers (id, org_id, name, type, source, proxy_role, provider, region, mesh_ip, distro, endpoint, status)
+		VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), 'provisioning')`,
+		id, orgID, name, typ, in.ProxyRole, in.Provider, in.Region, meshIP, in.Distro, strings.TrimSpace(in.HostIP)); err != nil {
 		return "", fmt.Errorf("pre-create server: %w", err)
 	}
 	return id, nil
@@ -410,7 +421,7 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 // derived Ready flag. Aliased `s` so readinessExpr's correlated subquery binds.
 const serverSelect = `
 	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
-	       s.agent_version, s.facts, s.mesh_ip, s.pubkey, s.last_seen_at, s.created_at,
+	       s.agent_version, s.facts, s.mesh_ip, s.endpoint, s.pubkey, s.last_seen_at, s.created_at,
 	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked,
 	       COALESCE(h.keep_public_ssh, TRUE), ` + readinessExpr + ` AS ready
 	  FROM servers s
@@ -418,7 +429,7 @@ const serverSelect = `
 
 func scanServerRow(row pgx.Row, srv *Server) error {
 	return row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
-		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
+		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Endpoint, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
 		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked,
 		&srv.KeepPublicSSH, &srv.Ready)
 }

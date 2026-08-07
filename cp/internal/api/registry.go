@@ -28,6 +28,9 @@ type provisionRequest struct {
 	Region    string `json:"region"`
 	ProxyRole bool   `json:"proxyRole"`
 	Distro    string `json:"distro"` // detected host OS; validated server-side
+	// HostIP: the public address from the connect wizard, stored as the
+	// server's initial endpoint (SIGMA-187).
+	HostIP string `json:"hostIp"`
 }
 
 type registerRequest struct {
@@ -94,7 +97,7 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.store.ProvisionServer(r.Context(), orgID, store.ProvisionInput{
 		Name: req.Name, Type: typ, Provider: req.Provider, Region: req.Region,
-		ProxyRole: req.ProxyRole, Distro: req.Distro,
+		ProxyRole: req.ProxyRole, Distro: req.Distro, HostIP: req.HostIP,
 	}, principalFrom(r).Name, defaultBootstrapTTL)
 	if errors.Is(err, store.ErrUnsupportedDistro) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   environmentMirrorRow,
+  localDeployStatus,
   localResourceKind,
   projectMirrorRow,
   resourceMirrorRow,
@@ -100,6 +101,43 @@ describe("resource mapping", () => {
     expect(row.version).toBe("v7");
     expect(row.lastDeployAt).toEqual(existing.lastDeployAt);
   });
+
+  // SIGMA-161: with the CP's latest deployment supplied, version and
+  // lastDeployAt track reality instead of freezing at resource creation.
+  it("derives version + lastDeployAt from the latest CP deployment", () => {
+    const row = resourceMirrorRow(cpResource(), null, {
+      gitSha: "abcdef1234567890",
+      status: "success",
+      createdAt: "2026-08-01T10:00:00Z",
+    });
+    expect(row.version).toBe("abcdef12");
+    expect(row.lastDeployAt).toEqual(new Date("2026-08-01T10:00:00Z"));
+    // A failed latest deploy still moves lastDeployAt but keeps the prior version.
+    const failed = resourceMirrorRow(
+      cpResource(),
+      { status: "running", repo: null, domain: null, version: "v7", lastDeployAt: new Date(0) },
+      { gitSha: "abcdef1234567890", status: "failed", createdAt: "2026-08-02T10:00:00Z" }
+    );
+    expect(failed.version).toBe("v7");
+    expect(failed.lastDeployAt).toEqual(new Date("2026-08-02T10:00:00Z"));
+  });
+
+  // SIGMA-194: preview resources carry their flag into the mirror.
+  it("carries ephemeral", () => {
+    expect(resourceMirrorRow(cpResource({ ephemeral: true })).ephemeral).toBe(true);
+    expect(resourceMirrorRow(cpResource()).ephemeral).toBe(false);
+  });
+});
+
+describe("deploy status mapping", () => {
+  it("collapses in-flight CP states to running and passes terminals through", () => {
+    expect(localDeployStatus("queued")).toBe("running");
+    expect(localDeployStatus("building")).toBe("running");
+    expect(localDeployStatus("deploying")).toBe("running");
+    expect(localDeployStatus("success")).toBe("success");
+    expect(localDeployStatus("failed")).toBe("failed");
+    expect(localDeployStatus("superseded")).toBe("superseded");
+  });
 });
 
 describe("project/environment mapping", () => {
@@ -136,7 +174,21 @@ describe("project/environment mapping", () => {
       id: "env_pr7",
       projectId: "prj_1",
       name: "pr-7",
+      production: false,
       createdAt: new Date("2026-07-02T00:00:00Z"),
     });
+  });
+
+  // SIGMA-190: the flag that seeds backup retention survives the mirror now.
+  it("carries production", () => {
+    const env: CpEnvironment = {
+      id: "env_p",
+      orgId: "org_1",
+      projectId: "prj_1",
+      name: "live",
+      production: true,
+      createdAt: "2026-07-02T00:00:00Z",
+    };
+    expect(environmentMirrorRow(env).production).toBe(true);
   });
 });

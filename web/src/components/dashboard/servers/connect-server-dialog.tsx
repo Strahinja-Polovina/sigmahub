@@ -149,6 +149,7 @@ export function ConnectServerDialog({
             proxyRole,
             distro,
             keepPublicSsh,
+            hostIp: ip,
           });
           if (res.mode === "cp") {
             setIssued({ command: res.command, expiresAt: res.expiresAt, bootstrapPubkey: res.bootstrapPubkey });

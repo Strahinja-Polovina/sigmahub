@@ -19,6 +19,7 @@ import {
   cpEnabled,
   cpEnvServerIds,
   cpListEnvironments,
+  cpListOrgDeployments,
   cpListProjects,
   cpListResources,
   cpListServers,
@@ -26,6 +27,7 @@ import {
 } from "./cp";
 import {
   environmentMirrorRow,
+  localDeployStatus,
   projectMirrorRow,
   resourceMirrorRow,
   staleIds,
@@ -83,10 +85,11 @@ function statusOf(st: OrgSyncState): CpSyncStatus {
  *  first write: tombstoning from partial data would delete rows the CP still
  *  owns, so any fetch failure aborts the pass with the mirror untouched. */
 export async function syncOrgMirror(orgId: string): Promise<void> {
-  const [cpServers, cpProjects, cpResources] = await Promise.all([
+  const [cpServers, cpProjects, cpResources, cpDeploys] = await Promise.all([
     cpListServers(orgId),
     cpListProjects(orgId),
     cpListResources(orgId),
+    cpListOrgDeployments(orgId),
   ]);
   const cpEnvs = (
     await Promise.all(cpProjects.map((p) => cpListEnvironments(orgId, p.id)))
@@ -141,6 +144,7 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
           status: row.status,
           agentVersion: row.agentVersion,
           ip: row.ip,
+          meshIp: row.meshIp,
           cpu: row.cpu,
           memGb: row.memGb,
         },
@@ -169,14 +173,16 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
       .values(row)
       .onConflictDoUpdate({
         target: s.environments.id,
-        set: { name: row.name, projectId: row.projectId },
+        set: { name: row.name, projectId: row.projectId, production: row.production },
       });
   }
 
-  // 4. Resources.
+  // 4. Resources. The latest CP deployment per resource feeds version and
+  // lastDeployAt (SIGMA-161 — both previously froze at resource creation).
+  const latestByResource = new Map(cpDeploys.latest.map((d) => [d.resourceId, d]));
   const resourcesById = new Map(localResources.map((r) => [r.id, r]));
   for (const res of cpResources) {
-    const row = resourceMirrorRow(res, resourcesById.get(res.id));
+    const row = resourceMirrorRow(res, resourcesById.get(res.id), latestByResource.get(res.id));
     await db
       .insert(s.resources)
       .values(row)
@@ -191,6 +197,40 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
           status: row.status,
           repo: row.repo,
           domain: row.domain,
+          ephemeral: row.ephemeral,
+          version: row.version,
+          lastDeployAt: row.lastDeployAt,
+        },
+      });
+  }
+
+  // 4b. Deployments — mirror the CP's recent + latest rows into the local
+  // deployments table every existing surface already reads (activity feed,
+  // Active deploys stat, per-resource latestDeploy). Only rows whose resource
+  // exists locally (FK); dedup by id (SIGMA-161).
+  const localResourceIds = new Set(cpResources.map((r) => r.id));
+  const deployRows = new Map<string, (typeof cpDeploys.recent)[number]>();
+  for (const d of [...cpDeploys.recent, ...cpDeploys.latest]) {
+    if (localResourceIds.has(d.resourceId)) deployRows.set(d.id, d);
+  }
+  for (const d of deployRows.values()) {
+    await db
+      .insert(s.deployments)
+      .values({
+        id: d.id,
+        resourceId: d.resourceId,
+        sha: d.gitSha ?? "",
+        status: localDeployStatus(d.status),
+        author: d.createdBy ?? "",
+        durationSec: d.durationSeconds ?? 0,
+        startedAt: new Date(d.startedAt ?? d.createdAt),
+      })
+      .onConflictDoUpdate({
+        target: s.deployments.id,
+        set: {
+          status: localDeployStatus(d.status),
+          durationSec: d.durationSeconds ?? 0,
+          startedAt: new Date(d.startedAt ?? d.createdAt),
         },
       });
   }

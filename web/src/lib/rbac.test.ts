@@ -17,14 +17,23 @@ describe("effectiveProjectRole", () => {
     expect(effectiveProjectRole("Org Admin", "Developer", true)).toBe("Org Admin");
   });
 
-  it("zero grants = legacy org-wide access (nobody loses access on ship)", () => {
+  it("unscoped members keep org-wide access (nobody loses access on ship)", () => {
     expect(effectiveProjectRole("Project Admin", undefined, false)).toBe("Project Admin");
     expect(effectiveProjectRole("Developer", undefined, false)).toBe("Developer");
   });
 
-  it("any grant scopes the user: ungranted projects become invisible", () => {
+  it("a scoped user's ungranted projects are invisible", () => {
     expect(effectiveProjectRole("Project Admin", undefined, true)).toBeNull();
     expect(canSeeProject("Developer", undefined, true)).toBe(false);
+  });
+
+  it("a scoped user with ZERO grants sees nothing — revoking the last grant never re-widens (SIGMA-167)", () => {
+    // The scoped flag is explicit membership state, not a live grant count: a
+    // contractor whose only grant was revoked (or whose only granted project
+    // was deleted) must not silently regain every project in the org.
+    expect(effectiveProjectRole("Project Admin", undefined, true)).toBeNull();
+    expect(effectiveProjectRole("Developer", undefined, true)).toBeNull();
+    expect(canSeeProject("Project Admin", undefined, true)).toBe(false);
   });
 
   it("the org role is the ceiling — a grant can only narrow, never widen", () => {

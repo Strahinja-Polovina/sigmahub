@@ -1,5 +1,7 @@
 package dsd
 
+import "strings"
+
 // Op kinds shared with the agent's apply registry. Defined here (a leaf package)
 // so the reconciler render and the agent apply cannot drift on the wire names.
 const (
@@ -47,14 +49,58 @@ const (
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,
 // so a clone/build/rollout chain and a rollback reference the same image.
+//
+// Bare (unpinned) tags are MUTABLE: a manual redeploy of the same commit
+// rebuilds the tag in place, so a rollback rendered from one silently re-ships
+// whatever the tag points at now (SIGMA-173). New builds therefore use the
+// pinned variants below; the bare form remains only for legacy rows recorded
+// before the pin existed.
 func DeployImageTag(resourceID, sha string) string {
 	return "sigmahub/" + resourceID + ":" + sha
 }
 
 // DeployServiceImageTag is the per-service image tag for a Compose service, so
 // each service in a multi-service resource builds and runs its own image.
+// Mutable like DeployImageTag — see the pinned variants.
 func DeployServiceImageTag(resourceID, service, sha string) string {
 	return "sigmahub/" + resourceID + "-" + service + ":" + sha
+}
+
+// DeployPin is a deployment's build pin: the short unique suffix under which
+// that deployment's images are tagged. Because every deployment builds under
+// its own pin, a tag is never rebuilt in place, and a rollback re-ships the
+// exact bytes of the release it names — not whatever a shared SHA tag has
+// mutated into since (SIGMA-173). Same derivation as the rollout generation
+// suffix: the trailing id segment, capped at 6 chars.
+func DeployPin(deploymentID string) string {
+	pin := deploymentID
+	if i := strings.LastIndex(pin, "_"); i >= 0 {
+		pin = pin[i+1:]
+	}
+	if len(pin) > 6 {
+		pin = pin[len(pin)-6:]
+	}
+	return pin
+}
+
+// PinnedImageTag is the immutable per-deployment image tag: the SHA tag plus
+// the build pin of the deployment that built it.
+func PinnedImageTag(resourceID, sha, pin string) string {
+	if pin == "" {
+		return DeployImageTag(resourceID, sha)
+	}
+	return DeployImageTag(resourceID, sha) + "-" + pin
+}
+
+// PinnedServiceImageTag is PinnedImageTag for one Compose service. The pin
+// makes a Compose release's per-service images re-derivable from its
+// deployment row alone, which is what lets a Compose rollback render
+// rollout-only ops instead of re-cloning from git (SIGMA-168).
+func PinnedServiceImageTag(resourceID, service, sha, pin string) string {
+	if pin == "" {
+		return DeployServiceImageTag(resourceID, service, sha)
+	}
+	return DeployServiceImageTag(resourceID, service, sha) + "-" + pin
 }
 
 // ServiceContainerName is the base container name for a Compose service (the

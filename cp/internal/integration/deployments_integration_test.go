@@ -299,3 +299,107 @@ func TestDeploymentSupersedeAndAdvance(t *testing.T) {
 		t.Fatal("the successful deployment should be a rollback target")
 	}
 }
+
+// TestConfigDeployments pins SIGMA-166's store half: a secret/domain change on
+// a resource whose standing target is a SUCCESSFUL release mints a 'config'
+// deployment that copies the release's coordinates AND its image pin (so the
+// render re-ships the running image under a fresh generation), returns the
+// server to re-render, and skips resources that are in flight or undeployed.
+func TestConfigDeployments(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cfgdep"
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID := reg.Server.ID
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	appSpec, _ := json.Marshal(map[string]any{"repo": "acme/app"})
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "web", Kind: "app", Spec: appSpec,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An undeployed resource mints nothing.
+	refs, err := st.CreateConfigDeployments(ctx, orgID, []string{res.ID}, "admin", "secret changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("undeployed resource must not mint a config deploy: %+v", refs)
+	}
+
+	// Deploy to success.
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: serverID,
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "shacfg1", ConfigHash: "cfg1",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "rollout", true, "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// The config deploy copies the release's sha + pin and returns the server.
+	refs, err = st.CreateConfigDeployments(ctx, orgID, []string{res.ID}, "admin", "secret changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].ServerID != serverID || refs[0].OrgID != orgID {
+		t.Fatalf("config deploy refs = %+v", refs)
+	}
+	var srcPin, cfgPin, cfgSHA, cfgStatus, cfgDigest string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT COALESCE(image_pin,'') FROM deployments WHERE id = $1`, dep.ID).Scan(&srcPin); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT COALESCE(image_pin,''), COALESCE(git_sha,''), status, COALESCE(image_digest,'')
+		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND trigger = 'config'`,
+		orgID, res.ID).Scan(&cfgPin, &cfgSHA, &cfgStatus, &cfgDigest); err != nil {
+		t.Fatal(err)
+	}
+	if srcPin == "" || cfgPin != srcPin {
+		t.Fatalf("config deploy must copy the source pin: src=%q cfg=%q", srcPin, cfgPin)
+	}
+	if cfgSHA != "shacfg1" || cfgStatus != "queued" {
+		t.Fatalf("config row = sha %q status %q", cfgSHA, cfgStatus)
+	}
+	if cfgDigest == "" {
+		t.Fatal("config deploy must copy the recorded image reference")
+	}
+
+	// With the config row in flight, a second change mints nothing new.
+	refs, err = st.CreateConfigDeployments(ctx, orgID, []string{res.ID}, "admin", "secret changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM deployments WHERE org_id = $1 AND resource_id = $2 AND trigger = 'config'`,
+		orgID, res.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 || n != 1 {
+		t.Fatalf("in-flight config deploy must not stack another: refs=%+v count=%d", refs, n)
+	}
+}

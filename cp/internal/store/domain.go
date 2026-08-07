@@ -50,8 +50,12 @@ type Resource struct {
 	Kind          string          `json:"kind"`
 	Spec          json.RawMessage `json:"spec"`
 	Status        json.RawMessage `json:"status"`
-	CreatedAt     time.Time       `json:"createdAt"`
-	UpdatedAt     time.Time       `json:"updatedAt"`
+	// Ephemeral marks a PR-preview resource (ensurePreviewTx): torn down with
+	// its PR, not a first-class service. Surfaced so the dashboard can badge it
+	// and guard its Delete instead of presenting it as ordinary (SIGMA-194).
+	Ephemeral bool      `json:"ephemeral"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // resourceServerTypes is the availability matrix: which server types may host
@@ -171,10 +175,14 @@ func (s *Store) UpdateProject(ctx context.Context, orgID, projectID, name, descr
 	return p, tx.Commit(ctx)
 }
 
-func (s *Store) DeleteProject(ctx context.Context, orgID, projectID, actor string) error {
+// DeleteProject removes a project (cascading its environments and resources)
+// and returns the distinct servers those resources ran on, so the caller can
+// re-render their DSDs — without the nudge a "deleted" database kept serving
+// connections for up to a minute until the fleet resync (SIGMA-193).
+func (s *Store) DeleteProject(ctx context.Context, orgID, projectID, actor string) ([]string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -182,7 +190,11 @@ func (s *Store) DeleteProject(ctx context.Context, orgID, projectID, actor strin
 	// cascade removes their backup policies — otherwise the customer's offsite
 	// snapshots survive in their bucket as undecryptable ciphertext (SIGMA-170).
 	if err := archiveRepoKeysTx(ctx, tx, orgID, "project", projectID); err != nil {
-		return fmt.Errorf("archive repo keys: %w", err)
+		return nil, fmt.Errorf("archive repo keys: %w", err)
+	}
+	servers, err := cascadeResourceCleanupTx(ctx, tx, orgID, "project_id", projectID)
+	if err != nil {
+		return nil, err
 	}
 
 	var name string
@@ -190,15 +202,15 @@ func (s *Store) DeleteProject(ctx context.Context, orgID, projectID, actor strin
 		`DELETE FROM projects WHERE org_id = $1 AND id = $2 RETURNING name`,
 		orgID, projectID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("delete project: %w", err)
+		return nil, fmt.Errorf("delete project: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Project deleted", name); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit(ctx)
+	return servers, tx.Commit(ctx)
 }
 
 // ── Environments ────────────────────────────────────────────────────────────
@@ -255,17 +267,24 @@ func (s *Store) ListEnvironments(ctx context.Context, orgID, projectID string) (
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteEnvironment(ctx context.Context, orgID, envID, actor string) error {
+// DeleteEnvironment removes an environment (cascading its resources) and
+// returns the distinct servers to re-render — same rationale as DeleteProject
+// (SIGMA-193).
+func (s *Store) DeleteEnvironment(ctx context.Context, orgID, envID, actor string) ([]string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Same key retention as DeleteProject (SIGMA-170) — an environment cascade
 	// takes its resources' backup policies with it.
 	if err := archiveRepoKeysTx(ctx, tx, orgID, "environment", envID); err != nil {
-		return fmt.Errorf("archive repo keys: %w", err)
+		return nil, fmt.Errorf("archive repo keys: %w", err)
+	}
+	servers, err := cascadeResourceCleanupTx(ctx, tx, orgID, "environment_id", envID)
+	if err != nil {
+		return nil, err
 	}
 
 	var name string
@@ -273,15 +292,107 @@ func (s *Store) DeleteEnvironment(ctx context.Context, orgID, envID, actor strin
 		`DELETE FROM environments WHERE org_id = $1 AND id = $2 RETURNING name`,
 		orgID, envID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("delete environment: %w", err)
+		return nil, fmt.Errorf("delete environment: %w", err)
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Environment deleted", name); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit(ctx)
+	return servers, tx.Commit(ctx)
+}
+
+// UpdateEnvironmentProduction flips an environment's production flag — the
+// seed for new databases' backup retention. It was write-once at creation and
+// the web derived it from a magic name match ("production"/"prod"), so a prod
+// environment named "live" or "prd" silently got the non-production backup
+// defaults forever, with no way to correct it (SIGMA-190). Audited.
+func (s *Store) UpdateEnvironmentProduction(ctx context.Context, orgID, envID string, production bool, actor string) (Environment, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return Environment{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var e Environment
+	err = tx.QueryRow(ctx, `
+		UPDATE environments SET production = $3
+		 WHERE org_id = $1 AND id = $2
+		 RETURNING id, org_id, project_id, name, production, created_at`,
+		orgID, envID, production).Scan(&e.ID, &e.OrgID, &e.ProjectID, &e.Name, &e.Production, &e.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Environment{}, ErrNotFound
+	}
+	if err != nil {
+		return Environment{}, err
+	}
+	action := "Environment unmarked production"
+	if production {
+		action = "Environment marked production"
+	}
+	if err := auditTx(ctx, tx, orgID, actor, action, e.Name); err != nil {
+		return Environment{}, err
+	}
+	return e, tx.Commit(ctx)
+}
+
+// cascadeResourceCleanupTx performs DeleteResource's post-delete duties for
+// every resource a project/environment cascade is about to remove (SIGMA-193):
+// it queues the pre-authorised volume teardown for EPHEMERAL resources (the
+// same carve-out DeleteResource applies — non-ephemeral volumes deliberately
+// stay on disk) and returns the distinct servers whose DSD must re-render.
+// MUST run BEFORE the DELETE that triggers the cascade — afterwards there is
+// nothing left to read. scopeCol is an internal constant, never user input.
+func cascadeResourceCleanupTx(ctx context.Context, tx pgx.Tx, orgID, scopeCol, scopeID string) ([]string, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT id, server_id, spec, ephemeral FROM resources WHERE org_id = $1 AND `+scopeCol+` = $2`,
+		orgID, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	type res struct {
+		id, serverID string
+		spec         json.RawMessage
+		ephemeral    bool
+	}
+	var all []res
+	for rows.Next() {
+		var r res
+		if err := rows.Scan(&r.id, &r.serverID, &r.spec, &r.ephemeral); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	var servers []string
+	for _, r := range all {
+		if r.serverID != "" && !seen[r.serverID] {
+			seen[r.serverID] = true
+			servers = append(servers, r.serverID)
+		}
+		if !r.ephemeral {
+			continue
+		}
+		for _, vol := range resourceVolumeNames(r.id, r.spec) {
+			if _, err := insertPendingDestructiveOpTx(ctx, tx, orgID, r.serverID, dsd.KindVolumeRemove, vol, "system"); err != nil {
+				return nil, err
+			}
+			if err := auditTx(ctx, tx, orgID, "system", "Destructive-op confirm requested (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
+				return nil, err
+			}
+			if err := auditTx(ctx, tx, orgID, "system", "Destructive-op confirmed (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return servers, nil
 }
 
 // ── Env ↔ server attachment ─────────────────────────────────────────────────
@@ -491,7 +602,7 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 
 // ListResources returns org resources, optionally filtered by environment.
 func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resource, error) {
-	q := `SELECT id, org_id, project_id, environment_id, server_id, name, kind, spec, status, created_at, updated_at
+	q := `SELECT id, org_id, project_id, environment_id, server_id, name, kind, spec, status, ephemeral, created_at, updated_at
 	        FROM resources WHERE org_id = $1`
 	args := []any{orgID}
 	if envID != "" {
@@ -508,7 +619,7 @@ func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resou
 	for rows.Next() {
 		var r Resource
 		if err := rows.Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.Name, &r.Kind,
-			&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.Spec, &r.Status, &r.Ephemeral, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

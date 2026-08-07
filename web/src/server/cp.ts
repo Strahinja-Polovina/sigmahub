@@ -37,6 +37,9 @@ export type CpServer = {
     memTotalMb?: number;
   } | null;
   meshIp: string | null;
+  /** Public ip:port — the connect wizard's host IP, refreshed by the agent's
+   *  STUN probe. Distinct from the private 10.8.x.x meshIp (SIGMA-187). */
+  endpoint: string | null;
   pubkey: string | null;
   lastSeenAt: string | null;
   createdAt: string;
@@ -236,7 +239,17 @@ export async function cpIssueBootstrapToken(
  *  Returns the bound token + the OpenSSH public key to place on the host. */
 export async function cpProvisionServer(
   orgId: string,
-  input: { name: string; type: string; provider: string; region: string; proxyRole: boolean; distro?: string },
+  input: {
+    name: string;
+    type: string;
+    provider: string;
+    region: string;
+    proxyRole: boolean;
+    distro?: string;
+    /** The wizard's "Host IP" — stored as the server's initial public endpoint
+     *  instead of being silently discarded (SIGMA-187). */
+    hostIp?: string;
+  },
   actor: CpActor
 ): Promise<{ serverId: string; token: string; expiresAt: string; bootstrapPubkey: string }> {
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/provision`, {
@@ -308,6 +321,8 @@ export type CpResource = {
   kind: string;
   spec: Record<string, unknown>;
   status: Record<string, unknown>;
+  /** PR-preview resource, torn down with its PR (SIGMA-194). */
+  ephemeral?: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -383,6 +398,20 @@ export async function cpCreateEnvironment(
 ): Promise<CpEnvironment> {
   return cpFetch(`${org(orgId)}/projects/${encodeURIComponent(projectId)}/environments`, {
     method: "POST",
+    body: JSON.stringify(input),
+  }, { orgId, actor });
+}
+
+/** Edit an environment's production flag (SIGMA-190 — previously write-once at
+ *  creation, silently inferred from the environment's name). */
+export async function cpUpdateEnvironment(
+  orgId: string,
+  envId: string,
+  input: { production: boolean },
+  actor: CpActor
+): Promise<CpEnvironment> {
+  return cpFetch(`${org(orgId)}/environments/${encodeURIComponent(envId)}`, {
+    method: "PATCH",
     body: JSON.stringify(input),
   }, { orgId, actor });
 }
@@ -1339,7 +1368,7 @@ export type CpDeployment = {
   environmentId?: string;
   serverId?: string;
   connectionId?: string;
-  trigger: string; // git | manual | rollback
+  trigger: string; // git | manual | rollback | config (re-ship after a secret/domain change)
   gitRef?: string;
   gitSha?: string;
   imageDigest?: string;
@@ -1369,6 +1398,17 @@ export async function cpListDeployments(orgId: string, resourceId: string, limit
   const { deployments } = await cpFetch<{ deployments: CpDeployment[] }>(
     `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/deployments?limit=${limit}`, undefined, { orgId });
   return deployments;
+}
+
+/** The org-wide deploy feed: recent deployments (activity stream) plus the
+ *  latest per resource, however old (SIGMA-161 — the dashboard's "Last deploy",
+ *  "Version", "Active deploys" and activity feed read this via the mirror). */
+export async function cpListOrgDeployments(
+  orgId: string,
+  limit = 50
+): Promise<{ recent: CpDeployment[]; latest: CpDeployment[] }> {
+  return cpFetch<{ recent: CpDeployment[]; latest: CpDeployment[] }>(
+    `${org(orgId)}/deployments?limit=${limit}`, undefined, { orgId });
 }
 
 export async function cpRollbackTargets(orgId: string, resourceId: string): Promise<CpDeployment[]> {
@@ -1445,6 +1485,7 @@ export async function cpMirrorServer(
         status: row.status,
         agentVersion: row.agentVersion,
         ip: row.ip,
+        meshIp: row.meshIp,
         cpu: row.cpu,
         memGb: row.memGb,
       },
@@ -1454,8 +1495,23 @@ export async function cpMirrorServer(
 
 type ServerRow = typeof s.servers.$inferSelect;
 
+/** The host part of a WireGuard endpoint ("203.0.113.7:51820" → "203.0.113.7").
+ *  Handles bracketed IPv6 ("[2001:db8::1]:51820"). */
+export function endpointHost(endpoint: string | null | undefined): string {
+  if (!endpoint) return "";
+  const v6 = endpoint.match(/^\[(.+)\]:\d+$/);
+  if (v6) return v6[1];
+  const i = endpoint.lastIndexOf(":");
+  return i > 0 && !endpoint.slice(i + 1).includes(":") ? endpoint.slice(0, i) : endpoint;
+}
+
 /** Map a control-plane server onto the local `servers` row shape the views
- *  render, so CP mode reuses the exact same components. */
+ *  render, so CP mode reuses the exact same components.
+ *
+ *  ip is the PUBLIC address (the wizard's host IP / the agent's STUN-probed
+ *  endpoint); meshIp is the private 10.8.x.x WireGuard address. The mesh IP
+ *  was previously mapped into `ip` and rendered under an "IP" header — a
+ *  wrong answer for DNS, firewalls, or SSH (SIGMA-187). */
 export function cpServerToRow(cp: CpServer): ServerRow {
   const memTotalMb = cp.facts?.memTotalMb ?? 0;
   return {
@@ -1468,7 +1524,8 @@ export function cpServerToRow(cp: CpServer): ServerRow {
     region: cp.region || "—",
     status: cp.status,
     agentVersion: cp.agentVersion,
-    ip: cp.meshIp ?? "",
+    ip: endpointHost(cp.endpoint),
+    meshIp: cp.meshIp ?? "",
     cpu: cp.facts?.numCpu ?? 0,
     memGb: memTotalMb ? Math.round(memTotalMb / 1024) : 0,
     byoVpn: false,

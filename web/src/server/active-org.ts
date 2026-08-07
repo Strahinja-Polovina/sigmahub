@@ -64,15 +64,16 @@ export async function ensurePersonalOrg() {
   return orgId;
 }
 
-/** Assert the session user belongs to `orgId`; returns their role. Throws otherwise. */
+/** Assert the session user belongs to `orgId`; returns their role and explicit
+ *  scoping flag (SIGMA-167). Throws otherwise. */
 export async function requireMembership(orgId: string) {
   const user = await getSessionUser();
   const [m] = await db
-    .select({ role: s.memberships.role })
+    .select({ role: s.memberships.role, scoped: s.memberships.scoped })
     .from(s.memberships)
     .where(and(eq(s.memberships.userId, user.id), eq(s.memberships.orgId, orgId)));
   if (!m) throw new Error("You are not a member of this organization.");
-  return { user, role: m.role };
+  return { user, role: m.role, scoped: m.scoped };
 }
 
 /** Assert the session user is an Org Admin of `orgId`. Returns the user. */
@@ -117,15 +118,23 @@ export async function projectGrants(
 }
 
 /** Projects the user may see in this org, or null for "all" (org admins and
- *  legacy users with zero grants). Read paths filter lists with this. */
+ *  UNSCOPED users). Read paths filter lists with this.
+ *
+ *  Scoping is the membership's explicit flag, not a grant count (SIGMA-167):
+ *  a scoped user whose last grant was revoked — or whose only granted project
+ *  was deleted — sees an EMPTY set, not everything. */
 export async function visibleProjects(
   userId: string,
   orgId: string,
   orgRole: string
 ): Promise<Set<string> | null> {
   if (orgRole === "Org Admin") return null;
+  const [m] = await db
+    .select({ scoped: s.memberships.scoped })
+    .from(s.memberships)
+    .where(and(eq(s.memberships.userId, userId), eq(s.memberships.orgId, orgId)));
   const grants = await projectGrants(userId, orgId);
-  if (grants.size === 0) return null;
+  if (!m?.scoped && grants.size === 0) return null; // unscoped: org-wide
   return new Set(grants.keys());
 }
 
@@ -138,7 +147,7 @@ export async function requireProjectRole(
   projectId: string,
   min: "Project Admin" | "Developer"
 ) {
-  const { user, role: orgRole } = await requireMembership(orgId);
+  const { user, role: orgRole, scoped } = await requireMembership(orgId);
   // Bind the project to the org BEFORE trusting any role. Without this, an Org
   // Admin of org A (every user is Org Admin of their personal org) passes the
   // Org-Admin short-circuit in effectiveProjectRole for a projectId that lives
@@ -152,7 +161,8 @@ export async function requireProjectRole(
     throw new Error("You do not have access to this project.");
   }
   const grants = await projectGrants(user.id, orgId);
-  const effective = effectiveProjectRole(orgRole, grants.get(projectId), grants.size > 0);
+  // Explicit scoping wins; grants.size covers pre-backfill rows defensively.
+  const effective = effectiveProjectRole(orgRole, grants.get(projectId), scoped || grants.size > 0);
   if (!effective) {
     throw new Error("You do not have access to this project.");
   }
@@ -192,7 +202,7 @@ export async function requireProjectAdminForResource(orgId: string, resourceId: 
 }
 
 /** Assert the session user can SEE `projectId` under P2-7 (org admins and
- *  zero-grant legacy users see all). Throws otherwise. */
+ *  unscoped users see all). Throws otherwise. */
 export async function assertProjectVisible(orgId: string, projectId: string) {
   const { user, role } = await requireMembership(orgId);
   const visible = await visibleProjects(user.id, orgId, role);
@@ -227,9 +237,9 @@ export async function requireEnvironmentVisible(orgId: string, environmentId: st
   await assertProjectVisible(orgId, env.projectId);
 }
 
-/** True when the session user sees every project in the org (org admin or a
- *  legacy user with no per-project grants) — the only case an org-wide read
- *  (e.g. an unscoped log search) is allowed for (SIGMA-84). */
+/** True when the session user sees every project in the org (org admin or an
+ *  unscoped member) — the only case an org-wide read (e.g. an unscoped log
+ *  search) is allowed for (SIGMA-84). */
 export async function hasFullOrgVisibility(orgId: string): Promise<boolean> {
   const { user, role } = await requireMembership(orgId);
   return (await visibleProjects(user.id, orgId, role)) === null;
