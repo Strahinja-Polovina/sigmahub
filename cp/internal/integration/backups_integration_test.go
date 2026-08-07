@@ -209,12 +209,23 @@ func TestBackupSweepBudgetsSplitByDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Ages ride make_interval(secs => float8): with a bare `now() - $n`,
+	// Postgres resolves the untyped parameter as timestamptz (preferring
+	// timestamptz - timestamptz over timestamptz - interval), which turns the
+	// whole expression into an interval that can't be inserted into created_at.
 	mkRun := func(id, status string, createdAgo time.Duration, startedAgo *time.Duration) {
 		t.Helper()
+		var startedSecs *float64
+		if startedAgo != nil {
+			secs := startedAgo.Seconds()
+			startedSecs = &secs
+		}
 		if _, err := st.Pool.Exec(ctx, `
 			INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, status, created_at, started_at)
-			VALUES ($1, $2, $3, $4, $5, 'backup', $6, now() - $7, now() - $8)`,
-			id, orgID, pg.ID, policyID, serverID, status, createdAgo, startedAgo); err != nil {
+			VALUES ($1, $2, $3, $4, $5, 'backup', $6,
+			        now() - make_interval(secs => $7),
+			        now() - make_interval(secs => $8))`,
+			id, orgID, pg.ID, policyID, serverID, status, createdAgo.Seconds(), startedSecs); err != nil {
 			t.Fatal(err)
 		}
 	}
