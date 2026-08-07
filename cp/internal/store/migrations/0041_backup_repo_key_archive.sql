@@ -10,12 +10,14 @@
 --
 -- This table keeps the wrapped key alive across the cascade. It is org-scoped
 -- and deliberately has NO foreign key to resources or backup_policies: the whole
--- point is to outlive them. The ciphertext keeps its original policy id so the
--- existing repoKeyAAD(org, policy) binding — and the KEK-rotation re-wrap — work
--- on archived rows unchanged.
+-- point is to outlive them. org_id is a bare TEXT like every other org-scoped CP
+-- table (backup_policies, org_deks, usage_hours) — organizations live in the web
+-- app's own database, so there is nothing here to reference. The ciphertext keeps
+-- its original policy id so the existing repoKeyAAD(org, policy) binding — and
+-- the KEK-rotation re-wrap — work on archived rows unchanged.
 CREATE TABLE IF NOT EXISTS backup_repo_key_archive (
 	policy_id           TEXT PRIMARY KEY,
-	org_id              TEXT NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+	org_id              TEXT NOT NULL,
 	resource_id         TEXT NOT NULL,
 	resource_name       TEXT NOT NULL DEFAULT '',
 	repo_key_ciphertext BYTEA NOT NULL,
