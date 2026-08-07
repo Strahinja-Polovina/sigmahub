@@ -82,6 +82,10 @@ type GitWebhookEvent struct {
 	Action       string // pull_request action (opened|synchronize|closed|...)
 	PRNumber     int    // pull_request number (0 for non-PR events)
 	Deleted      bool   // push that deleted the branch — never deploys
+	// InstallationID is the GitHub App installation the delivery was sent for.
+	// With repo uniqueness org-scoped (SIGMA-174) the repo name alone no longer
+	// identifies a tenant, so this is the primary routing key.
+	InstallationID string
 	// PushedAt is the head commit's timestamp for a push (nil if unavailable).
 	// Used to reject out-of-order webhook deliveries (SIGMA-136).
 	PushedAt *time.Time
@@ -90,7 +94,11 @@ type GitWebhookEvent struct {
 // WebhookOutcome reports what a delivery did, so the HTTP layer can shape its
 // (always 2xx) acknowledgement and tests can assert routing.
 type WebhookOutcome struct {
-	Duplicate  bool           // redelivered id — no-op
+	Duplicate bool // redelivered id — no-op
+	// Ambiguous: several orgs have this repo connected and the delivery carried
+	// no installation binding to pick one, so it was dropped unrouted rather
+	// than guessed into a foreign tenant (SIGMA-174).
+	Ambiguous  bool
 	Connection *GitConnection // nil when the repo is not connected
 	Enqueued   *DeployRequest // set when an auto-deploy was enqueued
 	PRHook     *DeployRequest // set when a pull_request routing hook was recorded
@@ -164,7 +172,9 @@ func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in Create
 		RETURNING created_at`,
 		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy).Scan(&c.CreatedAt)
 	if isUniqueViolation(err) {
-		return GitConnection{}, fmt.Errorf("%w: repository %q is already connected", ErrConflict, repo)
+		// Uniqueness is org-scoped (SIGMA-174), so this can only be the caller's
+		// own org's connection — the message discloses nothing cross-tenant.
+		return GitConnection{}, fmt.Errorf("%w: repository %q is already connected in this organization", ErrConflict, repo)
 	}
 	if err != nil {
 		return GitConnection{}, err
@@ -520,14 +530,16 @@ func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (Webho
 		return WebhookOutcome{Duplicate: true}, nil
 	}
 
-	// Resolve the connected repo. An unconnected repo still had its delivery
-	// recorded above (keeping redeliveries idempotent); nothing else to do.
-	conn, err := gitConnectionByRepoTx(ctx, tx, provider, ev.RepoFullName)
-	if errors.Is(err, ErrNotFound) {
-		if err := tx.Commit(ctx); err != nil {
-			return WebhookOutcome{}, err
+	// Resolve the connected repo, disambiguated by the delivery's installation
+	// (SIGMA-174 — several orgs may hold the same repo). An unconnected repo
+	// still had its delivery recorded above (keeping redeliveries idempotent);
+	// an ambiguous one is dropped rather than routed into a foreign tenant.
+	conn, err := gitConnectionForDeliveryTx(ctx, tx, provider, ev.RepoFullName, ev.InstallationID)
+	if errors.Is(err, ErrNotFound) || errors.Is(err, errAmbiguousDelivery) {
+		if cerr := tx.Commit(ctx); cerr != nil {
+			return WebhookOutcome{}, cerr
 		}
-		return WebhookOutcome{}, nil
+		return WebhookOutcome{Ambiguous: errors.Is(err, errAmbiguousDelivery)}, nil
 	}
 	if err != nil {
 		return WebhookOutcome{}, err
@@ -720,17 +732,88 @@ func (s *Store) gitCloneToken(ctx context.Context, orgID, connID string) (string
 
 // ── tx helpers ──────────────────────────────────────────────────────────────
 
-func gitConnectionByRepoTx(ctx context.Context, tx pgx.Tx, provider, repo string) (GitConnection, error) {
+// errAmbiguousDelivery marks a delivery whose repo is connected in several orgs
+// with no installation binding to pick one. Dropped, never guessed (SIGMA-174).
+var errAmbiguousDelivery = errors.New("ambiguous webhook delivery")
+
+const gitConnectionCols = `id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at, previews_enabled, COALESCE(preview_server_id, '')`
+
+func scanGitConnection(row pgx.Row) (GitConnection, error) {
 	var c GitConnection
-	err := tx.QueryRow(ctx, `
-		SELECT id, org_id, project_id, provider, installation_id, repo_full_name, created_by, created_at, previews_enabled, COALESCE(preview_server_id, '')
-		  FROM git_connections
-		 WHERE provider = $1 AND lower(repo_full_name) = $2`, provider, normalizeRepo(repo)).Scan(
-		&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt, &c.PreviewsEnabled, &c.PreviewServerID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return GitConnection{}, ErrNotFound
-	}
+	err := row.Scan(&c.ID, &c.OrgID, &c.ProjectID, &c.Provider, &c.InstallationID, &c.RepoFullName, &c.CreatedBy, &c.CreatedAt, &c.PreviewsEnabled, &c.PreviewServerID)
 	return c, err
+}
+
+// gitConnectionForDeliveryTx resolves an inbound delivery to a connection. Repo
+// uniqueness is org-scoped (SIGMA-174), so the repo name alone no longer
+// identifies a tenant. Resolution order:
+//  1. the org bound to the delivery's installation id (github_installations,
+//     the SIGMA-87 first-writer-wins ownership anchor), then that org's
+//     connection for the repo;
+//  2. a connection that recorded this installation id directly (created before
+//     the org claimed the installation);
+//  3. the unique global match — the pre-SIGMA-174 behavior, safe only while
+//     exactly one org holds the repo. Two or more matches without an
+//     installation binding return errAmbiguousDelivery.
+func gitConnectionForDeliveryTx(ctx context.Context, tx pgx.Tx, provider, repo, installationID string) (GitConnection, error) {
+	norm := normalizeRepo(repo)
+	if installationID != "" {
+		var orgID string
+		err := tx.QueryRow(ctx,
+			`SELECT org_id FROM github_installations WHERE installation_id = $1`,
+			installationID).Scan(&orgID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return GitConnection{}, err
+		}
+		if err == nil {
+			c, err := scanGitConnection(tx.QueryRow(ctx, `
+				SELECT `+gitConnectionCols+` FROM git_connections
+				 WHERE org_id = $1 AND provider = $2 AND lower(repo_full_name) = $3`,
+				orgID, provider, norm))
+			if err == nil {
+				return c, nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return GitConnection{}, err
+			}
+		}
+		c, err := scanGitConnection(tx.QueryRow(ctx, `
+			SELECT `+gitConnectionCols+` FROM git_connections
+			 WHERE installation_id = $1 AND provider = $2 AND lower(repo_full_name) = $3`,
+			installationID, provider, norm))
+		if err == nil {
+			return c, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return GitConnection{}, err
+		}
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT `+gitConnectionCols+` FROM git_connections
+		 WHERE provider = $1 AND lower(repo_full_name) = $2 LIMIT 2`, provider, norm)
+	if err != nil {
+		return GitConnection{}, err
+	}
+	defer rows.Close()
+	var conns []GitConnection
+	for rows.Next() {
+		c, err := scanGitConnection(rows)
+		if err != nil {
+			return GitConnection{}, err
+		}
+		conns = append(conns, c)
+	}
+	if err := rows.Err(); err != nil {
+		return GitConnection{}, err
+	}
+	switch len(conns) {
+	case 0:
+		return GitConnection{}, ErrNotFound
+	case 1:
+		return conns[0], nil
+	default:
+		return GitConnection{}, errAmbiguousDelivery
+	}
 }
 
 func branchMapTx(ctx context.Context, tx pgx.Tx, connID, branch string) (BranchMap, error) {

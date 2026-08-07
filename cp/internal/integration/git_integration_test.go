@@ -296,4 +296,86 @@ func TestGitConnectionUniqueRepo(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected conflict connecting the same repo twice")
 	}
+
+	// Uniqueness is ORG-scoped (SIGMA-174): another org connecting the same repo
+	// is not blocked — the global slot was the squatting/denial vector.
+	otherOrg := "org_uniq_b"
+	projB, err := st.CreateProject(ctx, otherOrg, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateGitConnection(ctx, otherOrg, store.CreateGitConnectionInput{
+		ProjectID: projB.ID, RepoFullName: "acme/dup",
+	}, "test"); err != nil {
+		t.Fatalf("cross-org connection of the same repo must succeed, got: %v", err)
+	}
+}
+
+// TestWebhookDeliveryOrgScoped covers SIGMA-174's routing half: when two orgs
+// hold the same repo, a delivery routes by its installation binding — never by
+// repo name alone — and an unattributable delivery is dropped, not guessed.
+func TestWebhookDeliveryOrgScoped(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+
+	setup := func(orgID, installation string) store.GitConnection {
+		t.Helper()
+		proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if installation != "" {
+			if err := st.ClaimInstallation(ctx, orgID, installation); err != nil {
+				t.Fatal(err)
+			}
+		}
+		conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+			ProjectID: proj.ID, RepoFullName: "Acme/Shared", InstallationID: installation,
+		}, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "auto", "test"); err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	setup("org_owner", "1001")
+	setup("org_other", "2002")
+
+	push := func(delivery, installation string) store.WebhookOutcome {
+		t.Helper()
+		out, err := st.HandleGitWebhook(ctx, store.GitWebhookEvent{
+			DeliveryID: delivery, Provider: "github", EventType: "push",
+			RepoFullName: "acme/shared", Ref: "refs/heads/main",
+			SHA: strings.Repeat("a", 40), InstallationID: installation,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// A delivery carrying org_owner's installation routes to org_owner only.
+	out := push("d-owner", "1001")
+	if out.Connection == nil || out.Connection.OrgID != "org_owner" {
+		t.Fatalf("delivery with installation 1001 must route to org_owner, got %+v", out.Connection)
+	}
+	if out.Enqueued == nil {
+		t.Fatal("expected an auto-branch deploy for the owning org")
+	}
+	// And org_other's installation routes to org_other.
+	out = push("d-other", "2002")
+	if out.Connection == nil || out.Connection.OrgID != "org_other" {
+		t.Fatalf("delivery with installation 2002 must route to org_other, got %+v", out.Connection)
+	}
+	// No installation and two candidate orgs: dropped, not guessed.
+	out = push("d-ambiguous", "")
+	if out.Connection != nil || !out.Ambiguous {
+		t.Fatalf("unattributable delivery must be dropped as ambiguous, got %+v", out)
+	}
 }

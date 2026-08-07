@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,7 +60,20 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The installation id is the delivery's tenant-ownership signal: repo
+	// uniqueness is org-scoped (SIGMA-174), so routing by repo name alone could
+	// land a delivery in the wrong org. GitHub App deliveries always carry it.
+	var inst struct {
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	_ = json.Unmarshal(body, &inst)
+
 	ev := store.GitWebhookEvent{DeliveryID: deliveryID, Provider: "github", EventType: event}
+	if inst.Installation.ID > 0 {
+		ev.InstallationID = strconv.FormatInt(inst.Installation.ID, 10)
+	}
 	switch event {
 	case "push":
 		var p struct {
@@ -148,6 +162,12 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case outcome.Duplicate:
 		resp["status"] = "duplicate"
+	case outcome.Ambiguous:
+		// Several orgs hold this repo and the delivery carried no installation
+		// binding to pick one — dropped rather than guessed (SIGMA-174).
+		s.log.Warn("webhook delivery ambiguous across orgs — dropped",
+			"delivery", deliveryID, "event", event)
+		resp["status"] = "ambiguous — delivery not routed"
 	case outcome.Connection == nil:
 		resp["status"] = "repo not connected"
 	case outcome.Enqueued != nil:
