@@ -67,6 +67,11 @@ ensure_tool tar tar
 # The firewall backend (nftables) and the CIS auditd control are not on the
 # stock base images; the host.cis / host.nftables DSD ops need them present.
 need nft || { echo "installing nftables..."; apt-get update -qq && apt-get install -y -qq nftables; }
+# wg-quick/wg back the WireGuard mesh. Without them mesh.Apply logs "wg-quick
+# not found; config rendered but not applied" and the sigma0 interface never
+# exists — so intra-fleet traffic, mesh-bound databases and the firewall's
+# `iifname "sigma0" accept` rule all silently do nothing (SIGMA-179).
+need wg-quick || { echo "installing wireguard-tools..."; apt-get update -qq && apt-get install -y -qq wireguard-tools; }
 apt-get install -y -qq auditd >/dev/null 2>&1 || echo "warning: could not install auditd; the CIS auditd control will score as unmet"
 # restic executes the P1-11 backup/verify ops (client-side encrypted backups).
 ensure_tool restic restic

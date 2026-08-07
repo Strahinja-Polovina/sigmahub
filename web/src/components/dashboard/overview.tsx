@@ -1,6 +1,6 @@
 "use client";
 
-import { toast } from "sonner";
+import Link from "next/link";
 import {
   Server,
   Boxes,
@@ -9,7 +9,6 @@ import {
   MoreHorizontal,
   Play,
   ScrollText,
-  RotateCw,
   ArrowUpRight,
 } from "lucide-react";
 
@@ -119,7 +118,7 @@ function StatCard({
   );
 }
 
-function ResourceActions({ resourceName }: { resourceName: string }) {
+function ResourceActions({ resourceId, resourceName }: { resourceId: string; resourceName: string }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -129,18 +128,19 @@ function ResourceActions({ resourceName }: { resourceName: string }) {
           </Button>
         }
       />
-      <DropdownMenuContent align="end" className="w-40">
-        <DropdownMenuItem className="gap-2" onClick={() => toast.success(`Deploy triggered for ${resourceName}`)}>
+      {/* These used to be toast-only: Deploy/Restart returned a green success
+          toast having done nothing, on the exact controls someone reaches for
+          during an incident, and no CP stop/restart endpoint exists at all
+          (SIGMA-162). Deploy and Logs now navigate to the resource, where the
+          real actions live; Restart is gone until there is a backend for it. */}
+      <DropdownMenuContent align="end" className="w-44">
+        <DropdownMenuItem render={<Link href={`/dashboard/resources/${resourceId}`} />} className="gap-2">
           <Play className="size-4 text-muted-foreground" />
-          Deploy
+          Deploy…
         </DropdownMenuItem>
-        <DropdownMenuItem className="gap-2" onClick={() => toast(`Streaming logs for ${resourceName}…`)}>
+        <DropdownMenuItem render={<Link href={`/dashboard/resources/${resourceId}?tab=logs`} />} className="gap-2">
           <ScrollText className="size-4 text-muted-foreground" />
           Logs
-        </DropdownMenuItem>
-        <DropdownMenuItem className="gap-2" onClick={() => toast.success(`Restarting ${resourceName}…`)}>
-          <RotateCw className="size-4 text-muted-foreground" />
-          Restart
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -273,7 +273,7 @@ export function Overview({
                       {formatDate(r.lastDeployAt)}
                     </TableCell>
                     <TableCell className="pr-4 text-right">
-                      <ResourceActions resourceName={r.name} />
+                      <ResourceActions resourceId={r.id} resourceName={r.name} />
                     </TableCell>
                   </TableRow>
                 ))}

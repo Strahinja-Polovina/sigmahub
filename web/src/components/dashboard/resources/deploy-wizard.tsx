@@ -63,6 +63,13 @@ type Repo = {
   build: "Dockerfile" | "docker-compose.yml";
   buildDetail: string;
   port: number;
+  /** Full inspector output, carried so the create call can persist it into the
+   *  resource spec — otherwise the rollout has no ports and its health probe
+   *  targets a port the app doesn't listen on (SIGMA-160). Absent in demo mode. */
+  detected?: {
+    ports?: number[];
+    healthCheck?: { type: string; path?: string; port?: number };
+  };
 };
 
 const MOCK_REPOS: Repo[] = [
@@ -284,6 +291,12 @@ export function DeployWizard({
           build: d.hasCompose ? "docker-compose.yml" : "Dockerfile",
           buildDetail: d.ports.length ? `ports ${d.ports.join(", ")}` : "no ports detected",
           port: d.ports[0] ?? 0,
+          detected: {
+            ports: d.ports,
+            healthCheck: d.healthCheck?.type
+              ? { type: d.healthCheck.type, path: d.healthCheck.path, port: d.healthCheck.port }
+              : undefined,
+          },
         });
       })
       .catch((err) => {
@@ -317,6 +330,7 @@ export function DeployWizard({
             name: repo?.fullName.split("/").pop() ?? "resource",
             kind: repo?.detectedKind ?? "app",
             repo: repo?.fullName,
+            detected: repo?.detected,
           });
           // The resource now exists. Persist env vars as secrets separately: a
           // secret failure must NOT be reported as a failed create (SIGMA-151),

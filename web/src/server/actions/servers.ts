@@ -11,6 +11,7 @@ import {
   cpIssueBootstrapToken,
   cpProvisionServer,
   cpSetHardening,
+  cpSetProxyRole,
   cpPublicUrl,
   cpDeleteServer,
 } from "../cp";
@@ -245,6 +246,28 @@ export async function setServerHardening(input: {
     orgId: input.orgId,
     actor: user.name,
     action: "Updated server hardening",
+    target: input.serverId,
+  });
+  revalidatePath("/dashboard", "layout");
+}
+
+/** Set a server's proxy/edge role from the dashboard. Opening 80/443 and
+ *  rendering Traefik is the precondition for a custom domain to route, so this
+ *  must be changeable after provisioning — not only in the connect dialog
+ *  (SIGMA-178). Project Admin+. */
+export async function setServerProxyRole(input: {
+  orgId: string;
+  serverId: string;
+  proxy: boolean;
+}) {
+  const { user, role } = await requireProjectAdmin(input.orgId);
+  if (cpEnabled()) {
+    await cpSetProxyRole(input.orgId, input.serverId, input.proxy, { name: user.name, role });
+  }
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: input.proxy ? "Enabled proxy role" : "Disabled proxy role",
     target: input.serverId,
   });
   revalidatePath("/dashboard", "layout");

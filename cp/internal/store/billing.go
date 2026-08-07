@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -249,4 +250,105 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 		}
 	}
 	return nil
+}
+
+// quantitySyncDebounce is how long a pushed quantity is trusted before the sweep
+// will push the same value again. Paddle confirms a quantity change with a
+// subscription.updated webhook, which normally lands in seconds; the debounce
+// only matters when that echo is slow or lost, and bounds how often we re-PATCH
+// an unchanged subscription.
+const quantitySyncDebounce = 30 * time.Minute
+
+// quantitySyncWindow is how far back a server counts as connected for billing.
+// The billable count is deliberately NOT the bare point-in-time running count:
+// servers flip to unreachable on a missed heartbeat, so a network blip across a
+// fleet would otherwise scale the subscription down (with an immediate proration
+// credit) and back up minutes later. Taking the high-water mark over the last
+// day matches what the dashboard already promises — "based on the servers
+// connected during the period" — and makes a scale-down take effect a day
+// later, never a scale-up.
+const quantitySyncWindow = 24 * time.Hour
+
+// SubscriptionDrift is one org whose Paddle subscription is billing a quantity
+// that no longer matches its connected-server count.
+type SubscriptionDrift struct {
+	OrgID          string
+	SubscriptionID string
+	// Billed is what Paddle currently charges for (its own echoed quantity).
+	Billed int
+	// Want is the quantity the subscription should carry.
+	Want int
+}
+
+// SubscriptionsNeedingQuantitySync returns the active subscriptions whose billed
+// quantity has drifted from the org's billable-server count (SIGMA-171).
+//
+// Only 'active' subscriptions with a stored subscription id are considered: a
+// canceled or past_due subscription must not be silently re-priced, and an org
+// that never checked out has nothing to update.
+//
+// Want is floored at 1. Paddle rejects a zero-quantity item, and auto-cancelling
+// a subscription from a sweep because an org's servers went quiet would be a far
+// worse failure than one month's minimum line — dropping to the free tier stays
+// a deliberate act through the customer portal.
+func (s *Store) SubscriptionsNeedingQuantitySync(ctx context.Context, now time.Time) ([]SubscriptionDrift, error) {
+	rows, err := s.Pool.Query(ctx, `
+		WITH counts AS (
+			SELECT b.org_id,
+			       b.paddle_subscription_id,
+			       b.quantity,
+			       b.synced_quantity,
+			       b.quantity_synced_at,
+			       GREATEST(
+			         (SELECT COUNT(*) FROM servers sv
+			           WHERE sv.org_id = b.org_id AND sv.deleted_at IS NULL AND sv.status = 'running'),
+			         (SELECT COUNT(DISTINCT sh.server_id) FROM server_hours sh
+			           WHERE sh.org_id = b.org_id AND sh.hour >= $1)
+			       ) AS connected
+			  FROM org_billing b
+			 WHERE b.status = 'active' AND b.paddle_subscription_id <> ''
+		)
+		SELECT org_id, paddle_subscription_id, quantity,
+		       GREATEST(1, connected - $2) AS want
+		  FROM counts
+		 WHERE GREATEST(1, connected - $2) <> quantity
+		   AND (quantity_synced_at IS NULL
+		        OR quantity_synced_at < $3
+		        OR synced_quantity IS DISTINCT FROM GREATEST(1, connected - $2))`,
+		now.UTC().Add(-quantitySyncWindow), BillingFreeTier, now.UTC().Add(-quantitySyncDebounce))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SubscriptionDrift
+	for rows.Next() {
+		var d SubscriptionDrift
+		if err := rows.Scan(&d.OrgID, &d.SubscriptionID, &d.Billed, &d.Want); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// RecordQuantitySynced notes that `quantity` was successfully pushed to Paddle.
+// It deliberately does NOT touch org_billing.quantity: that column is Paddle's
+// own state, ordered by last_event_at, and writing it here would make the
+// confirming subscription.updated webhook look like a stale replay.
+func (s *Store) RecordQuantitySynced(ctx context.Context, orgID string, quantity int, actor string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE org_billing SET synced_quantity = $2, quantity_synced_at = now(), updated_at = now()
+		 WHERE org_id = $1`, orgID, quantity); err != nil {
+		return err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Subscription quantity synced",
+		strconv.Itoa(quantity)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

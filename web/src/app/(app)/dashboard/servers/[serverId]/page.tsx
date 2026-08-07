@@ -65,12 +65,16 @@ export default async function ServerDetailPage({
         hosted={hosted}
         cpMode
         metricsPoints={points}
+        orgId={orgId}
+        canManage={role === "Org Admin" || role === "Project Admin"}
         hardening={{
           ready: Boolean(cpServer.ready),
           score: cpServer.hardeningScore ?? null,
           diskEncrypted: cpServer.diskEncrypted ?? null,
           sshLocked: cpServer.sshLocked ?? null,
           distro: cpServer.distro ?? null,
+          keepPublicSsh: cpServer.keepPublicSsh ?? true,
+          proxyRole: cpServer.proxyRole ?? false,
         }}
       />
     );

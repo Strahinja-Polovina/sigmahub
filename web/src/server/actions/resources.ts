@@ -34,6 +34,14 @@ export async function createResource(input: {
   kind: string;
   repo?: string;
   domain?: string;
+  /** Repo config from the CP's git inspector, carried through the wizard.
+   *  Without it the rendered rollout declares no ports and its health probe
+   *  falls back to a port the app does not listen on, so the first deploy is
+   *  guaranteed to fail the gate (SIGMA-160). */
+  detected?: {
+    ports?: number[];
+    healthCheck?: { type: string; path?: string; port?: number };
+  };
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
@@ -64,6 +72,21 @@ export async function createResource(input: {
     }
   }
 
+  // Build the persisted spec from what the inspector detected. `ports` drives
+  // the rollout's exposed ports AND the default TCP health probe; `healthCheck`
+  // overrides the probe when the repo declares one.
+  const detectedPorts = (input.detected?.ports ?? []).filter((p) => Number.isInteger(p) && p > 0 && p < 65536);
+  const spec: Record<string, unknown> = {
+    repo: input.repo ?? null,
+    domain: input.domain ?? null,
+  };
+  if (detectedPorts.length > 0) {
+    spec.ports = detectedPorts.map((container) => ({ container, host: 0, protocol: "tcp" }));
+  }
+  if (input.detected?.healthCheck?.type) {
+    spec.healthCheck = input.detected.healthCheck;
+  }
+
   let id = rid("res");
   if (cpEnabled()) {
     // CP mode: the control plane owns the resource record and enforces the
@@ -79,7 +102,7 @@ export async function createResource(input: {
         serverId: input.serverId,
         name,
         kind: cpKind(input.kind),
-        spec: { repo: input.repo ?? null, domain: input.domain ?? null },
+        spec,
       },
       { name: user.name, role }
     );

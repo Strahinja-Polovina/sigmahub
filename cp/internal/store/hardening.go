@@ -31,18 +31,25 @@ type HostHardening struct {
 }
 
 // HostHardeningForServer returns the effective hardening config for a server,
-// defaulting (lock down SSH, CIS on, no extra ports) when no row has been set.
+// defaulting (KEEP public SSH, CIS on, no extra ports) when no row has been set.
 func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (HostHardening, error) {
 	var (
-		meshIP      *string
-		proxyRole   bool
-		keepSSH     bool
-		cisEnabled  bool
-		extraRaw    []byte
+		meshIP     *string
+		proxyRole  bool
+		keepSSH    bool
+		cisEnabled bool
+		extraRaw   []byte
 	)
 	err := s.Pool.QueryRow(ctx, `
 		SELECT s.mesh_ip, s.proxy_role,
-		       COALESCE(h.keep_public_ssh, FALSE),
+		       -- Fail SAFE, not closed: with no explicit hardening row we keep
+		       -- public SSH. Closing port 22 is only survivable if the operator
+		       -- has another way in, and the mesh is not one — MeshPeers returns
+		       -- SigmaHub servers only, never an operator device, so "sshd is
+		       -- bound to the mesh" never yields human access and the lockdown
+		       -- is a lockout (SIGMA-179). Locking down must be an explicit,
+		       -- recorded choice.
+		       COALESCE(h.keep_public_ssh, TRUE),
 		       COALESCE(h.cis_enabled, TRUE),
 		       COALESCE(h.extra_ports, '[]'::jsonb)
 		  FROM servers s

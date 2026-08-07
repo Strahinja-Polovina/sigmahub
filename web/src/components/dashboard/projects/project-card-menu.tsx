@@ -177,6 +177,16 @@ export function ProjectCardMenu({
               This permanently removes the project and all of its environments,
               resources and deployment history. This can’t be undone.
             </DialogDescription>
+            {/* The dialog used to stop at "deployment history" and never mention
+                backups, while the delete cascaded away the restic repo key —
+                leaving the snapshots in the customer's bucket as ciphertext
+                nothing could open (SIGMA-170). The key is now retained; say so,
+                because the databases themselves still go. */}
+            <p className="text-sm text-muted-foreground">
+              Database volumes and their offsite snapshots are left in place, and
+              each database’s backup encryption key is retained so those
+              snapshots can still be opened.
+            </p>
           </DialogHeader>
           <DialogFooter>
             <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>

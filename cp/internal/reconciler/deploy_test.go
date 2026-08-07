@@ -170,6 +170,76 @@ func TestManualForceOnlyWhileInFlight(t *testing.T) {
 	}
 }
 
+// TestComposeManualForceOnlyWhileInFlight pins the same rule on the Compose
+// renderer, which originally missed the SIGMA-139 fix and kept Force=true for
+// every service forever after one Redeploy click (SIGMA-175).
+func TestComposeManualForceOnlyWhileInFlight(t *testing.T) {
+	spec := appResourceSpec{
+		Compose: &composeDeploySpec{Services: []composeServiceSpec{
+			{Name: "web", Build: ".", Ports: []int{80}, Rollout: "blue-green"},
+		}},
+	}
+	raw, _ := json.Marshal(spec)
+	rs := store.ResourceSpec{ResourceID: "res_c", ProjectID: "proj_c", Kind: "app", Spec: raw}
+
+	buildForce := func(status string) bool {
+		target := store.DeployTarget{
+			DeploymentID: "dep_1", ResourceID: "res_c", ProjectID: "proj_c", Provider: "github",
+			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg",
+			Trigger: "manual", Status: status,
+		}
+		ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+		if !ok {
+			t.Fatal("render should succeed")
+		}
+		for _, op := range ops {
+			if op.ID == "build:res_c:web" {
+				var b struct {
+					Force bool `json:"force"`
+				}
+				_ = json.Unmarshal(op.Spec, &b)
+				return b.Force
+			}
+		}
+		t.Fatal("no compose build op rendered")
+		return false
+	}
+
+	if !buildForce("deploying") {
+		t.Error("a manual Compose deploy in flight must force a rebuild")
+	}
+	if buildForce("success") {
+		t.Error("a succeeded manual Compose deploy must NOT keep forcing rebuilds (SIGMA-175)")
+	}
+}
+
+// TestDeployHealthNeverProbesUnknownPort pins SIGMA-160: with no declared port
+// the probe must be "none" (gate on running), never a TCP probe on port 0 —
+// the agent rewrites 0 to 80, so that would fail the gate for every app that
+// listens anywhere else, which is the normal case.
+func TestDeployHealthNeverProbesUnknownPort(t *testing.T) {
+	// No ports, no healthCheck → nothing to probe.
+	if got := deployHealth(appResourceSpec{}, json.RawMessage(`{}`)); got.Type != "none" {
+		t.Fatalf("portless probe = %+v, want type none", got)
+	}
+	// A declared port is probed over TCP as before.
+	spec := appResourceSpec{}
+	spec.Ports = append(spec.Ports, struct {
+		Container int    `json:"container"`
+		Host      int    `json:"host"`
+		Protocol  string `json:"protocol"`
+	}{Container: 3000})
+	got := deployHealth(spec, json.RawMessage(`{}`))
+	if got.Type != "tcp" || got.Port != 3000 {
+		t.Fatalf("declared port probe = %+v, want tcp/3000", got)
+	}
+	// A detected http health check still wins.
+	got = deployHealth(spec, json.RawMessage(`{"healthCheck":{"type":"http","path":"/healthz","port":8080}}`))
+	if got.Type != "http" || got.Path != "/healthz" || got.Port != 8080 {
+		t.Fatalf("http probe = %+v", got)
+	}
+}
+
 func opIDs(ops []dsd.Op) []string {
 	out := make([]string, len(ops))
 	for i, op := range ops {

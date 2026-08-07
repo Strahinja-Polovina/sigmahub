@@ -109,7 +109,11 @@ export function ConnectServerDialog({
   const [region, setRegion] = React.useState("");
   const [distro, setDistro] = React.useState("ubuntu-24.04");
   const [proxyRole, setProxyRole] = React.useState(false);
-  const [keepPublicSsh, setKeepPublicSsh] = React.useState(false);
+  // Default to KEEPING public SSH (SIGMA-179): mesh-only SSH is not yet a
+  // working replacement — the mesh carries SigmaHub servers only, never an
+  // operator device — so closing port 22 by default locks the operator out of
+  // their own host with no in-product way back.
+  const [keepPublicSsh, setKeepPublicSsh] = React.useState(true);
   const [vpn, setVpn] = React.useState(false);
   // CP mode: the real one-time install command + bootstrap key, shown once.
   const [issued, setIssued] = React.useState<{ command: string; expiresAt: string; bootstrapPubkey?: string } | null>(null);
@@ -123,7 +127,7 @@ export function ConnectServerDialog({
     setRegion("");
     setDistro("ubuntu-24.04");
     setProxyRole(false);
-    setKeepPublicSsh(false);
+    setKeepPublicSsh(true);
     setVpn(false);
     setIssued(null);
   }
@@ -302,7 +306,10 @@ export function ConnectServerDialog({
               </div>
             )}
 
-            {/* SSH lockdown is the default; keeping public SSH is the warned opt-out. */}
+            {/* Keeping public SSH is the DEFAULT: closing port 22 is only safe
+                when the operator has another way in, and the mesh is not one
+                today (it carries SigmaHub servers, never an operator device),
+                so the lockdown is opt-in and warned (SIGMA-179). */}
             {cpMode && (
               <div className="flex flex-col gap-2">
                 <div className="flex items-start justify-between gap-4">
@@ -312,20 +319,22 @@ export function ConnectServerDialog({
                       Keep public SSH open
                     </Label>
                     <p className="text-xs text-muted-foreground">
-                      Off (default): after enrollment sshd is bound to the mesh and
-                      port 22 is firewalled off.
+                      On (default): port 22 stays reachable, with password auth
+                      and root login disabled. Turn off only if you have another
+                      way into this host.
                     </p>
                   </div>
                   <Switch id="keep-ssh" checked={keepPublicSsh} onCheckedChange={setKeepPublicSsh} />
                 </div>
-                {keepPublicSsh && (
+                {!keepPublicSsh && (
                   <Alert variant="destructive">
                     <ShieldAlert className="size-4" />
-                    <AlertTitle>Public SSH stays exposed</AlertTitle>
+                    <AlertTitle>You may lose access to this host</AlertTitle>
                     <AlertDescription>
-                      Port 22 remains open to the internet and password auth is the
-                      only lockdown applied. Prefer mesh-only SSH unless a bastion
-                      requires it.
+                      Port 22 will be firewalled off after enrollment. SigmaHub
+                      does not yet put your workstation on the mesh, so unless you
+                      keep a bastion, VPN or provider console, this host becomes
+                      unreachable over SSH.
                     </AlertDescription>
                   </Alert>
                 )}

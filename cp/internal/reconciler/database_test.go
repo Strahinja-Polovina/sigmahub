@@ -94,7 +94,7 @@ func TestRenderDatabaseWithoutMeshFallsBackToStub(t *testing.T) {
 	// stay a no-op stub rather than publish on an undefined interface.
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
 		store.HostHardening{}, nil, nil, dbTargets("postgres", "database"), nil, nil, nil, ACMEConfig{})
-	op, ok := opByID(ops, "res:res_db")
+	op, ok := opByID(ops, "sync:res_db")
 	if !ok || op.Kind != dsd.KindResourceSync {
 		t.Fatalf("want resource.sync stub without mesh IP, got %+v", op)
 	}

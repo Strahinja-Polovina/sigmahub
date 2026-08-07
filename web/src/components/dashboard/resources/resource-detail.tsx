@@ -38,6 +38,18 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -176,31 +188,92 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
   );
 }
 
-function DeleteResourceButton({ resourceId, name }: { resourceId: string; name: string }) {
+/** Kinds whose deletion also destroys the only copy of their restic repo key,
+ *  so the confirm dialog must say so (SIGMA-170/185). */
+const DB_KINDS = ["postgres", "mysql", "redis", "mongo", "mongodb"];
+
+/** Delete is confirm-gated and typed: it cascades the resource's entire
+ *  deployment history — every sibling destructive action on this page already
+ *  confirms, this one used to fire straight from onClick (SIGMA-185).
+ *
+ *  A database's restic repo key is no longer destroyed with it: the control
+ *  plane archives the wrapped key before the cascade (SIGMA-170), so the
+ *  snapshots left in the customer's bucket stay openable. */
+function DeleteResourceButton({
+  resourceId,
+  name,
+  kind,
+}: {
+  resourceId: string;
+  name: string;
+  kind: string;
+}) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
-  return (
-    <Button
-      variant="destructive"
-      size="sm"
-      disabled={pending}
-      onClick={() =>
-        startTransition(async () => {
-          try {
-            await deleteResource({ resourceId });
-            toast.success(`${name} deleted`);
-            router.push("/dashboard/resources");
-          } catch (err) {
-            toast.error("Couldn’t delete", {
-              description: err instanceof Error ? err.message : "Please try again.",
-            });
-          }
-        })
+  const [typed, setTyped] = React.useState("");
+  const isDatabase = DB_KINDS.includes(kind);
+
+  function confirmDelete() {
+    startTransition(async () => {
+      try {
+        await deleteResource({ resourceId });
+        toast.success(`${name} deleted`);
+        router.push("/dashboard/resources");
+      } catch (err) {
+        toast.error("Couldn’t delete", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
       }
-    >
-      {pending ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-      Delete
-    </Button>
+    });
+  }
+
+  return (
+    <Dialog onOpenChange={(open) => !open && setTyped("")}>
+      <DialogTrigger
+        render={
+          <Button variant="destructive" size="sm" disabled={pending}>
+            <Trash2 className="size-4" />
+            Delete
+          </Button>
+        }
+      />
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Delete {name}?</DialogTitle>
+          <DialogDescription>
+            This removes the resource and its entire deployment history.
+            {isDatabase
+              ? " Data volumes and any snapshots already in your bucket are left in place, and the backup encryption key is retained so those snapshots can still be restored."
+              : " Data volumes are left in place and must be removed separately."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="confirm-resource-name" className="text-xs text-muted-foreground">
+            Type <span className="font-mono text-foreground">{name}</span> to confirm
+          </Label>
+          <Input
+            id="confirm-resource-name"
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            autoComplete="off"
+          />
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+            Cancel
+          </DialogClose>
+          <Button
+            variant="destructive"
+            type="button"
+            disabled={pending || typed.trim() !== name}
+            onClick={confirmDelete}
+          >
+            {pending && <Loader2 className="size-4 animate-spin" />}
+            Delete resource
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -667,7 +740,15 @@ export function ResourceDetail({
                       Permanently remove {resource.name} and its deployment history.
                     </p>
                   </div>
-                  <DeleteResourceButton resourceId={resource.id} name={resource.name} />
+                  {/* Gated like every sibling panel — it used to render for
+                      Developers and then throw a raw permission error. */}
+                  {canManage && (
+                    <DeleteResourceButton
+                      resourceId={resource.id}
+                      name={resource.name}
+                      kind={resource.kind}
+                    />
+                  )}
                 </div>
               </CardContent>
             </Card>

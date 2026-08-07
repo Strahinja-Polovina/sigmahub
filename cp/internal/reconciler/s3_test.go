@@ -133,7 +133,7 @@ func TestRenderS3SeaweedFS(t *testing.T) {
 func TestRenderS3WithoutMeshFallsBackToStub(t *testing.T) {
 	ops, _ := renderOps("srv_t", s3Specs(), nil, nil,
 		store.HostHardening{}, nil, nil, nil, s3Targets(), nil, nil, ACMEConfig{})
-	op, ok := opByID(ops, "res:res_s3")
+	op, ok := opByID(ops, "sync:res_s3")
 	if !ok || op.Kind != dsd.KindResourceSync {
 		t.Fatalf("want resource.sync stub without mesh IP, got %+v", op)
 	}

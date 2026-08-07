@@ -321,3 +321,39 @@ func (s *Server) handleAgentWALStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }
+
+// ── Repo-key custody (SIGMA-170) ────────────────────────────────────────────
+
+// handleListArchivedRepoKeys lists the repo keys retained for deleted
+// resources: which snapshot sets can still be opened, and when their resource
+// went away. Metadata only — no key material.
+func (s *Server) handleListArchivedRepoKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.domain.ListArchivedRepoKeys(r.Context(), r.PathValue("orgId"))
+	if err != nil {
+		s.writeStoreErr(w, err, "list archived repo keys")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+}
+
+// handleExportRepoKey returns the plaintext restic repository password for a
+// resource, live or deleted.
+//
+// Without it the repo key was only ever handed to an agent for a scheduled run,
+// so an operator who deleted a database — or lost the control plane — held a
+// bucket full of snapshots they were still paying for and could never open
+// (SIGMA-170). Org Admin only, and every export lands in the audit log: handing
+// out a decryption key is precisely the event an auditor needs to see.
+func (s *Server) handleExportRepoKey(w http.ResponseWriter, r *http.Request) {
+	key, err := s.domain.ExportRepoKey(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"), principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "export repo key")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"repoKey": key,
+		// Named so the caller knows what to do with it: restic reads the
+		// repository password from this environment variable.
+		"envVar": "RESTIC_PASSWORD",
+	})
+}

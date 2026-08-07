@@ -50,7 +50,12 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 	}
 	// Fresh, isolated state per run. cp_secrets is cleared too so the pepper
 	// and DSD key are re-wrapped under this run's throwaway KMS key.
-	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "server_hours", "org_billing", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "idempotency_keys", "github_installations", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_targets", "db_credentials", "s3_credentials", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
+	//
+	// Order matters: children before parents. backup_repo_key_archive has no
+	// cascade by design (SIGMA-170 — outliving its resource is the point), so
+	// nothing else empties it. It must be cleared explicitly, and before
+	// org_deks, which its repo_dek_id references.
+	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "server_hours", "org_billing", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "idempotency_keys", "github_installations", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_repo_key_archive", "backup_targets", "db_credentials", "s3_credentials", "secrets", "org_deks", "env_servers", "resources", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
 		if _, err := st.Pool.Exec(ctx, "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
@@ -163,7 +168,10 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	for _, op := range signed.Document.Ops {
 		opIDs[op.ID] = true
 	}
-	if !opIDs["res:"+res] {
+	// An app with no image is not containerised yet, so it renders the
+	// resource.sync stub under the "sync:" prefix rather than "res:" — the stub
+	// must not claim a state for a resource with nothing running (SIGMA-172).
+	if !opIDs["sync:"+res] {
 		t.Fatalf("resource op missing: %+v", signed.Document.Ops)
 	}
 	for _, want := range []string{"host:nftables:" + serverID, "host:sshd:" + serverID, "host:cis:" + serverID} {
@@ -173,7 +181,9 @@ func TestDSDDeliveryApplyReplayResync(t *testing.T) {
 	}
 	_ = pubB64
 
-	// Agent reports status → CP writes resources.status.
+	// Agent reports status → CP writes resources.status. A real container op
+	// carries the "res:<id>" id (see renderAppOps/renderContainerOps), which is
+	// what handleDSDStatus routes into resources.status; report under that id.
 	statusOps := map[string]json.RawMessage{
 		"res:" + res: json.RawMessage(`{"state":"applied"}`),
 	}
@@ -874,23 +884,26 @@ func TestHostHardening(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Default posture: SSH locked down, CIS on, proxy role carried, mesh iface set.
+	// Default posture: public SSH KEPT (fail-safe — the mesh carries no operator
+	// device, so an unrequested lockdown is a lockout, SIGMA-179), CIS on, proxy
+	// role carried, mesh iface set.
 	hh, err := st.HostHardeningForServer(ctx, res.ServerID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hh.KeepPublicSSH || !hh.CISEnabled || !hh.ProxyRole || hh.MeshInterface != "sigma0" || hh.MeshIP == "" {
+	if !hh.KeepPublicSSH || !hh.CISEnabled || !hh.ProxyRole || hh.MeshInterface != "sigma0" || hh.MeshIP == "" {
 		t.Fatalf("default hardening = %+v", hh)
 	}
 
-	// Opt out of SSH lockdown + add an exception; the render input reflects it.
-	if err := st.SetHardeningConfig(ctx, orgID, res.ServerID, true, true,
+	// Explicitly opt IN to the SSH lockdown + add an exception; the render input
+	// reflects both.
+	if err := st.SetHardeningConfig(ctx, orgID, res.ServerID, false, true,
 		[]store.PortException{{Port: 8443, Proto: "tcp"}}, "admin"); err != nil {
 		t.Fatal(err)
 	}
 	hh, _ = st.HostHardeningForServer(ctx, res.ServerID)
-	if !hh.KeepPublicSSH || len(hh.ExtraPorts) != 1 || hh.ExtraPorts[0].Port != 8443 {
-		t.Fatalf("after opt-out = %+v", hh)
+	if hh.KeepPublicSSH || len(hh.ExtraPorts) != 1 || hh.ExtraPorts[0].Port != 8443 {
+		t.Fatalf("after lockdown opt-in = %+v", hh)
 	}
 
 	// Cross-tenant guard: another org cannot change this server's hardening.
