@@ -52,7 +52,14 @@ type DomainAPI interface {
 	CreateSecret(ctx context.Context, orgID, actor string, in store.CreateSecretInput) (store.Secret, error)
 	ListSecrets(ctx context.Context, orgID, projectID, envID string) ([]store.Secret, error)
 	RevealSecret(ctx context.Context, orgID, secretID, actor string) (string, error)
-	DeleteSecret(ctx context.Context, orgID, secretID, actor string) error
+	DeleteSecret(ctx context.Context, orgID, secretID, actor string) (store.Secret, error)
+	// Config deployments (SIGMA-166): a secret or domain change alters the
+	// rendered container spec, and the standing SUCCESS target would re-render
+	// it under the same rollout generation — which the agent's never-cut guard
+	// refuses. Minting a 'config' deployment gives the change its own
+	// generation and re-ships the running release's pinned image.
+	AppResourcesForSecretScope(ctx context.Context, orgID, projectID, envID string) ([]string, error)
+	CreateConfigDeployments(ctx context.Context, orgID string, resourceIDs []string, actor, reason string) ([]store.ServerRef, error)
 	RotateKEK(ctx context.Context, orgID, actor string) (int, error)
 	RotateDEK(ctx context.Context, orgID, actor string) (string, error)
 	ReencryptSecrets(ctx context.Context, orgID string) (int, error)
@@ -90,7 +97,7 @@ type DomainAPI interface {
 	// Custom domains (P1-8). Attach/Detach return the host server id so the
 	// handler can re-render its DSD.
 	AttachDomain(ctx context.Context, orgID, resourceID, domain, challengeType, actor string) (store.Domain, string, error)
-	DetachDomain(ctx context.Context, orgID, domainID, actor string) (string, error)
+	DetachDomain(ctx context.Context, orgID, domainID, actor string) (serverID, resourceID string, err error)
 	ListDomainsForResource(ctx context.Context, orgID, resourceID string) ([]store.Domain, error)
 	// Deployments (P1-9). List is the release history; RollbackTargets are the
 	// retained-image candidates; CreateRollback queues a rebuild-free rollback and
@@ -359,13 +366,19 @@ func (s *Server) handleAttachDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
-	d, serverID, err := s.domain.AttachDomain(r.Context(), orgID, r.PathValue("resourceId"),
+	resourceID := r.PathValue("resourceId")
+	d, serverID, err := s.domain.AttachDomain(r.Context(), orgID, resourceID,
 		req.Domain, req.ChallengeType, principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "attach domain")
 		return
 	}
-	// A new domain adds Traefik router labels to the resource's container — re-render.
+	// A new domain adds Traefik router labels to the resource's container. The
+	// labels only reach a LIVE container through a fresh rollout generation, so
+	// mint a config deployment (SIGMA-166) before the re-render — without it the
+	// agent's never-cut guard refused the changed spec and the hostname never
+	// routed.
+	s.mintConfigDeploys(r, orgID, []string{resourceID}, "domain attached")
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
@@ -383,10 +396,15 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDetachDomain(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
-	serverID, err := s.domain.DetachDomain(r.Context(), orgID, r.PathValue("domainId"), principalFrom(r).Name)
+	serverID, resourceID, err := s.domain.DetachDomain(r.Context(), orgID, r.PathValue("domainId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "detach domain")
 		return
+	}
+	// Removing router labels changes the rendered spec — same generation rule
+	// as attach (SIGMA-166).
+	if resourceID != "" {
+		s.mintConfigDeploys(r, orgID, []string{resourceID}, "domain detached")
 	}
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)

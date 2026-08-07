@@ -235,7 +235,15 @@ func (f *fakeDomain) ListSecrets(_ context.Context, _, _, _ string) ([]store.Sec
 func (f *fakeDomain) RevealSecret(_ context.Context, _, _, _ string) (string, error) {
 	return "value", nil
 }
-func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) error      { return nil }
+func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) (store.Secret, error) {
+	return store.Secret{ID: "sec_1", ProjectID: "prj_1", Name: "DB_URL"}, nil
+}
+func (f *fakeDomain) AppResourcesForSecretScope(_ context.Context, _, _, _ string) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeDomain) CreateConfigDeployments(_ context.Context, _ string, _ []string, _, _ string) ([]store.ServerRef, error) {
+	return nil, nil
+}
 func (f *fakeDomain) RotateKEK(_ context.Context, _, _ string) (int, error)     { return 0, nil }
 func (f *fakeDomain) RotateDEK(_ context.Context, _, _ string) (string, error)  { return "dek_2", nil }
 func (f *fakeDomain) ReencryptSecrets(_ context.Context, _ string) (int, error) { return 0, nil }
@@ -297,8 +305,8 @@ func (f *fakeDomain) ExportRepoKey(_ context.Context, _, _, _ string) (string, e
 func (f *fakeDomain) AttachDomain(_ context.Context, orgID, resourceID, domain, challengeType, _ string) (store.Domain, string, error) {
 	return store.Domain{ID: "dom_1", OrgID: orgID, ResourceID: resourceID, Domain: domain, ChallengeType: challengeType, CertStatus: "pending"}, "srv_1", nil
 }
-func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, error) {
-	return "srv_1", nil
+func (f *fakeDomain) DetachDomain(_ context.Context, _, _, _ string) (string, string, error) {
+	return "srv_1", "res_1", nil
 }
 func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]store.Domain, error) {
 	return []store.Domain{}, nil

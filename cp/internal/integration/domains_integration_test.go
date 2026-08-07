@@ -121,13 +121,14 @@ func TestDomainsLifecycle(t *testing.T) {
 		t.Fatalf("cert state changed by a non-hosting server: %+v", got)
 	}
 
-	// Detach returns the host server (for reconcile) and removes the row.
-	dsrv, err := st.DetachDomain(ctx, orgID, dom.ID, "test")
+	// Detach returns the host server (for reconcile) + resource (for the
+	// SIGMA-166 config deployment) and removes the row.
+	dsrv, dres, err := st.DetachDomain(ctx, orgID, dom.ID, "test")
 	if err != nil {
 		t.Fatalf("detach: %v", err)
 	}
-	if dsrv != serverID {
-		t.Errorf("detach returned server %q, want %q", dsrv, serverID)
+	if dsrv != serverID || dres != res.ID {
+		t.Errorf("detach returned (%q,%q), want (%q,%q)", dsrv, dres, serverID, res.ID)
 	}
 	got, _ = st.ListDomainsForResource(ctx, orgID, res.ID)
 	if len(got) != 0 {

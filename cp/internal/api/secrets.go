@@ -38,6 +38,12 @@ func (s *Server) handleCreateSecret(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "create secret")
 		return
 	}
+	// A new (or re-valued) secret must actually reach the running containers:
+	// mint config deployments for the apps in scope and re-render their servers
+	// (SIGMA-166 — this handler previously had no reconcile hook at all, so the
+	// change waited for the fleet resync and then wedged the standing rollout
+	// generation).
+	s.mintConfigDeploysForSecretScope(r, orgID, sec, "secret changed")
 	writeJSON(w, http.StatusCreated, sec)
 }
 
@@ -71,11 +77,49 @@ func (s *Server) handleRevealSecret(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	secretID := r.PathValue("secretId")
-	if err := s.domain.DeleteSecret(r.Context(), orgID, secretID, principalFrom(r).Name); err != nil {
+	sec, err := s.domain.DeleteSecret(r.Context(), orgID, secretID, principalFrom(r).Name)
+	if err != nil {
 		s.writeStoreErr(w, err, "delete secret")
 		return
 	}
+	// A removed ref changes the rendered container spec — same rule as create
+	// (SIGMA-166).
+	s.mintConfigDeploysForSecretScope(r, orgID, sec, "secret removed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// mintConfigDeploysForSecretScope resolves the app resources a secret's scope
+// reaches and mints config deployments for them. Best-effort: the secret write
+// itself already committed, so a failure here logs and leaves convergence to
+// the fleet resync rather than failing the request.
+func (s *Server) mintConfigDeploysForSecretScope(r *http.Request, orgID string, sec store.Secret, reason string) {
+	envID := ""
+	if sec.EnvironmentID != nil {
+		envID = *sec.EnvironmentID
+	}
+	ids, err := s.domain.AppResourcesForSecretScope(r.Context(), orgID, sec.ProjectID, envID)
+	if err != nil {
+		s.log.Error("config deploys: resolve secret scope", "err", err)
+		return
+	}
+	s.mintConfigDeploys(r, orgID, ids, reason)
+}
+
+// mintConfigDeploys queues config deployments for the given resources and
+// nudges the affected servers (SIGMA-166). Best-effort, shared by the secret
+// and domain handlers.
+func (s *Server) mintConfigDeploys(r *http.Request, orgID string, resourceIDs []string, reason string) {
+	refs, err := s.domain.CreateConfigDeployments(r.Context(), orgID, resourceIDs, principalFrom(r).Name, reason)
+	if err != nil {
+		s.log.Error("config deploys: mint", "err", err, "reason", reason)
+		return
+	}
+	if s.reconcile == nil {
+		return
+	}
+	for _, ref := range refs {
+		s.reconcile.ReconcileAsync(ref.OrgID, ref.ServerID)
+	}
 }
 
 // handleRotateKEK re-wraps the org's DEKs under the current custody key (no data

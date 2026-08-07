@@ -164,7 +164,7 @@ export function EnvVarsTable({
               <TableRow>
                 <TableCell colSpan={3} className="py-8 text-center text-sm text-muted-foreground">
                   No secrets yet.
-                  {canManage ? " Add one to inject it at the next deploy." : ""}
+                  {canManage ? " Adding one redeploys the app with it injected." : ""}
                 </TableCell>
               </TableRow>
             )}
@@ -277,7 +277,7 @@ export function EnvVarsTable({
             <DialogTitle>Delete secret?</DialogTitle>
             <DialogDescription>
               <span className="font-mono text-foreground">{deleting?.name}</span> will be removed
-              and no longer injected on the next deploy. This can&apos;t be undone.
+              and the app redeployed without it. This can&apos;t be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

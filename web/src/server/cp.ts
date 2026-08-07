@@ -1339,7 +1339,7 @@ export type CpDeployment = {
   environmentId?: string;
   serverId?: string;
   connectionId?: string;
-  trigger: string; // git | manual | rollback
+  trigger: string; // git | manual | rollback | config (re-ship after a secret/domain change)
   gitRef?: string;
   gitSha?: string;
   imageDigest?: string;

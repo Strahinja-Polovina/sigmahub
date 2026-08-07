@@ -277,23 +277,54 @@ func (s *Store) RevealSecret(ctx context.Context, orgID, secretID, actor string)
 }
 
 // DeleteSecret removes a secret. Audited.
-func (s *Store) DeleteSecret(ctx context.Context, orgID, secretID, actor string) error {
+// DeleteSecret removes a secret and returns its metadata, so the caller can
+// mint config deployments for the app resources the removal reaches
+// (SIGMA-166 — a removed ref changes the rendered container spec).
+func (s *Store) DeleteSecret(ctx context.Context, orgID, secretID, actor string) (Secret, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return Secret{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var name string
+	var sec Secret
 	err = tx.QueryRow(ctx,
-		`DELETE FROM secrets WHERE org_id = $1 AND id = $2 RETURNING name`, orgID, secretID).Scan(&name)
+		`DELETE FROM secrets WHERE org_id = $1 AND id = $2
+		 RETURNING id, project_id, environment_id, name, env_var, created_by`,
+		orgID, secretID).Scan(&sec.ID, &sec.ProjectID, &sec.EnvironmentID, &sec.Name, &sec.EnvVar, &sec.CreatedBy)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return Secret{}, ErrNotFound
 	}
 	if err != nil {
-		return err
+		return Secret{}, err
 	}
-	if err := auditTx(ctx, tx, orgID, actor, "Secret deleted", name); err != nil {
-		return err
+	if err := auditTx(ctx, tx, orgID, actor, "Secret deleted", sec.Name); err != nil {
+		return Secret{}, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return Secret{}, err
+	}
+	return sec, nil
+}
+
+// AppResourcesForSecretScope returns the app resources a secret in this scope
+// reaches: the project's apps, narrowed to one environment when the secret is
+// environment-scoped. The set a secret change must re-deploy (SIGMA-166).
+func (s *Store) AppResourcesForSecretScope(ctx context.Context, orgID, projectID, envID string) ([]string, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id FROM resources
+		 WHERE org_id = $1 AND project_id = $2 AND kind = 'app'
+		   AND ($3 = '' OR environment_id = $3)`, orgID, projectID, envID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
