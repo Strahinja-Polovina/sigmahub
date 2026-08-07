@@ -22,6 +22,8 @@ export type SettingsMember = {
   name: string;
   email: string;
   role: string;
+  /** SIGMA-167: explicitly project-scoped (sees only granted projects). */
+  scoped: boolean;
 };
 export type PendingInvite = {
   id: string;

@@ -81,9 +81,9 @@ export default async function ProjectDetailPage({
   // P2-7: project-scoped users only see granted projects; the effective role
   // decides whether the members panel is editable.
   const sessionUser = await getSessionUser();
-  const { role: orgRole } = await requireMembership(orgId);
+  const { role: orgRole, scoped } = await requireMembership(orgId);
   const grants = await projectGrants(sessionUser.id, orgId);
-  const myEffectiveRole = effectiveProjectRole(orgRole, grants.get(projectId), grants.size > 0);
+  const myEffectiveRole = effectiveProjectRole(orgRole, grants.get(projectId), scoped || grants.size > 0);
   if (!myEffectiveRole) {
     return <ProjectDetailView project={null} panels={[]} orgServers={[]} />;
   }

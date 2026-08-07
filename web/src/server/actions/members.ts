@@ -210,6 +210,7 @@ export async function acceptInvite(input: { token: string }): Promise<{ orgId: s
 
     // Materialize grants, skipping any project that has since been deleted or
     // moved orgs — a stale grant must never block joining the org.
+    let granted = false;
     for (const g of parseProjectGrants(inv.projectGrants)) {
       const [proj] = await tx
         .select({ id: s.projects.id })
@@ -223,6 +224,18 @@ export async function acceptInvite(input: { token: string }): Promise<{ orgId: s
           target: [s.projectMemberships.projectId, s.projectMemberships.userId],
           set: { role: g.role },
         });
+      granted = true;
+    }
+    // An invite carrying grants creates a SCOPED member (SIGMA-167): the flag
+    // is explicit state, so a later revoke of their last grant narrows to
+    // nothing instead of silently widening to every project.
+    if (granted) {
+      await tx
+        .update(s.memberships)
+        .set({ scoped: true })
+        .where(
+          and(eq(s.memberships.orgId, inv.orgId), eq(s.memberships.userId, sessionUser.id))
+        );
     }
 
     await tx

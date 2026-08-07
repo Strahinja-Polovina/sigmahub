@@ -166,12 +166,12 @@ export default async function ResourceDetailPage({
   // affordances — canManage uses the effective project role, not the bare org
   // role, so a user narrowed to Developer here sees masked metadata only
   // (SIGMA-82). Secret create/reveal/delete stay Project Admin+; the CP re-checks.
-  const { user, role } = await requireMembership(orgId);
+  const { user, role, scoped } = await requireMembership(orgId);
   const grants = await projectGrants(user.id, orgId);
   const effectiveRole = effectiveProjectRole(
     role,
     grants.get(detail.resource.projectId),
-    grants.size > 0
+    scoped || grants.size > 0
   );
   if (!effectiveRole) notFound();
   const canManage = roleAtLeast(effectiveRole, "Project Admin");

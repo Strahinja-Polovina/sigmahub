@@ -40,8 +40,9 @@ export type ProjectMemberRow = {
 const ORG_DEFAULT = "__org__";
 
 /** P2-7 per-project roles. The org role is the ceiling; a grant scopes and
- *  narrows. Members with no grant follow the org default: org-wide access
- *  while they hold zero grants anywhere, invisible here once they hold any. */
+ *  narrows. Scoping is explicit membership state (SIGMA-167): unscoped members
+ *  keep org-wide access, a first grant scopes them, and revoking grants only
+ *  narrows — restoring org-wide access is a deliberate org-admin action. */
 export function ProjectMembersPanel({
   orgId,
   projectId,
@@ -60,7 +61,10 @@ export function ProjectMembersPanel({
       try {
         if (value === ORG_DEFAULT) {
           await revokeProjectRole({ orgId, projectId, userId });
-          toast.success("Grant removed — org default applies");
+          // Honest wording (SIGMA-167): a scoped member keeps NO access here —
+          // and if this was their last grant, no access anywhere. Nothing
+          // silently widens back to org-wide.
+          toast.success("Grant removed — no access to this project");
         } else {
           await setProjectRole({ orgId, projectId, userId, role: value });
           toast.success(`Granted ${value}`);
@@ -82,8 +86,9 @@ export function ProjectMembersPanel({
         </CardTitle>
         <CardDescription>
           The org role is always the ceiling — a grant can scope and narrow access, never
-          widen it. Members without any project grant keep org-wide access; their first
-          grant scopes them to granted projects only.
+          widen it. A member&apos;s first grant scopes them to granted projects only, and
+          removing grants only ever narrows further: revoking the last one leaves them with
+          no project access until an org admin explicitly restores org-wide access.
         </CardDescription>
       </CardHeader>
       <CardContent>

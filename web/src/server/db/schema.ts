@@ -36,6 +36,15 @@ export const memberships = pgTable(
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
     role: text("role").notNull().default("Developer"), // Org Admin | Project Admin | Developer
+    // SIGMA-167: explicit scoping state. Set true the FIRST time a project
+    // grant is issued and never cleared implicitly. Previously "is this user
+    // project-scoped?" was inferred from a live grant COUNT, so revoking a
+    // contractor's last grant — or deleting the only project they were
+    // granted — silently re-widened them to every project in the org, while
+    // the toast and audit trail described a narrowing. A scoped member with
+    // zero grants now sees NOTHING (fail closed); restoring org-wide access
+    // is an explicit admin action that clears this flag.
+    scoped: boolean("scoped").notNull().default(false),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   // At most one membership per (org, user) — the DB is the authority so a
@@ -117,6 +126,10 @@ export const environments = pgTable("environments", {
     .notNull()
     .references(() => projects.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
+  // SIGMA-190: mirrored from the CP so the dashboard can display and edit the
+  // flag that seeds database backup retention (previously dropped by the
+  // mirror, invisible, and write-once).
+  production: boolean("production").notNull().default(false),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
@@ -132,7 +145,11 @@ export const servers = pgTable("servers", {
   region: text("region").notNull(),
   status: text("status").notNull().default("provisioning"),
   agentVersion: text("agent_version").notNull().default(""),
+  // ip is the server's PUBLIC address; meshIp is the private 10.8.x.x
+  // WireGuard address. The UI previously presented the mesh IP under an "IP"
+  // header because the public one never reached this table (SIGMA-187).
   ip: text("ip").notNull().default(""),
+  meshIp: text("mesh_ip").notNull().default(""),
   cpu: integer("cpu").notNull().default(0),
   memGb: integer("mem_gb").notNull().default(0),
   byoVpn: boolean("byo_vpn").notNull().default(false),
@@ -169,6 +186,9 @@ export const resources = pgTable("resources", {
   repo: text("repo"),
   domain: text("domain"),
   version: text("version"),
+  // SIGMA-194: PR-preview resources, torn down with their PR. Badged in the
+  // UI and their Delete carries an explicit preview-breaking warning.
+  ephemeral: boolean("ephemeral").notNull().default(false),
   lastDeployAt: timestamp("last_deploy_at").notNull().defaultNow(),
 });
 

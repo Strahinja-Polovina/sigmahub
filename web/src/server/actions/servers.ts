@@ -166,6 +166,9 @@ export async function provisionServer(input: {
   proxyRole: boolean;
   distro?: string;
   keepPublicSsh?: boolean;
+  /** The wizard's "Host IP" — becomes the server's initial public endpoint
+   *  instead of being collected and silently discarded (SIGMA-187). */
+  hostIp?: string;
 }): Promise<ProvisionResult> {
   const { user, role } = await requireProjectAdmin(input.orgId);
   const name = input.name.trim();
@@ -204,6 +207,7 @@ export async function provisionServer(input: {
       region: input.region.trim(),
       proxyRole: input.proxyRole,
       distro: input.distro,
+      hostIp: input.hostIp?.trim() || undefined,
     },
     actor
   );

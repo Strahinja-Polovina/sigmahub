@@ -25,10 +25,17 @@ import {
   formatDate,
 } from "@/components/dashboard/projects/shared";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
-import { getActiveOrgId, requireMembership, visibleProjects } from "@/server/active-org";
+import { effectiveProjectRole, roleAtLeast } from "@/lib/rbac";
+import {
+  getActiveOrgId,
+  projectGrants,
+  requireMembership,
+  visibleProjects,
+} from "@/server/active-org";
 import { getEnvironmentPanel, getProject } from "@/server/queries";
 import { cpEnabled } from "@/server/cp";
 import { EnvLogSearch } from "@/components/dashboard/environments/env-log-search";
+import { EnvironmentProductionToggle } from "@/components/dashboard/projects/environment-production-toggle";
 
 export default async function EnvironmentDetailPage({
   params,
@@ -44,7 +51,7 @@ export default async function EnvironmentDetailPage({
 
   // P2-7 read scoping: a project-scoped user must not open environments (server
   // topology, resources, logs) in a project they were never granted (SIGMA-75).
-  const { user, role } = await requireMembership(orgId);
+  const { user, role, scoped } = await requireMembership(orgId);
   const visible = await visibleProjects(user.id, orgId, role);
 
   // Guard: unknown ids, an env/project that belongs to another org, or a
@@ -77,6 +84,11 @@ export default async function EnvironmentDetailPage({
   }
 
   const { env, servers, resources } = panel;
+  // The production toggle is Project Admin+ on THIS project (the action
+  // re-enforces server-side; this only gates the affordance).
+  const grants = await projectGrants(user.id, orgId);
+  const myRole = effectiveProjectRole(role, grants.get(projectId), scoped || grants.size > 0);
+  const canManageEnv = myRole ? roleAtLeast(myRole, "Project Admin") : false;
   const deploys = resources
     .map((r) => (r.latestDeploy ? { ...r.latestDeploy, resourceName: r.name } : null))
     .filter((d): d is NonNullable<typeof d> => Boolean(d))
@@ -93,11 +105,16 @@ export default async function EnvironmentDetailPage({
           <ArrowLeft className="size-3.5" />
           {project.name}
         </Link>
-        <div className="flex items-baseline gap-2">
+        <div className="flex items-center gap-2">
           <h1 className="text-xl font-semibold tracking-tight text-foreground">
             {env.name}
           </h1>
           <span className="text-sm text-muted-foreground">· {project.name}</span>
+          <EnvironmentProductionToggle
+            environmentId={env.id}
+            production={env.production}
+            canManage={canManageEnv}
+          />
         </div>
         <p className="text-sm text-muted-foreground">
           {resources.length} {resources.length === 1 ? "resource" : "resources"} ·{" "}

@@ -210,7 +210,7 @@ export function ServersView({
                     <TableHead>Provider · Region</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Agent</TableHead>
-                    <TableHead>IP</TableHead>
+                    <TableHead>Public IP</TableHead>
                     <TableHead>Resources</TableHead>
                     <TableHead className="pr-4">Access</TableHead>
                   </TableRow>

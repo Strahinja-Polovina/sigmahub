@@ -65,7 +65,11 @@ type ServerRowT = {
   region: string;
   status: string;
   agentVersion: string;
+  /** Public address; meshIp is the private 10.8.x.x WireGuard address. The
+   *  two are labeled distinctly — the mesh IP used to render as "IP", a wrong
+   *  answer for DNS/firewalls/SSH (SIGMA-187). */
   ip: string;
+  meshIp?: string;
   cpu: number;
   memGb: number;
   byoVpn: boolean;
@@ -354,7 +358,13 @@ export function ServerDetailView({
               {server.ip && (
                 <>
                   <span>·</span>
-                  <span className="font-mono text-xs">{server.ip}</span>
+                  <span className="font-mono text-xs">Public {server.ip}</span>
+                </>
+              )}
+              {server.meshIp && (
+                <>
+                  <span>·</span>
+                  <span className="font-mono text-xs">Mesh {server.meshIp}</span>
                 </>
               )}
             </p>

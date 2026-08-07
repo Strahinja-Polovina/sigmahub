@@ -222,9 +222,16 @@ export function ResourcesView({
                     <span className="text-muted-foreground/60"> / {r.envName}</span>
                   </TableCell>
                   <TableCell>
-                    <Badge variant="outline" className="font-mono">
-                      {KIND_LABELS[r.kind as ResourceKind]}
-                    </Badge>
+                    <span className="inline-flex items-center gap-1.5">
+                      <Badge variant="outline" className="font-mono">
+                        {KIND_LABELS[r.kind as ResourceKind]}
+                      </Badge>
+                      {"ephemeral" in r && Boolean(r.ephemeral) && (
+                        <Badge variant="secondary" className="text-[10px]">
+                          PR preview
+                        </Badge>
+                      )}
+                    </span>
                   </TableCell>
                   <TableCell>
                     <StatusBadge status={r.status as Status} />
