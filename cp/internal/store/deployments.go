@@ -412,6 +412,52 @@ func (s *Store) ListDeployments(ctx context.Context, orgID, resourceID string, l
 	return scanDeployments(rows)
 }
 
+// OrgDeployments is the dashboard's org-wide deploy feed: the most recent
+// deployments (the activity stream) plus the latest deployment per resource —
+// however old — so "Last deploy" / "Version" / "Active deploys" don't depend
+// on a recency window. Before this endpoint the web's CP mode had no org-wide
+// deploy source at all and rendered a permanently empty feed with columns
+// frozen at resource-creation time (SIGMA-161).
+type OrgDeployments struct {
+	Recent []Deployment `json:"recent"`
+	Latest []Deployment `json:"latest"`
+}
+
+const deploymentCols = `id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,
+	       image_digest, config_hash, status, detail, rollback_of, build_seconds, duration_seconds,
+	       created_by, created_at, started_at, finished_at, service_count, service_status`
+
+// ListOrgDeployments returns the org's deploy feed (see OrgDeployments).
+func (s *Store) ListOrgDeployments(ctx context.Context, orgID string, recentLimit int) (OrgDeployments, error) {
+	if recentLimit <= 0 || recentLimit > 100 {
+		recentLimit = 50
+	}
+	var out OrgDeployments
+	rows, err := s.Pool.Query(ctx, `
+		SELECT `+deploymentCols+` FROM deployments
+		 WHERE org_id = $1 ORDER BY created_at DESC LIMIT $2`, orgID, recentLimit)
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	out.Recent, err = scanDeployments(rows)
+	rows.Close()
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	rows, err = s.Pool.Query(ctx, `
+		SELECT DISTINCT ON (resource_id) `+deploymentCols+` FROM deployments
+		 WHERE org_id = $1 ORDER BY resource_id, created_at DESC`, orgID)
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	out.Latest, err = scanDeployments(rows)
+	rows.Close()
+	if err != nil {
+		return OrgDeployments{}, err
+	}
+	return out, nil
+}
+
 // RollbackTargets returns a resource's last N SUCCESSFUL releases whose exact
 // images can be re-shipped, newest-first — the candidates a &lt;30s rebuild-free
 // rollback can pick from. Eligible: pinned releases (image_pin — per-deployment

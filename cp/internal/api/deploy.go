@@ -23,6 +23,20 @@ func (s *Server) handleListDeployments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"deployments": deps})
 }
 
+// handleListOrgDeployments returns the org-wide deploy feed: the most recent
+// deployments plus the latest per resource, so the dashboard's overview,
+// activity feed and per-resource "Last deploy"/"Version" reflect reality in CP
+// mode instead of freezing at resource-creation time (SIGMA-161).
+func (s *Server) handleListOrgDeployments(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	feed, err := s.domain.ListOrgDeployments(r.Context(), r.PathValue("orgId"), limit)
+	if err != nil {
+		s.writeStoreErr(w, err, "list org deployments")
+		return
+	}
+	writeJSON(w, http.StatusOK, feed)
+}
+
 // handleRollbackTargets lists the last-N successful releases with a retained
 // image — the rebuild-free rollback candidates.
 func (s *Server) handleRollbackTargets(w http.ResponseWriter, r *http.Request) {

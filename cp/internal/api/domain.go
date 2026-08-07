@@ -24,10 +24,11 @@ type DomainAPI interface {
 	ListProjects(ctx context.Context, orgID string) ([]store.Project, error)
 	GetProject(ctx context.Context, orgID, projectID string) (store.Project, error)
 	UpdateProject(ctx context.Context, orgID, projectID, name, description, actor string) (store.Project, error)
-	DeleteProject(ctx context.Context, orgID, projectID, actor string) error
+	DeleteProject(ctx context.Context, orgID, projectID, actor string) ([]string, error)
 	CreateEnvironment(ctx context.Context, orgID, projectID, name string, production bool, actor string) (store.Environment, error)
 	ListEnvironments(ctx context.Context, orgID, projectID string) ([]store.Environment, error)
-	DeleteEnvironment(ctx context.Context, orgID, envID, actor string) error
+	UpdateEnvironmentProduction(ctx context.Context, orgID, envID string, production bool, actor string) (store.Environment, error)
+	DeleteEnvironment(ctx context.Context, orgID, envID, actor string) ([]string, error)
 	AttachServer(ctx context.Context, orgID, envID, serverID, actor string) error
 	DetachServer(ctx context.Context, orgID, envID, serverID, actor string) error
 	EnvServerIDs(ctx context.Context, orgID, envID string) ([]string, error)
@@ -104,6 +105,7 @@ type DomainAPI interface {
 	// returns the server to re-render; GetDeployment + DeployLogsSince back the
 	// build-log stream.
 	ListDeployments(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
+	ListOrgDeployments(ctx context.Context, orgID string, recentLimit int) (store.OrgDeployments, error)
 	RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]store.Deployment, error)
 	CreateRollback(ctx context.Context, orgID, resourceID, targetDeploymentID, actor string) (store.Deployment, string, error)
 	CreateManualRedeploy(ctx context.Context, orgID, resourceID, actor string) (store.Deployment, string, error)
@@ -193,10 +195,18 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	err := s.domain.DeleteProject(r.Context(), r.PathValue("orgId"), r.PathValue("projectId"), principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	servers, err := s.domain.DeleteProject(r.Context(), orgID, r.PathValue("projectId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "delete project")
 		return
+	}
+	// Re-render every affected server now — without the nudge the cascaded
+	// resources kept running until the 60s fleet resync (SIGMA-193).
+	if s.reconcile != nil {
+		for _, sid := range servers {
+			s.reconcile.ReconcileAsync(orgID, sid)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -230,11 +240,37 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"environments": envs})
 }
 
+// handleUpdateEnvironment edits an environment's production flag (SIGMA-190 —
+// previously write-once at creation, inferred web-side from a magic name).
+func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Production *bool `json:"production"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.Production == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "production (boolean) is required"})
+		return
+	}
+	env, err := s.domain.UpdateEnvironmentProduction(r.Context(),
+		r.PathValue("orgId"), r.PathValue("envId"), *req.Production, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "update environment")
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
 func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request) {
-	err := s.domain.DeleteEnvironment(r.Context(), r.PathValue("orgId"), r.PathValue("envId"), principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	servers, err := s.domain.DeleteEnvironment(r.Context(), orgID, r.PathValue("envId"), principalFrom(r).Name)
 	if err != nil {
 		s.writeStoreErr(w, err, "delete environment")
 		return
+	}
+	// Same nudge as project delete (SIGMA-193).
+	if s.reconcile != nil {
+		for _, sid := range servers {
+			s.reconcile.ReconcileAsync(orgID, sid)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

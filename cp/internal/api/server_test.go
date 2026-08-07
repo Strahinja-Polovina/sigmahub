@@ -143,14 +143,21 @@ func (f *fakeDomain) GetProject(context.Context, string, string) (store.Project,
 func (f *fakeDomain) UpdateProject(_ context.Context, orgID, projectID, name, desc, _ string) (store.Project, error) {
 	return store.Project{ID: projectID, OrgID: orgID, Name: name, Description: desc}, nil
 }
-func (f *fakeDomain) DeleteProject(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) DeleteProject(context.Context, string, string, string) ([]string, error) {
+	return nil, nil
+}
 func (f *fakeDomain) CreateEnvironment(_ context.Context, orgID, projectID, name string, prod bool, _ string) (store.Environment, error) {
 	return store.Environment{ID: "env_1", OrgID: orgID, ProjectID: projectID, Name: name, Production: prod}, nil
 }
 func (f *fakeDomain) ListEnvironments(context.Context, string, string) ([]store.Environment, error) {
 	return []store.Environment{}, nil
 }
-func (f *fakeDomain) DeleteEnvironment(context.Context, string, string, string) error { return nil }
+func (f *fakeDomain) UpdateEnvironmentProduction(_ context.Context, orgID, envID string, prod bool, _ string) (store.Environment, error) {
+	return store.Environment{ID: envID, OrgID: orgID, Production: prod}, nil
+}
+func (f *fakeDomain) DeleteEnvironment(context.Context, string, string, string) ([]string, error) {
+	return nil, nil
+}
 func (f *fakeDomain) AttachServer(context.Context, string, string, string, string) error {
 	return nil
 }
@@ -313,6 +320,9 @@ func (f *fakeDomain) ListDomainsForResource(_ context.Context, _, _ string) ([]s
 }
 func (f *fakeDomain) ListDeployments(_ context.Context, _, resourceID string, _ int) ([]store.Deployment, error) {
 	return []store.Deployment{}, nil
+}
+func (f *fakeDomain) ListOrgDeployments(_ context.Context, _ string, _ int) (store.OrgDeployments, error) {
+	return store.OrgDeployments{}, nil
 }
 func (f *fakeDomain) RollbackTargets(_ context.Context, _, _ string, _ int) ([]store.Deployment, error) {
 	return []store.Deployment{}, nil
