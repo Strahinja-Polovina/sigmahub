@@ -197,24 +197,27 @@ func TestBackupSweepBudgetsSplitByDispatch(t *testing.T) {
 	orgID := "org_sweep_split"
 	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
 
-	pg, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
-		EnvironmentID: envID, ServerID: serverID, Name: "shop", Kind: "postgres", Spec: json.RawMessage(`{}`),
-	}, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var policyID string
-	if err := st.Pool.QueryRow(ctx,
-		`SELECT id FROM backup_policies WHERE resource_id = $1`, pg.ID).Scan(&policyID); err != nil {
-		t.Fatal(err)
-	}
-
+	// Each fixture run gets its OWN resource (and hence its own auto-provisioned
+	// backup policy): backup_runs_daily_uniq is UNIQUE on (policy, kind, UTC day),
+	// so four same-day 'backup' rows on one policy can't exist.
+	//
 	// Ages ride make_interval(secs => float8): with a bare `now() - $n`,
 	// Postgres resolves the untyped parameter as timestamptz (preferring
 	// timestamptz - timestamptz over timestamptz - interval), which turns the
 	// whole expression into an interval that can't be inserted into created_at.
 	mkRun := func(id, status string, createdAgo time.Duration, startedAgo *time.Duration) {
 		t.Helper()
+		res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ServerID: serverID, Name: "db-" + id, Kind: "postgres", Spec: json.RawMessage(`{}`),
+		}, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var policyID string
+		if err := st.Pool.QueryRow(ctx,
+			`SELECT id FROM backup_policies WHERE resource_id = $1`, res.ID).Scan(&policyID); err != nil {
+			t.Fatal(err)
+		}
 		var startedSecs *float64
 		if startedAgo != nil {
 			secs := startedAgo.Seconds()
@@ -225,7 +228,7 @@ func TestBackupSweepBudgetsSplitByDispatch(t *testing.T) {
 			VALUES ($1, $2, $3, $4, $5, 'backup', $6,
 			        now() - make_interval(secs => $7),
 			        now() - make_interval(secs => $8))`,
-			id, orgID, pg.ID, policyID, serverID, status, createdAgo.Seconds(), startedSecs); err != nil {
+			id, orgID, res.ID, policyID, serverID, status, createdAgo.Seconds(), startedSecs); err != nil {
 			t.Fatal(err)
 		}
 	}
