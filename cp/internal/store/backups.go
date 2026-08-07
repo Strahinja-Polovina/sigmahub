@@ -391,18 +391,37 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 	return servers, tx.Commit(ctx)
 }
 
-// TimeoutStaleBackupRuns fails runs stuck pending/running longer than maxAge,
-// so a crashed agent can't freeze the schedule (tomorrow's run still enqueues)
-// and the day honestly reads not-green. Timed-out runs alert like any other
-// failure (P2-6) — this path bypasses SetBackupRunResult.
-func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, maxAge time.Duration) (int, error) {
+// TimeoutStaleBackupRuns fails runs that stopped making progress, so a crashed
+// agent can't freeze the schedule (tomorrow's run still enqueues) and the day
+// honestly reads not-green. Timed-out runs alert like any other failure (P2-6)
+// — this path bypasses SetBackupRunResult.
+//
+// Two budgets (SIGMA-163): a RUNNING run is timed from started_at — the moment
+// the agent fetched its credential — with execMaxAge sized just above the
+// agent's own 25-minute op cap. A PENDING run has not consumed any execution
+// budget: verify rows are deliberately withheld until their backup's sha is
+// known (SIGMA-137) and the agent applies ops serially, so queue time is
+// unbounded by design and gets the far larger queueMaxAge. The old single
+// created_at ceiling force-failed the day's verify whenever the dump alone
+// took ~12 minutes.
+func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, execMaxAge, queueMaxAge time.Duration) (int, error) {
+	now := time.Now()
 	var timedOut int
 	err := s.Pool.QueryRow(ctx, `
-		WITH failed AS (
-			UPDATE backup_runs
-			   SET status = 'failed', detail = 'timed out', finished_at = now()
-			 WHERE status IN ('pending', 'running') AND created_at < $1
-			 RETURNING id, org_id, kind, resource_id
+		WITH stale AS (
+			SELECT id, status AS old_status
+			  FROM backup_runs
+			 WHERE (status = 'running' AND COALESCE(started_at, created_at) < $1)
+			    OR (status = 'pending' AND created_at < $2)
+		),
+		failed AS (
+			UPDATE backup_runs b
+			   SET status = 'failed',
+			       detail = CASE WHEN s.old_status = 'pending' THEN 'timed out in queue' ELSE 'timed out' END,
+			       finished_at = now()
+			  FROM stale s
+			 WHERE b.id = s.id
+			 RETURNING b.id, b.org_id, b.kind, b.resource_id, s.old_status
 		),
 		enqueued AS (
 			INSERT INTO alert_outbox (org_id, channel_id, event, dedup_key, title, body)
@@ -411,7 +430,10 @@ func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, maxAge time.Duration
 			       'bkr:' || f.id,
 			       CASE f.kind WHEN 'backup' THEN 'Backup' WHEN 'verify' THEN 'Restore-verify' ELSE 'Restore' END
 			         || ' timed out for ' || COALESCE(res.name, f.resource_id),
-			       'The run made no progress and was failed by the scheduler (agent crashed or unreachable mid-run).'
+			       CASE WHEN f.old_status = 'pending'
+			            THEN 'The run was never dispatched within its queue window and was failed by the scheduler.'
+			            ELSE 'The dispatched run stopped reporting and was failed by the scheduler (agent crashed or unreachable mid-run).'
+			       END
 			  FROM failed f
 			  LEFT JOIN resources res ON res.id = f.resource_id
 			  JOIN alert_rules r ON r.org_id = f.org_id
@@ -423,7 +445,7 @@ func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, maxAge time.Duration
 			 )
 		)
 		SELECT count(*) FROM failed`,
-		time.Now().Add(-maxAge)).Scan(&timedOut)
+		now.Add(-execMaxAge), now.Add(-queueMaxAge)).Scan(&timedOut)
 	if err != nil {
 		return 0, err
 	}
@@ -574,8 +596,12 @@ func (s *Store) BackupCredentialForRun(ctx context.Context, serverID, runID stri
 		return BackupCredential{}, fmt.Errorf("decrypt repo key: %w", err)
 	}
 	// Mark running on first fetch so the schedule/timeout sweep sees progress.
+	// started_at anchors the sweep's execution budget: without it the 30-minute
+	// ceiling covered queue time too, force-failing runs that were never late
+	// (SIGMA-163).
 	if _, err := tx.Exec(ctx,
-		`UPDATE backup_runs SET status = 'running' WHERE id = $1 AND status = 'pending'`, runID); err != nil {
+		`UPDATE backup_runs SET status = 'running', started_at = now()
+		  WHERE id = $1 AND status = 'pending'`, runID); err != nil {
 		return BackupCredential{}, err
 	}
 	if err := auditTx(ctx, tx, orgID, "agent:"+serverID, "Backup repo key unwrapped (agent)", resourceID+" run "+runID); err != nil {

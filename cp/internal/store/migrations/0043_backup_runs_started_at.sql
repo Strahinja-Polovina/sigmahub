@@ -1,0 +1,14 @@
+-- SIGMA-163: backup_runs had no started_at, so the 30-minute stale-run sweep
+-- measured from ENQUEUE — queue time plus execution — while the agent's own
+-- per-op cap (25m) is calibrated on execution alone. A verify row is inserted
+-- in the same tick as its backup but deliberately not dispatched until the
+-- backup's sha is known (SIGMA-137), and the agent applies ops serially, so a
+-- ~12-minute dump — routine, well within the agent's cap — already burned the
+-- verify's budget before it was ever dispatched: a false verify_failed alert
+-- every day, a permanently red verify day, and verifyStreakDays pinned at 0.
+--
+-- started_at is stamped when the agent first fetches the run's credential (the
+-- pending → running flip). The sweep now times running runs from dispatch and
+-- gives never-dispatched rows a separate, much larger queue budget. The same
+-- split already exists for deployments (COALESCE(started_at, created_at)).
+ALTER TABLE backup_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
