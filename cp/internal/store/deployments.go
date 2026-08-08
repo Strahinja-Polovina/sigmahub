@@ -911,7 +911,25 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 				seen[r.buildServerID] = ServerRef{ServerID: r.buildServerID, OrgID: r.orgID}
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE deploy_requests SET status = 'drained' WHERE id = $1`, r.id); err != nil {
+		// Record what the push actually did. Marking every request 'drained'
+		// regardless made a push that resolved to NOTHING look exactly like one
+		// that deployed: the webhook was accepted, the request was drained, and
+		// no deploy ran. That is the normal state right after connecting a repo —
+		// before any resource exists — and the product had no answer to "I
+		// pushed, why is nothing happening?".
+		status, detail := "drained", ""
+		if len(apps) == 0 {
+			status = "no_targets"
+			detail = "no app resources in this environment yet — create one and push again, or use Redeploy"
+			if err := auditTx(ctx, tx, r.orgID, "webhook",
+				"Push matched no deployable resources", r.ref); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE deploy_requests
+			   SET status = $2, deployments_created = $3, detail = $4
+			 WHERE id = $1`, r.id, status, len(apps), detail); err != nil {
 			return nil, err
 		}
 	}

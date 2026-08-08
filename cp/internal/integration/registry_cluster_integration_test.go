@@ -436,6 +436,89 @@ func TestSecretFetchMatchesWhatWasRendered(t *testing.T) {
 	}
 }
 
+// A push that resolves to nothing has to say so.
+//
+// Every drained request was marked 'drained' whether it produced deployments or
+// not, so a push into an environment with no app resources — the normal state
+// right after connecting a repo — looked exactly like a successful one. The
+// webhook was accepted, the request was drained, and no deploy ever ran, with
+// nothing in the product to explain it.
+func TestPushWithNoTargetsSaysSo(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_push"
+
+	proj, err := st.CreateProject(ctx, orgID, "web", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := connectServer(t, st, orgID, "host")
+	if err := st.AttachServer(ctx, orgID, env.ID, server, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/web",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A push arrives. Inserted directly because the enqueue is tx-internal to
+	// the webhook path; the row is what the drain actually reads.
+	enqueuePush := func(id, sha string) {
+		t.Helper()
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO deploy_requests (id, org_id, connection_id, environment_id, kind, ref, sha, branch, status)
+			VALUES ($1,$2,$3,$4,'deploy','refs/heads/main',$5,'main','queued')`,
+			id, orgID, conn.ID, env.ID, sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Nothing to deploy yet.
+	enqueuePush("dpr_first", "abc1234567")
+	if _, err := st.DrainDeployRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reqs, err := st.ListDeployRequests(ctx, orgID, 10)
+	if err != nil || len(reqs) != 1 {
+		t.Fatalf("deploy requests = %+v err=%v", reqs, err)
+	}
+	if reqs[0].Status != "no_targets" {
+		t.Fatalf("a push that deployed nothing is recorded as %q", reqs[0].Status)
+	}
+	if reqs[0].DeploymentsCreated != 0 || reqs[0].Detail == "" {
+		t.Fatalf("the outcome must explain itself: %+v", reqs[0])
+	}
+
+	// Now there is something to deploy, and the same push shape must read
+	// differently — otherwise the distinction is decoration.
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: server, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:1.27"}`),
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	enqueuePush("dpr_second", "def7654321")
+	if _, err := st.DrainDeployRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reqs, _ = st.ListDeployRequests(ctx, orgID, 10)
+	var latest store.DeployRequest
+	for _, r := range reqs {
+		if r.SHA == "def7654321" {
+			latest = r
+		}
+	}
+	if latest.Status != "drained" || latest.DeploymentsCreated != 1 {
+		t.Fatalf("a push that deployed is recorded as %+v", latest)
+	}
+}
+
 // A resource's status has to be writable by the host that runs it. The two
 // kinds that belong to no single server — a cluster workload and a placed
 // Compose service — reported into nothing, so the dashboard showed them

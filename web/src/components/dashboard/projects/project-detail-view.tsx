@@ -68,7 +68,12 @@ import {
 } from "@/server/actions/projects";
 import { KindBadge, ServerTypeBadge, formatDate, formatDateTime } from "./shared";
 import { NewEnvironmentDialog } from "./new-environment-dialog";
-import { ProjectGitPanel, type GitAppInfo, type GitConnectionPanel } from "./project-git-panel";
+import {
+  ProjectGitPanel,
+  type GitAppInfo,
+  type GitConnectionPanel,
+  type PushActivity,
+} from "./project-git-panel";
 import { ProjectMembersPanel, type ProjectMemberRow } from "./project-members-panel";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
@@ -464,6 +469,7 @@ export function ProjectDetailView({
   orgId,
   gitEnabled = false,
   gitConnections,
+  pushes = [],
   gitApp,
   pendingInstallationId,
   projectMembers,
@@ -478,6 +484,8 @@ export function ProjectDetailView({
    *  hidden in demo mode where every git action would error. */
   gitEnabled?: boolean;
   gitConnections?: GitConnectionPanel[];
+  /** Recent pushes for this project, newest first. */
+  pushes?: PushActivity[];
   gitApp?: GitAppInfo;
   pendingInstallationId?: string;
   /** P2-7 per-project roles; undefined hides the panel (e.g. not-found view). */
@@ -614,6 +622,7 @@ export function ProjectDetailView({
           orgId={orgId!}
           projectId={project.id}
           connections={gitConnections!}
+          pushes={pushes}
           environments={environments}
           servers={orgServers.map((sv) => ({ id: sv.id, name: sv.name }))}
           gitApp={gitApp}

@@ -1035,7 +1035,13 @@ export type CpDeployRequest = {
   ref: string;
   sha: string;
   branch?: string;
+  /** queued | drained | no_targets. `no_targets` is the answer to "I pushed,
+   *  why is nothing happening?" — the environment has no app resources yet,
+   *  which used to be indistinguishable from a successful deploy. */
   status: string;
+  /** How many deployments the push produced; `detail` says why when zero. */
+  deploymentsCreated?: number;
+  detail?: string;
   createdAt: string;
 };
 
@@ -1348,6 +1354,15 @@ export async function cpPromoteBranch(orgId: string, mapId: string, actor: CpAct
  *  the project view renders repo → branch→env tables. Resilient per connection:
  *  one failing detail fetch (e.g. a concurrent delete → 404) drops that repo,
  *  not the whole panel. */
+export async function cpListDeployRequests(orgId: string): Promise<CpDeployRequest[]> {
+  const res = await cpFetch<{ deployRequests?: CpDeployRequest[] } | CpDeployRequest[]>(
+    `${org(orgId)}/git/deploy-requests`,
+    undefined,
+    { orgId }
+  );
+  return Array.isArray(res) ? res : (res.deployRequests ?? []);
+}
+
 export async function cpListGitConnectionsWithMaps(
   orgId: string,
   projectId: string

@@ -15,12 +15,46 @@ import {
   cpEnabled,
   cpGitAppInfo,
   cpListGitConnectionsWithMaps,
+  cpListDeployRequests,
   type CpGitConnection,
   type CpBranchMap,
 } from "@/server/cp";
 import { isInstallationId } from "@/lib/github-app";
 import { ProjectDetailView } from "@/components/dashboard/projects/project-detail-view";
-import type { GitAppInfo, GitConnectionPanel } from "@/components/dashboard/projects/project-git-panel";
+import type {
+  GitAppInfo,
+  GitConnectionPanel,
+  PushActivity,
+} from "@/components/dashboard/projects/project-git-panel";
+
+/** Recent pushes for this project's repositories, newest first.
+ *
+ *  A push that resolved to nothing used to be indistinguishable from one that
+ *  deployed, so "I pushed and nothing happened" had no answer anywhere. */
+async function loadPushes(
+  orgId: string,
+  connections: GitConnectionPanel[]
+): Promise<PushActivity[]> {
+  if (!cpEnabled() || connections.length === 0) return [];
+  const mine = new Set(connections.map((c) => c.connection.id));
+  try {
+    const all = await cpListDeployRequests(orgId);
+    return all
+      .filter((d) => mine.has(d.connectionId) && d.kind !== "pr_hook")
+      .slice(0, 5)
+      .map((d) => ({
+        id: d.id,
+        ref: d.ref,
+        sha: d.sha,
+        status: d.status,
+        deploymentsCreated: d.deploymentsCreated ?? 0,
+        detail: d.detail,
+        createdAt: d.createdAt,
+      }));
+  } catch {
+    return [];
+  }
+}
 
 /** Fetch the project's Git connections + branch routes (CP mode only). A CP
  *  failure must not break the page — degrade to an empty panel. */
@@ -116,6 +150,10 @@ export default async function ProjectDetailPage({
     loadGitConnections(orgId, projectId),
     loadGitApp(orgId),
   ]);
+  // What recent pushes to this project's repositories actually produced. The
+  // org-wide list is filtered to this project's connections; a CP failure just
+  // hides the section rather than breaking the page.
+  const pushes = await loadPushes(orgId, gitConnections);
   const orgServers = servers.map((sv) => ({
     id: sv.id,
     name: sv.name,
@@ -131,6 +169,7 @@ export default async function ProjectDetailPage({
       orgId={orgId}
       gitEnabled={cpEnabled()}
       gitConnections={gitConnections}
+      pushes={pushes}
       gitApp={gitApp}
       pendingInstallationId={pendingInstallationId}
       projectMembers={projectMembers}
