@@ -4,7 +4,8 @@
  * Every figure and claim here is drawn from the canonical SigmaHub knowledge base
  * (YouTrack SIGMA-A-1..A-3). If a number changes in the KB, change it here.
  *
- *  - Pricing: EUR 5 / connected server / month, all features included, no add-ons.
+ *  - Pricing: EUR 5 / unit / month (server weighted by management cost:
+ *    ordinary 1, Kubernetes node 2, GPU 4), all features included, no add-ons.
  *    Free up to 3 connected servers. No Enterprise tier on the public site.
  *  - SigmaHub never sells, rents or resells servers and never marks up infrastructure.
  */
@@ -34,7 +35,7 @@ export const HERO = {
     "SigmaHub is a managed cloud control plane for your own machines — Git deploys, managed databases, S3 storage, GPU/LLM inference, monitoring, disaster recovery and Kubernetes, from one dashboard. You pay for the platform, never for the servers.",
   primaryCta: { label: "Start free", href: "/dashboard" },
   secondaryCta: { label: "Talk to us", href: "#pricing" },
-  note: "Free for up to 3 servers · €5 per connected server after that · every feature included",
+  note: "Free for up to 3 units · €5 per unit after that · every feature included",
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -271,7 +272,7 @@ export const COST = {
     },
   ],
   kicker:
-    "A 10-server fleet runs €50/month on SigmaHub — GPU, storage, DR and Kubernetes included — versus per-service, per-GB and per-token billing on public cloud.",
+    "A 10-server fleet runs €35/month on SigmaHub — three units free, storage, DR and Kubernetes included — versus per-service, per-GB and per-token billing on public cloud.",
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -337,9 +338,9 @@ export const ONBOARDING = {
 
 export const PRICING = {
   eyebrow: "Pricing",
-  title: "One number. The count of your connected servers.",
+  title: "One number. The size of your fleet, weighted by what it takes to run.",
   subtitle:
-    "That's the entire price list. Every feature — deploys, databases, S3, GPU/LLM, monitoring, disaster recovery and Kubernetes — is included. No add-ons, no egress fees, no per-token GPU billing, no per-seat tax.",
+    "€5 per unit per month. An ordinary server is one unit, a Kubernetes node two, a GPU server four — because that is what each costs us to manage, never what your hardware costs. Every feature is included. No add-ons, no egress fees, no per-token GPU billing, no per-seat tax.",
   tiers: [
     {
       name: "Free",
@@ -349,7 +350,7 @@ export const PRICING = {
       cta: { label: "Start free", href: "/dashboard" },
       featured: false,
       features: [
-        "Up to 3 connected servers",
+        "Up to 3 units — three ordinary servers",
         "Every feature included — nothing gated",
         "Git deploys, databases & S3 storage",
         "GPU/LLM serving & Kubernetes",
@@ -360,12 +361,12 @@ export const PRICING = {
     {
       name: "Cloud",
       price: "€5",
-      unit: "/ connected server / month",
-      tagline: "Scale past three servers. Same everything, one meter.",
+      unit: "/ unit / month",
+      tagline: "Ordinary server 1 · Kubernetes node 2 · GPU server 4.",
       cta: { label: "Start free", href: "/dashboard" },
       featured: true,
       features: [
-        "Unlimited connected servers",
+        "Unlimited servers, clusters and GPUs",
         "Disaster recovery & automatic failover",
         "GPU/LLM serving with token metering",
         "Managed Kubernetes (k3s HA)",
@@ -375,7 +376,7 @@ export const PRICING = {
     },
   ],
   footnote:
-    "Your first three connected servers are always free. Connect a fourth and every server bills at €5/mo — SigmaHub never sells, rents or marks up your infrastructure. That's the whole deal.",
+    "Your first three units are always free, so three ordinary servers still cost nothing. Beyond that it is €5 per unit — SigmaHub never sells, rents or marks up your infrastructure, and a heavier weight only ever reflects more management on our side. That's the whole deal.",
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -392,7 +393,11 @@ export const FAQ = {
     },
     {
       q: "How does pricing work, exactly?",
-      a: "€5 × the number of connected servers per month. Your first three are free. Every feature is included — disaster recovery, GPU/LLM serving, Kubernetes, S3 and backups — with no add-ons, no egress fees and no per-token GPU billing.",
+      a: "€5 × your number of units per month, with the first three free. An ordinary server (including databases and storage) is 1 unit, a Kubernetes node 2, a GPU server 4. Every feature is included — disaster recovery, GPU/LLM serving, Kubernetes, S3 and backups — with no add-ons, no egress fees and no per-token GPU billing.",
+    },
+    {
+      q: "Why does a GPU server count as four units?",
+      a: "Because managing it is four times the work, not because the machine is expensive — it is your machine and we earn nothing on it. A GPU host means drivers, CUDA versions, the model runtime and token metering; a Kubernetes node means cluster lifecycle, upgrades and networking. An ordinary Docker host needs none of that, which is why it stays at one unit and the price you already know.",
     },
     {
       q: "What about servers behind NAT or a firewall?",

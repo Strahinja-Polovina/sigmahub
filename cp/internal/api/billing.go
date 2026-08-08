@@ -56,12 +56,12 @@ func (s *Server) handleBillingCheckout(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "billing checkout")
 		return
 	}
-	qty := summary.BillableServers
+	qty := summary.BillableUnits
 	if qty < 1 {
 		// Nothing billable yet (within the free tier) — checkout would create a
 		// zero-quantity transaction. Tell the UI honestly.
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-			"error": "no billable servers yet — the first 3 connected servers are free",
+			"error": "no billable units yet — the first 3 units are free (an ordinary server is 1 unit)",
 		})
 		return
 	}

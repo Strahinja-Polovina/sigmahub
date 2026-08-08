@@ -1076,8 +1076,13 @@ export async function cpConnectRepo(
 
 export type CpBillingSummary = {
   configured: boolean;
+  /** Connected SERVER count (what the fleet looks like). */
   connected: number;
-  billableServers: number;
+  /** Weighted total the subscription actually bills. */
+  units: number;
+  billableUnits: number;
+  /** Per-server-type explanation of `units`. */
+  breakdown: { type: string; count: number; weight: number; units: number }[];
   freeTier: number;
   unitPrice: number;
   currency: string;

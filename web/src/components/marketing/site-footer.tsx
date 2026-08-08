@@ -12,7 +12,7 @@ export function SiteFooter() {
             <Logo />
             <p className="mt-4 text-sm leading-relaxed text-muted-foreground">
               Managed cloud PaaS for servers you own. One dashboard, one bill —
-              €5 per connected server, everything included.
+              €5 per unit, everything included.
             </p>
           </div>
 

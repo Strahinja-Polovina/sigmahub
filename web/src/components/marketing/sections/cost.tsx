@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils";
  */
 function renderKicker(text: string): React.ReactNode {
   const emphatic: Record<string, string> = {
-    "€50/month": "font-semibold text-primary",
+    "€35/month": "font-semibold text-primary",
     included: "font-semibold text-foreground",
   };
   const parts = text.split(/(€50\/month|included)/g);

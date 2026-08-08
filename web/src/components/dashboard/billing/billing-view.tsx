@@ -36,17 +36,26 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { StatusDot } from "@/components/dashboard/status-indicator";
-import type { ServerType, Status } from "@/lib/mock";
+import type { Status } from "@/lib/mock";
+import { serverUnitWeight, type ServerUnitLine } from "@/lib/billing-units";
 
-const SERVER_TYPE_LABELS: Record<ServerType, string> = {
+const SERVER_TYPE_LABELS: Record<string, string> = {
   general: "General",
   database: "Database",
   storage: "Storage",
+  k8s: "Kubernetes node",
   gpu: "GPU",
 };
 
 type Billing = {
+  /** Connected SERVER count — what the fleet looks like. */
   connected: number;
+  /** Weighted total actually billed. */
+  units: number;
+  billableUnits: number;
+  /** Per-server-type explanation of `units`. */
+  breakdown: ServerUnitLine[];
+  /** Free allowance, in units. */
   freeTier: number;
   unitPrice: number;
   currency: string;
@@ -98,7 +107,7 @@ const INCLUDED_FEATURES: { label: string; icon: React.ElementType }[] = [
 type Subscription = {
   configured: boolean;
   status: string; // none | active | past_due | canceled
-  billableServers: number;
+  billableUnits: number;
   serverHoursThisMonth: number;
   orgId: string;
 };
@@ -158,7 +167,7 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
             Subscription: <span className={st.cls}>{st.text}</span>
           </span>
           <span className="text-xs text-muted-foreground tabular-nums">
-            {sub.billableServers} billable {sub.billableServers === 1 ? "server" : "servers"} ·{" "}
+            {sub.billableUnits} billable {sub.billableUnits === 1 ? "unit" : "units"} ·{" "}
             {sub.serverHoursThisMonth} connected server-hours this month
           </span>
           {sub.status === "past_due" && (
@@ -177,9 +186,9 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
             <Button
               size="sm"
               onClick={() => go("checkout")}
-              disabled={pending || sub.billableServers < 1}
+              disabled={pending || sub.billableUnits < 1}
             >
-              {sub.billableServers < 1 ? "Within free tier" : "Subscribe"}
+              {sub.billableUnits < 1 ? "Within free tier" : "Subscribe"}
             </Button>
           )}
         </div>
@@ -208,17 +217,20 @@ export function BillingView({
   // preview stays internally consistent above the free tier.
   const connectedServers = servers.filter((s) => s.status === "running");
   const provisioningCount = servers.length - connectedServers.length;
-  const freeUsed = Math.min(billing.connected, freeTier);
-  const freeRemaining = Math.max(0, freeTier - billing.connected);
-  const billableCount = Math.max(0, billing.connected - freeTier);
-  const invoiceTotal = connectedServers.length * unitPrice;
+  // Everything below counts UNITS, not servers: a GPU box is four of them, so a
+  // three-server fleet can still be above the free tier.
+  const freeUsed = Math.min(billing.units, freeTier);
+  const freeRemaining = Math.max(0, freeTier - billing.units);
+  const billableCount = billing.billableUnits;
+  const invoiceTotal = billing.units * unitPrice;
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-1">
         <h1 className="text-xl font-semibold tracking-tight text-foreground">Billing</h1>
         <p className="text-sm text-muted-foreground">
-          One simple meter for {orgName}: you pay only for connected servers.
+          One simple meter for {orgName}: {fc(unitPrice)} per connected unit. An ordinary
+          server is one unit; heavier servers to manage weigh more.
         </p>
       </div>
 
@@ -246,19 +258,20 @@ export function BillingView({
               </Badge>
             ) : (
               <p className="text-sm text-muted-foreground tabular-nums">
-                {billing.connected} connected × {fc(unitPrice)} per server
+                {billing.units} {billing.units === 1 ? "unit" : "units"} × {fc(unitPrice)},{" "}
+                {freeTier} free
               </p>
             )}
             <div className="rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
               {billing.isFree ? (
                 <>
-                  Free while you run {freeTier} or fewer connected servers. Beyond
-                  that, every connected server is billed {fc(unitPrice)}/mo.
+                  Free while your fleet is {freeTier} units or fewer. An ordinary server
+                  is 1 unit, a Kubernetes node 2, a GPU server 4.
                 </>
               ) : (
                 <>
-                  {billing.connected} connected{" "}
-                  {billing.connected === 1 ? "server" : "servers"} × {fc(unitPrice)} ={" "}
+                  ({billing.units} {billing.units === 1 ? "unit" : "units"} − {freeTier} free) ×{" "}
+                  {fc(unitPrice)} ={" "}
                   <span className="font-medium text-foreground">{fc(billing.amount)}</span>{" "}
                   / month
                 </>
@@ -276,11 +289,14 @@ export function BillingView({
             <CardTitle className="text-2xl tabular-nums">
               {billing.isFree ? (
                 <>
-                  {freeUsed} <span className="text-muted-foreground">of</span> {freeTier}
+                  {freeUsed} <span className="text-muted-foreground">of</span> {freeTier}{" "}
+                  <span className="text-base font-normal text-muted-foreground">units</span>
                 </>
               ) : (
                 <>
-                  All {billing.connected} <span className="text-muted-foreground">billed</span>
+                  {billableCount} <span className="text-muted-foreground">of</span>{" "}
+                  {billing.units}{" "}
+                  <span className="text-base font-normal text-muted-foreground">units billed</span>
                 </>
               )}
             </CardTitle>
@@ -291,9 +307,9 @@ export function BillingView({
               <span>
                 {billing.isFree
                   ? freeRemaining > 0
-                    ? `${freeRemaining} free ${freeRemaining === 1 ? "server" : "servers"} remaining`
+                    ? `${freeRemaining} free ${freeRemaining === 1 ? "unit" : "units"} remaining`
                     : "Free tier full"
-                  : `Above the ${freeTier}-server free tier`}
+                  : `Above the ${freeTier}-unit free tier`}
               </span>
               <span
                 className={
@@ -323,8 +339,8 @@ export function BillingView({
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             <p className="text-sm text-muted-foreground">
-              The only thing we count is your number of connected servers, at a flat{" "}
-              {fc(unitPrice)} each per month. Every capability is included:
+              We count units, at a flat {fc(unitPrice)} each per month — an ordinary server
+              is 1, a Kubernetes node 2, a GPU server 4. Every capability is included:
             </p>
             <ul className="grid grid-cols-2 gap-x-3 gap-y-1.5">
               {INCLUDED_FEATURES.map(({ label, icon: Icon }) => (
@@ -341,6 +357,54 @@ export function BillingView({
           </CardContent>
         </Card>
       </div>
+
+      {billing.breakdown.length > 0 && (
+        <Card>
+          <CardHeader className="border-b">
+            <CardTitle className="text-base">How your fleet adds up</CardTitle>
+            <CardDescription>
+              Why {billing.connected} {billing.connected === 1 ? "server" : "servers"} bills as{" "}
+              {billing.units} {billing.units === 1 ? "unit" : "units"}.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="pl-4">Server type</TableHead>
+                  <TableHead className="text-right">Connected</TableHead>
+                  <TableHead className="text-right">Weight</TableHead>
+                  <TableHead className="pr-4 text-right">Units</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {billing.breakdown.map((line) => (
+                  <TableRow key={line.type}>
+                    <TableCell className="pl-4 font-medium text-foreground">
+                      {SERVER_TYPE_LABELS[line.type] ?? line.type}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{line.count}</TableCell>
+                    <TableCell className="text-right text-muted-foreground tabular-nums">
+                      ×{line.weight}
+                    </TableCell>
+                    <TableCell className="pr-4 text-right tabular-nums">{line.units}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+              <TableFooter>
+                <TableRow>
+                  <TableCell colSpan={3} className="pl-4 font-medium text-foreground">
+                    Total units
+                  </TableCell>
+                  <TableCell className="pr-4 text-right font-semibold tabular-nums">
+                    {billing.units}
+                  </TableCell>
+                </TableRow>
+              </TableFooter>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader className="flex-row items-start justify-between gap-4 border-b">
@@ -369,7 +433,7 @@ export function BillingView({
                 <TableHead className="pl-4">Connected server</TableHead>
                 <TableHead>Type</TableHead>
                 <TableHead>Region</TableHead>
-                <TableHead className="text-right">Qty</TableHead>
+                <TableHead className="text-right">Units</TableHead>
                 <TableHead className="pr-4 text-right">Amount</TableHead>
               </TableRow>
             </TableHeader>
@@ -390,13 +454,14 @@ export function BillingView({
               <TableRow>
                 <TableCell colSpan={3} className="pl-4 text-muted-foreground">
                   {connectedServers.length}{" "}
-                  {connectedServers.length === 1 ? "server" : "servers"} × {fc(unitPrice)}
+                  {connectedServers.length === 1 ? "server" : "servers"} ={" "}
+                  {billing.units} {billing.units === 1 ? "unit" : "units"} × {fc(unitPrice)}
                   {billing.isFree && (
                     <span className="text-muted-foreground/70"> · free tier applied</span>
                   )}
                 </TableCell>
                 <TableCell className="text-right text-muted-foreground tabular-nums">
-                  {connectedServers.length}
+                  {billing.units}
                 </TableCell>
                 <TableCell className="pr-4 text-right font-medium tabular-nums">
                   {fc(invoiceTotal, true)}
@@ -444,6 +509,7 @@ function InvoiceRow({
   unitPrice: number;
   currency: string;
 }) {
+  const weight = serverUnitWeight(server.type);
   return (
     <TableRow>
       <TableCell className="pl-4 font-medium text-foreground">
@@ -459,13 +525,13 @@ function InvoiceRow({
       </TableCell>
       <TableCell>
         <Badge variant="outline" className="font-mono">
-          {SERVER_TYPE_LABELS[server.type as ServerType]}
+          {SERVER_TYPE_LABELS[server.type] ?? server.type}
         </Badge>
       </TableCell>
       <TableCell className="text-muted-foreground">{server.region}</TableCell>
-      <TableCell className="text-right text-muted-foreground tabular-nums">1</TableCell>
+      <TableCell className="text-right text-muted-foreground tabular-nums">{weight}</TableCell>
       <TableCell className="pr-4 text-right tabular-nums">
-        {money(unitPrice, currency, true)}
+        {money(weight * unitPrice, currency, true)}
       </TableCell>
     </TableRow>
   );

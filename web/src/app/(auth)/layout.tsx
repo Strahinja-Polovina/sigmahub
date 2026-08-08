@@ -21,7 +21,7 @@ const VALUE_BULLETS = [
   {
     icon: RotateCcw,
     title: "One simple meter",
-    body: "€5 per connected server / month, every feature included. Your first three servers are always free.",
+    body: "€5 per unit / month, every feature included. Your first three units — three ordinary servers — are always free.",
   },
 ];
 

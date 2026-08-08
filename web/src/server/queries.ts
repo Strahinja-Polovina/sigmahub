@@ -6,10 +6,17 @@ import { user } from "./db/auth-schema";
 import { cpEnabled, cpListServers, cpServerToRow } from "./cp";
 import { reportCpFailure } from "./cp-sync";
 import { hashInviteToken } from "../lib/invite";
+import {
+  UNIT_PRICE,
+  CURRENCY,
+  FREE_TIER_UNITS,
+  summarizeUnits,
+  billableUnits,
+} from "@/lib/billing-units";
 
-export const UNIT_PRICE = 5;
-export const FREE_TIER_SERVERS = 3;
-export const CURRENCY = "EUR";
+// Pricing lives in lib/billing-units (mirrored from the CP weight table);
+// re-exported here so existing importers keep working.
+export { UNIT_PRICE, CURRENCY, FREE_TIER_UNITS } from "@/lib/billing-units";
 
 export async function getOrgs() {
   return db.select().from(s.orgs);
@@ -178,14 +185,18 @@ export async function getDeployments(resourceId: string) {
 export async function getBillingSummary(orgId: string) {
   const all = await getServers(orgId).catch(() => []);
   // Match the CP/Paddle charge basis exactly (SIGMA-91): "connected" = running
-  // servers (the CP's ConnectedServerCount uses status='running'), and the
-  // charge is only for servers ABOVE the free tier (subtract), NOT every
-  // connected server once the tier is exceeded (the old cliff overstated it ~4x).
-  const connected = all.filter((x) => x.status === "running").length;
-  const billable = Math.max(0, connected - FREE_TIER_SERVERS);
+  // servers (the CP's ConnectedServerUnits uses status='running'), and the
+  // charge is only for units ABOVE the free tier (subtract), NOT every
+  // connected unit once the tier is exceeded (the old cliff overstated it ~4x).
+  const running = all.filter((x) => x.status === "running");
+  const { lines, servers: connected, units } = summarizeUnits(running);
+  const billable = billableUnits(units);
   return {
     connected,
-    freeTier: FREE_TIER_SERVERS,
+    units,
+    billableUnits: billable,
+    breakdown: lines,
+    freeTier: FREE_TIER_UNITS,
     unitPrice: UNIT_PRICE,
     currency: CURRENCY,
     amount: billable * UNIT_PRICE,

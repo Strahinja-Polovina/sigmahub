@@ -78,7 +78,7 @@ func TestBillingSummaryHonestOff(t *testing.T) {
 	}
 
 	// Billing store present but no Paddle client → configured=false.
-	fb := &fakeBilling{summary: store.BillingSummary{Connected: 4, BillableServers: 1, Amount: 5}}
+	fb := &fakeBilling{summary: store.BillingSummary{Connected: 4, Units: 4, BillableUnits: 1, Amount: 5}}
 	s = billingServer(t, fb, "")
 	req = httptest.NewRequest("GET", "/v1/orgs/org_1/billing", nil)
 	req.Header.Set("Authorization", "Bearer "+testServiceToken)
