@@ -299,6 +299,12 @@ function DeleteResourceButton({
   );
 }
 
+/** "a, b and c" — the failed reads read as prose rather than a bare array. */
+function formatList(items: string[]): string {
+  if (items.length === 1) return items[0];
+  return items.slice(0, -1).join(", ") + " and " + items[items.length - 1];
+}
+
 export function ResourceDetail({
   detail,
   orgId,
@@ -316,6 +322,7 @@ export function ResourceDetail({
   environmentId = "",
   cpTelemetry = null,
   statusError = null,
+  loadFailures = [],
 }: {
   detail: Detail;
   orgId?: string;
@@ -323,6 +330,10 @@ export function ResourceDetail({
    *  health-check timeout…). Rendered as a banner so an errored resource
    *  explains itself. */
   statusError?: string | null;
+  /** Control-plane reads that failed while building this page. An empty panel
+   *  and an unreadable one look identical, and the user acts on the difference:
+   *  "no domains" means none are attached, not that we could not ask. */
+  loadFailures?: string[];
   domains?: DomainRow[];
   /** True only when the control plane backs custom domains; the panel is hidden
    *  in demo mode where the attach/detach actions would error. */
@@ -454,6 +465,22 @@ export function ResourceDetail({
           </div>
         </div>
       </div>
+
+      {loadFailures.length > 0 && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
+          <div className="min-w-0 text-sm">
+            <p className="font-medium text-amber-700 dark:text-amber-500">
+              Some of this page couldn&apos;t be loaded
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              The control plane didn&apos;t answer for {formatList(loadFailures)}. What you see
+              below is incomplete — an empty section here does not mean there is nothing
+              there. Reload once the control plane is reachable.
+            </p>
+          </div>
+        </div>
+      )}
 
       {statusError && (
         <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">

@@ -28,26 +28,54 @@ import { ResourceDetail } from "@/components/dashboard/resources/resource-detail
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
 
-/** Load an app resource's custom domains (CP mode only). A CP failure degrades
- *  to an empty list rather than breaking the page. */
-async function loadDomains(orgId: string, resourceId: string, kind: string): Promise<DomainRow[]> {
-  if (!cpEnabled() || kind !== "app") return [];
+
+/**
+ * Reads that failed, so the page can say so.
+ *
+ * Every loader here degraded a control-plane failure into an empty list or a
+ * null — which renders as "no domains", "no releases", "no database". That is a
+ * different statement from "we could not read them", and it is the one the user
+ * acts on: they conclude the resource is fine and empty. Collecting the
+ * failures lets the page distinguish the two instead of lying by omission.
+ */
+type LoadFailures = string[];
+
+async function attempt<T>(
+  failures: LoadFailures,
+  what: string,
+  fn: () => Promise<T>,
+  fallback: T
+): Promise<T> {
   try {
-    return (await cpListDomains(orgId, resourceId)).map((d) => ({
+    return await fn();
+  } catch {
+    failures.push(what);
+    return fallback;
+  }
+}
+
+/** Load an app resource's custom domains (CP mode only). */
+async function loadDomains(
+  failures: LoadFailures,
+  orgId: string,
+  resourceId: string,
+  kind: string
+): Promise<DomainRow[]> {
+  if (!cpEnabled() || kind !== "app") return [];
+  return attempt(failures, "custom domains", async () =>
+    (await cpListDomains(orgId, resourceId)).map((d) => ({
       id: d.id,
       domain: d.domain,
       certStatus: d.certStatus,
       certExpiresAt: d.certExpiresAt,
       lastError: d.lastError,
-    }));
-  } catch {
-    return [];
-  }
+    })), []);
 }
 
 /** Load the CP release history + rollback candidates (CP mode only). A CP failure
  *  degrades to empty lists rather than breaking the page. */
 async function loadDeployments(
+  failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
@@ -78,6 +106,7 @@ async function loadDeployments(
       rollbackTargetIds: targets.map((t) => t.id),
     };
   } catch {
+    failures.push("release history");
     return { deployments: [], rollbackTargetIds: [] };
   }
 }
@@ -87,30 +116,24 @@ const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongo", "mongodb"]);
 /** Load a database resource's connection metadata (P1-10, CP mode only). A CP
  *  failure degrades to null rather than breaking the page. */
 async function loadDatabase(
+  failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
 ): Promise<CpDatabaseInfo | null> {
   if (!cpEnabled() || !DB_KINDS.has(cpKind(kind))) return null;
-  try {
-    return await cpGetDatabase(orgId, resourceId);
-  } catch {
-    return null;
-  }
+  return attempt(failures, "connection details", () => cpGetDatabase(orgId, resourceId), null);
 }
 
 /** Load an S3 resource's endpoint metadata (P2-1, CP mode only). */
 async function loadS3(
+  failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
 ): Promise<CpS3Info | null> {
   if (!cpEnabled() || kind !== "s3") return null;
-  try {
-    return await cpGetS3(orgId, resourceId);
-  } catch {
-    return null;
-  }
+  return attempt(failures, "endpoint details", () => cpGetS3(orgId, resourceId), null);
 }
 
 /** The live per-resource failure the agent reported (mesh bind, image pull,
@@ -157,18 +180,17 @@ async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelem
 async function loadBackups(
   orgId: string,
   resourceId: string,
-  isDatabase: boolean
+  isDatabase: boolean,
+  failures: LoadFailures
 ): Promise<{ targets: CpBackupTarget[]; runs: CpBackupRun[] }> {
   if (!isDatabase) return { targets: [], runs: [] };
-  try {
+  return attempt(failures, "backups", async () => {
     const [targets, runs] = await Promise.all([
       cpListBackupTargets(orgId),
       cpListBackupRuns(orgId, resourceId),
     ]);
     return { targets, runs };
-  } catch {
-    return { targets: [], runs: [] };
-  }
+  }, { targets: [], runs: [] });
 }
 
 export default async function ResourceDetailPage({
@@ -204,15 +226,19 @@ export default async function ResourceDetailPage({
     detail.resource.projectId,
     detail.resource.environmentId
   );
-  const domains = await loadDomains(orgId, resourceId, detail.resource.kind);
+  // Collected across every control-plane read so the page can distinguish
+  // "empty" from "could not be read" instead of rendering both the same way.
+  const loadFailures: LoadFailures = [];
+  const domains = await loadDomains(loadFailures, orgId, resourceId, detail.resource.kind);
   const { deployments, rollbackTargetIds } = await loadDeployments(
+    loadFailures,
     orgId,
     resourceId,
     detail.resource.kind
   );
-  const database = await loadDatabase(orgId, resourceId, detail.resource.kind);
-  const s3 = await loadS3(orgId, resourceId, detail.resource.kind);
-  const backups = await loadBackups(orgId, resourceId, database !== null);
+  const database = await loadDatabase(loadFailures, orgId, resourceId, detail.resource.kind);
+  const s3 = await loadS3(loadFailures, orgId, resourceId, detail.resource.kind);
+  const backups = await loadBackups(orgId, resourceId, database !== null, loadFailures);
   const telemetry = await loadTelemetry(orgId, resourceId);
   const statusError = await loadStatusError(
     orgId,
@@ -225,14 +251,12 @@ export default async function ResourceDetailPage({
   // demo mode) → both stay empty and the panel doesn't render.
   const [compose, placementServers] = await Promise.all([
     cpEnabled() && detail.resource.kind === "app"
-      ? cpGetComposeServices(orgId, detail.resource.id).catch(() => null)
+      ? attempt(loadFailures, "the service graph", () => cpGetComposeServices(orgId, detail.resource.id), null)
       : Promise.resolve(null),
     cpEnabled()
-      ? cpListServers(orgId)
-          .then((list) =>
-            list.map((sv) => ({ id: sv.id, name: sv.name, type: sv.type }))
-          )
-          .catch(() => [])
+      ? attempt(loadFailures, "the server list", async () =>
+          (await cpListServers(orgId)).map((sv) => ({ id: sv.id, name: sv.name, type: sv.type })),
+        [] as { id: string; name: string; type: string }[])
       : Promise.resolve([]),
   ]);
 
@@ -240,6 +264,7 @@ export default async function ResourceDetailPage({
     <ResourceDetail
       detail={{ ...detail, secrets, canManage }}
       statusError={statusError}
+      loadFailures={loadFailures}
       orgId={orgId}
       domains={domains}
       domainsEnabled={cpEnabled()}
