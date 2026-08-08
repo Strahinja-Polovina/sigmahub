@@ -87,6 +87,60 @@ jobs:
           CGO_ENABLED: "0"
         run: go build ./...
 
+  agent-k8s-e2e:
+    name: agent (real Kubernetes API server)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    # The manifests the agent writes are hand-rolled YAML — deliberately, so the
+    # binary stays static and dependency-free — which means nothing in the type
+    # system says the output is valid. One wrong indentation level and every
+    # cluster deploy fails at the API server while the product reports a
+    # successful apply. So a real control plane validates them.
+    #
+    # `k3s server --disable-agent` is an API server, scheduler and controller
+    # manager with no kubelet: it pulls no images and schedules no pods, which is
+    # what makes this cheap enough to run on every PR.
+    env:
+      K3S_VERSION: v1.31.4+k3s1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+      - name: Start a k3s control plane
+        run: |
+          set -euo pipefail
+          curl -sfL -o /tmp/k3s \
+            "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION/+/%2B}/k3s"
+          chmod +x /tmp/k3s
+          sudo mkdir -p /tmp/k3sdata
+          # 0644 on the kubeconfig: k3s must run as root, the test does not.
+          sudo /tmp/k3s server --disable-agent --disable traefik \
+            --data-dir /tmp/k3sdata \
+            --write-kubeconfig /tmp/k3sdata/kubeconfig \
+            --write-kubeconfig-mode 0644 \
+            --bind-address 127.0.0.1 > /tmp/k3s-server.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if sudo /tmp/k3s kubectl --kubeconfig /tmp/k3sdata/kubeconfig \
+                 version -o json >/dev/null 2>&1; then
+              echo "API server up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "API server did not come up:"; tail -50 /tmp/k3s-server.log; exit 1
+      - name: Kubernetes manifest e2e
+        env:
+          SIGMAD_K8S_E2E: "1"
+          KUBECONFIG: /tmp/k3sdata/kubeconfig
+          SIGMAD_KUBECTL: /tmp/k3s
+        run: go test ./internal/k8s/ -run TestK8sE2E -v
+      - name: k3s server log on failure
+        if: failure()
+        run: tail -100 /tmp/k3s-server.log
+
   agent:
     name: agent (vet · test · build)
     runs-on: ubuntu-latest
