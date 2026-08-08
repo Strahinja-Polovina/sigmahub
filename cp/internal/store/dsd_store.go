@@ -294,9 +294,31 @@ type ResourceSpec struct {
 	Ephemeral  bool
 }
 
+// ResourceHostedHereClause decides whether a resource has anything to render on
+// a given server. Owning it is the common case; hosting one of its Compose
+// services under per-service placement is the other.
+//
+// Everything a server needs in order to render a placed service has to agree on
+// this — the spec, its secrets, its domains — because they are read separately
+// and combined. When only some of them included placed resources, the placement
+// host got a deploy target for a resource it had no spec for, rendered nothing,
+// and the service simply never started with no error anywhere. Keeping the rule
+// in one place is what stops the next reader from being reintroduced.
+//
+// $1 is the server; the query must expose the resource as `r`.
+const ResourceHostedHereClause = `
+		(r.server_id = $1
+		 OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		     AND EXISTS (
+		       SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
+		        WHERE svc->>'serverId' = $1)))`
+
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, project_id, kind, spec, ephemeral FROM resources WHERE server_id = $1 ORDER BY created_at`,
+		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral
+		  FROM resources r
+		 WHERE`+ResourceHostedHereClause+`
+		 ORDER BY r.created_at`,
 		serverID)
 	if err != nil {
 		return nil, err

@@ -148,7 +148,7 @@ func (s *Store) DomainsForServer(ctx context.Context, serverID string) (map[stri
 		SELECT d.id, d.org_id, d.resource_id, d.domain, d.challenge_type, d.cert_status, d.cert_serial, d.cert_expires_at, d.last_error, d.created_by, d.created_at, d.updated_at
 		  FROM domains d
 		  JOIN resources r ON r.id = d.resource_id
-		 WHERE r.server_id = $1
+		 WHERE`+ResourceHostedHereClause+`
 		 ORDER BY d.resource_id, d.domain`, serverID)
 	if err != nil {
 		return nil, err
