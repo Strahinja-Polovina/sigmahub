@@ -12,8 +12,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
@@ -431,6 +433,79 @@ func TestSecretFetchMatchesWhatWasRendered(t *testing.T) {
 	stranger := connectServer(t, st, orgID, "stranger")
 	if _, err := st.ResolveSecretsForResource(ctx, orgID, stranger, app.ID, "agent:"+stranger); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("an unrelated server resolved another resource's secrets: err = %v", err)
+	}
+}
+
+// A resource's status has to be writable by the host that runs it. The two
+// kinds that belong to no single server — a cluster workload and a placed
+// Compose service — reported into nothing, so the dashboard showed them
+// provisioning forever while they were running fine.
+func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	orgID := "org_resstatus"
+	envID, cpServer, worker := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:1.27"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A status report is only accepted against a DSD the CP has issued.
+	if _, _, err := st.StoreDSD(ctx, orgID, cpServer, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindK8sApply, Spec: json.RawMessage(`{}`),
+	}}, "hash-1", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+
+	reported := json.RawMessage(`{"state":"failed","error":"ImagePullBackOff"}`)
+	if _, err := st.ApplyDSDStatus(ctx, cpServer, 1,
+		map[string]json.RawMessage{app.ID: reported}, false); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListResources(ctx, orgID, envID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got store.Resource
+	for _, r := range list {
+		if r.ID == app.ID {
+			got = r
+		}
+	}
+	if !strings.Contains(string(got.Status), "ImagePullBackOff") {
+		t.Fatalf("the cluster node's status report did not land: %s", got.Status)
+	}
+
+	// A node of the same cluster is legitimate; a server outside it is not.
+	if _, _, err := st.StoreDSD(ctx, orgID, worker, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindK8sApply, Spec: json.RawMessage(`{}`),
+	}}, "hash-w", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+	stranger := connectServer(t, st, orgID, "stranger")
+	if _, _, err := st.StoreDSD(ctx, orgID, stranger, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindResourceSync, Spec: json.RawMessage(`{}`),
+	}}, "hash-s", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyDSDStatus(ctx, stranger, 1,
+		map[string]json.RawMessage{app.ID: json.RawMessage(`{"state":"running"}`)}, true); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = st.ListResources(ctx, orgID, envID)
+	for _, r := range list {
+		if r.ID == app.ID && !strings.Contains(string(r.Status), "ImagePullBackOff") {
+			t.Fatalf("an unrelated server overwrote the resource's status: %s", r.Status)
+		}
 	}
 }
 

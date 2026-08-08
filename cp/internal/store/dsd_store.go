@@ -450,10 +450,17 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 		return false, err
 	}
 	for resourceID, st := range opStatus {
-		// Only touch resources that belong to this server (defence in depth
+		// Only touch resources this server actually hosts (defence in depth
 		// against a compromised agent reporting foreign resource ids).
+		//
+		// "Hosts" has to be the same rule the document was rendered from. A bare
+		// server_id matched neither of the two kinds that belong to no single
+		// server — a cluster workload, and a Compose service placed on another
+		// machine — so their reports updated nothing and the dashboard showed
+		// them provisioning forever while they were running fine.
 		if _, err := tx.Exec(ctx,
-			`UPDATE resources SET status = $3, updated_at = now() WHERE id = $1 AND server_id = $2`,
+			`UPDATE resources r SET status = $3, updated_at = now()
+			  WHERE r.id = $1 AND`+ResourceHostedHere("$2"),
 			resourceID, serverID, st); err != nil {
 			return false, fmt.Errorf("update resource status: %w", err)
 		}
