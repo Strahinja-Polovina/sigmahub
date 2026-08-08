@@ -46,7 +46,7 @@ import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
-import { detectRepo } from "@/server/actions/git";
+import { detectRepo, connectRepo } from "@/server/actions/git";
 import {
   KIND_LABELS,
   SERVER_TYPE_LABELS,
@@ -179,6 +179,9 @@ export function DeployWizard({
   const [step, setStep] = React.useState(1);
   const [repoQuery, setRepoQuery] = React.useState("");
   const [repo, setRepo] = React.useState<Repo | null>(null);
+  // Optional token for private repos (CP mode): used for detection here and
+  // stored by auto-connecting the repo to the project on create.
+  const [repoToken, setRepoToken] = React.useState("");
   // Managed-service mode: a picked engine kind replaces the git repo as the
   // source (databases/object storage never had a repo to detect).
   const [serviceKind, setServiceKind] = React.useState<ResourceKind | null>(null);
@@ -270,6 +273,7 @@ export function DeployWizard({
       setStep(1);
       setRepoQuery("");
       setRepo(null);
+      setRepoToken("");
       setServiceKind(null);
       setServiceName("");
       setDetecting(false);
@@ -297,7 +301,7 @@ export function DeployWizard({
     }
     setDetecting(true);
     setRepo(null);
-    detectRepo({ orgId, repoFullName: fullName })
+    detectRepo({ orgId, repoFullName: fullName, token: repoToken.trim() || undefined })
       .then((d) => {
         if (!d.deployable) {
           toast.error("Repository is not deployable", {
@@ -355,6 +359,28 @@ export function DeployWizard({
             repo: serviceKind ? undefined : repo?.fullName,
             detected: serviceKind ? undefined : repo?.detected,
           });
+          // A token was supplied for a private repo: persist it by connecting
+          // the repo to the project now, so the build pipeline (and future
+          // detections) can read it without re-entering the token. An
+          // already-connected repo conflicts — that's fine, keep going.
+          if (!serviceKind && repo && repoToken.trim()) {
+            try {
+              await connectRepo({
+                orgId,
+                projectId,
+                repoFullName: repo.fullName,
+                token: repoToken.trim(),
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : "";
+              if (!msg.toLowerCase().includes("already connected")) {
+                toast.warning("Repository token was not saved", {
+                  description:
+                    "The resource was created, but connecting the repository failed. Connect it in the project's Git panel.",
+                });
+              }
+            }
+          }
           // The resource now exists. Persist env vars as secrets separately: a
           // secret failure must NOT be reported as a failed create (SIGMA-151),
           // so collect per-key failures and keep going instead of aborting.
@@ -631,9 +657,26 @@ export function DeployWizard({
                   Detect
                 </Button>
               </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="wizard-repo-token" className="text-xs text-muted-foreground">
+                  Access token <span className="opacity-70">(only for private repositories)</span>
+                </Label>
+                <Input
+                  id="wizard-repo-token"
+                  type="password"
+                  value={repoToken}
+                  onChange={(e) => setRepoToken(e.target.value)}
+                  placeholder="github_pat_… / ghp_…"
+                  className="font-mono"
+                  autoComplete="off"
+                />
+              </div>
               <p className="text-xs text-muted-foreground">
-                Public GitHub repositories detect directly; private ones connect
-                with a token from the project’s Git panel.
+                Public GitHub repositories detect directly. For a private one,
+                paste a token with read access (Contents) — it is stored
+                encrypted and connects the repository to the project on deploy.
+                Repositories already connected in the project’s Git panel need
+                no token here.
               </p>
               {repo && (
                 <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
