@@ -263,7 +263,7 @@ func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDep
 	// The resource must belong to the org; capture its server if not supplied.
 	var serverID string
 	err = tx.QueryRow(ctx,
-		`SELECT server_id FROM resources WHERE org_id = $1 AND id = $2`, orgID, in.ResourceID).Scan(&serverID)
+		`SELECT COALESCE(server_id,'') FROM resources WHERE org_id = $1 AND id = $2`, orgID, in.ResourceID).Scan(&serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -847,7 +847,7 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 		// App resources in the request's target environment (of the connection's
 		// project). Each gets a queued deployment.
 		res, err := tx.Query(ctx, `
-			SELECT id, server_id, spec FROM resources
+			SELECT id, COALESCE(server_id,''), spec FROM resources
 			 WHERE org_id = $1 AND project_id = $2 AND environment_id = $3 AND kind = 'app'`,
 			r.orgID, r.projectID, r.envID)
 		if err != nil {

@@ -181,7 +181,7 @@ func (s *Store) ForceReapplyResource(ctx context.Context, orgID, resourceID, act
 	var serverID *string
 	var name string
 	err = tx.QueryRow(ctx,
-		`SELECT server_id, name FROM resources WHERE org_id = $1 AND id = $2`,
+		`SELECT COALESCE(server_id,''), name FROM resources WHERE org_id = $1 AND id = $2`,
 		orgID, resourceID).Scan(&serverID, &name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound

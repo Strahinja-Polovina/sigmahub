@@ -384,7 +384,7 @@ func (s *Store) UpdateEnvironmentProduction(ctx context.Context, orgID, envID st
 // nothing left to read. scopeCol is an internal constant, never user input.
 func cascadeResourceCleanupTx(ctx context.Context, tx pgx.Tx, orgID, scopeCol, scopeID string) ([]string, error) {
 	rows, err := tx.Query(ctx,
-		`SELECT id, server_id, spec, ephemeral FROM resources WHERE org_id = $1 AND `+scopeCol+` = $2`,
+		`SELECT id, COALESCE(server_id,''), spec, ephemeral FROM resources WHERE org_id = $1 AND `+scopeCol+` = $2`,
 		orgID, scopeID)
 	if err != nil {
 		return nil, err
@@ -639,8 +639,8 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	r := Resource{ID: newID("res")}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9,''))
-		RETURNING id, org_id, project_id, environment_id, server_id, name, kind, spec, status, created_at, updated_at`,
+		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''))
+		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), name, kind, spec, status, created_at, updated_at`,
 		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID,
 	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
@@ -679,7 +679,7 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 
 // ListResources returns org resources, optionally filtered by environment.
 func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resource, error) {
-	q := `SELECT id, org_id, project_id, environment_id, server_id, name, kind, spec, status, ephemeral, created_at, updated_at
+	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), name, kind, spec, status, ephemeral, created_at, updated_at
 	        FROM resources WHERE org_id = $1`
 	args := []any{orgID}
 	if envID != "" {
@@ -728,7 +728,7 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 		ephemeral bool
 	)
 	err = tx.QueryRow(ctx,
-		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, server_id, spec, ephemeral`,
+		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, COALESCE(server_id,''), spec, ephemeral`,
 		orgID, resourceID).Scan(&name, &serverID, &spec, &ephemeral)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
