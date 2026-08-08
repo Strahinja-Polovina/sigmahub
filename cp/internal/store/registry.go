@@ -123,15 +123,101 @@ func (s *Store) hashToken(tok string) []byte {
 	return mac.Sum(nil)
 }
 
-// normalizeFacts guarantees the facts column always holds a JSON object.
-// Anything else — empty, JSON null, a scalar or an array — collapses to {},
-// so readers and `facts->>'key'` filters never hit a non-object.
+// zeroValuedFactKeys are the reported host facts whose zero value means "the
+// probe could not answer" rather than a real reading — an agent that could not
+// read /etc/os-release, or could not stat the data root. They are stripped
+// before the facts are merged so a failed probe leaves the last known value
+// standing instead of blanking it (SIGMA-201; see facts.go for the rules).
+//
+// Three keys are pointedly NOT in this list, because their zero IS the reading:
+//
+//   - `gpu` — an empty inventory is a real answer ("I looked, this host has no
+//     GPU"), or a machine whose card was pulled advertises it forever.
+//   - `diskFreeBytes` — zero free is exactly the state worth knowing about, and
+//     it is reachable: gopsutil reports the unprivileged-available figure, which
+//     hits 0 on ext4 while the root reserve still has room. Stripping it made a
+//     FULL disk keep advertising its last healthy free-space figure forever.
+//     The agent sends this one as a pointer, so "could not stat" is absent and
+//     "genuinely zero" is 0 — a distinction `omitempty` on a plain uint64
+//     cannot make.
+//   - `dockerVersion` — because facts MERGE, a key that is merely omitted keeps
+//     its old value. A host that had Docker removed reports
+//     dockerAvailable:false and omits the version, so the dashboard went on
+//     showing the version of a daemon that is no longer installed. An explicit
+//     "" now clears it.
+var zeroValuedFactKeys = []string{"distro", "distroName", "diskPath", "diskTotalBytes"}
+
+// maxFactKeys and maxFactBytes bound one server's facts cell.
+//
+// Facts are merged, and a merge never removes a key: without a bound, an agent
+// token holder can add one new key per 30-second heartbeat until the jsonb cell
+// reaches Postgres' 1 GB field limit, after which that server can never
+// heartbeat again — a self-inflicted denial of service on a host the operator
+// owns. Assignment used to bound this implicitly; the merge that fixed version
+// skew removed the bound, so it has to be stated.
+const (
+	maxFactKeys  = 64
+	maxFactBytes = 16 << 10
+)
+
+// normalizeFacts guarantees the facts payload is a JSON object and strips the
+// keys that carry no information.
+//
+// Anything that is not an object — empty, JSON null, a scalar, an array, or
+// malformed JSON — collapses to {}, so readers and `facts->>'key'` filters
+// never hit a non-object. Malformed JSON used to be passed straight through to
+// the jsonb cast and fail the whole heartbeat; now the payload is simply empty,
+// which, because facts are MERGED, leaves the stored facts intact.
+//
+// Values are re-emitted verbatim (they stay json.RawMessage), so this only ever
+// removes keys — it never rewrites a reading.
 func normalizeFacts(facts json.RawMessage) json.RawMessage {
+	empty := json.RawMessage(`{}`)
 	trimmed := bytes.TrimSpace(facts)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return json.RawMessage(`{}`)
+		return empty
 	}
-	return trimmed
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return empty
+	}
+	// A JSON null is "no value" for ANY fact, not just the ones below: merging
+	// it in would replace a real reading with a null that every reader then has
+	// to special-case on top of the absent case it already handles.
+	for key, raw := range obj {
+		if string(bytes.TrimSpace(raw)) == "null" {
+			delete(obj, key)
+		}
+	}
+	for _, key := range zeroValuedFactKeys {
+		if isZeroJSON(obj[key]) {
+			delete(obj, key)
+		}
+	}
+	// Refuse an oversized or over-wide payload outright rather than merging part
+	// of it: a partial merge would be indistinguishable from a healthy check-in
+	// while still growing the cell. Empty means "nothing to merge", so the
+	// stored facts survive and the heartbeat itself still succeeds — a host is
+	// not taken offline for sending junk.
+	if len(obj) > maxFactKeys {
+		return empty
+	}
+	out, err := json.Marshal(obj)
+	if err != nil || len(out) > maxFactBytes {
+		return empty
+	}
+	return out
+}
+
+// isZeroJSON reports whether a raw value is absent, null, "", 0 or false — the
+// encodings a Go zero value takes on the wire when an agent serializes a field
+// it could not fill in.
+func isZeroJSON(raw json.RawMessage) bool {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", `""`, "0", "false":
+		return true
+	}
+	return false
 }
 
 // ProvisionInput describes a server to pre-create during onboarding.
@@ -413,16 +499,31 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 		return RegisterResult{}, ErrTokenInvalid
 	}
 	facts = normalizeFacts(facts)
+	reported := ParseHostFacts(facts)
 
 	// Populate the pre-created row with what the agent reports at first contact.
 	// Name/type/provider/region/mesh_ip were set at provision time and are kept.
+	//
+	// facts is MERGED rather than assigned, on the same terms as the heartbeat
+	// (see RecordHeartbeat): the pre-created row starts at '{}' so this is
+	// normally equivalent, and using one rule at both entry points means the
+	// absent-is-unchanged guarantee cannot hold on one path and not the other.
+	//
+	// distro from the agent WINS over the provisioned value. The provisioned
+	// one came out of a dropdown the operator picked before they had ever
+	// logged into the machine; /etc/os-release is what the machine actually is
+	// (SIGMA-201). An agent that could not read it reports nothing and the
+	// operator's answer stands.
 	var srv Server
 	err = tx.QueryRow(ctx, `
-		UPDATE servers
-		   SET agent_version = $3, facts = $4, pubkey = NULLIF($5, '')
-		 WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL
+		UPDATE servers s
+		   SET agent_version = $3,
+		       facts = s.facts || $4::jsonb,
+		       pubkey = NULLIF($5, ''),
+		       distro = COALESCE(NULLIF($6, ''), s.distro)
+		 WHERE s.id = $1 AND s.org_id = $2 AND s.deleted_at IS NULL
 		 RETURNING id, org_id, name, type, source, proxy_role, provider, region, status, agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at`,
-		serverID, orgID, agentVersion, facts, pubkey,
+		serverID, orgID, agentVersion, facts, pubkey, reported.Distro,
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

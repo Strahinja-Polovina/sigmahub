@@ -30,18 +30,32 @@ type provisionRequest struct {
 	Provider  string `json:"provider"`
 	Region    string `json:"region"`
 	ProxyRole bool   `json:"proxyRole"`
-	Distro    string `json:"distro"` // detected host OS; validated server-side
+	// Distro is what the operator PICKED in the connect wizard, before the
+	// machine had ever been asked. It is only the starting value now: the agent
+	// reports the real one from /etc/os-release at register and on every
+	// heartbeat, and that reading replaces this (SIGMA-201).
+	Distro string `json:"distro"` // validated server-side
 	// HostIP: the public address from the connect wizard, stored as the
 	// server's initial endpoint (SIGMA-187).
 	HostIP string `json:"hostIp"`
 }
 
 type registerRequest struct {
-	BootstrapToken string          `json:"bootstrapToken"`
-	Name           string          `json:"name"`
-	AgentVersion   string          `json:"agentVersion"`
-	Facts          json.RawMessage `json:"facts"`
-	Pubkey         string          `json:"pubkey"`
+	BootstrapToken string `json:"bootstrapToken"`
+	Name           string `json:"name"`
+	AgentVersion   string `json:"agentVersion"`
+	// Facts is the agent's host description, carried as raw JSON on purpose:
+	// a control plane older than the agent talking to it must store the fields
+	// it does not yet understand rather than silently dropping them, which is
+	// what a fully typed struct here would do.
+	//
+	// The keys the product acts on are decoded by store.ParseHostFacts, whose
+	// HostFacts covers exactly the Requirement.Fact names in the server catalog
+	// — arch, distro, diskTotalBytes, gpu (SIGMA-201). Declaring them a second
+	// time here would create a second opinion about what a missing value means,
+	// which is the class of bug serverTypeError below exists to document.
+	Facts  json.RawMessage `json:"facts"`
+	Pubkey string          `json:"pubkey"`
 }
 
 // serverTypeError validates a requested server type against the CANONICAL

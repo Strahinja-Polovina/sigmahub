@@ -35,6 +35,35 @@ export type CpServer = {
     kernel?: string;
     numCpu?: number;
     memTotalMb?: number;
+    /** SIGMA-201 — reported by the agent at register and on every heartbeat.
+     *  Every field is optional because an agent older than the fact, or one
+     *  whose probe could not answer, simply omits it; the control plane keeps
+     *  the last known value rather than blanking it, so `undefined` here means
+     *  "never established", not "empty". */
+    /** Catalog distro id ("ubuntu-24.04"), read from /etc/os-release — the
+     *  machine's own answer, not the one picked in the connect wizard. */
+    distro?: string;
+    /** os-release PRETTY_NAME, for display only. */
+    distroName?: string;
+    /** Bytes, for the filesystem at diskPath — NOT a percentage. The server
+     *  catalog states disk floors in bytes and a percentage cannot be compared
+     *  against one. */
+    diskTotalBytes?: number;
+    diskFreeBytes?: number;
+    diskPath?: string;
+    /** Accelerator inventory. Present with `count: 0` on a host that was asked
+     *  and has none; absent only when the agent never looked. VRAM is in BYTES
+     *  per card so the LLM fit estimate (SIGMA-214) can do arithmetic with it
+     *  rather than parsing a rounded "24GB" label. */
+    gpu?: {
+      vendor?: string;
+      model?: string;
+      count?: number;
+      vramBytesPerGpu?: number;
+      vramBytesTotal?: number;
+      driverVersion?: string;
+      cards?: { index: number; model: string; vramBytes: number }[];
+    };
   } | null;
   meshIp: string | null;
   /** Public ip:port — the connect wizard's host IP, refreshed by the agent's
