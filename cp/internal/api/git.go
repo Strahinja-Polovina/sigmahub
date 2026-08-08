@@ -29,6 +29,9 @@ type GitAPI interface {
 	// GitHub App (SIGMA-87): bind an installation id to the acting org
 	// (first-writer-wins); errors if it belongs to another org.
 	ClaimInstallation(ctx context.Context, orgID, installationID string) error
+	// GitTokenForRepo resolves the stored credential for an org's already-
+	// connected repo ("" = public; ErrNotFound = not connected).
+	GitTokenForRepo(ctx context.Context, orgID, repoFullName string) (string, error)
 }
 
 // claimInstallation binds a client-supplied installation id to the acting org
@@ -131,6 +134,14 @@ func (s *Server) handleGitDetect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.effectiveGitToken(r.Context(), req.Token, req.InstallationID)
+	// No explicit credential: fall back to the one stored when this repo was
+	// connected in the Git panel, so detection of an already-connected private
+	// repo works from the deploy wizard (which never carries a token).
+	if token == "" && s.git != nil {
+		if stored, err := s.git.GitTokenForRepo(r.Context(), r.PathValue("orgId"), req.RepoFullName); err == nil {
+			token = stored
+		}
+	}
 	detected, err := s.inspector.Inspect(r.Context(), req.RepoFullName, token)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not read repository: " + err.Error()})

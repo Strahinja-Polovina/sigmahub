@@ -65,7 +65,56 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 			files[name] = content
 		}
 	}
+	// Nothing found can mean two very different things: the repo really has no
+	// Dockerfile/Compose at its root, or the repo is invisible to us — GitHub
+	// answers 404 for EVERY path of a private repo when the token is missing or
+	// unauthorized. Distinguish them with one repo-level probe so the UI can say
+	// "connect the private repo" instead of the misleading "no Dockerfile".
+	if len(files) == 0 {
+		visible, err := i.repoVisible(ctx, base, repo, token)
+		if err != nil {
+			return gitdetect.Detected{}, err
+		}
+		if !visible {
+			return gitdetect.Detected{
+				Ports: []int{}, Env: []string{},
+				HealthCheck: gitdetect.HealthCheck{Type: "tcp", IntervalSec: 10, Source: "default"},
+				Deployable:  false,
+				Reason: "repository not found or not accessible — if it is private, connect it in the project's Git panel " +
+					"(access token or GitHub App) and try again",
+			}, nil
+		}
+	}
 	return gitdetect.Detect(files), nil
+}
+
+// repoVisible reports whether the repo itself resolves with the given
+// credentials (GET /repos/{owner}/{name}); a 404 here means the repo does not
+// exist or is private and unreadable with this token.
+func (i *Inspector) repoVisible(ctx context.Context, base, repo, token string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/repos/%s", base, repo), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := i.Client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden:
+		return false, nil
+	default:
+		return false, fmt.Errorf("github repo %s: unexpected status %s", repo, resp.Status)
+	}
 }
 
 type contentsResponse struct {

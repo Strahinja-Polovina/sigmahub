@@ -20,7 +20,9 @@ func stubContents(files map[string]string, wantAuth string) *httptest.Server {
 		// /repos/{owner}/{name}/contents/{path}
 		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/repos/"), "/contents/", 2)
 		if len(parts) != 2 {
-			w.WriteHeader(http.StatusBadRequest)
+			// Repo-level probe (GET /repos/{owner}/{name}): the repo exists in
+			// these fixtures; only its files vary.
+			_ = json.NewEncoder(w).Encode(map[string]string{"full_name": parts[0]})
 			return
 		}
 		content, ok := files[parts[1]]
@@ -90,6 +92,28 @@ func TestInspectUndeployable(t *testing.T) {
 	}
 	if d.Reason == "" {
 		t.Error("expected actionable reason")
+	}
+}
+
+// TestInspectInaccessibleRepo proves an invisible repo (GitHub 404s every path
+// of a private repo when the token is missing/unauthorized) is reported as
+// not-accessible — not as the misleading "no Dockerfile found".
+func TestInspectInaccessibleRepo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
+	d, err := insp.Inspect(context.Background(), "o/private", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Deployable {
+		t.Fatal("an invisible repo must not be deployable")
+	}
+	if !strings.Contains(d.Reason, "not accessible") {
+		t.Errorf("reason should say the repo is not accessible, got %q", d.Reason)
 	}
 }
 

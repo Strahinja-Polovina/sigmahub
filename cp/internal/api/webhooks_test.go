@@ -80,6 +80,9 @@ func (f *fakeGit) ClaimInstallation(_ context.Context, _, installationID string)
 	f.claimedInstallation = installationID
 	return nil
 }
+func (f *fakeGit) GitTokenForRepo(_ context.Context, _, _ string) (string, error) {
+	return "", store.ErrNotFound
+}
 
 // fakeInspector returns a scripted detection.
 type fakeInspector struct {

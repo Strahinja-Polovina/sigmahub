@@ -730,6 +730,27 @@ func (s *Store) gitCloneToken(ctx context.Context, orgID, connID string) (string
 	return string(plain), nil
 }
 
+// GitTokenForRepo resolves the credential to READ an org's connected repo:
+// the connection's App installation token or stored PAT (same resolution as a
+// clone). "" with nil error = connected public repo; ErrNotFound = the repo is
+// not connected in this org. Lets repo detection see a private repo that was
+// already connected in the Git panel instead of failing tokenless (the wizard
+// never carries a token).
+func (s *Store) GitTokenForRepo(ctx context.Context, orgID, repoFullName string) (string, error) {
+	repo := strings.Trim(strings.TrimSpace(repoFullName), "/")
+	var connID string
+	err := s.Pool.QueryRow(ctx,
+		`SELECT id FROM git_connections WHERE org_id = $1 AND repo_full_name = $2`,
+		orgID, repo).Scan(&connID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return s.gitCloneToken(ctx, orgID, connID)
+}
+
 // ── tx helpers ──────────────────────────────────────────────────────────────
 
 // errAmbiguousDelivery marks a delivery whose repo is connected in several orgs
