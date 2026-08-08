@@ -27,7 +27,7 @@ func TestRenderComposeDeployOps(t *testing.T) {
 		RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg", Trigger: "git",
 	}
 
-	ops, networkID, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+	ops, networkID, ok := renderComposeDeployOps(rs, spec, nil, nil, target, "")
 	if !ok {
 		t.Fatal("render should succeed")
 	}
@@ -104,7 +104,7 @@ func TestRenderComposePortlessAndInvalid(t *testing.T) {
 	rs := store.ResourceSpec{ResourceID: "res_p", ProjectID: "proj_p", Kind: "app", Spec: raw}
 	target := store.DeployTarget{DeploymentID: "dep_2", Provider: "github", RepoFullName: "acme/w", SHA: "beef1234", Trigger: "git"}
 
-	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target, "")
 	if !ok {
 		t.Fatal("render should succeed")
 	}
@@ -145,7 +145,7 @@ func TestManualForceOnlyWhileInFlight(t *testing.T) {
 			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg",
 			Trigger: "manual", Status: status,
 		}
-		ops, _, ok := renderDeployOps(rs, nil, nil, target)
+		ops, _, ok := renderDeployOps(rs, nil, nil, target, "")
 		if !ok {
 			t.Fatal("render should succeed")
 		}
@@ -188,7 +188,7 @@ func TestComposeManualForceOnlyWhileInFlight(t *testing.T) {
 			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg",
 			Trigger: "manual", Status: status,
 		}
-		ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+		ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target, "")
 		if !ok {
 			t.Fatal("render should succeed")
 		}
@@ -257,7 +257,7 @@ func TestRenderDeployPinnedImageAndVolumes(t *testing.T) {
 		RepoFullName: "acme/app", SHA: "abcdef1234", ConfigHash: "cfg", Trigger: "git",
 		ImagePin: "dep10p",
 	}
-	ops, networkID, ok := renderDeployOps(rs, nil, nil, target)
+	ops, networkID, ok := renderDeployOps(rs, nil, nil, target, "")
 	if !ok {
 		t.Fatal("render should succeed")
 	}
@@ -332,7 +332,7 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 		target := base
 		target.DeploymentID, target.Trigger, target.ImagePin = "dep_20", trigger, "src111"
 		target.ImageDigest = dsd.PinnedImageTag("res_r", "abcdef1234", "src111")
-		ops, _, ok := renderDeployOps(rs, nil, nil, target)
+		ops, _, ok := renderDeployOps(rs, nil, nil, target, "")
 		if !ok {
 			t.Fatalf("%s render should succeed", trigger)
 		}
@@ -355,8 +355,8 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 	standing.DeploymentID, standing.Trigger, standing.ImagePin = "dep_1", "git", "p1"
 	cfgTarget.DeploymentID, cfgTarget.Trigger, cfgTarget.ImagePin = "dep_2", "config", "p1"
 	cfgTarget.ImageDigest = dsd.PinnedImageTag("res_r", "abcdef1234", "p1")
-	opsA, _, _ := renderDeployOps(rs, nil, nil, standing)
-	opsB, _, _ := renderDeployOps(rs, nil, nil, cfgTarget)
+	opsA, _, _ := renderDeployOps(rs, nil, nil, standing, "")
+	opsB, _, _ := renderDeployOps(rs, nil, nil, cfgTarget, "")
 	genA, genB := "", ""
 	for _, op := range opsA {
 		if op.ID == "res:res_r" {
@@ -371,7 +371,7 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 	// A config row with no pinned source (legacy) rebuilds the full pipeline.
 	legacy := base
 	legacy.DeploymentID, legacy.Trigger = "dep_30", "config"
-	ops, _, ok := renderDeployOps(rs, nil, nil, legacy)
+	ops, _, ok := renderDeployOps(rs, nil, nil, legacy, "")
 	if !ok {
 		t.Fatal("legacy config render should succeed")
 	}
@@ -402,7 +402,7 @@ func TestRenderComposeRollbackReshipsWithoutGit(t *testing.T) {
 		RepoFullName: "acme/app", SHA: "abcdef1234", ConfigHash: "cfg",
 		Trigger: "rollback", ImagePin: "src222",
 	}
-	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target)
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target, "")
 	if !ok {
 		t.Fatal("render should succeed")
 	}
@@ -449,4 +449,146 @@ func dependsOn(op dsd.Op, dep string) bool {
 		}
 	}
 	return false
+}
+
+// composeMultiServer is a two-tier app: the API on the app server, Postgres on
+// a dedicated database server, with the API depending on the database.
+func composeMultiServer() (store.ResourceSpec, appResourceSpec) {
+	spec := appResourceSpec{
+		Env: map[string]string{"LOG_LEVEL": "info"},
+		Compose: &composeDeploySpec{Services: []composeServiceSpec{
+			{
+				Name: "api", Build: ".", Ports: []int{8080},
+				DependsOn: []string{"db"},
+				ServerID:  "srv_app",
+				Env:       map[string]string{"DB_HOST": "10.8.0.4", "LOG_LEVEL": "debug"},
+			},
+			{
+				Name: "db", Image: "postgres:16", Ports: []int{5432},
+				Rollout: "recreate", ServerID: "srv_db",
+			},
+		}},
+	}
+	raw, _ := json.Marshal(spec)
+	return store.ResourceSpec{ResourceID: "res_m", ProjectID: "proj_m", Kind: "app", Spec: raw}, spec
+}
+
+func multiServerTarget(serviceStatus map[string]string) store.DeployTarget {
+	return store.DeployTarget{
+		DeploymentID: "dep_m", ResourceID: "res_m", ProjectID: "proj_m", Provider: "github",
+		RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "beef01", ConfigHash: "cfg",
+		Trigger: "git", ServerID: "srv_app", ServiceStatus: serviceStatus,
+	}
+}
+
+// Each server's document renders only the services placed on it — a Compose app
+// can span hosts instead of being pinned to one.
+func TestComposePlacementSplitsServicesAcrossServers(t *testing.T) {
+	rs, spec := composeMultiServer()
+
+	dbOps, _, ok := renderComposeDeployOps(rs, spec, nil, nil, multiServerTarget(nil), "srv_db")
+	if !ok {
+		t.Fatal("the database server must render its placed service")
+	}
+	for _, op := range dbOps {
+		if op.ID == "res:res_m:api" {
+			t.Fatal("the api service is placed on srv_app; srv_db must not render it")
+		}
+	}
+	if _, found := opByID(dbOps, "res:res_m:db"); !found {
+		t.Fatalf("db rollout missing from the database server: %+v", opIDs(dbOps))
+	}
+
+	// The app server has nothing to render yet: its only service waits on a
+	// database that has not reported success.
+	if _, _, ok := renderComposeDeployOps(rs, spec, nil, nil, multiServerTarget(nil), "srv_app"); ok {
+		t.Fatal("api must be gated until the remote db reports success")
+	}
+}
+
+// The cross-server gate opens only once the dependency reports success — this is
+// what stops an app from starting against a database that isn't up.
+func TestComposeCrossServerDependencyGate(t *testing.T) {
+	rs, spec := composeMultiServer()
+
+	for _, state := range []string{"", "deploying", "failed"} {
+		status := map[string]string{}
+		if state != "" {
+			status["db"] = state
+		}
+		if _, _, ok := renderComposeDeployOps(rs, spec, nil, nil, multiServerTarget(status), "srv_app"); ok {
+			t.Fatalf("db=%q must keep the api gated", state)
+		}
+	}
+
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil,
+		multiServerTarget(map[string]string{"db": "success"}), "srv_app")
+	if !ok {
+		t.Fatal("a successful db must release the api")
+	}
+	api, found := opByID(ops, "res:res_m:api")
+	if !found {
+		t.Fatalf("api rollout missing: %+v", opIDs(ops))
+	}
+	// The dependency lives in another document, so it must NOT appear as an op
+	// dependency — a dangling reference would wedge the whole apply.
+	for _, d := range api.DependsOn {
+		if d == "res:res_m:db" {
+			t.Fatal("a remotely-placed dependency must not become a local op dependency")
+		}
+	}
+}
+
+// Same-server dependencies keep using op ordering, unchanged.
+func TestComposeSameServerDependencyStaysOpOrdered(t *testing.T) {
+	spec := appResourceSpec{
+		Compose: &composeDeploySpec{Services: []composeServiceSpec{
+			{Name: "api", Build: ".", Ports: []int{8080}, DependsOn: []string{"cache"}, ServerID: "srv_1"},
+			{Name: "cache", Image: "redis:7", Ports: []int{6379}, ServerID: "srv_1"},
+		}},
+	}
+	raw, _ := json.Marshal(spec)
+	rs := store.ResourceSpec{ResourceID: "res_s", ProjectID: "p", Kind: "app", Spec: raw}
+	target := store.DeployTarget{
+		DeploymentID: "dep_s", ResourceID: "res_s", SHA: "aa", Trigger: "git", ServerID: "srv_1",
+	}
+
+	// No service status at all: co-located services are ordered by the graph, so
+	// they must NOT be gated on a status report that only exists cross-server.
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil, target, "srv_1")
+	if !ok {
+		t.Fatal("co-located services must render together")
+	}
+	api, _ := opByID(ops, "res:res_s:api")
+	if !dependsOn(api, "res:res_s:cache") {
+		t.Fatalf("api must depend on cache in-document: %+v", api.DependsOn)
+	}
+}
+
+// Per-service env is layered over the resource env, so services on different
+// hosts can carry different values for the same key.
+func TestComposePerServiceEnvOverridesResourceEnv(t *testing.T) {
+	rs, spec := composeMultiServer()
+	ops, _, ok := renderComposeDeployOps(rs, spec, nil, nil,
+		multiServerTarget(map[string]string{"db": "success"}), "srv_app")
+	if !ok {
+		t.Fatal("render should succeed")
+	}
+	apiOp, _ := opByID(ops, "res:res_m:api")
+	var rollout rolloutOpSpec
+	if err := json.Unmarshal(apiOp.Spec, &rollout); err != nil {
+		t.Fatal(err)
+	}
+	if got := rollout.Container.Env["DB_HOST"]; got != "10.8.0.4" {
+		t.Fatalf("service env not applied: DB_HOST = %q", got)
+	}
+	if got := rollout.Container.Env["LOG_LEVEL"]; got != "debug" {
+		t.Fatalf("service env must win over resource env: LOG_LEVEL = %q", got)
+	}
+
+	// The resource-level map must not be mutated — the db service on the other
+	// server still sees the original value.
+	if spec.Env["LOG_LEVEL"] != "info" {
+		t.Fatalf("resource env was mutated: %+v", spec.Env)
+	}
 }

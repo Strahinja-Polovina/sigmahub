@@ -49,6 +49,14 @@ type composeServiceSpec struct {
 	Ports      []int    `json:"ports,omitempty"`      // container ports to expose
 	Rollout    string   `json:"rollout,omitempty"`    // blue-green (default) | recreate
 	DependsOn  []string `json:"dependsOn,omitempty"`
+	// ServerID places this service on a specific server. Empty means "the
+	// resource's own server", so a plain single-server Compose app needs no
+	// placement at all and keeps rendering exactly as before.
+	ServerID string `json:"serverId,omitempty"`
+	// Env is this service's own environment, merged OVER the resource-level env.
+	// Services on different hosts usually need different values (a DB host, a
+	// queue URL), which one shared map cannot express.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // The op-spec structs mirror the agent's container package JSON tags exactly.

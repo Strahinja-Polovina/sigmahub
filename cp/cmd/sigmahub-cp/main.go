@@ -360,6 +360,7 @@ func run() error {
 			InstallationTokens:  installTokens,
 			InstallationAccounts: installAccounts,
 			GitIntegration:       st,
+			Compose:              st,
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			PublicURL:           cfg.PublicURL,

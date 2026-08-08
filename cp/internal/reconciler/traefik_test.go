@@ -165,7 +165,7 @@ func TestBlueGreenRoutersAreGenerationScoped(t *testing.T) {
 			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: sha, ConfigHash: "cfg",
 			Trigger: "git", CreatedAt: createdAt,
 		}
-		ops, _, ok := renderDeployOps(rs, nil, domains, target)
+		ops, _, ok := renderDeployOps(rs, nil, domains, target, "")
 		if !ok {
 			t.Fatal("render should succeed")
 		}

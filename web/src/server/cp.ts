@@ -1672,3 +1672,45 @@ export async function cpSelectGitRepo(
     { orgId, actor }
   );
 }
+
+// ── Compose placement (multi-service apps) ──────────────────────────────────
+
+export type CpComposeService = {
+  name: string;
+  build?: string;
+  image?: string;
+  ports?: number[];
+  rollout?: string;
+  dependsOn?: string[];
+  /** Explicit placement; empty means the resource's own server. */
+  serverId?: string;
+  env?: Record<string, string>;
+};
+
+export type CpComposeServices = {
+  services: CpComposeService[];
+  /** Where services with no explicit placement run. */
+  homeServerId: string;
+};
+
+export async function cpGetComposeServices(
+  orgId: string,
+  resourceId: string
+): Promise<CpComposeServices> {
+  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/compose`, undefined, {
+    orgId,
+  });
+}
+
+export async function cpSetComposePlacements(
+  orgId: string,
+  resourceId: string,
+  placements: { service: string; serverId: string; env?: Record<string, string> }[],
+  actor: CpActor
+): Promise<{ status: string; servers: string[] }> {
+  return cpFetch(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/compose/placements`,
+    { method: "PUT", body: JSON.stringify({ placements }) },
+    { orgId, actor }
+  );
+}

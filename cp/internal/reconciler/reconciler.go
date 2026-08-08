@@ -87,7 +87,7 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 			// A git-deployed app (has a deploy target) renders the build pipeline;
 			// a registry-image app keeps the direct container.apply path.
 			if target, isGit := deployTargets[rs.ResourceID]; isGit {
-				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target); ok {
+				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target, serverID); ok {
 					resourceOps = append(resourceOps, depOps...)
 					// A Compose app deploys onto its own per-resource network
 					// ("net:res:<id>"); a single-container app shares the project network.

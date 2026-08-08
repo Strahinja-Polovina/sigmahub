@@ -928,6 +928,15 @@ type DeployTarget struct {
 	// from stored data rather than render-time wall-clock: a resync has to
 	// re-render byte-identical labels.
 	CreatedAt time.Time
+	// ServiceStatus is the per-service state of a Compose deployment
+	// (service → deploying|success|failed). It is what makes a cross-server
+	// dependency enforceable: a service placed on another host can only be
+	// rendered once the services it depends on report success, and those live
+	// in a different server's document where op-level DependsOn cannot reach.
+	ServiceStatus map[string]string
+	// ServerID is the server the deployment was created against — the "home"
+	// server for services that declare no explicit placement.
+	ServerID string
 }
 
 // DeployTargetsForServer returns the current deploy target per app resource on a
@@ -935,15 +944,25 @@ type DeployTarget struct {
 // reconciler renders the deploy pipeline from these instead of a bare
 // container.apply.
 func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (map[string]DeployTarget, error) {
+	// A Compose app may place services on servers OTHER than the one its
+	// deployment was created against, so this server is a target when it owns
+	// the deployment OR hosts at least one of the app's services. Without the
+	// second clause a placed service would never appear in any document and
+	// would silently never deploy.
 	rows, err := s.Pool.Query(ctx, `
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
 		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
-		       d.created_at
+		       d.created_at, d.service_status, COALESCE(d.server_id, '')
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
-		 WHERE d.server_id = $1 AND d.status IN ('queued','building','deploying','success')
+		 WHERE d.status IN ('queued','building','deploying','success')
+		   AND (d.server_id = $1
+		        OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		            AND EXISTS (
+		              SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
+		               WHERE svc->>'serverId' = $1)))
 		 ORDER BY d.resource_id, d.created_at DESC`, serverID)
 	if err != nil {
 		return nil, err
@@ -953,9 +972,16 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 	for rows.Next() {
 		var t DeployTarget
 		var ref, sha, cfg, digest *string
+		var svcStatus []byte
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
-			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.ImagePin, &t.Trigger, &t.Status, &t.CreatedAt); err != nil {
+			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.ImagePin, &t.Trigger, &t.Status, &t.CreatedAt,
+			&svcStatus, &t.ServerID); err != nil {
 			return nil, err
+		}
+		if len(svcStatus) > 0 {
+			// A malformed/absent map just means "nothing has reported yet"; a
+			// decode error must not drop the whole deploy target.
+			_ = json.Unmarshal(svcStatus, &t.ServiceStatus)
 		}
 		t.Ref, t.SHA, t.ConfigHash, t.ImageDigest = deref(ref), deref(sha), deref(cfg), deref(digest)
 		out[t.ResourceID] = t

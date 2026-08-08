@@ -71,6 +71,7 @@ type Server struct {
 	domain              DomainAPI
 	git                 GitAPI
 	gitIntegration      GitIntegrationAPI
+	compose             ComposeAPI
 	inspector           RepoInspector
 	repoLister          RepoLister
 	installTokens       InstallationTokenSource
@@ -134,6 +135,8 @@ type Options struct {
 	GitIntegration GitIntegrationAPI
 	// RepoLister lists the repos an installation grants — the picker's source.
 	RepoLister RepoLister
+	// Compose backs per-service placement for multi-service apps.
+	Compose ComposeAPI
 	// InstallationAccounts names an installation's account for the dashboard.
 	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
@@ -174,6 +177,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		installTokens:       opts.InstallationTokens,
 		installAccounts:     opts.InstallationAccounts,
 		gitIntegration:      opts.GitIntegration,
+		compose:             opts.Compose,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -342,6 +346,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/integration", s.requireService(store.RoleProjectAdmin, s.handleConnectGitIntegration))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/integration/{installationId}", s.requireService(store.RoleProjectAdmin, s.handleDisconnectGitIntegration))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/repos", s.requireService(store.RoleDeveloper, s.handleListGitRepos))
+	// Compose placement: reading the service graph is member-visible; moving a
+	// service between servers changes what runs where, so Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/compose", s.requireService(store.RoleDeveloper, s.handleGetComposeServices))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/compose/placements", s.requireService(store.RoleProjectAdmin, s.handleSetComposePlacements))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))
 	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
 	// environment list is member-visible.
