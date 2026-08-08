@@ -148,7 +148,7 @@ func (s *Store) DomainsForServer(ctx context.Context, serverID string) (map[stri
 		SELECT d.id, d.org_id, d.resource_id, d.domain, d.challenge_type, d.cert_status, d.cert_serial, d.cert_expires_at, d.last_error, d.created_by, d.created_at, d.updated_at
 		  FROM domains d
 		  JOIN resources r ON r.id = d.resource_id
-		 WHERE`+ResourceHostedHereClause+`
+		 WHERE`+ResourceHostedHere("$1")+`
 		 ORDER BY d.resource_id, d.domain`, serverID)
 	if err != nil {
 		return nil, err
@@ -169,11 +169,14 @@ func (s *Store) DomainsForServer(ctx context.Context, serverID string) (map[stri
 // Idempotent: re-reporting the same issued serial is a no-op change. status is
 // one of pending|issuing|issued|failed.
 //
-// Scoped to the REPORTING server (server_id), not merely the domain name: an
-// agent token authenticates one specific host, so a stolen/compromised token
-// must not be able to write cert state for a domain hosted on a different server
-// (BOLA). The join to resources enforces that the domain routes to a resource
-// scheduled on this server.
+// Scoped to the REPORTING server, not merely the domain name: an agent token
+// authenticates one specific host, so a stolen/compromised token must not be
+// able to write cert state for a domain hosted on a different server (BOLA).
+//
+// The rule is ResourceHostedHere, matching what DomainsForServer put in this
+// host's document. A bare `server_id` was narrower than what is rendered, so the
+// host actually terminating TLS for a placed web service — or a cluster node —
+// had its report rejected and the certificate state never left 'pending'.
 func (s *Store) SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	tx, err := s.Pool.Begin(ctx)
@@ -191,7 +194,8 @@ func (s *Store) SetDomainCertStatus(ctx context.Context, serverID, domain, statu
 		       last_error = $6,
 		       updated_at = now()
 		  FROM resources r
-		 WHERE r.id = d.resource_id AND r.server_id = $1 AND lower(d.domain) = $2
+		 WHERE r.id = d.resource_id AND lower(d.domain) = $2
+		   AND`+ResourceHostedHere("$1")+`
 		 RETURNING d.org_id`,
 		serverID, domain, status, serial, expiresAt, certErr).Scan(&orgID)
 	if errors.Is(err, pgx.ErrNoRows) {

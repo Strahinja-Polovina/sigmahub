@@ -29,7 +29,7 @@ func (s *Store) SecretRefsForServer(ctx context.Context, serverID string) (map[s
 		  JOIN secrets s
 		    ON s.org_id = r.org_id AND s.project_id = r.project_id
 		   AND (s.environment_id = r.environment_id OR s.environment_id IS NULL)
-		 WHERE`+ResourceHostedHereClause+`
+		 WHERE`+ResourceHostedHere("$1")+`
 		 ORDER BY r.id, (s.environment_id IS NULL), s.name`, serverID)
 	if err != nil {
 		return nil, err
@@ -57,12 +57,18 @@ func (s *Store) SecretRefsForServer(ctx context.Context, serverID string) (map[s
 // environment secret of the same name (env overrides project). Every fetch is
 // audited (the "audit on every read incl. agent fetch" invariant).
 //
-// The resource must be scheduled onto the REQUESTING server (server_id), not
-// merely belong to the org: an agent token authenticates one specific server, so
+// The resource must actually be hosted by the REQUESTING server, not merely
+// belong to the org: an agent token authenticates one specific server, so
 // scoping by org alone would let any compromised/stolen agent token drain every
-// resource's decrypted secrets across the whole org (BOLA). This mirrors
-// SecretRefsForServer's WHERE r.server_id constraint, so the value-fetch path
-// grants exactly what the reference/DSD path already delivered to this host.
+// resource's decrypted secrets across the whole org (BOLA).
+//
+// "Hosted" is ResourceHostedHere, the same rule SecretRefsForServer renders
+// from — the value-fetch path must grant exactly what the reference path put in
+// this host's document, no more and no less. It used to be a bare
+// `server_id = $3`, which is narrower than what is rendered: a cluster workload
+// belongs to no server and a placed Compose service belongs to another one, so
+// both were handed a reference and then refused the value, failing the apply
+// with "resolve secrets" and no indication of why.
 func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]ResolvedSecret, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -73,7 +79,8 @@ func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, 
 	var projectID string
 	var envID *string
 	err = tx.QueryRow(ctx,
-		`SELECT project_id, environment_id FROM resources WHERE org_id = $1 AND id = $2 AND server_id = $3`,
+		`SELECT r.project_id, r.environment_id FROM resources r
+		  WHERE r.org_id = $1 AND r.id = $2 AND`+ResourceHostedHere("$3"),
 		orgID, resourceID, serverID).Scan(&projectID, &envID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

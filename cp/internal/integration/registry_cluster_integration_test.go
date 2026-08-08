@@ -12,8 +12,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
@@ -356,6 +358,212 @@ func TestPlacedComposeServiceIsVisibleToItsHost(t *testing.T) {
 	}
 	if strangerRefs, _ := st.SecretRefsForServer(ctx, stranger); len(strangerRefs[res.ID]) != 0 {
 		t.Fatal("an unrelated server must not be handed the resource's secret refs")
+	}
+}
+
+// The value-fetch path has to grant exactly what the reference path rendered.
+//
+// A resource's secret references go into a host's document from one query and
+// the values come back through another. When the second was narrower, the host
+// was handed a reference and then refused the value — the apply failed with
+// "resolve secrets" and nothing said why. That is reachable two ways: a cluster
+// workload belongs to no server, and a placed Compose service belongs to a
+// different one.
+func TestSecretFetchMatchesWhatWasRendered(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_secretfetch"
+	envID, cpServer, worker := clusterFixture(t, st, orgID)
+
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{
+		ProjectID: projectID, EnvironmentID: envID, Name: "DATABASE_URL",
+		Value: "postgres://u:p@db/app", EnvVar: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddClusterNode(ctx, orgID, cluster.ID, worker, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:1.27","ports":[{"container":80}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rendered: the control-plane node must be told the workload has a secret,
+	// or the manifest carries an empty Secret and the app starts unconfigured.
+	refs, err := st.SecretRefsForServer(ctx, cpServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs[app.ID]) == 0 {
+		t.Fatalf("the control-plane node got no secret refs for its cluster workload: %+v", refs)
+	}
+
+	// Fetched: and it must actually be able to resolve them.
+	resolved, err := st.ResolveSecretsForResource(ctx, orgID, cpServer, app.ID, "agent:"+cpServer)
+	if err != nil {
+		t.Fatalf("the node that renders the workload cannot fetch its secrets: %v", err)
+	}
+	found := false
+	for _, r := range resolved {
+		if r.Name == "DATABASE_URL" && r.Value == "postgres://u:p@db/app" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("secret did not resolve: %+v", resolved)
+	}
+
+	// A server in neither the cluster nor the placement set must still be
+	// refused — the scoping is what stops a stolen agent token draining the org.
+	stranger := connectServer(t, st, orgID, "stranger")
+	if _, err := st.ResolveSecretsForResource(ctx, orgID, stranger, app.ID, "agent:"+stranger); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("an unrelated server resolved another resource's secrets: err = %v", err)
+	}
+}
+
+// A resource's status has to be writable by the host that runs it. The two
+// kinds that belong to no single server — a cluster workload and a placed
+// Compose service — reported into nothing, so the dashboard showed them
+// provisioning forever while they were running fine.
+func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	orgID := "org_resstatus"
+	envID, cpServer, worker := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:1.27"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A status report is only accepted against a DSD the CP has issued.
+	if _, _, err := st.StoreDSD(ctx, orgID, cpServer, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindK8sApply, Spec: json.RawMessage(`{}`),
+	}}, "hash-1", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+
+	reported := json.RawMessage(`{"state":"failed","error":"ImagePullBackOff"}`)
+	if _, err := st.ApplyDSDStatus(ctx, cpServer, 1,
+		map[string]json.RawMessage{app.ID: reported}, false); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListResources(ctx, orgID, envID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got store.Resource
+	for _, r := range list {
+		if r.ID == app.ID {
+			got = r
+		}
+	}
+	if !strings.Contains(string(got.Status), "ImagePullBackOff") {
+		t.Fatalf("the cluster node's status report did not land: %s", got.Status)
+	}
+
+	// A node of the same cluster is legitimate; a server outside it is not.
+	if _, _, err := st.StoreDSD(ctx, orgID, worker, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindK8sApply, Spec: json.RawMessage(`{}`),
+	}}, "hash-w", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+	stranger := connectServer(t, st, orgID, "stranger")
+	if _, _, err := st.StoreDSD(ctx, orgID, stranger, []dsd.Op{{
+		ID: "res:" + app.ID, Kind: dsd.KindResourceSync, Spec: json.RawMessage(`{}`),
+	}}, "hash-s", dsdKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyDSDStatus(ctx, stranger, 1,
+		map[string]json.RawMessage{app.ID: json.RawMessage(`{"state":"running"}`)}, true); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = st.ListResources(ctx, orgID, envID)
+	for _, r := range list {
+		if r.ID == app.ID && !strings.Contains(string(r.Status), "ImagePullBackOff") {
+			t.Fatalf("an unrelated server overwrote the resource's status: %s", r.Status)
+		}
+	}
+}
+
+// A certificate report has to be accepted from the host that actually rendered
+// the domain, or the state never leaves 'pending' on exactly the deploys that
+// span more than one machine.
+func TestCertStatusAcceptedFromTheHostThatRendersTheDomain(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cert"
+
+	proj, err := st.CreateProject(ctx, orgID, "web", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := connectServer(t, st, orgID, "owner")
+	placed := connectServer(t, st, orgID, "placed")
+	stranger := connectServer(t, st, orgID, "stranger")
+	for _, id := range []string{owner, placed, stranger} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec, err := json.Marshal(map[string]any{"compose": map[string]any{"services": []map[string]any{
+		{"name": "web", "image": "nginx:1.27", "ports": []int{8080}, "serverId": placed},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: owner, Name: "site", Kind: "app", Spec: spec,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.AttachDomain(ctx, orgID, res.ID, "app.example.com", "http", "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The placement host renders the domain, so it is the one terminating TLS.
+	if doms, _ := st.DomainsForServer(ctx, placed); len(doms[res.ID]) == 0 {
+		t.Fatal("the placement host was not given the domain it has to route")
+	}
+	if err := st.SetDomainCertStatus(ctx, placed, "app.example.com", "issued", "01ab", nil, ""); err != nil {
+		t.Fatalf("the host that renders the domain cannot report its certificate: %v", err)
+	}
+	doms, err := st.ListDomainsForResource(ctx, orgID, res.ID)
+	if err != nil || len(doms) != 1 || doms[0].CertStatus != "issued" {
+		t.Fatalf("cert status = %+v (err %v)", doms, err)
+	}
+
+	// An unrelated host must not be able to write cert state for it.
+	if err := st.SetDomainCertStatus(ctx, stranger, "app.example.com", "failed", "", nil, "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("an unrelated server wrote another host's certificate state: err = %v", err)
 	}
 }
 

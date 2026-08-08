@@ -294,30 +294,41 @@ type ResourceSpec struct {
 	Ephemeral  bool
 }
 
-// ResourceHostedHereClause decides whether a resource has anything to render on
-// a given server. Owning it is the common case; hosting one of its Compose
-// services under per-service placement is the other.
+// ResourceHostedHere decides whether a resource has anything to do with a given
+// server. Three ways it can:
 //
-// Everything a server needs in order to render a placed service has to agree on
-// this — the spec, its secrets, its domains — because they are read separately
-// and combined. When only some of them included placed resources, the placement
-// host got a deploy target for a resource it had no spec for, rendered nothing,
-// and the service simply never started with no error anywhere. Keeping the rule
-// in one place is what stops the next reader from being reintroduced.
+//   - the server owns it, the common case;
+//   - it deploys into a cluster and this server is one of that cluster's nodes,
+//     so it belongs to no server at all;
+//   - it hosts one of the resource's Compose services under per-service placement.
 //
-// $1 is the server; the query must expose the resource as `r`.
-const ResourceHostedHereClause = `
-		(r.server_id = $1
+// EVERY read a server makes about a resource has to agree on this — the spec,
+// its secrets, its domains, and the endpoints the agent later calls to resolve
+// those secrets and report a certificate. They are read separately and combined,
+// so a disagreement is not a compile error; it is a service that renders and
+// then cannot start, or a workload the API server accepts with an empty Secret.
+// Keeping the rule in one place is what stops the next reader from drifting.
+//
+// serverParam names the placeholder holding the server id, because the callers
+// do not agree on argument order. The query must expose the resource as `r`.
+func ResourceHostedHere(serverParam string) string {
+	p := serverParam
+	return `
+		(r.server_id = ` + p + `
+		 OR (r.cluster_id IS NOT NULL AND EXISTS (
+		       SELECT 1 FROM cluster_nodes n
+		        WHERE n.cluster_id = r.cluster_id AND n.server_id = ` + p + `))
 		 OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
 		     AND EXISTS (
 		       SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		        WHERE svc->>'serverId' = $1)))`
+		        WHERE svc->>'serverId' = ` + p + `)))`
+}
 
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral
 		  FROM resources r
-		 WHERE`+ResourceHostedHereClause+`
+		 WHERE`+ResourceHostedHere("$1")+`
 		 ORDER BY r.created_at`,
 		serverID)
 	if err != nil {
@@ -439,10 +450,17 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 		return false, err
 	}
 	for resourceID, st := range opStatus {
-		// Only touch resources that belong to this server (defence in depth
+		// Only touch resources this server actually hosts (defence in depth
 		// against a compromised agent reporting foreign resource ids).
+		//
+		// "Hosts" has to be the same rule the document was rendered from. A bare
+		// server_id matched neither of the two kinds that belong to no single
+		// server — a cluster workload, and a Compose service placed on another
+		// machine — so their reports updated nothing and the dashboard showed
+		// them provisioning forever while they were running fine.
 		if _, err := tx.Exec(ctx,
-			`UPDATE resources SET status = $3, updated_at = now() WHERE id = $1 AND server_id = $2`,
+			`UPDATE resources r SET status = $3, updated_at = now()
+			  WHERE r.id = $1 AND`+ResourceHostedHere("$2"),
 			resourceID, serverID, st); err != nil {
 			return false, fmt.Errorf("update resource status: %w", err)
 		}
