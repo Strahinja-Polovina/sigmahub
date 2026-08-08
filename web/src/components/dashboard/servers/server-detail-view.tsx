@@ -66,6 +66,7 @@ import {
   setServerHardening,
   setServerProxyRole,
   reissueInstallCommand,
+  updateServerAgent,
 } from "@/server/actions/servers";
 import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
@@ -184,6 +185,20 @@ function ServerActions({
     });
   }
 
+  function updateAgent() {
+    startTransition(async () => {
+      const res = await updateServerAgent({ serverId });
+      if (res.ok) {
+        toast.success(`Agent update to ${res.version} queued`, {
+          description:
+            "The agent downloads the signed release, verifies it, swaps its binary and restarts — no SSH needed. The new version shows here after its next check-in.",
+        });
+      } else {
+        toast.error("Couldn’t queue the agent update", { description: res.error });
+      }
+    });
+  }
+
   function disconnect() {
     startTransition(async () => {
       try {
@@ -236,6 +251,14 @@ function ServerActions({
           <DropdownMenuItem className="gap-2" onClick={reissue}>
             <KeyRound className="size-4 text-muted-foreground" />
             New install command
+          </DropdownMenuItem>
+        )}
+        {/* Dashboard-driven upgrade to the platform's pinned agent release —
+            operators never SSH in for updates. */}
+        {cpMode && !provisioning && (
+          <DropdownMenuItem className="gap-2" onClick={updateAgent}>
+            <RotateCw className="size-4 text-muted-foreground" />
+            Update agent
           </DropdownMenuItem>
         )}
         {/* The control plane refuses deletion only while resources are still

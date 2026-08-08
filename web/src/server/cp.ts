@@ -272,6 +272,21 @@ export async function cpReissueBootstrapToken(
   );
 }
 
+/** Dashboard-driven agent upgrade: the CP renders an agent.update op until the
+ *  agent's heartbeat reports the requested version. Project Admin+. */
+export async function cpUpdateServerAgent(
+  orgId: string,
+  serverId: string,
+  version: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/agent-update`,
+    { method: "POST", body: JSON.stringify({ version }) },
+    { orgId, actor }
+  );
+}
+
 /** Set a server's proxy/edge role. Opens 80/443 in the firewall and makes the
  *  reconciler render Traefik on this host — the precondition for any custom
  *  domain to route. Project Admin+ on the CP; audited (SIGMA-178). */

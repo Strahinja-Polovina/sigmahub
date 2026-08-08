@@ -44,6 +44,10 @@ func (f *fakeStore) ReissueBootstrapToken(_ context.Context, orgID, serverID, cr
 	}, nil
 }
 
+func (f *fakeStore) SetDesiredAgentVersion(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
 func (f *fakeStore) RegisterServer(_ context.Context, tok, name, ver string, facts json.RawMessage, pubkey string) (store.RegisterResult, error) {
 	if f.registerErr != nil {
 		return store.RegisterResult{}, f.registerErr

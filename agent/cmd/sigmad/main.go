@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,12 +28,18 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/s3ops"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/selfupdate"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/telemetry"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
 var version = "dev"
+
+// restartRequested is set by a successfully-applied agent.update op; the DSD
+// loop exits AFTER reporting the op status, so the CP records "applied" before
+// systemd restarts the (already-swapped) binary.
+var restartRequested atomic.Bool
 
 func main() {
 	if err := run(); err != nil {
@@ -242,6 +249,20 @@ func run() error {
 	// unregistered host op kind is still rejected.
 	hostDriver := host.NewDriver()
 	hostDriver.Register(registry)
+	// Dashboard-driven agent upgrades (agent.update): cosign-verified download
+	// + atomic binary swap; the DSD loop exits after the op status is reported
+	// and systemd (Restart=always) brings the new binary up.
+	updater := &selfupdate.Updater{
+		Log:            log,
+		CurrentVersion: version,
+		RequestRestart: func() { restartRequested.Store(true) },
+	}
+	updater.Register(registry)
+	// Self-heal the host tool set (wireguard-tools/nftables/restic): hosts
+	// onboarded with a pre-v0.1.1 installer are missing wireguard-tools, which
+	// keeps the mesh down and mesh-bound databases unschedulable. Runs in the
+	// background so a slow apt never delays registration/heartbeat.
+	go selfupdate.EnsureHostTools(ctx, log)
 	if avail, ver := container.Probe(ctx, docker); avail {
 		log.Info("docker runtime available", "version", ver)
 	} else {
@@ -536,6 +557,12 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 			log.Warn("dsd: status report failed", "err", err)
 		} else {
 			_ = journal.SetLastReportedVersion(signed.Document.Version)
+		}
+		if restartRequested.Load() {
+			// agent.update swapped the binary on disk; exit now that the op
+			// result is reported — systemd restarts us as the new version.
+			log.Info("agent.update applied; exiting for restart")
+			os.Exit(0)
 		}
 	}
 }

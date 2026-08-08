@@ -28,6 +28,12 @@ type HostHardening struct {
 	KeepPublicSSH bool
 	CISEnabled    bool
 	ExtraPorts    []PortException
+	// AgentVersion / DesiredAgentVersion drive the agent.update op: rendered
+	// while they differ, dropped once the agent heartbeats the new version.
+	// Loaded here because this is the per-server host state the reconciler
+	// already reads for every render.
+	AgentVersion        string
+	DesiredAgentVersion string
 }
 
 // HostHardeningForServer returns the effective hardening config for a server,
@@ -39,9 +45,11 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 		keepSSH    bool
 		cisEnabled bool
 		extraRaw   []byte
+		agentVer   string
+		desiredVer string
 	)
 	err := s.Pool.QueryRow(ctx, `
-		SELECT s.mesh_ip, s.proxy_role,
+		SELECT s.mesh_ip, s.proxy_role, s.agent_version, s.desired_agent_version,
 		       -- Fail SAFE, not closed: with no explicit hardening row we keep
 		       -- public SSH. Closing port 22 is only survivable if the operator
 		       -- has another way in, and the mesh is not one — MeshPeers returns
@@ -55,7 +63,7 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 		  FROM servers s
 		  LEFT JOIN server_hardening h ON h.server_id = s.id
 		 WHERE s.id = $1 AND s.deleted_at IS NULL`, serverID).
-		Scan(&meshIP, &proxyRole, &keepSSH, &cisEnabled, &extraRaw)
+		Scan(&meshIP, &proxyRole, &agentVer, &desiredVer, &keepSSH, &cisEnabled, &extraRaw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return HostHardening{}, ErrNotFound
 	}
@@ -63,10 +71,12 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 		return HostHardening{}, err
 	}
 	hh := HostHardening{
-		MeshInterface: meshInterface,
-		ProxyRole:     proxyRole,
-		KeepPublicSSH: keepSSH,
-		CISEnabled:    cisEnabled,
+		MeshInterface:       meshInterface,
+		ProxyRole:           proxyRole,
+		KeepPublicSSH:       keepSSH,
+		CISEnabled:          cisEnabled,
+		AgentVersion:        agentVer,
+		DesiredAgentVersion: desiredVer,
 	}
 	if meshIP != nil {
 		hh.MeshIP = *meshIP

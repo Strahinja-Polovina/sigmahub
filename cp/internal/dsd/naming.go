@@ -13,6 +13,9 @@ const (
 	KindVolumeRemove   = "volume.remove"
 	// Host-hardening ops (P1-5) — the ONLY channel for post-enrollment host
 	// changes. Names must match the agent's host package byte-for-byte.
+	// Agent lifecycle (dashboard-driven upgrade).
+	KindAgentUpdate = "agent.update"
+
 	KindHostNftables = "host.nftables"
 	KindHostSSHD     = "host.sshd"
 	KindHostCIS      = "host.cis"

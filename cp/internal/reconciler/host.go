@@ -34,6 +34,19 @@ func renderHostOps(serverID string, hh store.HostHardening) []dsd.Op {
 		cis, _ := json.Marshal(map[string]any{"level": 1})
 		ops = append(ops, dsd.Op{ID: "host:cis:" + serverID, Kind: dsd.KindHostCIS, Spec: cis})
 	}
+
+	// Dashboard-driven agent upgrade: rendered while the desired version
+	// differs from what the agent last reported; the agent's post-update
+	// heartbeat carries the new version and the op drops out of the document.
+	// The op id embeds the target version so a later retarget is a new op.
+	if hh.DesiredAgentVersion != "" && hh.DesiredAgentVersion != hh.AgentVersion {
+		up, _ := json.Marshal(map[string]string{"version": hh.DesiredAgentVersion})
+		ops = append(ops, dsd.Op{
+			ID:   "agent:update:" + serverID + ":" + hh.DesiredAgentVersion,
+			Kind: dsd.KindAgentUpdate,
+			Spec: up,
+		})
+	}
 	return ops
 }
 

@@ -15,6 +15,7 @@ import {
   cpPublicUrl,
   cpDeleteServer,
   cpReissueBootstrapToken,
+  cpUpdateServerAgent,
 } from "../cp";
 
 /** GitHub repo whose releases host install.sh + the pinned sigmad assets. */
@@ -264,6 +265,37 @@ export async function reissueInstallCommand(input: { serverId: string }): Promis
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
   };
+}
+
+/** Request a dashboard-driven agent upgrade to the platform's pinned release
+ *  (SIGMAHUB_AGENT_VERSION). The agent downloads the cosign-verified release,
+ *  swaps its binary and restarts — no operator SSH. Returns a readable result
+ *  (thrown server-action errors are redacted in production). */
+export async function updateServerAgent(input: { serverId: string }): Promise<
+  { ok: true; version: string } | { ok: false; error: string }
+> {
+  try {
+    if (!cpEnabled()) throw new Error("Agent updates need a control plane.");
+    const version = agentVersion();
+    const [server] = await db
+      .select()
+      .from(s.servers)
+      .where(eq(s.servers.id, input.serverId));
+    const orgId = server?.orgId ?? (await getActiveOrgId());
+    if (!orgId) throw new Error("No active organization.");
+    const { user, role } = await requireProjectAdmin(orgId);
+    await cpUpdateServerAgent(orgId, input.serverId, version, { name: user.name, role });
+    await writeAudit({
+      orgId,
+      actor: user.name,
+      action: `Requested agent update to ${version}`,
+      target: server?.name ?? input.serverId,
+    });
+    revalidatePath("/dashboard", "layout");
+    return { ok: true, version };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Update request failed." };
+  }
 }
 
 /** Toggle a server's hardening config from the dashboard (keep-public-SSH

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -134,6 +135,36 @@ func (s *Server) handleReissueBootstrapToken(w http.ResponseWriter, r *http.Requ
 		"expiresAt":       res.ExpiresAt,
 		"bootstrapPubkey": res.BootstrapPubkey,
 	})
+}
+
+var releaseVersionRe = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
+
+// handleAgentUpdate records the desired agent version for a server so the
+// reconciler renders an agent.update op — the dashboard-driven, no-SSH upgrade
+// path. Project Admin+.
+func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	serverID := r.PathValue("serverId")
+	var req struct {
+		Version string `json:"version"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if !releaseVersionRe.MatchString(req.Version) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "version must be a released tag like v0.1.2"})
+		return
+	}
+	if err := s.store.SetDesiredAgentVersion(r.Context(), orgID, serverID, req.Version, principalFrom(r).Name); err != nil {
+		s.writeStoreErr(w, err, "set desired agent version")
+		return
+	}
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(orgID, serverID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "queued", "version": req.Version})
 }
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {

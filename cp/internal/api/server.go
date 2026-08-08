@@ -26,6 +26,7 @@ type StoreAPI interface {
 	IssueBootstrapToken(ctx context.Context, orgID, serverName, serverType, provider, region, createdBy string, ttl time.Duration) (string, string, time.Time, error)
 	ProvisionServer(ctx context.Context, orgID string, in store.ProvisionInput, createdBy string, ttl time.Duration) (store.ProvisionResult, error)
 	ReissueBootstrapToken(ctx context.Context, orgID, serverID, createdBy string, ttl time.Duration) (store.ProvisionResult, error)
+	SetDesiredAgentVersion(ctx context.Context, orgID, serverID, version, actor string) error
 	RegisterServer(ctx context.Context, bootstrapToken, name, agentVersion string, facts json.RawMessage, pubkey string) (store.RegisterResult, error)
 	ServerByAgentToken(ctx context.Context, token string) (store.Server, error)
 	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
@@ -209,6 +210,9 @@ func (s *Server) routes() {
 	// Re-issue the install command for a pre-created server that never finished
 	// onboarding (lost/expired token). 409 unless it is still `provisioning`.
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/reissue-token", s.requireService(store.RoleProjectAdmin, s.handleReissueBootstrapToken))
+	// Dashboard-driven agent upgrade: sets the desired version; the reconciler
+	// renders agent.update until the agent converges.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/agent-update", s.requireService(store.RoleProjectAdmin, s.handleAgentUpdate))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))

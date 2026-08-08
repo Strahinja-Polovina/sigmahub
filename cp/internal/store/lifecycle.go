@@ -10,6 +10,35 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// SetDesiredAgentVersion records the version the operator wants a server's
+// agent upgraded to; the reconciler renders an agent.update op until the
+// agent's heartbeat converges on it. Audited.
+func (s *Store) SetDesiredAgentVersion(ctx context.Context, orgID, serverID, version, actor string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var name string
+	err = tx.QueryRow(ctx, `
+		UPDATE servers SET desired_agent_version = $1
+		 WHERE id = $2 AND org_id = $3 AND deleted_at IS NULL
+		 RETURNING name`, version, serverID, orgID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO cp_audit_log (org_id, actor, action, target)
+		VALUES ($1, $2, $3, $4)`,
+		orgID, actor, "Agent update requested ("+version+")", name); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // DeleteServer decommissions a server. It refuses (ErrConflict, → 409) while
 // resources are still bound so the caller can re-home or remove them first.
 // Otherwise it SOFT-DELETES: the row and its mesh_ip are retained (only
