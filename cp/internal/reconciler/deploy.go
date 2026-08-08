@@ -49,6 +49,10 @@ type buildImageOpSpec struct {
 	// Force skips the build-dedup short-circuit so a manual redeploy rebuilds the
 	// same commit (e.g. to pick up base-image changes) instead of reusing the cached image.
 	Force bool `json:"force,omitempty"`
+	// PushImage is set when the build runs on a DEDICATED build server: the
+	// deploy target can't read another host's Docker daemon, so the image has to
+	// reach a registry both can see.
+	PushImage bool `json:"pushImage,omitempty"`
 }
 
 type healthProbe struct {
@@ -247,7 +251,40 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		// A manual redeploy forces a rebuild of the same commit; git-triggered
 		// deploys keep the warm-cache dedup.
 		Force: manualForce(target),
+		// Where the built image must end up. On a dedicated build server the
+		// deploy target cannot read the local Docker daemon of another host, so
+		// the image is pushed to the registry the target then pulls from.
+		PushImage: target.BuildServerID != "" && target.BuildServerID != target.ServerID,
 	})
+
+	// Dedicated build server: the clone + build land in ITS document, and the
+	// deploy target renders only the rollout. Splitting the pipeline this way
+	// keeps a build — the most CPU- and disk-hungry thing we run — off the
+	// machine that is serving traffic.
+	if bs := target.BuildServerID; bs != "" && bs != target.ServerID {
+		if serverID == bs {
+			return []dsd.Op{
+				{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},
+				{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build},
+			}, "", true
+		}
+		// The deploy target. The build op lives in another document, so it can't
+		// be an op dependency here (a dangling reference would wedge the apply):
+		// hold the rollout until the deployment has moved past building, exactly
+		// as a cross-server Compose dependency is gated.
+		if target.Status == "queued" || target.Status == "building" {
+			return nil, "", false
+		}
+		// Pull the image the build server pushed, then roll out.
+		pullID := "pull:" + rs.ResourceID
+		pull, _ := json.Marshal(map[string]string{"image": imageTag})
+		ops = append(ops,
+			dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull},
+			dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: append(rolloutDeps, pullID), Spec: rolloutBytes},
+		)
+		return ops, networkID, true
+	}
+
 	ops = append(ops,
 		dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},
 		dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build},

@@ -203,6 +203,8 @@ export async function setBranchMapping(input: {
   branch: string;
   environmentId: string;
   policy: "auto" | "manual";
+  /** Build this branch on a dedicated server instead of the deploy target. */
+  buildServerId?: string;
 }): Promise<CpBranchMap> {
   ensureCp();
   // Authorize on the connection's real project (SIGMA-93), not the client's.
@@ -212,7 +214,12 @@ export async function setBranchMapping(input: {
   const m = await cpSetBranchMap(
     input.orgId,
     input.connectionId,
-    { branch, environmentId: input.environmentId, policy: input.policy },
+    {
+      branch,
+      environmentId: input.environmentId,
+      policy: input.policy,
+      buildServerId: input.buildServerId,
+    },
     { name: user.name, role }
   );
   await writeAudit({

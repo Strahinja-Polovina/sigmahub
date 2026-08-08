@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -25,6 +26,8 @@ type fakeImageBuilder struct {
 	exists   bool
 	built    bool
 	buildErr error
+	pushed   bool
+	pushErr  error
 }
 
 func (f *fakeImageBuilder) ImageExists(context.Context, string) (bool, error) { return f.exists, nil }
@@ -34,6 +37,10 @@ func (f *fakeImageBuilder) ImageBuild(_ context.Context, _, _, _ string, _ io.Wr
 }
 func (f *fakeImageBuilder) ImageDigest(context.Context, string) (string, error) {
 	return "sha256:deadbeef", nil
+}
+func (f *fakeImageBuilder) ImagePush(_ context.Context, _ string, _ io.Writer) error {
+	f.pushed = true
+	return f.pushErr
 }
 
 func newTestBuilder(t *testing.T, docker ImageBuilder, cred CredentialFetcher) (*Builder, *[]capturedCmd) {
@@ -215,5 +222,75 @@ func TestBuildForceRebuildsDespiteExistingImage(t *testing.T) {
 	}
 	if !fb2.built {
 		t.Fatal("Force must rebuild even when the image already exists")
+	}
+}
+
+// A dedicated build server must PUSH what it builds: the deploy target cannot
+// read this machine's Docker daemon, so an unpushed image leaves the rollout
+// waiting for something that never arrives.
+func TestBuildPushesForAnotherHost(t *testing.T) {
+	fb := &fakeImageBuilder{}
+	b, _ := newTestBuilder(t, fb, nil)
+	dir := b.ContextDir("res_1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, _ := json.Marshal(BuildImageSpec{
+		ResourceID: "res_1", SHA: "abc", ImageTag: "reg.example/app:abc", PushImage: true,
+	})
+	if err := b.opBuildImage(context.Background(), dsd.Op{Kind: KindImageBuild, Spec: spec}); err != nil {
+		t.Fatal(err)
+	}
+	if !fb.built || !fb.pushed {
+		t.Fatalf("built=%v pushed=%v, want both", fb.built, fb.pushed)
+	}
+}
+
+// A push failure must fail the op. Reporting a successful build whose image
+// nobody can pull would wedge the deploy target with no explanation.
+func TestBuildFailsWhenPushFails(t *testing.T) {
+	fb := &fakeImageBuilder{pushErr: errors.New("registry unreachable")}
+	b, _ := newTestBuilder(t, fb, nil)
+	dir := b.ContextDir("res_2")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(BuildImageSpec{
+		ResourceID: "res_2", SHA: "abc", ImageTag: "reg.example/app:abc", PushImage: true,
+	})
+	err := b.opBuildImage(context.Background(), dsd.Op{Kind: KindImageBuild, Spec: spec})
+	if err == nil {
+		t.Fatal("a failed push must fail the build op")
+	}
+	if !strings.Contains(err.Error(), "registry unreachable") {
+		t.Fatalf("error must carry the cause: %v", err)
+	}
+}
+
+// Building for THIS host never pushes — there is no registry round trip to pay
+// for when the deploy target is the machine that just built it.
+func TestBuildDoesNotPushForLocalDeploy(t *testing.T) {
+	fb := &fakeImageBuilder{}
+	b, _ := newTestBuilder(t, fb, nil)
+	dir := b.ContextDir("res_3")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(BuildImageSpec{ResourceID: "res_3", SHA: "abc", ImageTag: "app:abc"})
+	if err := b.opBuildImage(context.Background(), dsd.Op{Kind: KindImageBuild, Spec: spec}); err != nil {
+		t.Fatal(err)
+	}
+	if fb.pushed {
+		t.Fatal("a local build must not push")
 	}
 }

@@ -136,3 +136,8 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "servers": servers})
 }
+
+// LLMAPI is the model-hosting slice of the store.
+type LLMAPI interface {
+	GetLLM(ctx context.Context, orgID, resourceID string) (store.LLMInfo, error)
+}

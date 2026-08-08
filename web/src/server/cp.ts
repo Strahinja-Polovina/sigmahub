@@ -1019,6 +1019,8 @@ export type CpBranchMap = {
   lastRef?: string;
   lastSha?: string;
   lastPushedAt?: string;
+  /** Dedicated build server, when the mapping names one. */
+  buildServerId?: string;
   createdAt: string;
   /** True when mapping enqueued the branch head as the first build. */
   initialDeploy?: boolean;
@@ -1315,7 +1317,13 @@ export async function cpDisconnectRepo(orgId: string, connId: string, actor: CpA
 export async function cpSetBranchMap(
   orgId: string,
   connId: string,
-  input: { branch: string; environmentId: string; policy: "auto" | "manual" },
+  input: {
+    branch: string;
+    environmentId: string;
+    policy: "auto" | "manual";
+    /** Build on a dedicated server instead of the deploy target. */
+    buildServerId?: string;
+  },
   actor: CpActor
 ): Promise<CpBranchMap> {
   return cpFetch(`${org(orgId)}/git/connections/${encodeURIComponent(connId)}/branches`, {

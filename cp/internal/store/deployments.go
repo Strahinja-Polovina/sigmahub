@@ -805,8 +805,15 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The branch map carries the optional dedicated build server, so a
+	// deployment records where its build should run at the moment it is created
+	// (rather than re-reading a mapping that may change mid-flight).
 	rows, err := tx.Query(ctx, `
-		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id
+		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id,
+		       COALESCE((SELECT bm.build_server_id FROM git_branch_map bm
+		                  WHERE bm.connection_id = dr.connection_id
+		                    AND bm.environment_id = dr.environment_id
+		                  LIMIT 1), '')
 		  FROM deploy_requests dr
 		  JOIN git_connections c ON c.id = dr.connection_id
 		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
@@ -815,12 +822,15 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 	if err != nil {
 		return nil, err
 	}
-	type req struct{ id, orgID, connID, envID, ref, sha, projectID string }
+	type req struct {
+		id, orgID, connID, envID, ref, sha, projectID string
+		buildServerID                                 string
+	}
 	var reqs []req
 	for rows.Next() {
 		var r req
 		var env *string
-		if err := rows.Scan(&r.id, &r.orgID, &r.connID, &env, &r.ref, &r.sha, &r.projectID); err != nil {
+		if err := rows.Scan(&r.id, &r.orgID, &r.connID, &env, &r.ref, &r.sha, &r.projectID, &r.buildServerID); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -872,13 +882,20 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 			depID := newID("dep")
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
-				                         trigger, git_ref, git_sha, image_pin, config_hash, service_count, status, created_by)
-				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,$10,$11,'queued','github-webhook')`,
-				depID, r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, deployPin(depID), cfgHash, svcCount); err != nil {
+				                         trigger, git_ref, git_sha, image_pin, config_hash, service_count, status, created_by,
+				                         build_server_id)
+				VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,'git',$7,$8,$9,$10,$11,'queued','github-webhook',NULLIF($12,''))`,
+				depID, r.orgID, a.id, r.envID, a.serverID, r.connID, r.ref, r.sha, deployPin(depID), cfgHash, svcCount,
+				r.buildServerID); err != nil {
 				return nil, err
 			}
 			if a.serverID != "" {
 				seen[a.serverID] = ServerRef{ServerID: a.serverID, OrgID: r.orgID}
+			}
+			// The build server needs a re-render too: the build op lands in ITS
+			// document, not the deploy target's.
+			if r.buildServerID != "" && r.buildServerID != a.serverID {
+				seen[r.buildServerID] = ServerRef{ServerID: r.buildServerID, OrgID: r.orgID}
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE deploy_requests SET status = 'drained' WHERE id = $1`, r.id); err != nil {
@@ -937,6 +954,9 @@ type DeployTarget struct {
 	// ServerID is the server the deployment was created against — the "home"
 	// server for services that declare no explicit placement.
 	ServerID string
+	// BuildServerID is the dedicated server that compiles the image, when the
+	// branch mapping named one. Empty means "build on the deploy target".
+	BuildServerID string
 }
 
 // DeployTargetsForServer returns the current deploy target per app resource on a
@@ -953,12 +973,13 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		SELECT DISTINCT ON (d.resource_id)
 		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
 		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
-		       d.created_at, d.service_status, COALESCE(d.server_id, '')
+		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
 		 WHERE d.status IN ('queued','building','deploying','success')
 		   AND (d.server_id = $1
+		        OR d.build_server_id = $1
 		        OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
 		            AND EXISTS (
 		              SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
@@ -975,7 +996,7 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 		var svcStatus []byte
 		if err := rows.Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
 			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.ImagePin, &t.Trigger, &t.Status, &t.CreatedAt,
-			&svcStatus, &t.ServerID); err != nil {
+			&svcStatus, &t.ServerID, &t.BuildServerID); err != nil {
 			return nil, err
 		}
 		if len(svcStatus) > 0 {

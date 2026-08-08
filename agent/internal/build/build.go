@@ -29,6 +29,10 @@ type ImageBuilder interface {
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	ImageBuild(ctx context.Context, contextDir, dockerfile, tag string, logs io.Writer) error
 	ImageDigest(ctx context.Context, ref string) (string, error)
+	// ImagePush publishes a built image so another host can pull it. Only used
+	// by a dedicated build server, which builds for machines that cannot read
+	// its local Docker daemon.
+	ImagePush(ctx context.Context, ref string, logs io.Writer) error
 }
 
 // LogSink streams a build/orchestration log line (to the control plane). Nil-safe
@@ -216,6 +220,16 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 	logs := &lineWriter{ctx: ctx, sink: b.sink, deploymentID: spec.DeploymentID}
 	if err := b.docker.ImageBuild(ctx, dir, dockerfile, spec.ImageTag, logs); err != nil {
 		return fmt.Errorf("build image: %w", err)
+	}
+	// Dedicated build server: the deploy target pulls this image, and it cannot
+	// read this machine's Docker daemon. A push failure has to fail the op — a
+	// "successful" build whose image nobody can pull would leave the rollout
+	// waiting on an image that never arrives.
+	if spec.PushImage {
+		b.stream(ctx, spec.DeploymentID, "build", "pushing "+spec.ImageTag+" for the deploy target")
+		if err := b.docker.ImagePush(ctx, spec.ImageTag, logs); err != nil {
+			return fmt.Errorf("push image %s: %w", spec.ImageTag, err)
+		}
 	}
 	return nil
 }

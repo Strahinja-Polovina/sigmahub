@@ -180,7 +180,8 @@ func allocateS3Port(ctx context.Context, tx pgx.Tx, serverID string) (int, error
 	err := tx.QueryRow(ctx, `
 		SELECT GREATEST(
 			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
-			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1)
+			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1),
+			COALESCE((SELECT MAX(port) FROM llm_endpoints WHERE server_id = $1), $2 - 1)
 		) + 1`, serverID, dbPortBase).Scan(&port)
 	if err != nil {
 		return 0, fmt.Errorf("s3 port max: %w", err)

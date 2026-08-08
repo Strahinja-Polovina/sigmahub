@@ -109,6 +109,13 @@ type containerOpSpec struct {
 	// Labels are Docker container labels — the P1-8 Traefik ingress path renders
 	// router labels here when the resource has an attached domain.
 	Labels map[string]string `json:"labels,omitempty"`
+	// GPUs requests NVIDIA devices for the container (-1 = every GPU on the
+	// host). Without it an inference runtime silently falls back to CPU and
+	// serves tokens uselessly slowly on hardware the customer pays a lot for.
+	GPUs int `json:"gpus,omitempty"`
+	// ShmSizeMB overrides the 64 MB Docker default. Model loading needs a large
+	// shared-memory segment; the default makes it fail with an unhelpful error.
+	ShmSizeMB int64 `json:"shmSizeMb,omitempty"`
 }
 
 // renderAppOps expands one "app" resource into its ordered container ops:

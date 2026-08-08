@@ -48,7 +48,7 @@ func (f *fakeGit) GetGitConnection(context.Context, string, string) (store.GitCo
 	return store.GitConnection{}, store.ErrNotFound
 }
 func (f *fakeGit) DeleteGitConnection(context.Context, string, string, string) error { return nil }
-func (f *fakeGit) SetBranchMap(_ context.Context, _, connID, branch, envID, policy, _ string) (store.BranchMap, error) {
+func (f *fakeGit) SetBranchMap(_ context.Context, _, connID, branch, envID, policy, _, _ string) (store.BranchMap, error) {
 	return store.BranchMap{ID: "gbm_1", ConnectionID: connID, Branch: branch, EnvironmentID: envID, Policy: policy}, nil
 }
 func (f *fakeGit) ListBranchMaps(context.Context, string, string) ([]store.BranchMap, error) {

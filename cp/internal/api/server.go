@@ -73,6 +73,7 @@ type Server struct {
 	gitIntegration      GitIntegrationAPI
 	compose             ComposeAPI
 	clusters            ClusterAPI
+	llm                 LLMAPI
 	inspector           RepoInspector
 	repoLister          RepoLister
 	installTokens       InstallationTokenSource
@@ -140,6 +141,8 @@ type Options struct {
 	Compose ComposeAPI
 	// Clusters backs Kubernetes cluster setup and membership.
 	Clusters ClusterAPI
+	// LLM backs GPU model-hosting endpoints.
+	LLM LLMAPI
 	// InstallationAccounts names an installation's account for the dashboard.
 	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
@@ -182,6 +185,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		gitIntegration:      opts.GitIntegration,
 		compose:             opts.Compose,
 		clusters:            opts.Clusters,
+		llm:                 opts.LLM,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -359,6 +363,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters/{clusterId}/nodes", s.requireService(store.RoleProjectAdmin, s.handleAddClusterNode))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}/nodes/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleRemoveClusterNode))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteCluster))
+	// GPU model hosting: the endpoint readout is member-visible, as are the
+	// runtimes this control plane can actually render.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/llm", s.requireService(store.RoleDeveloper, s.handleGetLLM))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/engines", s.requireService(store.RoleDeveloper, s.handleListLLMEngines))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/compose", s.requireService(store.RoleDeveloper, s.handleGetComposeServices))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/compose/placements", s.requireService(store.RoleProjectAdmin, s.handleSetComposePlacements))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))

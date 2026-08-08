@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,16 +60,53 @@ type Resource struct {
 }
 
 // resourceServerTypes is the availability matrix: which server types may host
-// which resource kind. Enforced in the API layer via AllowedServerTypes, not
-// just the UI. s3/llm are reserved for later phases but already mapped.
+// which resource kind. Enforced in the store, not just the UI.
+//
+// The rules behind it, so a future edit is a decision rather than a guess:
+//   - "vps" is a general-purpose host that happens to be virtualized. It hosts
+//     whatever a general server hosts; the difference is disclosure (shared
+//     tenancy, burst CPU, no nested virt), not capability.
+//   - "k8s" nodes host nothing directly. Their workloads arrive through the
+//     cluster's control plane, so aiming a resource at a node individually is
+//     always a mistake and is refused rather than quietly scheduled.
+//   - "build" servers compile images and ship them to a registry; they run no
+//     long-lived workloads of their own.
+//   - "llm" needs a GPU. Serving a model on CPU is technically possible and
+//     practically useless, so it is not offered.
 var resourceServerTypes = map[string][]string{
-	"app":      {"general", "gpu"},
-	"postgres": {"database", "general"},
-	"mysql":    {"database", "general"},
-	"redis":    {"database", "general"},
-	"mongodb":  {"database", "general"},
+	"app":      {"general", "vps", "gpu"},
+	"postgres": {"database", "general", "vps"},
+	"mysql":    {"database", "general", "vps"},
+	"redis":    {"database", "general", "vps"},
+	"mongodb":  {"database", "general", "vps"},
 	"s3":       {"storage"},
 	"llm":      {"gpu"},
+}
+
+// serverTypes is every type a server may declare. A type outside this set is a
+// typo, and typos must fail at enrollment rather than producing a host nothing
+// can be scheduled onto.
+var serverTypes = map[string]bool{
+	"general":  true,
+	"vps":      true,
+	"database": true,
+	"storage":  true,
+	"gpu":      true,
+	"k8s":      true,
+	"build":    true,
+}
+
+// IsServerType reports whether a server type is known.
+func IsServerType(t string) bool { return serverTypes[t] }
+
+// ServerTypes lists the known server types, for the API to publish.
+func ServerTypes() []string {
+	out := make([]string, 0, len(serverTypes))
+	for t := range serverTypes {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // AllowedServerTypes returns the server types a resource kind may run on,
@@ -623,6 +661,11 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// P2-1: S3 storage provisions the same way (root credentials + mesh port),
 	// minus the backup-policy row — object-store DR is out of the P1-11 path.
 	// P2-2: the selected engine (gated above) is recorded on the credentials row.
+	if IsLLMKind(in.Kind) {
+		if err := s.provisionLLMTx(ctx, tx, orgID, r); err != nil {
+			return Resource{}, err
+		}
+	}
 	if IsS3Kind(in.Kind) {
 		if err := s.provisionS3Tx(ctx, tx, orgID, r, s3Engine); err != nil {
 			return Resource{}, err

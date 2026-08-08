@@ -32,7 +32,7 @@ func seaweedTargets() map[string]store.S3Target {
 // password strictly as a secret reference.
 func TestRenderS3FansIntoContainerOps(t *testing.T) {
 	ops, _ := renderOps("srv_t", s3Specs(), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, s3Targets(), nil, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, s3Targets(), nil, nil, nil, ACMEConfig{}, clusterRender{})
 
 	if _, ok := opByID(ops, "net:proj_x"); !ok {
 		t.Fatal("missing network op")
@@ -90,7 +90,7 @@ func TestRenderS3FansIntoContainerOps(t *testing.T) {
 // S3-gateway port 8333, access key in plain env, secret strictly as a reference.
 func TestRenderS3SeaweedFS(t *testing.T) {
 	ops, _ := renderOps("srv_t", s3Specs(), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, seaweedTargets(), nil, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, seaweedTargets(), nil, nil, nil, ACMEConfig{}, clusterRender{})
 
 	ctr, ok := opByID(ops, "res:res_s3")
 	if !ok {
@@ -132,7 +132,7 @@ func TestRenderS3SeaweedFS(t *testing.T) {
 
 func TestRenderS3WithoutMeshFallsBackToStub(t *testing.T) {
 	ops, _ := renderOps("srv_t", s3Specs(), nil, nil,
-		store.HostHardening{}, nil, nil, nil, s3Targets(), nil, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{}, nil, nil, nil, s3Targets(), nil, nil, nil, ACMEConfig{}, clusterRender{})
 	op, ok := opByID(ops, "sync:res_s3")
 	if !ok || op.Kind != dsd.KindResourceSync {
 		t.Fatalf("want resource.sync stub without mesh IP, got %+v", op)

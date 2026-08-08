@@ -443,7 +443,7 @@ func (s *Store) DeployTargetForResource(ctx context.Context, resourceID string) 
 	err := s.Pool.QueryRow(ctx, `
 		SELECT d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
 		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
-		       d.created_at, d.service_status, COALESCE(d.server_id, '')
+		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
 		  FROM deployments d
 		  JOIN resources r ON r.id = d.resource_id
 		  JOIN git_connections c ON c.id = d.connection_id
@@ -451,7 +451,7 @@ func (s *Store) DeployTargetForResource(ctx context.Context, resourceID string) 
 		 ORDER BY d.created_at DESC LIMIT 1`, resourceID).
 		Scan(&t.DeploymentID, &t.ResourceID, &t.ProjectID, &t.ConnectionID, &t.Provider,
 			&t.RepoFullName, &ref, &sha, &cfg, &digest, &t.ImagePin, &t.Trigger, &t.Status, &t.CreatedAt,
-			&svcStatus, &t.ServerID)
+			&svcStatus, &t.ServerID, &t.BuildServerID)
 	if err != nil {
 		return DeployTarget{}, err
 	}

@@ -181,6 +181,13 @@ type ContainerSpec struct {
 	// applied separately and win on any key collision.
 	Labels map[string]string `json:"labels,omitempty"`
 
+	// GPUs requests NVIDIA devices (-1 = every GPU on the host). Without it an
+	// inference runtime silently falls back to CPU. Part of the spec hash, so
+	// changing the request recreates the container.
+	GPUs int `json:"gpus,omitempty"`
+	// ShmSizeMB overrides Docker's 64 MB default /dev/shm. Model loading needs a
+	// large shared-memory segment; the default fails with an unhelpful error.
+	ShmSizeMB int64 `json:"shmSizeMb,omitempty"`
 	// Forbidden by the local policy. The control plane never sets these; they
 	// exist only so the agent can detect and reject a DSD that does.
 	Privileged  bool        `json:"privileged,omitempty"`

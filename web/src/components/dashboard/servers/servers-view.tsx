@@ -146,15 +146,11 @@ export function ServersView({
   const [filter, setFilter] = React.useState<Filter>("all");
 
   const counts = React.useMemo(() => {
-    const c: Record<Filter, number> = {
-      all: servers.length,
-      general: 0,
-      database: 0,
-      storage: 0,
-      gpu: 0,
-    };
-    // An unknown or newly added type must not crash the counter — count it
-    // under "all" only, which is what the filter row can represent.
+    // Seeded from SERVER_TYPE_ORDER so adding a server type can't leave a
+    // counter undefined (and crash the filter row) the way a hand-written
+    // literal would. An unknown type still counts toward "all".
+    const c = { all: servers.length } as Record<Filter, number>;
+    for (const t of SERVER_TYPE_ORDER) c[t] = 0;
     for (const sv of servers) {
       if (sv.type in c) c[sv.type as Filter] += 1;
     }

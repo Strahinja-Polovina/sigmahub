@@ -362,6 +362,7 @@ func run() error {
 			GitIntegration:       st,
 			Compose:              st,
 			Clusters:             st,
+			LLM:                  st,
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			PublicURL:           cfg.PublicURL,

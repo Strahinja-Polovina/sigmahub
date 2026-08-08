@@ -535,3 +535,26 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 		"issuedAt": time.Now().UTC(),
 	})
 }
+
+// handleGetLLM returns a model endpoint's readout (CP mode, llm kind only).
+func (s *Server) handleGetLLM(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "model hosting is not configured"})
+		return
+	}
+	info, err := s.llm.GetLLM(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"))
+	if err != nil {
+		s.writeStoreErr(w, err, "llm endpoint")
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// handleListLLMEngines publishes the supported inference runtimes so the
+// dashboard offers exactly what the control plane can render.
+func (s *Server) handleListLLMEngines(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"engines": store.LLMEngineNames(),
+		"default": store.DefaultLLMEngine,
+	})
+}
