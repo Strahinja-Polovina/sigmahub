@@ -75,6 +75,13 @@ func run() error {
 
 	c := client.New(*endpoint)
 
+	// One collector for both the register and the heartbeat path (SIGMA-201).
+	// The same facts go out on EVERY check-in, not just the first: a host gains
+	// a GPU, has a driver installed, or has its disk grown long after it was
+	// enrolled, and a fleet stuck on what each machine looked like on day one
+	// schedules against fiction.
+	hostFactsCollector := facts.New(*dataDir)
+
 	// Mesh identity exists before registration so the pubkey rides along on
 	// the very first request. The private key never leaves the data dir.
 	meshPriv, meshPub, err := mesh.LoadOrCreateKey(*dataDir)
@@ -90,7 +97,7 @@ func run() error {
 		if *bootstrap == "" {
 			return errors.New("no persisted identity and no --bootstrap-token given")
 		}
-		f, _ := json.Marshal(facts.Collect())
+		f, _ := json.Marshal(hostFactsCollector.Collect(ctx))
 		hostname := *name
 		if hostname == "" {
 			hostname, _ = os.Hostname()
@@ -426,7 +433,7 @@ func run() error {
 		if hb == 1 || hb%postureEvery == 0 {
 			posture = hostDriver.Posture(ctx)
 		}
-		hostFacts := facts.Collect()
+		hostFacts := hostFactsCollector.Collect(ctx)
 		if avail, ver := container.Probe(ctx, docker); avail {
 			hostFacts.DockerAvailable = true
 			hostFacts.DockerVersion = ver

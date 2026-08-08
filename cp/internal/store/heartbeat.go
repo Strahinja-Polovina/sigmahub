@@ -52,6 +52,7 @@ type HeartbeatInput struct {
 // Status flips are audited.
 func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in HeartbeatInput) error {
 	facts := normalizeFacts(in.Facts)
+	reported := ParseHostFacts(facts)
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -61,19 +62,36 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 
 	// The self-join FROM clause exposes the pre-update row, so one statement
 	// both applies the update and reports whether the status flipped.
+	//
+	// facts are MERGED (`s.facts || $3`), not assigned. This used to be a plain
+	// assignment, which made the stored facts a snapshot of whatever the
+	// currently-installed agent happened to know how to say: roll out a fact
+	// (SIGMA-201's distro/disk/GPU) and every host still running the previous
+	// build silently blanks it on its next 30-second check-in. Merging makes an
+	// absent key mean "unchanged", so an old agent keeps heartbeating and keeps
+	// its facts, and normalizeFacts has already dropped the keys a CURRENT
+	// agent sent as zero because its probe failed. The cost of the merge is
+	// that a key is never removed by omission — anything whose absence must
+	// mean "no longer true" has to be reported explicitly, which is exactly why
+	// the agent always sends `gpu` even when the host has none.
+	//
+	// distro tracks the agent's reading for the same reason as at register: the
+	// provisioned value was a guess, this one is the machine's own answer.
 	var orgID, name, prevStatus, status string
 	err = tx.QueryRow(ctx, `
 		UPDATE servers s
 		   SET last_seen_at = now(),
 		       agent_version = COALESCE(NULLIF($2, ''), s.agent_version),
-		       facts = $3,
+		       facts = s.facts || $3::jsonb,
 		       pubkey = COALESCE(NULLIF($4, ''), s.pubkey),
 		       endpoint = COALESCE(NULLIF($5, ''), s.endpoint),
+		       distro = COALESCE(NULLIF($6, ''), s.distro),
 		       status = CASE WHEN s.status IN ('provisioning', 'unreachable') THEN 'running' ELSE s.status END
 		  FROM servers old
 		 WHERE s.id = $1 AND old.id = s.id AND s.deleted_at IS NULL
 		 RETURNING s.org_id, s.name, old.status, s.status`,
-		serverID, in.AgentVersion, facts, in.Pubkey, in.Endpoint).Scan(&orgID, &name, &prevStatus, &status)
+		serverID, in.AgentVersion, facts, in.Pubkey, in.Endpoint, reported.Distro,
+	).Scan(&orgID, &name, &prevStatus, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}

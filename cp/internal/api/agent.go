@@ -50,7 +50,15 @@ type hardeningReport struct {
 }
 
 type heartbeatRequest struct {
-	AgentVersion  string              `json:"agentVersion"`
+	AgentVersion string `json:"agentVersion"`
+	// Facts is re-sent on EVERY heartbeat, not just at register, so a host that
+	// gains a GPU, has a driver installed or has its disk grown is not stuck
+	// with what it looked like on day one (SIGMA-201). Same raw-JSON contract as
+	// registerRequest.Facts: unknown keys are stored, and the keys the product
+	// acts on are decoded once by store.ParseHostFacts.
+	//
+	// An OLD agent omits the SIGMA-201 keys entirely. That must not blank them:
+	// RecordHeartbeat merges rather than assigns, so absent means "unchanged".
 	Facts         json.RawMessage     `json:"facts"`
 	Pubkey        string              `json:"pubkey"`
 	Endpoint      string              `json:"endpoint"`
