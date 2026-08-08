@@ -135,6 +135,7 @@ export default async function ProjectDetailPage({
       pendingInstallationId={pendingInstallationId}
       projectMembers={projectMembers}
       canManageMembers={canManageMembers}
+      cpMode={cpEnabled()}
     />
   );
 }

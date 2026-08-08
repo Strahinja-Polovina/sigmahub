@@ -14,6 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { attachDomain, detachDomain } from "@/server/actions/domains";
+import { DnsSetupDialog } from "./dns-setup-dialog";
 
 export type DomainRow = {
   id: string;
@@ -95,6 +96,7 @@ export function ResourceDomainsPanel({
   canManage: boolean;
 }) {
   const [pending, startTransition] = React.useTransition();
+  const [dnsFor, setDnsFor] = React.useState<DomainRow | null>(null);
 
   function remove(d: DomainRow) {
     startTransition(async () => {
@@ -116,7 +118,9 @@ export function ResourceDomainsPanel({
         </CardTitle>
         <CardDescription>
           Point a domain’s DNS at this server; sigmahub’s proxy issues and renews a Let’s Encrypt
-          certificate automatically and serves it over HTTPS.
+          certificate automatically and serves it over HTTPS. Use{" "}
+          <span className="font-medium text-foreground">DNS setup</span> on a domain to see the
+          exact record to create and whether it has taken effect.
         </CardDescription>
       </CardHeader>
       <CardContent className="pt-4">
@@ -138,11 +142,19 @@ export function ResourceDomainsPanel({
                     {d.lastError.slice(0, 60)}
                   </span>
                 )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="ml-auto h-7"
+                  onClick={() => setDnsFor(d)}
+                >
+                  <Globe className="size-3.5" />
+                  DNS setup
+                </Button>
                 {canManage && (
                   <Button
                     variant="ghost"
                     size="icon-sm"
-                    className="ml-auto"
                     aria-label={`Detach ${d.domain}`}
                     disabled={pending}
                     onClick={() => remove(d)}
@@ -156,6 +168,17 @@ export function ResourceDomainsPanel({
         )}
         {canManage && <AddDomainForm orgId={orgId} resourceId={resourceId} />}
       </CardContent>
+
+      {dnsFor && (
+        <DnsSetupDialog
+          orgId={orgId}
+          resourceId={resourceId}
+          domainId={dnsFor.id}
+          domain={dnsFor.domain}
+          open
+          onOpenChange={(o: boolean) => !o && setDnsFor(null)}
+        />
+      )}
     </Card>
   );
 }

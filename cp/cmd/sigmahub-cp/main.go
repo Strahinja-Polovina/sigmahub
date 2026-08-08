@@ -363,6 +363,7 @@ func run() error {
 			Compose:              st,
 			Clusters:             st,
 			LLM:                  st,
+			DNS:                  st,
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			PublicURL:           cfg.PublicURL,

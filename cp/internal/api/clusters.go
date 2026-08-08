@@ -141,3 +141,8 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 type LLMAPI interface {
 	GetLLM(ctx context.Context, orgID, resourceID string) (store.LLMInfo, error)
 }
+
+// DNSAPI derives and verifies a custom domain's DNS records.
+type DNSAPI interface {
+	DNSSetupForDomain(ctx context.Context, orgID, domainID string) (store.DNSSetup, error)
+}

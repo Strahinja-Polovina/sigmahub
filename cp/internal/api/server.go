@@ -74,6 +74,7 @@ type Server struct {
 	compose             ComposeAPI
 	clusters            ClusterAPI
 	llm                 LLMAPI
+	dns                 DNSAPI
 	inspector           RepoInspector
 	repoLister          RepoLister
 	installTokens       InstallationTokenSource
@@ -143,6 +144,8 @@ type Options struct {
 	Clusters ClusterAPI
 	// LLM backs GPU model-hosting endpoints.
 	LLM LLMAPI
+	// DNS derives and verifies the records a custom domain needs.
+	DNS DNSAPI
 	// InstallationAccounts names an installation's account for the dashboard.
 	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
@@ -186,6 +189,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		compose:             opts.Compose,
 		clusters:            opts.Clusters,
 		llm:                 opts.LLM,
+		dns:                 opts.DNS,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -367,6 +371,9 @@ func (s *Server) routes() {
 	// runtimes this control plane can actually render.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/llm", s.requireService(store.RoleDeveloper, s.handleGetLLM))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/engines", s.requireService(store.RoleDeveloper, s.handleListLLMEngines))
+	// DNS setup for a custom domain: which record to create and whether it is
+	// live. Member-visible — knowing why a domain doesn't route isn't a mutation.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/domains/{domainId}/dns", s.requireService(store.RoleDeveloper, s.handleDomainDNS))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/compose", s.requireService(store.RoleDeveloper, s.handleGetComposeServices))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/compose/placements", s.requireService(store.RoleProjectAdmin, s.handleSetComposePlacements))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))

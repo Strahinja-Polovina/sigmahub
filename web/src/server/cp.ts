@@ -1805,3 +1805,26 @@ export async function cpDeleteCluster(
     { orgId, actor }
   );
 }
+
+// ── DNS setup for custom domains ────────────────────────────────────────────
+
+export type CpDNSRecord = { type: string; name: string; value: string; ttl: number };
+
+export type CpDNSSetup = {
+  domain: string;
+  /** Apex domains must use an A record — a CNAME is illegal there. */
+  apex: boolean;
+  records: CpDNSRecord[];
+  verified: boolean;
+  /** What DNS currently answers, so a mismatch shows the actual wrong value. */
+  observed?: string[];
+  reason?: string;
+  certStatus: string;
+  checkedAt: string;
+};
+
+export async function cpDomainDNS(orgId: string, domainId: string): Promise<CpDNSSetup> {
+  return cpFetch(`${org(orgId)}/domains/${encodeURIComponent(domainId)}/dns`, undefined, {
+    orgId,
+  });
+}
