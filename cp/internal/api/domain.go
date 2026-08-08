@@ -33,6 +33,10 @@ type DomainAPI interface {
 	DetachServer(ctx context.Context, orgID, envID, serverID, actor string) error
 	EnvServerIDs(ctx context.Context, orgID, envID string) ([]string, error)
 	CreateResource(ctx context.Context, orgID string, in store.CreateResourceInput, actor string) (store.Resource, error)
+	// ControlPlaneServerForCluster names the node a cluster workload renders
+	// into. A cluster resource has no server_id, so it is the only handle a
+	// mutation has on the document that has to be rebuilt.
+	ControlPlaneServerForCluster(ctx context.Context, orgID, clusterID string) (string, error)
 	ListResources(ctx context.Context, orgID, envID string) ([]store.Resource, error)
 	DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	// ForceReapplyResource backs the unconditional Redeploy for resources with
@@ -128,11 +132,18 @@ type DomainAPI interface {
 // unattached server) 422.
 func (s *Server) writeStoreErr(w http.ResponseWriter, err error, op string) {
 	var inv store.ErrInvalid
+	var notClusterable store.ErrKindNotClusterable
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	case errors.Is(err, store.ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	// A stateful kind aimed at a cluster is a domain-rule refusal like any
+	// other, but it is its own error type rather than an ErrInvalid, so it fell
+	// through to the 500 branch: the one refusal whose whole point is explaining
+	// itself reached the client as "internal error".
+	case errors.As(err, &notClusterable):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": notClusterable.Error()})
 	case errors.As(err, &inv):
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": inv.Msg})
 	default:
@@ -318,20 +329,51 @@ func (s *Server) handleEnvServers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateResource(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EnvironmentID string          `json:"environmentId"`
-		ServerID      string          `json:"serverId"`
-		Name          string          `json:"name"`
-		Kind          string          `json:"kind"`
-		Spec          json.RawMessage `json:"spec"`
+		EnvironmentID string `json:"environmentId"`
+		ServerID      string `json:"serverId"`
+		// ClusterID deploys INTO a Kubernetes cluster instead of onto one server.
+		// The store has supported it since clusters shipped, but nothing outside
+		// the process could ever set it: this handler didn't decode the field and
+		// refused anything without a serverId, so the whole cluster render path
+		// was unreachable over HTTP (SIGMA-200).
+		ClusterID string          `json:"clusterId"`
+		Name      string          `json:"name"`
+		Kind      string          `json:"kind"`
+		Spec      json.RawMessage `json:"spec"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil ||
-		strings.TrimSpace(req.Name) == "" || req.Kind == "" || req.EnvironmentID == "" || req.ServerID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "environmentId, serverId, name and kind are required"})
+		strings.TrimSpace(req.Name) == "" || req.Kind == "" || req.EnvironmentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "environmentId, name and kind are required"})
+		return
+	}
+	req.ServerID, req.ClusterID = strings.TrimSpace(req.ServerID), strings.TrimSpace(req.ClusterID)
+	// Exactly one target. The old check was `req.ServerID == ""` alone, so a
+	// correct cluster deploy came back "serverId is required" — an error that
+	// describes the shape the handler happened to expect rather than what is
+	// wrong with the request, and that reads as a client bug when the client did
+	// nothing wrong. Name the actual mistake in both directions.
+	switch {
+	case req.ServerID == "" && req.ClusterID == "":
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "a deploy target is required: pass serverId to run this on one server, or clusterId to run it in a cluster"})
+		return
+	case req.ServerID != "" && req.ClusterID != "":
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "serverId and clusterId are mutually exclusive: a resource runs on one server or inside a cluster, not both"})
+		return
+	}
+	// The cluster exclusion is a domain rule, not a request shape, so it answers
+	// 422 with the reason. The store enforces it again inside the create
+	// transaction — this is the copy that gets to say it before a round trip.
+	if req.ClusterID != "" && !store.ClusterKindAllowed(req.Kind) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": store.ErrKindNotClusterable{Kind: req.Kind}.Error()})
 		return
 	}
 	res, err := s.domain.CreateResource(r.Context(), r.PathValue("orgId"), store.CreateResourceInput{
 		EnvironmentID: req.EnvironmentID,
 		ServerID:      req.ServerID,
+		ClusterID:     req.ClusterID,
 		Name:          strings.TrimSpace(req.Name),
 		Kind:          req.Kind,
 		Spec:          req.Spec,
@@ -340,9 +382,25 @@ func (s *Server) handleCreateResource(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "create resource")
 		return
 	}
-	// The resource changed the target server's desired state — re-render its DSD.
+	// Re-render whatever actually applies this resource. A server resource is its
+	// own server's business; a cluster workload renders only into the
+	// control-plane node's document and the resource carries no server_id to
+	// point at, so it has to be looked up.
 	if s.reconcile != nil {
-		s.reconcile.ReconcileAsync(res.OrgID, res.ServerID)
+		switch {
+		case res.ServerID != "":
+			s.reconcile.ReconcileAsync(res.OrgID, res.ServerID)
+		case req.ClusterID != "":
+			cp, cerr := s.domain.ControlPlaneServerForCluster(r.Context(), res.OrgID, req.ClusterID)
+			if cerr != nil {
+				// Non-fatal: the resource exists and the 60s fleet resync will pick
+				// it up. Only the immediacy is lost, so don't fail a good create.
+				s.log.Warn("cluster workload created but its control-plane node could not be re-rendered",
+					"cluster", req.ClusterID, "err", cerr)
+			} else {
+				s.reconcile.ReconcileAsync(res.OrgID, cp)
+			}
+		}
 	}
 	writeJSON(w, http.StatusCreated, res)
 }

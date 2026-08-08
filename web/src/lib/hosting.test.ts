@@ -128,8 +128,15 @@ describe("nothing keeps a second copy of the vocabulary", () => {
     const offenders: string[] = [];
     for (const file of files) {
       const src = readFileSync(file, "utf8");
+      // Match a vocabulary word used as an OBJECT KEY: bare, or fully quoted,
+      // and never preceded by a quote. The looser `["']?name["']?\s*:` counted
+      // the colon INSIDE a string literal, so `image: "postgres:16"` in a demo
+      // compose fixture read as a table keyed by resource kind — and three
+      // docker image tags in one file failed a guard about something else
+      // entirely. A key is what this is looking for; an image reference is not
+      // a key, and no real offender writes one without balanced quotes.
       const named = vocabulary.filter((v) =>
-        new RegExp(`(^|[^\\w-])["']?${v}["']?\\s*:`, "m").test(src)
+        new RegExp(`(^|[^\\w\\-"'])(${v}|"${v}"|'${v}')\\s*:`, "m").test(src)
       );
       if (named.length < 3) continue;
       if (new RegExp(`Record<\\s*${typeName}\\s*,`).test(src)) continue;

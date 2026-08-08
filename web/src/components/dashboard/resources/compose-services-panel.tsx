@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { setComposePlacements } from "@/server/actions/compose";
+import { ROLLOUT_RECREATE, recreateReason } from "@/lib/deploy-spec";
 import type { CpComposeService } from "@/server/cp";
 
 const HOME = "__home__";
@@ -174,8 +175,8 @@ export function ComposeServicesPanel({
                     {svc.image}
                   </Badge>
                 )}
-                {svc.rollout === "recreate" && (
-                  <Badge variant="outline" className="text-[10px]">
+                {svc.rollout === ROLLOUT_RECREATE && (
+                  <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-600">
                     recreate
                   </Badge>
                 )}
@@ -185,6 +186,17 @@ export function ComposeServicesPanel({
                   </span>
                 )}
               </div>
+
+              {/* The badge alone reads as an arbitrary product decision. This
+                  service is the exception to the zero-downtime promise the rest
+                  of the UI makes, so it has to say which exclusive resource
+                  makes it one. */}
+              {recreateReason(svc) && (
+                <p className="text-xs text-amber-600">
+                  Deploys with a brief outage: stopped before its replacement starts, because{" "}
+                  {recreateReason(svc)}.
+                </p>
+              )}
 
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="flex flex-col gap-1.5">

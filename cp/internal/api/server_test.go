@@ -190,7 +190,13 @@ func (f *fakeDomain) CreateResource(_ context.Context, orgID string, in store.Cr
 	if store.AllowedServerTypes(in.Kind) == nil {
 		return store.Resource{}, store.ErrInvalid{Msg: "unknown resource kind"}
 	}
-	return store.Resource{ID: "res_1", OrgID: orgID, Name: in.Name, Kind: in.Kind}, nil
+	return store.Resource{ID: "res_1", OrgID: orgID, Name: in.Name, Kind: in.Kind, ServerID: in.ServerID}, nil
+}
+func (f *fakeDomain) ControlPlaneServerForCluster(_ context.Context, _, clusterID string) (string, error) {
+	if clusterID == "" {
+		return "", store.ErrNotFound
+	}
+	return "srv_cp", nil
 }
 func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Resource, error) {
 	return []store.Resource{}, nil

@@ -292,6 +292,15 @@ type ResourceSpec struct {
 	Kind       string
 	Spec       json.RawMessage
 	Ephemeral  bool
+	// ClusterID is set when the resource deploys INTO a cluster, i.e. when it
+	// belongs to no server. A node still reads such a resource — see
+	// ResourceHostedHere, and the secrets that have to reach it — but it must
+	// never be rendered as one of that node's own containers: Kubernetes runs it,
+	// on a host the scheduler picks. Without this the same resource rendered a
+	// k8s.apply on the control plane AND a container.apply under the SAME op id
+	// on every node of the cluster, so each node would additionally have run the
+	// workload itself, outside the scheduler that is supposed to own it.
+	ClusterID string
 }
 
 // ResourceHostedHere decides whether a resource has anything to do with a given
@@ -326,7 +335,7 @@ func ResourceHostedHere(serverParam string) string {
 
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral
+		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral, COALESCE(r.cluster_id, '')
 		  FROM resources r
 		 WHERE`+ResourceHostedHere("$1")+`
 		 ORDER BY r.created_at`,
@@ -338,7 +347,7 @@ func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]
 	out := []ResourceSpec{}
 	for rows.Next() {
 		var r ResourceSpec
-		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral); err != nil {
+		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral, &r.ClusterID); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

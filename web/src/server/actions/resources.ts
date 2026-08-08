@@ -8,6 +8,11 @@ import { requireProjectAdminForResource, requireProjectRole } from "../active-or
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import {
+  buildResourceSpec,
+  resolveDeployTarget,
+  type DetectedComposeService,
+} from "@/lib/deploy-spec";
+import {
   cpEnabled,
   cpCreateResource,
   cpDeleteResource,
@@ -30,6 +35,10 @@ export async function createResource(input: {
   projectId: string;
   environmentId: string;
   serverId?: string | null;
+  /** Deploy INTO a Kubernetes cluster instead of onto one server — the
+   *  scheduler picks the node. Mutually exclusive with serverId; the control
+   *  plane refuses both and neither (SIGMA-200). */
+  clusterId?: string | null;
   name: string;
   kind: string;
   repo?: string;
@@ -44,6 +53,11 @@ export async function createResource(input: {
   detected?: {
     ports?: number[];
     healthCheck?: { type: string; path?: string; port?: number };
+    /** The repo's Compose service graph. Dropping it made a repo that
+     *  describes five services deploy as a single container: `spec.compose`
+     *  was never written, so the reconciler's per-service branch had nothing
+     *  to render from and could not be reached at all (SIGMA-199). */
+    services?: DetectedComposeService[];
   };
   /** Inference runtime + model, for kind "llm". The control plane refuses an
    *  unknown runtime, so this is passed through rather than defaulted. */
@@ -54,6 +68,11 @@ export async function createResource(input: {
   const { user, role } = await requireProjectRole(project.orgId, input.projectId, "Project Admin");
   const name = input.name.trim();
   if (!name) throw new Error("Resource name is required.");
+  // Exactly one deploy target, decided once and used everywhere below — the
+  // ownership check, the CP call and the local mirror row all have to agree on
+  // it. The control plane re-checks; this only says so a round trip earlier.
+  const target = resolveDeployTarget({ serverId: input.serverId, clusterId: input.clusterId });
+  if (!target.ok) throw new Error(target.error);
 
   // Don't trust the client-supplied env/server ids: they must belong to this
   // project/org, or a member of one org could plant a resource on another's
@@ -68,50 +87,37 @@ export async function createResource(input: {
   // Demo mode resolves the server from the local table; in CP mode servers
   // live in the control plane, so the ownership check + FK-satisfying local
   // mirror happen below (cpMirrorServer 404s cross-org ids).
-  if (input.serverId && !cpEnabled()) {
+  if (target.serverId && !cpEnabled()) {
     const [sv] = await db
       .select({ orgId: s.servers.orgId })
       .from(s.servers)
-      .where(eq(s.servers.id, input.serverId));
+      .where(eq(s.servers.id, target.serverId));
     if (!sv || sv.orgId !== project.orgId) {
       throw new Error("Server does not belong to this organization.");
     }
   }
 
-  // Build the persisted spec from what the inspector detected. `ports` drives
-  // the rollout's exposed ports AND the default TCP health probe; `healthCheck`
-  // overrides the probe when the repo declares one.
-  const detectedPorts = (input.detected?.ports ?? []).filter((p) => Number.isInteger(p) && p > 0 && p < 65536);
-  const spec: Record<string, unknown> = {
-    repo: input.repo ?? null,
-    domain: input.domain ?? null,
-  };
-  if (detectedPorts.length > 0) {
-    spec.ports = detectedPorts.map((container) => ({ container, host: 0, protocol: "tcp" }));
-  }
-  if (input.detected?.healthCheck?.type) {
-    spec.healthCheck = input.detected.healthCheck;
-  }
-  // An inference endpoint is defined by what it runs: without these the control
-  // plane has nothing to render and refuses the create.
-  if (input.llm?.engine) {
-    spec.engine = input.llm.engine;
-    spec.model = input.llm.model;
-  }
+  // The spec is built by a pure helper so it is testable — see
+  // buildResourceSpec, and the regression that motivated extracting it.
+  const spec = buildResourceSpec(input);
 
   let id = rid("res");
   if (cpEnabled()) {
     // CP mode: the control plane owns the resource record and enforces the
     // kind/server-type availability matrix + env attachment server-side. The
     // local row mirrors it under the same id for read models; mirror the CP
-    // server first so the local resources.server_id FK holds.
-    if (!input.serverId) throw new Error("A target server is required.");
-    await cpMirrorServer(project.orgId, input.serverId);
+    // server first so the local resources.server_id FK holds. A cluster
+    // workload has no server to mirror — the scheduler picks its node — so the
+    // local row simply carries no server_id.
+    if (target.serverId) {
+      await cpMirrorServer(project.orgId, target.serverId);
+    }
     const created = await cpCreateResource(
       project.orgId,
       {
         environmentId: input.environmentId,
-        serverId: input.serverId,
+        serverId: target.serverId,
+        clusterId: target.clusterId,
         name,
         kind: input.kind,
         spec,
@@ -151,7 +157,7 @@ export async function createResource(input: {
     id,
     projectId: input.projectId,
     environmentId: input.environmentId,
-    serverId: input.serverId ?? null,
+    serverId: target.serverId ?? null,
     name,
     kind: input.kind,
     status: cp ? "provisioning" : "running",
