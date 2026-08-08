@@ -35,6 +35,15 @@ type GitAPI interface {
 	// EnqueueBranchDeploy enqueues a deploy of a known commit on a mapped
 	// branch — the initial-deploy path that doesn't wait for a webhook push.
 	EnqueueBranchDeploy(ctx context.Context, orgID, mapID, ref, sha, actor string) (store.DeployRequest, error)
+	// RecordBranchHead remembers a branch's head without enqueuing anything, so
+	// a manual branch can be promoted the moment it is mapped.
+	RecordBranchHead(ctx context.Context, orgID, mapID, ref, sha string) error
+	// HeadDeployOriginForResource resolves the repo + mapped branch a resource
+	// deploys from (ErrNotFound when it deploys from no repo).
+	HeadDeployOriginForResource(ctx context.Context, orgID, resourceID string) (store.HeadDeployOrigin, error)
+	// CreateHeadDeployment queues a deploy of one explicit commit for ONE
+	// resource — the first deploy of a resource with no history to replay.
+	CreateHeadDeployment(ctx context.Context, orgID, resourceID, actor string, o store.HeadDeployOrigin, sha string) (store.Deployment, string, error)
 }
 
 // claimInstallation binds a client-supplied installation id to the acting org
@@ -326,13 +335,29 @@ func (s *Server) handleSetBranchMap(w http.ResponseWriter, r *http.Request) {
 					webhookRegistered = true
 				}
 			}
-			if req.Policy == "auto" && m.LastSHA == "" {
-				if sha, err := s.inspector.BranchHead(r.Context(), conn.RepoFullName, m.Branch, token); err != nil {
+			// Resolve the head for BOTH policies. An 'auto' branch deploys it now;
+			// a 'manual' branch only records it — but recording is what makes
+			// Promote possible at all, and until this ran a manual branch was
+			// unpromotable until somebody pushed a commit, which is the one thing
+			// the operator was trying to avoid having to do.
+			if m.LastSHA == "" {
+				sha, err := s.inspector.BranchHead(r.Context(), conn.RepoFullName, m.Branch, token)
+				switch {
+				case err != nil:
 					s.log.Warn("initial deploy: branch head", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
-				} else if _, err := s.git.EnqueueBranchDeploy(r.Context(), orgID, m.ID, "refs/heads/"+m.Branch, sha, actor); err != nil {
-					s.log.Warn("initial deploy: enqueue", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
-				} else {
-					initialDeploy = true
+				case req.Policy == "auto":
+					if _, err := s.git.EnqueueBranchDeploy(r.Context(), orgID, m.ID, "refs/heads/"+m.Branch, sha, actor); err != nil {
+						s.log.Warn("initial deploy: enqueue", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
+					} else {
+						initialDeploy = true
+						m.LastSHA = sha
+					}
+				default:
+					if err := s.git.RecordBranchHead(r.Context(), orgID, m.ID, "refs/heads/"+m.Branch, sha); err != nil {
+						s.log.Warn("initial deploy: record head", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
+					} else {
+						m.LastSHA = sha
+					}
 				}
 			}
 		}

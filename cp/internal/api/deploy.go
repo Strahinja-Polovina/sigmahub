@@ -74,12 +74,20 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, dep)
 }
 
-// handleRedeploy retriggers a resource's deploy UNCONDITIONALLY. A git-deployed
-// resource with history replays its last deployment (fresh clone→build→rollout
-// of the same commit); anything else — databases, object storage, registry
-// apps, or an errored first apply — falls back to a forced DSD re-issue so the
-// agent re-runs the resource's ops with the last known config. "Redeploy did
-// nothing" must not be a reachable outcome. Project Admin+.
+// handleRedeploy retriggers a resource's deploy UNCONDITIONALLY, in three
+// escalating steps:
+//
+//  1. history to replay → a fresh clone→build→rollout of the same commit;
+//  2. no history but a connected repo → resolve the mapped branch's HEAD and
+//     deploy that commit (SIGMA-177);
+//  3. neither — a database, object storage, a registry-image app, an errored
+//     first apply → force a DSD re-issue so the agent re-runs the ops.
+//
+// Step 2 is what makes the button honest on a brand-new resource. Everything
+// that could create a deployment used to read a PREVIOUS one, so a resource
+// with a repo connected and a branch mapped still could not be deployed from
+// the dashboard: the only way to reach the first build was to push a commit.
+// "Redeploy did nothing" must not be a reachable outcome. Project Admin+.
 func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	resourceID := r.PathValue("resourceId")
@@ -97,7 +105,14 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "redeploy")
 		return
 	}
-	// No deployment history to replay — force a re-apply instead.
+	if dep, serverID, ok := s.deployRepoHead(r, orgID, resourceID, actor); ok {
+		if s.reconcile != nil && serverID != "" {
+			s.reconcile.ReconcileAsync(orgID, serverID)
+		}
+		writeJSON(w, http.StatusCreated, dep)
+		return
+	}
+	// Not deployed from a repo at all — force a re-apply instead.
 	serverID, ferr := s.domain.ForceReapplyResource(r.Context(), orgID, resourceID, actor)
 	if ferr != nil {
 		s.writeStoreErr(w, ferr, "redeploy (force re-apply)")
@@ -107,6 +122,36 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": "", "trigger": "reapply", "status": "queued"})
+}
+
+// deployRepoHead queues a deploy of the current head of the branch mapped to
+// this resource's environment. Reports ok=false — never an HTTP error — when
+// the resource deploys from no repo, when git isn't wired, or when the provider
+// can't be reached: each of those is a reason to fall through to the re-apply
+// path, not to fail the request.
+func (s *Server) deployRepoHead(r *http.Request, orgID, resourceID, actor string) (store.Deployment, string, bool) {
+	if s.git == nil || s.inspector == nil {
+		return store.Deployment{}, "", false
+	}
+	origin, err := s.git.HeadDeployOriginForResource(r.Context(), orgID, resourceID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.log.Warn("deploy head: resolve origin", "resource", resourceID, "err", err)
+		}
+		return store.Deployment{}, "", false
+	}
+	token, _ := s.git.GitTokenForRepo(r.Context(), orgID, origin.RepoFullName)
+	sha, err := s.inspector.BranchHead(r.Context(), origin.RepoFullName, origin.Branch, token)
+	if err != nil {
+		s.log.Warn("deploy head: branch head", "repo", origin.RepoFullName, "branch", origin.Branch, "err", err)
+		return store.Deployment{}, "", false
+	}
+	dep, serverID, err := s.git.CreateHeadDeployment(r.Context(), orgID, resourceID, actor, origin, sha)
+	if err != nil {
+		s.log.Warn("deploy head: create deployment", "resource", resourceID, "err", err)
+		return store.Deployment{}, "", false
+	}
+	return dep, serverID, true
 }
 
 // deployLogStreamTimeout bounds an SSE log stream so a stuck deployment can't

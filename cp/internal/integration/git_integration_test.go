@@ -379,3 +379,223 @@ func TestWebhookDeliveryOrgScoped(t *testing.T) {
 		t.Fatalf("unattributable delivery must be dropped as ambiguous, got %+v", out)
 	}
 }
+
+// TestFirstDeployFromRepoHead is the cold start against a real database
+// (SIGMA-177): a resource with a connected repo, a mapped branch and NO
+// deployment history has to be deployable.
+//
+// The two halves that were missing: nothing joined a resource to the branch its
+// environment is mapped to, and nothing could mint a deployment from a commit
+// that was not already recorded on a previous one. Together they meant the only
+// route to a first build was a git push — with the repo connected, the branch
+// mapped, and the commit sitting one API call away the whole time.
+func TestFirstDeployFromRepoHead(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_headdeploy"
+
+	proj, err := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := connectServer(t, st, orgID, "runner")
+	builder := connectServer(t, st, orgID, "builder")
+	for _, id := range []string{server, builder} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "manual", builder, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: server, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"compose":{"services":[{"name":"web","build":"."},{"name":"db","image":"postgres:16"}]}}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Redeploy has nothing to replay — that is the state the Deploy button used
+	// to dead-end in.
+	if _, _, err := st.CreateManualRedeploy(ctx, orgID, app.ID, "admin"); err == nil {
+		t.Fatal("a resource with no history must have nothing to redeploy")
+	}
+
+	origin, err := st.HeadDeployOriginForResource(ctx, orgID, app.ID)
+	if err != nil {
+		t.Fatalf("resolve deploy origin: %v", err)
+	}
+	if origin.RepoFullName != "acme/shop" || origin.Branch != "main" || origin.Ref != "refs/heads/main" {
+		t.Fatalf("origin = %+v, want the repo and branch mapped to this resource's environment", origin)
+	}
+	if origin.ServerID != server || origin.BuildServerID != builder {
+		t.Fatalf("origin server=%q build=%q, want %q/%q — the deploy must land where the resource lives and build where the map says",
+			origin.ServerID, origin.BuildServerID, server, builder)
+	}
+
+	dep, target, err := st.CreateHeadDeployment(ctx, orgID, app.ID, "operator", origin, "cafebabedeadbeef")
+	if err != nil {
+		t.Fatalf("create head deployment: %v", err)
+	}
+	if target != server {
+		t.Fatalf("re-render target = %q, want %q", target, server)
+	}
+	if dep.GitSHA != "cafebabedeadbeef" || dep.GitRef != "refs/heads/main" || dep.Trigger != "manual" || dep.Status != "queued" {
+		t.Fatalf("deployment = %+v", dep)
+	}
+	// The per-service denominator has to be real, or a Compose deploy can never
+	// complete: nothing else sets it on this path.
+	if dep.ServiceCount != 2 {
+		t.Fatalf("serviceCount = %d, want 2", dep.ServiceCount)
+	}
+
+	// It renders: the deploy target now has a deploy target, which is the whole
+	// point of the button.
+	targets, err := st.DeployTargetsForServer(ctx, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := targets[app.ID]
+	if !ok {
+		t.Fatalf("the deploy target did not reach the server's render: %+v", targets)
+	}
+	if got.SHA != "cafebabedeadbeef" || got.BuildServerID != builder {
+		t.Fatalf("render target = %+v", got)
+	}
+
+	// And the branch map learned the commit, so Promote stops claiming there is
+	// nothing to promote.
+	maps, err := st.ListBranchMaps(ctx, orgID, conn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(maps) != 1 || maps[0].LastSHA != "cafebabedeadbeef" {
+		t.Fatalf("branch maps = %+v, want the head recorded", maps)
+	}
+	if _, err := st.PromoteBranch(ctx, orgID, m.ID, "admin"); err != nil {
+		t.Fatalf("promote after a head deploy: %v", err)
+	}
+}
+
+// A resource that deploys from no repo resolves no origin, so the Deploy button
+// falls through to the re-apply path instead of inventing a git deploy for a
+// database.
+func TestHeadDeployOriginRequiresAConnectedRepo(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_noorigin"
+
+	proj, _ := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	env, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	server := connectServer(t, st, orgID, "runner")
+	if err := st.AttachServer(ctx, orgID, env.ID, server, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// An app with no git connection at all.
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: server, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx:1"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HeadDeployOriginForResource(ctx, orgID, app.ID); err != store.ErrNotFound {
+		t.Fatalf("origin for a repo-less app = %v, want ErrNotFound", err)
+	}
+
+	// A connected repo whose branch is mapped to a DIFFERENT environment is not
+	// this resource's origin either — deploying it would ship another
+	// environment's branch.
+	conn, _ := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+	}, "admin")
+	staging, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "staging", false, "admin")
+	if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "develop", staging.ID, "auto", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HeadDeployOriginForResource(ctx, orgID, app.ID); err != store.ErrNotFound {
+		t.Fatalf("origin resolved across environments = %v, want ErrNotFound", err)
+	}
+
+	// A database is never a git deploy, even in an environment with a mapping.
+	if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "manual", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	db, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: server, Name: "pg", Kind: "postgres",
+		Spec: json.RawMessage(`{"version":"16"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HeadDeployOriginForResource(ctx, orgID, db.ID); err != store.ErrNotFound {
+		t.Fatalf("origin for a database = %v, want ErrNotFound", err)
+	}
+	// The app in the same environment now does resolve.
+	if _, err := st.HeadDeployOriginForResource(ctx, orgID, app.ID); err != nil {
+		t.Fatalf("origin for the mapped app: %v", err)
+	}
+}
+
+// RecordBranchHead unblocks Promote on a freshly mapped manual branch, and a
+// real push always outranks it.
+func TestRecordBranchHeadFillsOnlyABlank(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_recordhead"
+
+	proj, _ := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	env, _ := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	conn, _ := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+	}, "admin")
+	m, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "manual", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PromoteBranch(ctx, orgID, m.ID, "admin"); err == nil {
+		t.Fatal("a branch with no recorded commit has nothing to promote")
+	}
+
+	if err := st.RecordBranchHead(ctx, orgID, m.ID, "refs/heads/main", "aaaa111"); err != nil {
+		t.Fatal(err)
+	}
+	maps, _ := st.ListBranchMaps(ctx, orgID, conn.ID)
+	if len(maps) != 1 || maps[0].LastSHA != "aaaa111" {
+		t.Fatalf("branch maps = %+v", maps)
+	}
+	if maps[0].LastPushedAt != nil {
+		t.Error("recording a head is not a push and must not claim one")
+	}
+
+	// A second resolve must not overwrite: whatever is recorded — a real push,
+	// most importantly — wins over asking the provider again.
+	if err := st.RecordBranchHead(ctx, orgID, m.ID, "refs/heads/main", "bbbb222"); err != nil {
+		t.Fatal(err)
+	}
+	maps, _ = st.ListBranchMaps(ctx, orgID, conn.ID)
+	if maps[0].LastSHA != "aaaa111" {
+		t.Fatalf("recorded head was overwritten: %+v", maps[0])
+	}
+
+	// Cross-org writes are refused (silently — the caller is best-effort).
+	if err := st.RecordBranchHead(ctx, "org_other", m.ID, "refs/heads/main", "cccc333"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PromoteBranch(ctx, orgID, m.ID, "admin"); err != nil {
+		t.Fatalf("promote after recording a head: %v", err)
+	}
+}
