@@ -29,7 +29,9 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: sigmahub-cp:latest
+    # CI deploys pin a prebuilt registry image (CP_IMAGE=ghcr.io/…:<sha>);
+    # the default keeps the self-hosted `docker compose build` flow working.
+    image: ${CP_IMAGE:-sigmahub-cp:latest}
     restart: unless-stopped
     depends_on:
       db:
@@ -80,7 +82,7 @@ services:
     build:
       context: ../../web
       dockerfile: Dockerfile
-    image: sigmahub-web:latest
+    image: ${WEB_IMAGE:-sigmahub-web:latest}
     restart: unless-stopped
     depends_on:
       db:
