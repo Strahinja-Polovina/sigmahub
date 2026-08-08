@@ -46,7 +46,7 @@ import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
-import { detectRepo, connectRepo, setBranchMapping } from "@/server/actions/git";
+import { detectRepo, wireRepoToEnvironment } from "@/server/actions/git";
 import {
   KIND_LABELS,
   SERVER_TYPE_LABELS,
@@ -372,50 +372,35 @@ export function DeployWizard({
             repo: serviceKind ? undefined : repo?.fullName,
             detected: serviceKind ? undefined : repo?.detected,
           });
-          // Wire push-to-deploy for the golden path: connect the repo to the
-          // project (persisting the token, if one was supplied for a private
-          // repo) and auto-map its default branch to the chosen environment.
-          // An already-connected repo conflicts on connect — fine, the Git
-          // panel owns it then; mapping failures are non-fatal and reported.
+          // Wire push-to-deploy for the golden path in ONE resilient call:
+          // connect the repo (reusing an existing org connection instead of
+          // failing on the conflict), map the default branch to the chosen
+          // environment, (re)register the push webhook and enqueue the
+          // initial deploy of the branch head. Failures never undo the
+          // created resource — they surface as actionable toasts.
           if (!serviceKind && repo) {
-            try {
-              const conn = await connectRepo({
-                orgId,
-                projectId,
-                repoFullName: repo.fullName,
-                token: repoToken.trim() || undefined,
+            const wired = await wireRepoToEnvironment({
+              orgId,
+              projectId,
+              repoFullName: repo.fullName,
+              token: repoToken.trim() || undefined,
+              branch: repo.defaultBranch,
+              environmentId,
+            });
+            if (!wired.ok) {
+              toast.warning("Repository not fully wired", {
+                description: `${wired.error} — finish the setup in the project's Git panel.`,
               });
-              try {
-                const map = await setBranchMapping({
-                  orgId,
-                  projectId,
-                  connectionId: conn.id,
-                  branch: repo.defaultBranch,
-                  environmentId,
-                  policy: "auto",
-                });
-                if (map.initialDeploy) {
-                  toast.success("First build started", {
-                    description: `Deploying ${repo.defaultBranch}@HEAD — watch the Deployments tab.`,
-                  });
-                }
-                if (conn.webhookRegistered === false) {
-                  toast.info("Push webhook not registered", {
-                    description:
-                      "Pushes won't auto-deploy yet — the token may lack webhook permission. Add the webhook on GitHub or reconnect with a token that can manage webhooks.",
-                  });
-                }
-              } catch {
-                toast.warning("Branch not mapped", {
-                  description: `Map ${repo.defaultBranch} to this environment in the project's Git panel to enable push-to-deploy.`,
+            } else {
+              if (wired.initialDeploy) {
+                toast.success("First build started", {
+                  description: `Deploying ${repo.defaultBranch}@HEAD — watch the Deployments tab.`,
                 });
               }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : "";
-              if (!msg.toLowerCase().includes("already connected")) {
-                toast.warning("Repository not connected", {
+              if (!wired.webhookRegistered) {
+                toast.info("Push webhook not registered", {
                   description:
-                    "The resource was created, but connecting the repository failed. Connect it in the project's Git panel.",
+                    "Pushes won't auto-deploy yet — the token may lack webhook permission. Add the webhook on GitHub or reconnect with a token that can manage webhooks.",
                 });
               }
             }

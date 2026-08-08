@@ -7,6 +7,7 @@ import {
   cpEnabled,
   cpDetectRepo,
   cpConnectRepo,
+  cpListGitConnections,
   cpSetBranchMap,
   cpDeleteBranchMap,
   cpPromoteBranch,
@@ -98,6 +99,70 @@ export async function connectRepo(input: {
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected Git repo", target: repo });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
   return conn;
+}
+
+/** One-call repo wiring for the deploy wizard: connect the repo to the project
+ *  (reusing an existing org connection instead of failing on the conflict) and
+ *  map a branch to the environment — which server-side also (re)registers the
+ *  push webhook and enqueues the initial deploy of the branch head. Returns a
+ *  readable summary instead of throwing: Next.js redacts thrown server-action
+ *  messages in production. */
+export async function wireRepoToEnvironment(input: {
+  orgId: string;
+  projectId: string;
+  repoFullName: string;
+  token?: string;
+  branch: string;
+  environmentId: string;
+}): Promise<
+  | { ok: true; initialDeploy: boolean; webhookRegistered: boolean }
+  | { ok: false; error: string }
+> {
+  ensureCp();
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const repo = input.repoFullName.trim();
+  try {
+    let conn: CpGitConnection | undefined;
+    try {
+      conn = await cpConnectRepo(
+        input.orgId,
+        { projectId: input.projectId, repoFullName: repo, token: input.token },
+        { name: user.name, role }
+      );
+      await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected Git repo", target: repo });
+    } catch (err) {
+      // A repo connects once per org — reuse the existing connection so the
+      // wizard's second run (or a second resource on the same repo) still
+      // maps the branch and triggers the initial deploy.
+      const msg = err instanceof Error ? err.message : "";
+      if (!msg.toLowerCase().includes("already connected")) throw err;
+      const existing = await cpListGitConnections(input.orgId);
+      conn = existing.find((c) => c.repoFullName.toLowerCase() === repo.toLowerCase());
+      if (!conn) throw err;
+    }
+    const map = await cpSetBranchMap(
+      input.orgId,
+      conn.id,
+      { branch: input.branch.trim(), environmentId: input.environmentId, policy: "auto" },
+      { name: user.name, role }
+    );
+    await writeAudit({
+      orgId: input.orgId,
+      actor: user.name,
+      action: `Mapped branch ${input.branch} (auto)`,
+      target: input.environmentId,
+    });
+    revalidatePath(`/dashboard/projects/${input.projectId}`);
+    return {
+      ok: true,
+      initialDeploy: Boolean(map.initialDeploy),
+      webhookRegistered: Boolean(
+        (map as { webhookRegistered?: boolean }).webhookRegistered ?? conn.webhookRegistered
+      ),
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not wire the repository." };
+  }
 }
 
 /** Map a branch to an environment with a deploy policy (auto | manual). */
