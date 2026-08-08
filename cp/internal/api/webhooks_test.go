@@ -32,6 +32,14 @@ type fakeGit struct {
 	// last ClaimInstallation call (SIGMA-87 handler tests).
 	claimErr            error
 	claimedInstallation string
+	// headOrigin scripts the repo+branch a resource deploys from; origin (zero
+	// value) means "deploys from no repo" and drives the fall-through. headSHA
+	// records the commit the head-deploy path created (SIGMA-177).
+	headOrigin    store.HeadDeployOrigin
+	headOriginErr error
+	headSHA       string
+	// recordedHead is the sha handed to RecordBranchHead at map time.
+	recordedHead string
 }
 
 func (f *fakeGit) HandleGitWebhook(_ context.Context, ev store.GitWebhookEvent) (store.WebhookOutcome, error) {
@@ -86,6 +94,23 @@ func (f *fakeGit) GitTokenForRepo(_ context.Context, _, _ string) (string, error
 }
 func (f *fakeGit) EnqueueBranchDeploy(_ context.Context, _, mapID, ref, sha, _ string) (store.DeployRequest, error) {
 	return store.DeployRequest{ID: "dr_test", Ref: ref, SHA: sha}, nil
+}
+func (f *fakeGit) RecordBranchHead(_ context.Context, _, _, _, sha string) error {
+	f.recordedHead = sha
+	return nil
+}
+func (f *fakeGit) HeadDeployOriginForResource(context.Context, string, string) (store.HeadDeployOrigin, error) {
+	if f.headOriginErr != nil {
+		return store.HeadDeployOrigin{}, f.headOriginErr
+	}
+	if f.headOrigin.RepoFullName == "" {
+		return store.HeadDeployOrigin{}, store.ErrNotFound
+	}
+	return f.headOrigin, nil
+}
+func (f *fakeGit) CreateHeadDeployment(_ context.Context, _, resourceID, _ string, o store.HeadDeployOrigin, sha string) (store.Deployment, string, error) {
+	f.headSHA = sha
+	return store.Deployment{ID: "dep_head", ResourceID: resourceID, Trigger: "manual", GitSHA: sha, GitRef: o.Ref, Status: "queued"}, o.ServerID, nil
 }
 
 // fakeInspector returns a scripted detection.

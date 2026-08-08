@@ -433,8 +433,15 @@ func (s *Store) SetBranchMap(ctx context.Context, orgID, connID, branch, envID, 
 
 // ListBranchMaps returns a connection's branch routes (org-scoped).
 func (s *Store) ListBranchMaps(ctx context.Context, orgID, connID string) ([]BranchMap, error) {
+	// The column list must match scanBranchMap exactly — build_server_id was
+	// added to the row scanner and not to this SELECT, so every call to the
+	// branch-map list failed with "number of field descriptions must equal
+	// number of destinations" and the project's Git panel listed no branches at
+	// all. Nothing caught it because nothing read a branch map back from a real
+	// database.
 	rows, err := s.Pool.Query(ctx, `
-		SELECT m.id, m.connection_id, m.branch, m.environment_id, m.policy, m.last_ref, m.last_sha, m.last_pushed_at, m.created_at
+		SELECT m.id, m.connection_id, m.branch, m.environment_id, m.policy, m.last_ref, m.last_sha,
+		       m.last_pushed_at, m.build_server_id, m.created_at
 		  FROM git_branch_map m
 		  JOIN git_connections c ON c.id = m.connection_id
 		 WHERE c.org_id = $1 AND m.connection_id = $2
@@ -520,6 +527,40 @@ func (s *Store) PromoteBranch(ctx context.Context, orgID, mapID, actor string) (
 		return DeployRequest{}, err
 	}
 	return dr, nil
+}
+
+// RecordBranchHead remembers a branch's head commit WITHOUT enqueuing anything
+// — the 'manual' half of the initial-deploy path.
+//
+// Promote is the button that ships a manual branch, and it refuses when the map
+// carries no sha. That sha was written in exactly one place: the push webhook.
+// So a freshly mapped manual branch had nothing to promote until someone pushed
+// a commit — the repo's actual HEAD was one API call away and the product never
+// asked for it. Recording it at map time makes Promote work the moment the
+// branch is mapped, which is what the button already claims to do.
+//
+// Only fills a blank: a real push must always win over a resolve-at-map-time,
+// so this never overwrites a recorded sha, and it leaves last_pushed_at alone —
+// nothing was pushed.
+func (s *Store) RecordBranchHead(ctx context.Context, orgID, mapID, ref, sha string) error {
+	if strings.TrimSpace(sha) == "" {
+		return ErrInvalid{Msg: "commit sha is required"}
+	}
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE git_branch_map m
+		   SET last_ref = COALESCE(NULLIF($3,''), 'refs/heads/' || m.branch), last_sha = $4
+		  FROM git_connections c
+		 WHERE m.id = $2 AND c.id = m.connection_id AND c.org_id = $1
+		   AND COALESCE(m.last_sha,'') = ''`, orgID, mapID, ref, sha)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the map is not this org's, or it already carries a sha. Both are
+		// no-ops by design; the caller is best-effort.
+		return nil
+	}
+	return nil
 }
 
 // EnqueueBranchDeploy enqueues a deploy of a KNOWN commit on a mapped branch —
@@ -978,4 +1019,129 @@ func recordPRHookTx(ctx context.Context, tx pgx.Tx, orgID, connID, ref, sha, bra
 		RETURNING created_at`,
 		d.ID, orgID, connID, ref, sha, branch).Scan(&d.CreatedAt)
 	return d, err
+}
+
+// HeadDeployOrigin is where a resource's code comes from: the git connection its
+// project is wired to, and the branch mapped to its environment. It is what the
+// control plane needs to ask the provider "what is this branch's HEAD?" and then
+// deploy that commit.
+type HeadDeployOrigin struct {
+	MapID         string
+	ConnectionID  string
+	Provider      string
+	RepoFullName  string
+	Branch        string
+	Ref           string
+	EnvironmentID string
+	ServerID      string
+	BuildServerID string
+}
+
+// HeadDeployOriginForResource resolves the repo and branch a resource deploys
+// from, or ErrNotFound when it deploys from no repo at all (a registry-image
+// app, a database, a project with no connection, or an environment no branch is
+// mapped to).
+//
+// This exists because "deploy this app" had no answer for an app that had never
+// been deployed. Every path that could create a deployment read the PREVIOUS
+// one — redeploy copied its git coordinates, rollback reused its image, promote
+// replayed the last pushed sha — so a resource created five minutes ago, with a
+// repo connected and a branch mapped, could not be deployed at all until
+// somebody pushed a commit to it. The coordinates were all sitting in the
+// database; nothing joined them up.
+func (s *Store) HeadDeployOriginForResource(ctx context.Context, orgID, resourceID string) (HeadDeployOrigin, error) {
+	var o HeadDeployOrigin
+	err := s.Pool.QueryRow(ctx, `
+		SELECT m.id, c.id, c.provider, c.repo_full_name, m.branch,
+		       COALESCE(m.last_ref, 'refs/heads/' || m.branch),
+		       COALESCE(r.environment_id,''), COALESCE(r.server_id,''), COALESCE(m.build_server_id,'')
+		  FROM resources r
+		  JOIN git_connections c ON c.project_id = r.project_id AND c.org_id = r.org_id
+		  JOIN git_branch_map m ON m.connection_id = c.id AND m.environment_id = r.environment_id
+		 WHERE r.org_id = $1 AND r.id = $2 AND r.kind = 'app'
+		 ORDER BY m.created_at DESC
+		 LIMIT 1`, orgID, resourceID).Scan(&o.MapID, &o.ConnectionID, &o.Provider, &o.RepoFullName,
+		&o.Branch, &o.Ref, &o.EnvironmentID, &o.ServerID, &o.BuildServerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return HeadDeployOrigin{}, ErrNotFound
+	}
+	if err != nil {
+		return HeadDeployOrigin{}, err
+	}
+	return o, nil
+}
+
+// CreateHeadDeployment queues a deploy of an explicit commit for ONE resource —
+// the "deploy the current HEAD" path, used when the resource has no deployment
+// history to replay.
+//
+// It is deliberately resource-scoped, unlike the webhook path: a push means
+// "everything in this environment moves", a Deploy button on one resource means
+// that resource. The commit is supplied by the caller (the API layer resolves it
+// from the provider) so the store stays free of outbound HTTP.
+//
+// The branch map learns the sha too, when it does not already know one, so the
+// project's Promote button stops claiming there is nothing to promote.
+func (s *Store) CreateHeadDeployment(ctx context.Context, orgID, resourceID, actor string, o HeadDeployOrigin, sha string) (Deployment, string, error) {
+	if strings.TrimSpace(sha) == "" {
+		return Deployment{}, "", ErrInvalid{Msg: "commit sha is required"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var spec []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT spec FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&spec); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, "", ErrNotFound
+		}
+		return Deployment{}, "", err
+	}
+
+	d := Deployment{
+		ID: newID("dep"), OrgID: orgID, ResourceID: resourceID, EnvironmentID: o.EnvironmentID,
+		ServerID: o.ServerID, ConnectionID: o.ConnectionID, Trigger: "manual", GitRef: o.Ref,
+		GitSHA: sha, ConfigHash: configHash(spec), Status: "queued", CreatedBy: actor,
+		ServiceCount: composeServiceCount(spec),
+	}
+	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
+		return Deployment{}, "", err
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
+		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by,
+		                         build_server_id)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),$8,$9,NULLIF($10,''),$11,'queued',$12,NULLIF($13,''))
+		RETURNING created_at`,
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA,
+		deployPin(d.ID), d.ConfigHash, d.ServiceCount, actor, o.BuildServerID).Scan(&d.CreatedAt)
+	if err != nil {
+		return Deployment{}, "", err
+	}
+	if o.MapID != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE git_branch_map SET last_ref = $2, last_sha = $3
+			 WHERE id = $1 AND COALESCE(last_sha,'') = ''`, o.MapID, d.GitRef, sha); err != nil {
+			return Deployment{}, "", err
+		}
+	}
+	if err := auditTx(ctx, tx, orgID, actor,
+		"Deploy queued from "+o.Branch+" head ("+shortSHA(sha)+")", resourceID); err != nil {
+		return Deployment{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, "", err
+	}
+	return d, d.ServerID, nil
+}
+
+// shortSHA is the 7-character form used in audit lines and the UI.
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }

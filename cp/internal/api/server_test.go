@@ -142,6 +142,11 @@ type fakeDomain struct {
 	idem map[string]store.IdempotentResponse
 	// createCount counts CreateProject executions to prove replay skips them.
 	createCount int
+	// noDeployHistory scripts a resource that has never been deployed, so the
+	// redeploy handler takes its fallback paths (SIGMA-177). reapplied records
+	// that it reached the last one.
+	noDeployHistory bool
+	reapplied       bool
 }
 
 func (f *fakeDomain) CreateProject(_ context.Context, orgID, name, desc, actor string) (store.Project, error) {
@@ -194,6 +199,7 @@ func (f *fakeDomain) DeleteResource(context.Context, string, string, string) (st
 	return "", nil
 }
 func (f *fakeDomain) ForceReapplyResource(context.Context, string, string, string) (string, error) {
+	f.reapplied = true
 	return "srv_1", nil
 }
 func (f *fakeDomain) SetHardeningConfig(context.Context, string, string, bool, bool, []store.PortException, string) error {
@@ -348,6 +354,9 @@ func (f *fakeDomain) CreateRollback(_ context.Context, orgID, resourceID, target
 	return store.Deployment{ID: "dep_rb", OrgID: orgID, ResourceID: resourceID, Trigger: "rollback", RollbackOf: targetDeploymentID, Status: "queued"}, "srv_1", nil
 }
 func (f *fakeDomain) CreateManualRedeploy(_ context.Context, orgID, resourceID, _ string) (store.Deployment, string, error) {
+	if f.noDeployHistory {
+		return store.Deployment{}, "", store.ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
+	}
 	return store.Deployment{ID: "dep_md", OrgID: orgID, ResourceID: resourceID, Trigger: "manual", Status: "queued"}, "srv_1", nil
 }
 func (f *fakeDomain) GetDeployment(_ context.Context, orgID, deploymentID string) (store.Deployment, error) {
