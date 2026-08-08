@@ -62,7 +62,7 @@ func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, cha
 
 	var kind, serverID string
 	err = tx.QueryRow(ctx,
-		`SELECT kind, server_id FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&kind, &serverID)
+		`SELECT kind, COALESCE(server_id,'') FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&kind, &serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Domain{}, "", ErrNotFound
 	}
@@ -108,7 +108,7 @@ func (s *Store) DetachDomain(ctx context.Context, orgID, domainID, actor string)
 
 	var domain string
 	err = tx.QueryRow(ctx, `
-		SELECT d.domain, r.server_id, r.id
+		SELECT d.domain, COALESCE(r.server_id,''), r.id
 		  FROM domains d JOIN resources r ON r.id = d.resource_id
 		 WHERE d.org_id = $1 AND d.id = $2`, orgID, domainID).Scan(&domain, &serverID, &resourceID)
 	if errors.Is(err, pgx.ErrNoRows) {
