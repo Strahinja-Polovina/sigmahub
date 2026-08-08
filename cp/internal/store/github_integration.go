@@ -129,8 +129,12 @@ func (s *Store) DeleteOrgInstallation(ctx context.Context, orgID, installationID
 	}
 	// Connections keep their rows (and their repos keep deploying from a stored
 	// token if they have one); they simply lose the installation binding.
+	//
+	// The empty string — not NULL — is how this schema spells "no installation":
+	// the column is NOT NULL (0015_git.sql), CreateGitConnection inserts "" when
+	// none is supplied, and 0032's backfill filters on `<> ''`.
 	if _, err := tx.Exec(ctx, `
-		UPDATE git_connections SET installation_id = NULL
+		UPDATE git_connections SET installation_id = ''
 		 WHERE org_id = $1 AND installation_id = $2`, orgID, installationID); err != nil {
 		return err
 	}
