@@ -46,4 +46,9 @@ type BuildImageSpec struct {
 	// server). The deploy target cannot read this machine's Docker daemon, so
 	// the image has to reach a registry both can see.
 	PushImage bool `json:"pushImage,omitempty"`
+	// RegistryHost is the registry to authenticate the push against. The agent
+	// resolves the credential over its own channel — the DSD carries the
+	// coordinates, never the password. Empty means an anonymous push, which
+	// only a registry that permits one will accept.
+	RegistryHost string `json:"registryHost,omitempty"`
 }

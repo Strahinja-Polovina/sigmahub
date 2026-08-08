@@ -1035,6 +1035,80 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 	return token, repo, provider, nil
 }
 
+// deploymentReporterClause decides whether the reporting server is entitled to
+// advance a deployment. It MUST stay the mirror image of DeployTargetsForServer's
+// WHERE: a server that RENDERS a deployment's ops has to be allowed to REPORT on
+// them, and every asymmetry between the two is a deployment that renders, runs
+// and then hangs forever because its report was silently dropped.
+//
+// Four ways a server legitimately owns part of a deployment:
+//   - it is the deploy target;
+//   - it is the dedicated build server, so the clone+build ops are in ITS document;
+//   - the resource deploys into a cluster and this server is one of its nodes;
+//   - it hosts one of the app's Compose services under per-service placement.
+//
+// $1 is the reporting server, and the query it is spliced into must expose the
+// deployment as `d` and its resource as `r`.
+const deploymentReporterClause = `
+		   (d.server_id = $1
+		    OR d.build_server_id = $1
+		    OR (r.cluster_id IS NOT NULL AND EXISTS (
+		          SELECT 1 FROM cluster_nodes n
+		           WHERE n.cluster_id = r.cluster_id AND n.server_id = $1))
+		    OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		        AND EXISTS (
+		          SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
+		           WHERE svc->>'serverId' = $1)))`
+
+// DeployPeersForResource returns the OTHER servers whose documents are gated on
+// this resource's deployment status, so they can be re-rendered the moment it
+// moves.
+//
+// A single-server deploy needs none of this: every op is in one document and
+// op-level ordering does the work. The moment a deploy spans machines it stops
+// being true — the build lives in the build server's document, a placed Compose
+// service in its host's, a cluster workload in the control plane's — and the
+// control plane holds each of those back until the deployment says the step
+// before it finished. Without a nudge, "held back" means "until the next
+// 60-second resync", which a three-stage pipeline pays three times over for no
+// reason. The reporting server is excluded: it has just been rendered.
+func (s *Store) DeployPeersForResource(ctx context.Context, resourceID, excludeServerID string) ([]ServerRef, error) {
+	rows, err := s.Pool.Query(ctx, `
+		WITH dep AS (
+			SELECT d.id, d.org_id, d.server_id, d.build_server_id, r.cluster_id, r.spec
+			  FROM deployments d
+			  JOIN resources r ON r.id = d.resource_id
+			 WHERE d.resource_id = $1 AND d.status IN ('queued','building','deploying','success')
+			 ORDER BY d.created_at DESC LIMIT 1)
+		SELECT DISTINCT sv, org_id FROM (
+			SELECT server_id AS sv, org_id FROM dep
+			UNION ALL
+			SELECT build_server_id, org_id FROM dep
+			UNION ALL
+			SELECT n.server_id, dep.org_id FROM dep
+			  JOIN cluster_nodes n ON n.cluster_id = dep.cluster_id
+			UNION ALL
+			SELECT svc->>'serverId', dep.org_id FROM dep,
+			  LATERAL jsonb_array_elements(
+			    CASE WHEN jsonb_typeof(dep.spec->'compose'->'services') = 'array'
+			         THEN dep.spec->'compose'->'services' ELSE '[]'::jsonb END) svc
+		) peers
+		 WHERE sv IS NOT NULL AND sv <> '' AND sv <> $2`, resourceID, excludeServerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ServerRef
+	for rows.Next() {
+		var ref ServerRef
+		if err := rows.Scan(&ref.ServerID, &ref.OrgID); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
 // AdvanceDeploymentForResource transitions the in-flight deployment for a
 // (server, resource) as its pipeline ops report in. phase is "clone" | "build" |
 // "rollout"; a failure fails the deployment. No-op (ErrNotFound) when there is no
@@ -1044,9 +1118,12 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 	var depID, curStatus, gitSHA, pin string
 	var depVersion int64
 	err := s.Pool.QueryRow(ctx, `
-		SELECT id, status, COALESCE(git_sha,''), COALESCE(image_pin,''), dsd_version FROM deployments
-		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA, &pin, &depVersion)
+		SELECT d.id, d.status, COALESCE(d.git_sha,''), COALESCE(d.image_pin,''), d.dsd_version
+		  FROM deployments d
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.resource_id = $2 AND d.status IN ('queued','building','deploying')
+		   AND`+deploymentReporterClause+`
+		 ORDER BY d.created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &curStatus, &gitSHA, &pin, &depVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // no in-flight deployment (supersede keeps this to at most one)
 	}
@@ -1135,9 +1212,12 @@ func (s *Store) AdvanceDeploymentService(ctx context.Context, serverID, resource
 	var serviceCount int
 	var depVersion int64
 	err = tx.QueryRow(ctx, `
-		SELECT id, COALESCE(git_sha,''), service_count, dsd_version FROM deployments
-		 WHERE server_id = $1 AND resource_id = $2 AND status IN ('queued','building','deploying')
-		 ORDER BY created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &gitSHA, &serviceCount, &depVersion)
+		SELECT d.id, COALESCE(d.git_sha,''), d.service_count, d.dsd_version
+		  FROM deployments d
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.resource_id = $2 AND d.status IN ('queued','building','deploying')
+		   AND`+deploymentReporterClause+`
+		 ORDER BY d.created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &gitSHA, &serviceCount, &depVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}

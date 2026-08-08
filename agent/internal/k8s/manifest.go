@@ -9,13 +9,16 @@ package k8s
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 )
 
-// renderManifests builds the workload's YAML document.
-func renderManifests(spec ApplySpec, ns string, secrets []Secret) (string, error) {
+// renderManifests builds the workload's YAML document. pull, when set, is the
+// registry credential the node needs to fetch the image; it becomes a
+// dockerconfigjson Secret plus an imagePullSecrets reference.
+func renderManifests(spec ApplySpec, ns string, secrets []Secret, pull *RegistryCredential) (string, error) {
 	replicas := spec.Replicas
 	if replicas < 1 {
 		replicas = 1
@@ -48,6 +51,29 @@ func renderManifests(spec ApplySpec, ns string, secrets []Secret) (string, error
 		}
 	}
 
+	// Registry credential. A private image is the normal case for anything we
+	// built: the build server pushed it under the org's account, so the node
+	// cannot pull it anonymously.
+	pullSecretName := name + "-registry"
+	if pull != nil {
+		auth := base64.StdEncoding.EncodeToString([]byte(pull.Username + ":" + pull.Password))
+		cfg, err := json.Marshal(map[string]any{
+			"auths": map[string]any{
+				pull.Host: map[string]string{
+					"username": pull.Username,
+					"password": pull.Password,
+					"auth":     auth,
+				},
+			},
+		})
+		if err != nil {
+			return "", fmt.Errorf("render registry credential: %w", err)
+		}
+		b.WriteString("---\napiVersion: v1\nkind: Secret\ntype: kubernetes.io/dockerconfigjson\n")
+		fmt.Fprintf(&b, "metadata:\n  name: %s\n  namespace: %s\ndata:\n", yamlStr(pullSecretName), yamlStr(ns))
+		fmt.Fprintf(&b, "  .dockerconfigjson: %s\n", base64.StdEncoding.EncodeToString(cfg))
+	}
+
 	// Deployment.
 	b.WriteString("---\napiVersion: apps/v1\nkind: Deployment\n")
 	fmt.Fprintf(&b, "metadata:\n  name: %s\n  namespace: %s\n  labels:\n    app: %s\n",
@@ -55,7 +81,11 @@ func renderManifests(spec ApplySpec, ns string, secrets []Secret) (string, error
 	fmt.Fprintf(&b, "spec:\n  replicas: %d\n  selector:\n    matchLabels:\n      app: %s\n",
 		replicas, yamlStr(name))
 	fmt.Fprintf(&b, "  template:\n    metadata:\n      labels:\n        app: %s\n", yamlStr(name))
-	b.WriteString("    spec:\n      containers:\n")
+	b.WriteString("    spec:\n")
+	if pull != nil {
+		fmt.Fprintf(&b, "      imagePullSecrets:\n        - name: %s\n", yamlStr(pullSecretName))
+	}
+	b.WriteString("      containers:\n")
 	fmt.Fprintf(&b, "        - name: %s\n          image: %s\n", yamlStr(name), yamlStr(spec.Image))
 
 	if len(spec.Ports) > 0 {

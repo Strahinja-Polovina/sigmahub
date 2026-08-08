@@ -275,6 +275,38 @@ func (c *Client) PostS3OpStatus(ctx context.Context, agentToken, opID string, ok
 	}, nil)
 }
 
+// ClusterNodeStatus is this node's own account of k3s on it. Without it a
+// cluster has no way to leave 'provisioning': the control plane can see that
+// the agent is checking in, which says nothing about whether k3s came up.
+type ClusterNodeStatus struct {
+	Ready       bool   `json:"ready"`
+	Message     string `json:"message,omitempty"`
+	APIEndpoint string `json:"apiEndpoint,omitempty"`
+	Version     string `json:"version,omitempty"`
+}
+
+// PostClusterStatus reports this node's k3s state. Scope is derived server-side
+// from the agent token — a node can only ever report about itself.
+func (c *Client) PostClusterStatus(ctx context.Context, agentToken string, st ClusterNodeStatus) error {
+	return c.post(ctx, "/v1/agent/cluster-status", agentToken, st, nil)
+}
+
+// RegistryCredentialResponse authenticates a push (on a build server) or a pull
+// (on a cluster node) against the org's registry. In-memory only; the CP audits
+// every release.
+type RegistryCredentialResponse struct {
+	Host     string `json:"host"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// FetchRegistryCredential resolves the org's registry credential.
+func (c *Client) FetchRegistryCredential(ctx context.Context, agentToken string) (RegistryCredentialResponse, error) {
+	var res RegistryCredentialResponse
+	err := c.do(ctx, http.MethodGet, "/v1/agent/registry-credential", agentToken, nil, &res)
+	return res, err
+}
+
 // WALTarget is a PITR-enabled resource whose WAL this server ships (P2-5).
 type WALTarget struct {
 	ResourceID string `json:"resourceId"`

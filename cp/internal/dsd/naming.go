@@ -1,6 +1,10 @@
 package dsd
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
 
 // Op kinds shared with the agent's apply registry. Defined here (a leaf package)
 // so the reconciler render and the agent apply cannot drift on the wire names.
@@ -162,4 +166,77 @@ func ContainerName(resourceID string) string { return "sigmahub-" + resourceID }
 // VolumeName is a named Docker volume for a resource's declared volume.
 func VolumeName(resourceID, vol string) string {
 	return "sigmahub-" + resourceID + "-" + vol
+}
+
+// Kubernetes object naming.
+//
+// Docker accepts almost anything as a container name; Kubernetes does not. An
+// object name is an RFC 1123 label — lowercase alphanumerics and '-', starting
+// and ending alphanumeric, at most 63 characters — and our identifiers are
+// `prefix_hex`. That single underscore made EVERY name the control plane
+// rendered illegal, so the agent rejected each k8s.apply op before it wrote a
+// manifest and no cluster workload could ever be deployed. The agent still
+// validates (a bad name must fail loudly rather than produce a manifest the API
+// server silently drops); these helpers are what make the names it sees valid.
+
+// k8sNameMax is the RFC 1123 label limit Kubernetes enforces on object names.
+const k8sNameMax = 63
+
+// K8sName rewrites an identifier into a legal Kubernetes object name.
+// Deterministic, so a resync renders byte-identical manifests. A name too long
+// to fit carries a digest of the original, because truncation alone would let
+// two long names that share a prefix collapse onto one object.
+func K8sName(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range strings.ToLower(raw) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		// Nothing legal survived. Returning empty (rather than inventing a name)
+		// makes the caller skip the op instead of applying a workload under a
+		// name that identifies nothing.
+		return ""
+	}
+	if len(s) <= k8sNameMax {
+		return s
+	}
+	sum := sha256.Sum256([]byte(raw))
+	suffix := "-" + hex.EncodeToString(sum[:4])
+	return strings.Trim(s[:k8sNameMax-len(suffix)], "-") + suffix
+}
+
+// K8sWorkloadName is the Kubernetes name for a resource's workload. A Compose
+// service gets its own object per service, so the graph deploys as a graph
+// rather than as one opaque pod.
+func K8sWorkloadName(resourceID, service string) string {
+	if service == "" {
+		return K8sName(ContainerName(resourceID))
+	}
+	return K8sName(ServiceContainerName(resourceID, service))
+}
+
+// K8sNamespace is the namespace a project's cluster workloads live in — the
+// cluster-side counterpart of its Docker network.
+func K8sNamespace(projectID string) string { return K8sName(NetworkName(projectID)) }
+
+// QualifyImage prefixes a locally-scoped image tag with the registry repository
+// it must be pushed to and pulled from.
+//
+// A bare `sigmahub/<res>:<sha>` tag is fine while the build and the run happen
+// on the same Docker daemon. The moment they don't — a dedicated build server,
+// or any cluster workload, where the scheduler picks the node — Docker resolves
+// that tag to docker.io/sigmahub and the push is answered with a 401. Empty
+// repository ⇒ the local tag, unchanged: a same-host build needs no registry.
+func QualifyImage(repository, tag string) string {
+	repository = strings.Trim(strings.TrimSpace(repository), "/")
+	if repository == "" {
+		return tag
+	}
+	return repository + "/" + strings.TrimPrefix(tag, "sigmahub/")
 }

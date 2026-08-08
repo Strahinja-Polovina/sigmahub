@@ -40,6 +40,10 @@ type StoreAPI interface {
 	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error
 	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string, reportVersion int64) error
+	// DeployPeersForResource lists the other servers whose documents are gated
+	// on this resource's deployment status, so a multi-machine pipeline advances
+	// on the report rather than on the next resync.
+	DeployPeersForResource(ctx context.Context, resourceID, excludeServerID string) ([]store.ServerRef, error)
 	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
 	// Backups (P1-11): the audited per-run credential release and the agent's
 	// terminal result report, plus the op-status failure fallback.
@@ -73,6 +77,7 @@ type Server struct {
 	gitIntegration      GitIntegrationAPI
 	compose             ComposeAPI
 	clusters            ClusterAPI
+	registry            RegistryAPI
 	llm                 LLMAPI
 	dns                 DNSAPI
 	inspector           RepoInspector
@@ -142,6 +147,9 @@ type Options struct {
 	Compose ComposeAPI
 	// Clusters backs Kubernetes cluster setup and membership.
 	Clusters ClusterAPI
+	// Registry backs the org's container image registry — what makes a build on
+	// one machine runnable on another.
+	Registry RegistryAPI
 	// LLM backs GPU model-hosting endpoints.
 	LLM LLMAPI
 	// DNS derives and verifies the records a custom domain needs.
@@ -153,11 +161,11 @@ type Options struct {
 	// PublicURL is the CP's own public base URL (e.g. https://cp.example.com).
 	// With GitHubWebhookSecret set, connecting a repo auto-registers the
 	// push-to-deploy webhook pointing at <PublicURL>/v1/webhooks/github.
-	PublicURL string
-	DSDStore            DSDStore
-	DSDWaiter           DSDWaiter
-	Reconcile           ReconcileTrigger
-	DSDPublicKey        ed25519.PublicKey
+	PublicURL    string
+	DSDStore     DSDStore
+	DSDWaiter    DSDWaiter
+	Reconcile    ReconcileTrigger
+	DSDPublicKey ed25519.PublicKey
 	// Telemetry is the P1-13 forwarder (nil disables the pipeline endpoints);
 	// TelemetryStore is its store slice.
 	Telemetry      *telemetry.Forwarder
@@ -188,6 +196,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		gitIntegration:      opts.GitIntegration,
 		compose:             opts.Compose,
 		clusters:            opts.Clusters,
+		registry:            opts.Registry,
 		llm:                 opts.LLM,
 		dns:                 opts.DNS,
 		githubAppSlug:       opts.GitHubAppSlug,
@@ -367,6 +376,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters/{clusterId}/nodes", s.requireService(store.RoleProjectAdmin, s.handleAddClusterNode))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}/nodes/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleRemoveClusterNode))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteCluster))
+	// The org's image registry. Reading it is member-visible (the dashboard shows
+	// where images go); writing it is org-admin, because the credential it stores
+	// is push access to every image the org builds.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/registry", s.requireService(store.RoleDeveloper, s.handleGetRegistry))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/registry", s.requireService(store.RoleOrgAdmin, s.handleSetRegistry))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/registry", s.requireService(store.RoleOrgAdmin, s.handleDeleteRegistry))
 	// GPU model hosting: the endpoint readout is member-visible, as are the
 	// runtimes this control plane can actually render.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/llm", s.requireService(store.RoleDeveloper, s.handleGetLLM))
@@ -422,6 +437,10 @@ func (s *Server) routes() {
 	// agent's terminal status report.
 	s.mux.HandleFunc("GET /v1/agent/s3-op-credential", s.requireAgent(s.handleAgentS3OpCredential))
 	s.mux.HandleFunc("POST /v1/agent/s3-op-status", s.requireAgent(s.handleAgentS3OpStatus))
+	// A cluster node's own account of whether k3s came up on it, and the
+	// registry credential a build server needs to push what it built.
+	s.mux.HandleFunc("POST /v1/agent/cluster-status", s.requireAgent(s.handleAgentClusterStatus))
+	s.mux.HandleFunc("GET /v1/agent/registry-credential", s.requireAgent(s.handleAgentRegistryCredential))
 	// WAL shipping (P2-5).
 	s.mux.HandleFunc("GET /v1/agent/wal-targets", s.requireAgent(s.handleAgentWALTargets))
 	s.mux.HandleFunc("GET /v1/agent/wal-credential", s.requireAgent(s.handleAgentWALCredential))

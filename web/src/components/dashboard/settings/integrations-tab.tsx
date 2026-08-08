@@ -33,6 +33,8 @@ import {
 } from "@/components/ui/dialog";
 import { githubInstallUrl } from "@/lib/github-app";
 import { disconnectGitIntegration } from "@/server/actions/git";
+import { RegistryCard } from "./registry-card";
+import type { CpImageRegistry } from "@/server/cp";
 
 export type Installation = {
   installationId: string;
@@ -53,6 +55,7 @@ export function IntegrationsTab({
   slug,
   installations,
   canManage,
+  registry = { configured: false, registry: null, repository: "" },
 }: {
   orgId: string;
   /** The control plane has a GitHub App registered at all. */
@@ -60,6 +63,13 @@ export function IntegrationsTab({
   slug: string;
   installations: Installation[];
   canManage: boolean;
+  /** The org's container registry — where built images go so a machine other
+   *  than the builder can run them. */
+  registry?: {
+    configured: boolean;
+    registry: CpImageRegistry | null;
+    repository: string;
+  };
 }) {
   const connected = installations.length > 0;
 
@@ -168,6 +178,14 @@ export function IntegrationsTab({
           )}
         </CardContent>
       </Card>
+
+      <RegistryCard
+        orgId={orgId}
+        configured={registry.configured}
+        registry={registry.registry}
+        repository={registry.repository}
+        canManage={canManage}
+      />
     </div>
   );
 }

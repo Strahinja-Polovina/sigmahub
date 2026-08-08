@@ -25,7 +25,11 @@ type Store interface {
 	// that cluster (rendered only into the control-plane node's document).
 	ClusterMembershipForServer(ctx context.Context, serverID string) (store.ClusterMembership, bool, error)
 	ResourceSpecsForCluster(ctx context.Context, clusterID string) ([]store.ResourceSpec, error)
+	ClusterBuildSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
 	DeployTargetForResource(ctx context.Context, resourceID string) (store.DeployTarget, error)
+	// ImageRepositoryForOrg is the registry prefix cross-host image tags carry;
+	// empty when the org has configured no registry.
+	ImageRepositoryForOrg(ctx context.Context, orgID string) (string, error)
 	PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]store.PendingDestructiveOp, error)
 	SecretRefsForServer(ctx context.Context, serverID string) (map[string][]store.SecretRefMeta, error)
 	HostHardeningForServer(ctx context.Context, serverID string) (store.HostHardening, error)
@@ -71,6 +75,21 @@ type clusterRender struct {
 	// workloads are the resources deployed into the cluster. Populated only for
 	// the control-plane node, which is the single applier.
 	workloads []store.ResourceSpec
+	// builds are cluster workloads whose images THIS server compiles. A cluster
+	// resource belongs to no server, so without this its clone+build ops would
+	// land in no document at all and the manifests would reference images
+	// nothing had ever been asked to produce. Independent of membership: a build
+	// server usually is not in the cluster it builds for.
+	builds []store.ResourceSpec
+}
+
+// registryRender is the org's image registry for one render pass. Cross-host
+// images (a dedicated build server, every cluster workload) are qualified with
+// the repository; the host rides along so the agent knows to authenticate.
+// Both empty when no registry is configured.
+type registryRender struct {
+	repository string
+	host       string
 }
 
 // renderOps builds the ordered op list for a server. "app" resources fan into
@@ -79,7 +98,7 @@ type clusterRender struct {
 // address; the remaining kinds (s3/llm) keep the P1-2 no-op "resource.sync"
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender, registry registryRender) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 
@@ -98,10 +117,17 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	if cluster.member && cluster.membership.Role == store.NodeRoleControlPlane && nodeOpID != "" {
 		for _, rs := range cluster.workloads {
 			wl, ok := renderClusterWorkloadOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID],
-				deployTargets[rs.ResourceID], cluster.membership, nodeOpID)
+				deployTargets[rs.ResourceID], cluster.membership, nodeOpID, registry.repository, registry.host)
 			if ok {
 				resourceOps = append(resourceOps, wl...)
 			}
+		}
+	}
+	// Builds for cluster workloads. This server is the build server, which is a
+	// different job from being a node — it is usually not in the cluster at all.
+	for _, rs := range cluster.builds {
+		if bops, ok := renderClusterBuildOps(rs, deployTargets[rs.ResourceID], registry.repository); ok {
+			resourceOps = append(resourceOps, bops...)
 		}
 	}
 
@@ -131,7 +157,7 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 			// A git-deployed app (has a deploy target) renders the build pipeline;
 			// a registry-image app keeps the direct container.apply path.
 			if target, isGit := deployTargets[rs.ResourceID]; isGit {
-				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target, serverID); ok {
+				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target, serverID, registry); ok {
 					resourceOps = append(resourceOps, depOps...)
 					// A Compose app deploys onto its own per-resource network
 					// ("net:res:<id>"); a single-container app shares the project network.
@@ -213,6 +239,16 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	return ops, dsd.SpecHash(ops)
 }
 
+// registryHost is the authentication host of a repository prefix — everything
+// before the first slash. `ghcr.io/acme` authenticates against ghcr.io; a
+// bare-host repository authenticates against itself.
+func registryHost(repository string) string {
+	if i := strings.Index(repository, "/"); i > 0 {
+		return repository[:i]
+	}
+	return repository
+}
+
 // Reconcile renders a server's DSD; on a real change it bumps the version,
 // signs, persists and wakes any long-poll waiter for that server.
 func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) error {
@@ -276,6 +312,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 			}
 		}
 	}
+	// Cluster workloads this server BUILDS for. Unrelated to membership, and
+	// their deploy targets are keyed by resource id like any other.
+	clusterBuilds, err := r.st.ClusterBuildSpecsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	cluster.builds = clusterBuilds
+	for _, b := range clusterBuilds {
+		if _, have := deployTargets[b.ResourceID]; have {
+			continue
+		}
+		if t, terr := r.st.DeployTargetForResource(ctx, b.ResourceID); terr == nil && t.DeploymentID != "" {
+			deployTargets[b.ResourceID] = t
+		}
+	}
+	// The org's image registry: what qualifies every cross-host image tag.
+	repository, err := r.st.ImageRepositoryForOrg(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	registry := registryRender{repository: repository, host: registryHost(repository)}
 	dbTargets, err := r.st.DBTargetsForServer(ctx, serverID)
 	if err != nil {
 		return err
@@ -296,7 +353,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster)
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster, registry)
 	signed, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

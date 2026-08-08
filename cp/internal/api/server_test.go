@@ -103,6 +103,9 @@ func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string
 func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, string, string, bool, string, int64) error {
 	return nil
 }
+func (f *fakeStore) DeployPeersForResource(context.Context, string, string) ([]store.ServerRef, error) {
+	return nil, nil
+}
 func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
 	return nil
 }

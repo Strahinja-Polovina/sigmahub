@@ -11,6 +11,7 @@ import { BetaMetricsTab } from "./beta-metrics-tab";
 import { SecurityTab } from "./security-tab";
 import { AlertsTab } from "./alerts-tab";
 import { IntegrationsTab, type Installation } from "./integrations-tab";
+import type { CpImageRegistry } from "@/server/cp";
 
 export type SettingsOrg = {
   id: string;
@@ -53,6 +54,7 @@ export function SettingsView({
   orgCreatedAt = null,
   twoFactorEnabled = false,
   gitIntegration = null,
+  registry,
 }: {
   org: SettingsOrg;
   members: SettingsMember[];
@@ -73,6 +75,12 @@ export function SettingsView({
     slug: string;
     installations: Installation[];
   } | null;
+  /** The org's container registry, shown alongside GitHub in Integrations. */
+  registry?: {
+    configured: boolean;
+    registry: CpImageRegistry | null;
+    repository: string;
+  };
 }) {
   const isAdmin = currentUserRole === "Org Admin";
 
@@ -136,6 +144,7 @@ export function SettingsView({
               slug={gitIntegration?.slug ?? ""}
               installations={gitIntegration?.installations ?? []}
               canManage={isAdmin}
+              registry={registry}
             />
           </TabsContent>
         )}

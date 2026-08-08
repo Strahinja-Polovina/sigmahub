@@ -28,6 +28,7 @@ type fakeImageBuilder struct {
 	buildErr error
 	pushed   bool
 	pushErr  error
+	pushAuth RegistryAuth
 }
 
 func (f *fakeImageBuilder) ImageExists(context.Context, string) (bool, error) { return f.exists, nil }
@@ -38,7 +39,8 @@ func (f *fakeImageBuilder) ImageBuild(_ context.Context, _, _, _ string, _ io.Wr
 func (f *fakeImageBuilder) ImageDigest(context.Context, string) (string, error) {
 	return "sha256:deadbeef", nil
 }
-func (f *fakeImageBuilder) ImagePush(_ context.Context, _ string, _ io.Writer) error {
+func (f *fakeImageBuilder) ImagePush(_ context.Context, _ string, auth RegistryAuth, _ io.Writer) error {
+	f.pushAuth = auth
 	f.pushed = true
 	return f.pushErr
 }
@@ -247,6 +249,64 @@ func TestBuildPushesForAnotherHost(t *testing.T) {
 	}
 	if !fb.built || !fb.pushed {
 		t.Fatalf("built=%v pushed=%v, want both", fb.built, fb.pushed)
+	}
+}
+
+// A push to a real registry has to authenticate. This used to send
+// base64("{}") unconditionally — an anonymous push, which every hosted registry
+// answers with a 401, so the dedicated build server could never actually ship
+// an image anywhere.
+func TestPushCarriesTheRegistryCredential(t *testing.T) {
+	fb := &fakeImageBuilder{}
+	b, _ := newTestBuilder(t, fb, nil)
+	b.registry = func(context.Context) (RegistryAuth, error) {
+		return RegistryAuth{Host: "ghcr.io", Username: "bot", Password: "s3cret"}, nil
+	}
+	dir := b.ContextDir("res_auth")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(BuildImageSpec{
+		ResourceID: "res_auth", SHA: "abc", ImageTag: "ghcr.io/acme/app:abc",
+		PushImage: true, RegistryHost: "ghcr.io",
+	})
+	if err := b.opBuildImage(context.Background(), dsd.Op{Kind: KindImageBuild, Spec: spec}); err != nil {
+		t.Fatal(err)
+	}
+	if fb.pushAuth.Username != "bot" || fb.pushAuth.Password != "s3cret" || fb.pushAuth.Host != "ghcr.io" {
+		t.Fatalf("push auth = %+v, want the org's registry credential", fb.pushAuth)
+	}
+}
+
+// No way to resolve the credential must fail the op HERE, naming the cause.
+// Pushing anonymously instead surfaces much later as an unexplained pull
+// failure on whichever machine was supposed to run the image.
+func TestPushWithoutACredentialSourceFails(t *testing.T) {
+	fb := &fakeImageBuilder{}
+	b, _ := newTestBuilder(t, fb, nil) // no registry fetcher wired
+	dir := b.ContextDir("res_noauth")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(BuildImageSpec{
+		ResourceID: "res_noauth", SHA: "abc", ImageTag: "ghcr.io/acme/app:abc",
+		PushImage: true, RegistryHost: "ghcr.io",
+	})
+	err := b.opBuildImage(context.Background(), dsd.Op{Kind: KindImageBuild, Spec: spec})
+	if err == nil {
+		t.Fatal("a push that needs a credential and has none must fail loudly")
+	}
+	if fb.pushed {
+		t.Fatal("nothing must be pushed anonymously to a registry that requires auth")
+	}
+	if !strings.Contains(err.Error(), "ghcr.io") {
+		t.Fatalf("error must name the registry: %v", err)
 	}
 }
 

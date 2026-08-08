@@ -18,6 +18,54 @@ type ClusterAPI interface {
 	AddClusterNode(ctx context.Context, orgID, clusterID, serverID, actor string) error
 	RemoveClusterNode(ctx context.Context, orgID, clusterID, serverID, actor string) error
 	DeleteCluster(ctx context.Context, orgID, clusterID, actor string) ([]string, error)
+	// ReportClusterNode records what a node says about k3s on it and rederives
+	// the cluster's status from the node rows.
+	ReportClusterNode(ctx context.Context, serverID string, rep store.ClusterNodeReport) (clusterID, status string, err error)
+}
+
+// handleAgentClusterStatus is how a cluster stops reading "provisioning"
+// forever. The node is the only thing that knows whether k3s actually came up
+// on it, so it reports — and the report is scoped to the reporting server by the
+// agent token: a node can say something about itself and nothing else.
+func (s *Server) handleAgentClusterStatus(w http.ResponseWriter, r *http.Request) {
+	if s.clusters == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "clusters are not configured"})
+		return
+	}
+	srv := serverFrom(r)
+	var req struct {
+		Ready       bool   `json:"ready"`
+		Message     string `json:"message"`
+		APIEndpoint string `json:"apiEndpoint"`
+		Version     string `json:"version"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	clusterID, status, err := s.clusters.ReportClusterNode(r.Context(), srv.ID, store.ClusterNodeReport{
+		Ready:       req.Ready,
+		Message:     req.Message,
+		APIEndpoint: req.APIEndpoint,
+		Version:     req.Version,
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		// The server left the cluster between rendering the op and reporting on
+		// it. Accept and discard rather than making the agent retry a report
+		// about a membership that no longer exists.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
+		return
+	}
+	if err != nil {
+		s.writeStoreErr(w, err, "cluster status")
+		return
+	}
+	// A ready control plane is what lets workloads render at all, so the node's
+	// own document has to be rebuilt as soon as it says so.
+	if s.reconcile != nil {
+		s.reconcile.ReconcileAsync(srv.OrgID, srv.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status, "clusterId": clusterID})
 }
 
 func (s *Server) handleListClusters(w http.ResponseWriter, r *http.Request) {

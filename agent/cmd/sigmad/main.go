@@ -156,17 +156,38 @@ func run() error {
 	driver.Register(registry)
 	// Kubernetes (k3s): membership + workload ops behind the same typed
 	// registry. A host that never joins a cluster simply never sees these ops.
-	k8sDriver := k8s.NewDriver(func(ctx context.Context, resourceID string) ([]k8s.Secret, error) {
-		res, err := c.FetchSecrets(ctx, st.AgentToken, resourceID)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]k8s.Secret, 0, len(res.Secrets))
-		for _, s := range res.Secrets {
-			out = append(out, k8s.Secret{Name: s.Name, Value: s.Value, EnvVar: s.EnvVar})
-		}
-		return out, nil
-	})
+	k8sDriver := k8s.NewDriver(
+		func(ctx context.Context, resourceID string) ([]k8s.Secret, error) {
+			res, err := c.FetchSecrets(ctx, st.AgentToken, resourceID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]k8s.Secret, 0, len(res.Secrets))
+			for _, s := range res.Secrets {
+				out = append(out, k8s.Secret{Name: s.Name, Value: s.Value, EnvVar: s.EnvVar})
+			}
+			return out, nil
+		},
+		// A node pulling an image we built needs the org's registry credential,
+		// which never travels in the DSD.
+		func(ctx context.Context) (k8s.RegistryCredential, error) {
+			res, err := c.FetchRegistryCredential(ctx, st.AgentToken)
+			if err != nil {
+				return k8s.RegistryCredential{}, err
+			}
+			return k8s.RegistryCredential{Host: res.Host, Username: res.Username, Password: res.Password}, nil
+		},
+		// The node's own account of whether k3s came up — the only thing that
+		// can move a cluster off 'provisioning'.
+		func(ctx context.Context, rep k8s.NodeReport) error {
+			return c.PostClusterStatus(ctx, st.AgentToken, client.ClusterNodeStatus{
+				Ready:       rep.Ready,
+				Message:     rep.Message,
+				APIEndpoint: rep.APIEndpoint,
+				Version:     rep.Version,
+			})
+		},
+	)
 	k8sDriver.Register(registry)
 	// Git deploy build path (P1-9): git.clone + image.build behind the same
 	// registry (the no-shell enforcement point). The clone credential is fetched
@@ -183,6 +204,15 @@ func run() error {
 				return "", err
 			}
 			return res.Token, nil
+		},
+		// Pushing a built image for another host authenticates against the org's
+		// registry. An anonymous push is a 401 everywhere that matters.
+		func(ctx context.Context) (build.RegistryAuth, error) {
+			res, err := c.FetchRegistryCredential(ctx, st.AgentToken)
+			if err != nil {
+				return build.RegistryAuth{}, err
+			}
+			return build.RegistryAuth{Host: res.Host, Username: res.Username, Password: res.Password}, nil
 		},
 		buildRoot,
 		log,

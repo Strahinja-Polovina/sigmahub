@@ -240,6 +240,23 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 			s.log.Error("advance deployment service", "err", err, "phase", a.phase, "resource", a.resID, "service", a.service)
 		}
 	}
+	// Re-render the peers a multi-machine deploy holds back. The build lives in
+	// the build server's document, a placed Compose service in its host's, a
+	// cluster workload in the control plane's — and each is gated on the
+	// deployment reaching the step this report just delivered. Without the nudge
+	// they would sit until the next 60s resync, once per stage.
+	//
+	// Deduped and ordered so a batch carrying several ops of one resource
+	// produces one nudge per peer, deterministically.
+	seenRes := map[string]bool{}
+	var advanced []string
+	for _, a := range advances {
+		if !seenRes[a.resID] {
+			seenRes[a.resID] = true
+			advanced = append(advanced, a.resID)
+		}
+	}
+	s.nudgeDeployPeers(r.Context(), srv.ID, advanced)
 	// Synthesize a per-resource status for Compose apps from their service ops:
 	// failed if any service failed (first error carried), applied only when every
 	// reported service applied. Never overrides a direct bare res:<id> status.
@@ -269,6 +286,25 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": applied})
+}
+
+// nudgeDeployPeers re-renders the other servers a resource's deploy spans.
+// Best-effort: a failure here only costs the 60s resync, so it is logged rather
+// than failing the agent's status POST.
+func (s *Server) nudgeDeployPeers(ctx context.Context, reportingServerID string, resourceIDs []string) {
+	if s.reconcile == nil || len(resourceIDs) == 0 {
+		return
+	}
+	for _, resID := range resourceIDs {
+		peers, err := s.store.DeployPeersForResource(ctx, resID, reportingServerID)
+		if err != nil {
+			s.log.Error("deploy peers", "err", err, "resource", resID)
+			continue
+		}
+		for _, p := range peers {
+			s.reconcile.ReconcileAsync(p.OrgID, p.ServerID)
+		}
+	}
 }
 
 // dsdPublicKeyB64 is the base64 of the CP's DSD-signing public key, served in
