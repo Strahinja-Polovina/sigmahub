@@ -361,6 +361,7 @@ func run() error {
 			InstallationAccounts: installAccounts,
 			GitIntegration:       st,
 			Compose:              st,
+			Clusters:             st,
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			PublicURL:           cfg.PublicURL,

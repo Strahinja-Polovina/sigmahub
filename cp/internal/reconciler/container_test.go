@@ -27,7 +27,7 @@ func TestRenderAppResourceFansIntoContainerOps(t *testing.T) {
 	specs := []store.ResourceSpec{
 		{ResourceID: "res_a", ProjectID: "proj_x", Kind: "app", Spec: spec},
 	}
-	ops, hash := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{})
+	ops, hash := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{}, clusterRender{})
 	if hash == "" {
 		t.Fatal("empty doc hash")
 	}
@@ -85,7 +85,7 @@ func TestRenderDedupsProjectNetwork(t *testing.T) {
 		spec, _ := json.Marshal(map[string]any{"image": "nginx:1.27"})
 		return store.ResourceSpec{ResourceID: id, ProjectID: "proj_x", Kind: "app", Spec: spec}
 	}
-	ops, _ := renderOps("srv_t", []store.ResourceSpec{mk("res_a"), mk("res_b")}, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{})
+	ops, _ := renderOps("srv_t", []store.ResourceSpec{mk("res_a"), mk("res_b")}, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{}, clusterRender{})
 	netCount := 0
 	for _, op := range ops {
 		if op.Kind == dsd.KindNetworkEnsure {
@@ -104,7 +104,7 @@ func TestRenderStubFallback(t *testing.T) {
 		{ResourceID: "res_db", ProjectID: "proj_x", Kind: "postgres", Spec: json.RawMessage(`{}`)},
 		{ResourceID: "res_app", ProjectID: "proj_x", Kind: "app", Spec: noImage},
 	}
-	ops, _ := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{})
+	ops, _ := renderOps("srv_t", specs, nil, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{}, clusterRender{})
 	for _, id := range []string{"sync:res_db", "sync:res_app"} {
 		op, ok := opByID(ops, id)
 		if !ok || op.Kind != dsd.KindResourceSync {
@@ -126,7 +126,7 @@ func TestRenderAppendsDestructiveOps(t *testing.T) {
 	pending := []store.PendingDestructiveOp{
 		{ID: "pdo_1", OpKind: dsd.KindVolumeRemove, Target: "sigmahub-res_a-data"},
 	}
-	ops, _ := renderOps("srv_t", nil, pending, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{})
+	ops, _ := renderOps("srv_t", nil, pending, nil, store.HostHardening{}, nil, nil, nil, nil, nil, nil, ACMEConfig{}, clusterRender{})
 	op, ok := opByID(ops, "volrm:pdo_1")
 	if !ok || op.Kind != dsd.KindVolumeRemove {
 		t.Fatalf("missing volume.remove op: %+v (ok=%v)", op, ok)

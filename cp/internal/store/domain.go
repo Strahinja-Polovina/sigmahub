@@ -480,9 +480,12 @@ func (s *Store) EnvServerIDs(ctx context.Context, orgID, envID string) ([]string
 type CreateResourceInput struct {
 	EnvironmentID string
 	ServerID      string
-	Name          string
-	Kind          string
-	Spec          json.RawMessage
+	// ClusterID deploys INTO a Kubernetes cluster instead of onto one server.
+	// Mutually exclusive with ServerID.
+	ClusterID string
+	Name      string
+	Kind      string
+	Spec      json.RawMessage
 }
 
 // CreateResource enforces the domain rules the UI can't be trusted with:
@@ -528,48 +531,79 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		return Resource{}, err
 	}
 
-	var serverType string
-	// FOR SHARE locks the server row so a concurrent DeleteServer (FOR UPDATE)
-	// cannot tombstone it between this liveness check and the resource insert —
-	// the two serialize, so the resource either blocks the delete or is rejected
-	// against an already-tombstoned server (SIGMA-132).
-	if err := tx.QueryRow(ctx,
-		`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
-		orgID, in.ServerID).Scan(&serverType); errors.Is(err, pgx.ErrNoRows) {
-		return Resource{}, ErrNotFound
-	} else if err != nil {
-		return Resource{}, err
-	}
-
-	ok := false
-	for _, t := range allowed {
-		if t == serverType {
-			ok = true
-			break
+	// Cluster deploy: the workload is scheduled by Kubernetes, so it has no
+	// server of its own and the server-type matrix does not apply. What DOES
+	// apply is the stateful-kind exclusion — a database rescheduled onto a node
+	// without its data is data loss, so it must live on its own server.
+	if in.ClusterID != "" {
+		if in.ServerID != "" {
+			return Resource{}, ErrInvalid{Msg: "a resource targets either a server or a cluster, not both"}
 		}
-	}
-	if !ok {
-		return Resource{}, ErrInvalid{Msg: fmt.Sprintf(
-			"resource kind %q cannot run on a %q server; allowed server types: %s",
-			in.Kind, serverType, strings.Join(allowed, ", "))}
+		if !ClusterKindAllowed(in.Kind) {
+			return Resource{}, ErrKindNotClusterable{Kind: in.Kind}
+		}
+		var clusterEnv string
+		if err := tx.QueryRow(ctx,
+			`SELECT environment_id FROM clusters WHERE org_id = $1 AND id = $2 FOR SHARE`,
+			orgID, in.ClusterID).Scan(&clusterEnv); errors.Is(err, pgx.ErrNoRows) {
+			return Resource{}, ErrNotFound
+		} else if err != nil {
+			return Resource{}, err
+		}
+		if clusterEnv != in.EnvironmentID {
+			return Resource{}, ErrInvalid{Msg: "that cluster belongs to a different environment"}
+		}
+	} else if in.ServerID == "" {
+		return Resource{}, ErrInvalid{Msg: "a target server or cluster is required"}
 	}
 
-	var attached bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM env_servers WHERE org_id = $1 AND environment_id = $2 AND server_id = $3)`,
-		orgID, in.EnvironmentID, in.ServerID).Scan(&attached); err != nil {
-		return Resource{}, err
-	}
-	if !attached {
-		return Resource{}, ErrInvalid{Msg: "server is not attached to the target environment"}
+	var serverType string
+	// Server placement checks. A cluster deploy has no server of its own — the
+	// scheduler picks the node — so the type matrix and env attachment are the
+	// cluster's concern, already validated above.
+	if in.ClusterID == "" {
+		// FOR SHARE locks the server row so a concurrent DeleteServer (FOR UPDATE)
+		// cannot tombstone it between this liveness check and the resource insert —
+		// the two serialize, so the resource either blocks the delete or is rejected
+		// against an already-tombstoned server (SIGMA-132).
+		if err := tx.QueryRow(ctx,
+			`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
+			orgID, in.ServerID).Scan(&serverType); errors.Is(err, pgx.ErrNoRows) {
+			return Resource{}, ErrNotFound
+		} else if err != nil {
+			return Resource{}, err
+		}
+
+		ok := false
+		for _, t := range allowed {
+			if t == serverType {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return Resource{}, ErrInvalid{Msg: fmt.Sprintf(
+				"resource kind %q cannot run on a %q server; allowed server types: %s",
+				in.Kind, serverType, strings.Join(allowed, ", "))}
+		}
+
+		var attached bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM env_servers WHERE org_id = $1 AND environment_id = $2 AND server_id = $3)`,
+			orgID, in.EnvironmentID, in.ServerID).Scan(&attached); err != nil {
+			return Resource{}, err
+		}
+		if !attached {
+			return Resource{}, ErrInvalid{Msg: "server is not attached to the target environment"}
+		}
 	}
 
 	r := Resource{ID: newID("res")}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9,''))
 		RETURNING id, org_id, project_id, environment_id, server_id, name, kind, spec, status, created_at, updated_at`,
-		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec),
+		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID,
 	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if isUniqueViolation(err) {

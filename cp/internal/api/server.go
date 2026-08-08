@@ -72,6 +72,7 @@ type Server struct {
 	git                 GitAPI
 	gitIntegration      GitIntegrationAPI
 	compose             ComposeAPI
+	clusters            ClusterAPI
 	inspector           RepoInspector
 	repoLister          RepoLister
 	installTokens       InstallationTokenSource
@@ -137,6 +138,8 @@ type Options struct {
 	RepoLister RepoLister
 	// Compose backs per-service placement for multi-service apps.
 	Compose ComposeAPI
+	// Clusters backs Kubernetes cluster setup and membership.
+	Clusters ClusterAPI
 	// InstallationAccounts names an installation's account for the dashboard.
 	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
@@ -178,6 +181,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		installAccounts:     opts.InstallationAccounts,
 		gitIntegration:      opts.GitIntegration,
 		compose:             opts.Compose,
+		clusters:            opts.Clusters,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -348,6 +352,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/repos", s.requireService(store.RoleDeveloper, s.handleListGitRepos))
 	// Compose placement: reading the service graph is member-visible; moving a
 	// service between servers changes what runs where, so Project Admin+.
+	// Kubernetes clusters: reading is member-visible; building one out of the
+	// org's servers changes what runs where, so Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/clusters", s.requireService(store.RoleDeveloper, s.handleListClusters))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateCluster)))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters/{clusterId}/nodes", s.requireService(store.RoleProjectAdmin, s.handleAddClusterNode))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}/nodes/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleRemoveClusterNode))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteCluster))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/compose", s.requireService(store.RoleDeveloper, s.handleGetComposeServices))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/compose/placements", s.requireService(store.RoleProjectAdmin, s.handleSetComposePlacements))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))

@@ -153,3 +153,27 @@ func TestDisconnectIntegrationGuardsLiveConnections(t *testing.T) {
 		t.Fatalf("unknown installation err = %v, want ErrNotFound", err)
 	}
 }
+
+// A cluster refuses stateful kinds outright — the rule lives in the store, not
+// only in the UI, because losing a database to a rescheduling event is data
+// loss rather than a degraded deploy.
+func TestClusterRefusesStatefulKinds(t *testing.T) {
+	for _, kind := range []string{"postgres", "mysql", "redis", "mongodb", "s3"} {
+		if store.ClusterKindAllowed(kind) {
+			t.Fatalf("%s must not be deployable into a cluster", kind)
+		}
+	}
+	for _, kind := range []string{"app", "llm"} {
+		if !store.ClusterKindAllowed(kind) {
+			t.Fatalf("%s must be deployable into a cluster", kind)
+		}
+	}
+	// The published list is what the dashboard renders, so it must match.
+	published := map[string]bool{}
+	for _, k := range store.ClusterExcludedKinds() {
+		published[k] = true
+	}
+	if len(published) != 5 || !published["postgres"] || !published["s3"] {
+		t.Fatalf("excluded kinds published to the UI = %v", store.ClusterExcludedKinds())
+	}
+}

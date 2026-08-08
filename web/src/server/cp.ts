@@ -1714,3 +1714,86 @@ export async function cpSetComposePlacements(
     { orgId, actor }
   );
 }
+
+// ── Kubernetes clusters ─────────────────────────────────────────────────────
+
+export type CpClusterNode = {
+  serverId: string;
+  serverName: string;
+  serverType: string;
+  status: string;
+  meshIp: string;
+  role: string; // control-plane | worker
+  joinedAt: string;
+};
+
+export type CpCluster = {
+  id: string;
+  orgId: string;
+  environmentId: string;
+  name: string;
+  status: string; // provisioning | ready | degraded
+  apiEndpoint: string;
+  kubernetesVersion: string;
+  createdBy: string;
+  createdAt: string;
+  nodes: CpClusterNode[];
+};
+
+export async function cpListClusters(
+  orgId: string,
+  environmentId?: string
+): Promise<{ clusters: CpCluster[]; excludedKinds: string[] }> {
+  const q = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
+  return cpFetch(`${org(orgId)}/clusters${q}`, undefined, { orgId });
+}
+
+export async function cpCreateCluster(
+  orgId: string,
+  input: { environmentId: string; name: string; controlPlaneId: string },
+  actor: CpActor
+): Promise<CpCluster> {
+  return cpFetch(
+    `${org(orgId)}/clusters`,
+    { method: "POST", body: JSON.stringify(input) },
+    { orgId, actor, idempotencyKey: `cluster:${input.environmentId}:${input.name}` }
+  );
+}
+
+export async function cpAddClusterNode(
+  orgId: string,
+  clusterId: string,
+  serverId: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/clusters/${encodeURIComponent(clusterId)}/nodes`,
+    { method: "POST", body: JSON.stringify({ serverId }) },
+    { orgId, actor }
+  );
+}
+
+export async function cpRemoveClusterNode(
+  orgId: string,
+  clusterId: string,
+  serverId: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(serverId)}`,
+    { method: "DELETE" },
+    { orgId, actor }
+  );
+}
+
+export async function cpDeleteCluster(
+  orgId: string,
+  clusterId: string,
+  actor: CpActor
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/clusters/${encodeURIComponent(clusterId)}`,
+    { method: "DELETE" },
+    { orgId, actor }
+  );
+}
