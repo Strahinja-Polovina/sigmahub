@@ -23,6 +23,34 @@ type rolloutDocker interface {
 	ContainerStart(ctx context.Context, id string) error
 	ContainerStop(ctx context.Context, id string, grace time.Duration) error
 	ContainerRemove(ctx context.Context, id string, force bool) error
+	// ContainerLogTail is read on a health-gate failure, before the container is
+	// removed. Its output is the only account of why the new version never
+	// became healthy.
+	ContainerLogTail(ctx context.Context, id string, n int) ([]string, error)
+}
+
+// startupSink ships a failed generation's own output to the control plane, under
+// the deploy log's "startup" stream. Nil disables it (tests, and any path with
+// no deployment to attach the lines to).
+type startupSink func(ctx context.Context, deploymentID string, lines []string)
+
+// startupLogLines caps what a crash-looping container can push into the deploy
+// log. The tail is what matters — the panic is at the end.
+const startupLogLines = 100
+
+// captureStartupLogs reads the failed container's output and hands it to the
+// sink. Every failure here is swallowed on purpose: this runs on the way to
+// reporting a health-gate failure, and must never replace that error with a
+// worse one about log collection.
+func captureStartupLogs(ctx context.Context, dk rolloutDocker, sink startupSink, deploymentID, id string) {
+	if sink == nil || deploymentID == "" {
+		return
+	}
+	lines, err := dk.ContainerLogTail(ctx, id, startupLogLines)
+	if err != nil || len(lines) == 0 {
+		return
+	}
+	sink(ctx, deploymentID, lines)
 }
 
 // Prober reports whether a container at ip is healthy per the probe. Swapped in
@@ -262,7 +290,7 @@ func inUseImages(ctx context.Context, dk interface {
 // Invariant (never cut): the new container is created, started, and HEALTH-GATED
 // before any old generation is touched. A health-gate failure removes ONLY the
 // new container, leaving the previous version serving.
-func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec RolloutSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf) error {
+func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec RolloutSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf, startup startupSink) error {
 	resourceID := spec.Container.ResourceID
 	service := spec.Container.Service
 	newName := rolloutName(spec.Container.Name, spec.Generation)
@@ -308,6 +336,10 @@ func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec Ro
 	// 2. Health-gate. On failure, remove ONLY the new container — the old keeps
 	// serving (never cut).
 	if err := gateHealthy(ctx, dk, probe, newName, spec.Health); err != nil {
+		// Before the evidence is destroyed: the container's own output is the
+		// difference between "health gate timed out" and a stack trace naming
+		// the missing environment variable.
+		captureStartupLogs(ctx, dk, startup, spec.DeploymentID, id)
 		_ = dk.ContainerRemove(ctx, id, true)
 		return fmt.Errorf("new version unhealthy, kept previous: %w", err)
 	}
@@ -321,7 +353,7 @@ func performRollout(ctx context.Context, dk rolloutDocker, probe Prober, spec Ro
 // removed FIRST, then the new one is created and started. There is a brief
 // downtime window by design — two generations cannot coexist. Factored from the
 // Docker specifics for testing.
-func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec RecreateSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf) error {
+func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec RecreateSpec, body any, hash string, postStart func(ctx context.Context, id string) error, log logf, startup startupSink) error {
 	resourceID := spec.Container.ResourceID
 	service := spec.Container.Service
 	newName := rolloutName(spec.Container.Name, spec.Generation)
@@ -336,6 +368,7 @@ func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec R
 		return err
 	} else if ok && cur.Running && cur.Labels[LabelSpecHash] == hash {
 		if err := gateHealthy(ctx, dk, probe, newName, spec.Health); err != nil {
+			captureStartupLogs(ctx, dk, startup, spec.DeploymentID, cur.ID)
 			return fmt.Errorf("recreated service unhealthy: %w", err)
 		}
 		return drainOld(ctx, dk, resourceID, service, newName, log)
@@ -364,6 +397,10 @@ func performRecreate(ctx context.Context, dk rolloutDocker, probe Prober, spec R
 	// Verify the new generation becomes healthy; on failure report it (there is no
 	// old generation to fall back to — the recreate window is the documented risk).
 	if err := gateHealthy(ctx, dk, probe, newName, spec.Health); err != nil {
+		// The recreate path leaves the unhealthy container in place (there is no
+		// old generation to fall back to), so its logs survive — but shipping
+		// them keeps the deploy view the one place you look either way.
+		captureStartupLogs(ctx, dk, startup, spec.DeploymentID, id)
 		return fmt.Errorf("recreated service unhealthy: %w", err)
 	}
 	return nil
@@ -413,7 +450,7 @@ func (d *Driver) opRollout(ctx context.Context, op dsd.Op) error {
 		return writeFileSecrets(cur.Pid, fileSecrets)
 	}
 
-	if err := performRollout(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
+	if err := performRollout(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn, d.startup); err != nil {
 		return err
 	}
 	// Record the live generation as desired so the reconcile loop repairs it if
@@ -467,7 +504,7 @@ func (d *Driver) opRecreate(ctx context.Context, op dsd.Op) error {
 		return writeFileSecrets(cur.Pid, fileSecrets)
 	}
 
-	if err := performRecreate(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn); err != nil {
+	if err := performRecreate(ctx, d.docker, defaultProbe, spec, body, hash, postStart, d.log.Warn, d.startup); err != nil {
 		return err
 	}
 	if err := d.persistRolloutGeneration(genSpec); err != nil {

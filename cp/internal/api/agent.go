@@ -137,6 +137,11 @@ func (s *Server) handleAgentGitCredential(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"token": token, "repoFullName": repo, "provider": provider})
 }
 
+// validDeployLogStream is the closed set of deploy-log streams: 'build' is the
+// builder's output, 'startup' is a failed generation's own logs captured before
+// the container is removed (SIGMA-181).
+var validDeployLogStream = map[string]bool{"build": true, "startup": true}
+
 // handleAgentBuildLog ingests build/orchestration log lines for the deploy SSE
 // stream. Bounded per request.
 func (s *Server) handleAgentBuildLog(w http.ResponseWriter, r *http.Request) {
@@ -152,10 +157,17 @@ func (s *Server) handleAgentBuildLog(w http.ResponseWriter, r *http.Request) {
 	if len(req.Lines) > 500 {
 		req.Lines = req.Lines[:500]
 	}
+	// The stream is a UI column, rendered verbatim next to every line. Bound it
+	// to the streams the agent actually produces so a buggy or compromised agent
+	// can't paint arbitrary labels into an operator's deploy view.
+	if req.Stream != "" && !validDeployLogStream[req.Stream] {
+		req.Stream = "build"
+	}
 	srv := serverFrom(r)
 	for _, line := range req.Lines {
-		// Server-scoped: the store drops lines for a deployment not on this host, so
-		// a compromised agent can't forge into another server's deploy log.
+		// Scoped to the servers that RUN this deployment — the deploy target, its
+		// build server, a cluster node, a Compose placement host. A server with no
+		// part in it can't forge into another deployment's log.
 		if err := s.store.AppendDeployLog(r.Context(), srv.ID, req.DeploymentID, req.Stream, line); err != nil {
 			s.log.Error("append deploy log", "err", err)
 			break

@@ -60,6 +60,26 @@ func main() {
 }
 `
 
+// crashImage is a container that fails the way real ones do: it writes the
+// reason to stderr and exits. Everything the operator needs to fix the deploy is
+// in those two lines — and they are destroyed with the container unless the
+// agent reads them first (SIGMA-181).
+const crashImage = "sigmahub-e2e/crash:1"
+
+const crashSource = `package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Fprintln(os.Stderr, "FATAL: DATABASE_URL is not set")
+	fmt.Fprintln(os.Stderr, "exiting")
+	os.Exit(1)
+}
+`
+
 func fleetGate(t *testing.T) {
 	t.Helper()
 	if os.Getenv("SIGMAHUB_FLEET_E2E") == "" {
@@ -75,26 +95,33 @@ func fleetGate(t *testing.T) {
 
 // buildIdleImage compiles the idle binary statically and packages it with no
 // base layer.
-func buildIdleImage(t *testing.T) {
+func buildIdleImage(t *testing.T) { buildTinyImage(t, idleImage, "idle", idleSource) }
+
+// buildCrashImage packages the container that dies on boot.
+func buildCrashImage(t *testing.T) { buildTinyImage(t, crashImage, "crash", crashSource) }
+
+// buildTinyImage compiles a single-file Go program statically and packages it
+// with no base layer, so nothing has to be pulled from a public registry.
+func buildTinyImage(t *testing.T, tag, name, source string) {
 	t.Helper()
-	if out, err := exec.Command("docker", "image", "inspect", idleImage).CombinedOutput(); err == nil {
+	if out, err := exec.Command("docker", "image", "inspect", tag).CombinedOutput(); err == nil {
 		return // already built by an earlier run
 	} else if len(out) == 0 {
 		t.Fatal("docker image inspect produced nothing")
 	}
 
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "main.go"), idleSource)
-	write(t, filepath.Join(dir, "go.mod"), "module idle\n\ngo 1.21\n")
-	build := exec.Command(goBinary(t), "build", "-o", "idle", ".")
+	write(t, filepath.Join(dir, "main.go"), source)
+	write(t, filepath.Join(dir, "go.mod"), "module "+name+"\n\ngo 1.21\n")
+	build := exec.Command(goBinary(t), "build", "-o", name, ".")
 	build.Dir = dir
 	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build idle binary: %v\n%s", err, out)
+		t.Fatalf("build %s binary: %v\n%s", name, err, out)
 	}
-	write(t, filepath.Join(dir, "Dockerfile"), "FROM scratch\nCOPY idle /idle\nENTRYPOINT [\"/idle\"]\n")
-	if out, err := exec.Command("docker", "build", "-t", idleImage, dir).CombinedOutput(); err != nil {
-		t.Fatalf("build %s: %v\n%s", idleImage, err, out)
+	write(t, filepath.Join(dir, "Dockerfile"), "FROM scratch\nCOPY "+name+" /"+name+"\nENTRYPOINT [\"/"+name+"\"]\n")
+	if out, err := exec.Command("docker", "build", "-t", tag, dir).CombinedOutput(); err != nil {
+		t.Fatalf("build %s: %v\n%s", tag, err, out)
 	}
 }
 
@@ -317,6 +344,19 @@ func fleetCP(t *testing.T, st *store.Store, dsdKey ed25519.PrivateKey) (*httptes
 	})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
+
+	// The fleet resync loop, which production runs at 60s and httptest does not
+	// start at all. Without it a nudge is the ONLY thing that ever renders — and
+	// a nudge that arrives while the agent's own reconcile holds the per-server
+	// lock is deliberately dropped (the holder converges the same state, the
+	// resync re-runs anything skipped). With no resync there is nothing to re-run
+	// it, so a mutation that loses that race is never rendered at all and the
+	// test hangs on a deadline with an empty document. Short interval so the
+	// convergence it guarantees fits inside the test's patience.
+	loopCtx, stopLoop := context.WithCancel(context.Background())
+	t.Cleanup(stopLoop)
+	go rec.Run(loopCtx, 2*time.Second)
+
 	return ts, rec, func() string { return "control plane log:\n" + tailFile(logPath, 30) }
 }
 
@@ -531,4 +571,113 @@ func TestFleetClusterNodeReportsItsFailure(t *testing.T) {
 		t.Fatalf("node reported ready but the cluster did not follow: status=%q endpoint=%q",
 			list[0].Status, list[0].APIEndpoint)
 	}
+}
+
+// A container that dies on boot must leave its reason behind.
+//
+// The health gate does its job — the deploy fails and nothing is cut over —
+// but the container is then removed, and with it the only explanation. What the
+// deploy view showed was "new version unhealthy": true, useless, and identical
+// for a missing environment variable, a bad migration and a typo in the
+// entrypoint. The reason is on the container's own stderr, so it has to be read
+// in the window between the gate failing and the removal.
+//
+// Run across two processes because both halves of the fix live on different
+// machines: the agent reads and posts the logs, and the control plane decides
+// whether to keep them. The service is placed on the host that is NOT the
+// deployment's server, which is exactly the case the control plane used to
+// throw away — an agent dutifully posting logs into a void (SIGMA-181).
+func TestFleetCrashLoopShipsItsLogs(t *testing.T) {
+	fleetGate(t)
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	image := publishCrashImage(t)
+	sigmad := buildSigmad(t)
+
+	ts, rec, cpLog := fleetCP(t, st, dsdKey)
+	orgID := "org_fleet_logs"
+
+	proj, err := st.CreateProject(ctx, orgID, "shop", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The deploy target is a registered server with no process behind it, and the
+	// one service is placed on the host that DOES run an agent. That split is the
+	// point: the logs are produced by a server that is not the deployment's
+	// server_id. Enrolling it without a sigmad also keeps the two agents off each
+	// other's containers — a fleet test runs both against ONE Docker daemon, so a
+	// second agent would GC the placed container as an orphan it has no ops for,
+	// something two real hosts with their own daemons never do.
+	appHost := connectServer(t, st, orgID, "logs-app")
+	dataHost := startAgent(t, st, sigmad, ts.URL, orgID, "logs-data")
+	for _, id := range []string{appHost, dataHost.serverID} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The service declares a port, so the rollout gates on a TCP probe rather
+	// than on "the container is running" — which a container that dies a
+	// moment after start can still satisfy on the first poll.
+	spec, err := json.Marshal(map[string]any{
+		"compose": map[string]any{"services": []map[string]any{
+			{"name": "db", "image": image, "ports": []int{5432}, "serverId": dataHost.serverID},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: appHost, Name: "shopapp", Kind: "app", Spec: spec,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeContainers("sigmahub-" + res.ID)
+
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: appHost,
+		ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.ReconcileAsync(orgID, dataHost.serverID)
+
+	// The health gate runs to its full timeout before giving up, so this waits
+	// out a real one rather than a shortened test-only value.
+	deployLogs := func() string {
+		logs, lerr := st.DeployLogsSince(ctx, dep.ID, 0, 200)
+		if lerr != nil {
+			return "deploy logs: " + lerr.Error()
+		}
+		out := "deploy logs:"
+		for _, l := range logs {
+			out += "\n  " + l.Stream + " | " + l.Line
+		}
+		return out
+	}
+	waitFor(t, 4*time.Minute, "the failed container's own output to reach the deploy log", func() bool {
+		logs, lerr := st.DeployLogsSince(ctx, dep.ID, 0, 200)
+		if lerr != nil {
+			return false
+		}
+		for _, l := range logs {
+			if l.Stream == "startup" && strings.Contains(l.Line, "DATABASE_URL is not set") {
+				return true
+			}
+		}
+		return false
+	}, deployLogs, deploymentState(st, orgID, dep.ID), cpLog, dataHost.tail)
 }

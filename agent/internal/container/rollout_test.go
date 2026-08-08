@@ -21,6 +21,13 @@ type fakeRollout struct {
 	nextID     int
 	startIP    string // IP assigned to a container on start ("" = none, stays unhealthy)
 	failCreate bool
+	// logs is what a container "wrote"; the health-gate failure path reads it
+	// before removing the container.
+	logs []string
+}
+
+func (f *fakeRollout) ContainerLogTail(_ context.Context, _ string, _ int) ([]string, error) {
+	return f.logs, nil
 }
 
 func newFakeRollout() *fakeRollout {
@@ -130,7 +137,7 @@ func TestRolloutNeverCuts(t *testing.T) {
 	f.seed("sigmahub-res_a", "res_a", "oldhash", true) // the currently-serving old gen
 
 	spec, body := rolloutSpec("res_a", "gen2", "newhash")
-	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -160,7 +167,7 @@ func TestRolloutHealthFailKeepsOld(t *testing.T) {
 	f.seed("sigmahub-res_a", "res_a", "oldhash", true)
 
 	spec, body := rolloutSpec("res_a", "gen2", "newhash")
-	err := performRollout(context.Background(), f, unhealthyProbe, spec, body, "newhash", nil, noLog)
+	err := performRollout(context.Background(), f, unhealthyProbe, spec, body, "newhash", nil, noLog, nil)
 	if err == nil {
 		t.Fatal("expected a health-gate failure")
 	}
@@ -177,6 +184,87 @@ func TestRolloutHealthFailKeepsOld(t *testing.T) {
 	}
 }
 
+// TestRolloutHealthFailShipsStartupLogs proves the diagnosis survives the
+// cleanup. A container that crashes on boot fails the health gate and is then
+// removed — and with it the only record of WHY it crashed, leaving the deploy
+// view showing "health check timed out" and nothing else (SIGMA-181). The tail
+// must therefore be read while the container still exists: the sink call has to
+// land BEFORE the remove, under the failed deployment's id.
+func TestRolloutHealthFailShipsStartupLogs(t *testing.T) {
+	f := newFakeRollout()
+	f.seed("sigmahub-res_a", "res_a", "oldhash", true)
+	f.logs = []string{"panic: dial tcp 10.0.0.5:5432: connection refused", "goroutine 1 [running]:"}
+
+	spec, body := rolloutSpec("res_a", "gen2", "newhash")
+	spec.DeploymentID = "dep_1"
+
+	var gotDep string
+	var gotLines []string
+	sink := func(_ context.Context, deploymentID string, lines []string) {
+		gotDep, gotLines = deploymentID, lines
+		f.events = append(f.events, "startup-logs")
+	}
+	if err := performRollout(context.Background(), f, unhealthyProbe, spec, body, "newhash", nil, noLog, sink); err == nil {
+		t.Fatal("expected a health-gate failure")
+	}
+	if gotDep != "dep_1" {
+		t.Errorf("startup logs posted under deployment %q, want dep_1", gotDep)
+	}
+	if len(gotLines) != 2 || !strings.Contains(gotLines[0], "connection refused") {
+		t.Fatalf("startup logs = %q, want the container's own output", gotLines)
+	}
+	var order []string
+	for _, e := range f.events {
+		if e == "startup-logs" || e == "remove:sigmahub-res_a-gen2" {
+			order = append(order, e)
+		}
+	}
+	if len(order) != 2 || order[0] != "startup-logs" {
+		t.Fatalf("logs must be read before the container is removed, got %v (all: %v)", order, f.events)
+	}
+}
+
+// TestRolloutHealthFailWithoutDeploymentStaysQuiet proves a reconcile that is
+// not part of a deployment posts nothing: there is no deploy view to post it to,
+// and a deployment-less line would be dropped by the control plane anyway.
+func TestRolloutHealthFailWithoutDeploymentStaysQuiet(t *testing.T) {
+	f := newFakeRollout()
+	f.logs = []string{"boom"}
+	spec, body := rolloutSpec("res_a", "gen2", "newhash") // no DeploymentID
+
+	called := false
+	sink := func(context.Context, string, []string) { called = true }
+	if err := performRollout(context.Background(), f, unhealthyProbe, spec, body, "newhash", nil, noLog, sink); err == nil {
+		t.Fatal("expected a health-gate failure")
+	}
+	if called {
+		t.Error("a reconcile outside a deployment must not post startup logs")
+	}
+}
+
+// TestRecreateHealthFailShipsStartupLogs is the same guarantee on the recreate
+// path, which volume-holding apps and Compose services with named volumes take.
+func TestRecreateHealthFailShipsStartupLogs(t *testing.T) {
+	f := newFakeRollout()
+	f.logs = []string{"exec /app/server: no such file or directory"}
+	spec := RecreateSpec{
+		Container:    ContainerSpec{ResourceID: "res_a", Name: "sigmahub-res_a", Image: "img"},
+		Generation:   "gen2",
+		Health:       HealthProbe{Type: "http", Port: 8080, Path: "/", IntervalSec: 1, TimeoutSec: 1},
+		DeploymentID: "dep_2",
+	}
+	body := map[string]any{"Labels": map[string]string{LabelManaged: "true", LabelResourceID: "res_a", LabelSpecHash: "newhash"}}
+
+	var gotLines []string
+	sink := func(_ context.Context, _ string, lines []string) { gotLines = lines }
+	if err := performRecreate(context.Background(), f, unhealthyProbe, spec, body, "newhash", nil, noLog, sink); err == nil {
+		t.Fatal("expected a health-gate failure")
+	}
+	if len(gotLines) != 1 || !strings.Contains(gotLines[0], "no such file or directory") {
+		t.Fatalf("recreate startup logs = %q, want the container's own output", gotLines)
+	}
+}
+
 // TestRolloutIdempotent proves a re-apply of an already-running generation drains
 // stragglers but does not recreate the current container.
 func TestRolloutIdempotent(t *testing.T) {
@@ -184,7 +272,7 @@ func TestRolloutIdempotent(t *testing.T) {
 	f.seed("sigmahub-res_a-gen2", "res_a", "newhash", true) // already the current gen
 
 	spec, body := rolloutSpec("res_a", "gen2", "newhash")
-	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range f.events {
@@ -317,7 +405,7 @@ func TestPerformRolloutRefusesHardCut(t *testing.T) {
 	f.seed("sigmahub-res_a-gen2", "res_a", "stalehash", true)
 
 	spec, body := rolloutSpec("res_a", "gen2", "newhash")
-	err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog)
+	err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog, nil)
 	if err == nil {
 		t.Fatal("expected performRollout to refuse cutting a running same-name container")
 	}
@@ -339,7 +427,7 @@ func TestPerformRolloutReplacesStoppedLeftover(t *testing.T) {
 	f.seed("sigmahub-res_a-gen2", "res_a", "stalehash", false) // stopped leftover
 
 	spec, body := rolloutSpec("res_a", "gen2", "newhash")
-	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+	if err := performRollout(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog, nil); err != nil {
 		t.Fatalf("stopped leftover should be replaceable: %v", err)
 	}
 	if indexOf(f.events, "remove:sigmahub-res_a-gen2") < 0 {
@@ -407,7 +495,7 @@ func TestPerformRecreateRemovesOldFirst(t *testing.T) {
 	f.seedSvc("sigmahub-res_a-web-g1", "res_a", "web", "whash", true)
 
 	spec, body := recreateSpec("res_a", "db", "g2", "newhash")
-	if err := performRecreate(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+	if err := performRecreate(context.Background(), f, healthyProbe, spec, body, "newhash", nil, noLog, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The old db generation must be removed before the new db is created.
@@ -435,14 +523,14 @@ func TestPerformRecreateReGatesHealthOnResume(t *testing.T) {
 	// healthy; the short-circuit must re-gate and fail.
 	fBad := newFakeRollout()
 	fBad.seedSvc("sigmahub-res_a-db-g2", "res_a", "db", "newhash", true)
-	if err := performRecreate(context.Background(), fBad, unhealthyProbe, spec, body, "newhash", nil, noLog); err == nil {
+	if err := performRecreate(context.Background(), fBad, unhealthyProbe, spec, body, "newhash", nil, noLog, nil); err == nil {
 		t.Fatal("resumed recreate of an unhealthy running generation must fail, not report success")
 	}
 
 	// Healthy: the same short-circuit converges and returns nil.
 	fOK := newFakeRollout()
 	fOK.seedSvc("sigmahub-res_a-db-g2", "res_a", "db", "newhash", true)
-	if err := performRecreate(context.Background(), fOK, healthyProbe, spec, body, "newhash", nil, noLog); err != nil {
+	if err := performRecreate(context.Background(), fOK, healthyProbe, spec, body, "newhash", nil, noLog, nil); err != nil {
 		t.Fatalf("resumed recreate of a healthy running generation should converge: %v", err)
 	}
 }

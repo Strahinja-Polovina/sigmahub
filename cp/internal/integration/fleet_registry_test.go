@@ -161,18 +161,31 @@ func (r *fleetRegistry) put(digest string, content []byte) {
 
 // publishIdleImage builds the idle image and pushes it to a registry started for
 // this test, returning the reference the agents will pull.
-//
-// 127.0.0.1 so the daemon treats it as insecure and speaks plain HTTP without
-// any daemon configuration.
 func publishIdleImage(t *testing.T) string {
 	t.Helper()
 	buildIdleImage(t)
+	return publishImage(t, idleImage, "fleet/idle:1")
+}
 
+// publishCrashImage does the same for the container that dies on boot.
+func publishCrashImage(t *testing.T) string {
+	t.Helper()
+	buildCrashImage(t)
+	return publishImage(t, crashImage, "fleet/crash:1")
+}
+
+// publishImage pushes a locally-built tag to a registry started for this test
+// and returns the reference the agents will pull.
+//
+// 127.0.0.1 so the daemon treats it as insecure and speaks plain HTTP without
+// any daemon configuration.
+func publishImage(t *testing.T, local, name string) string {
+	t.Helper()
 	srv := httptest.NewServer(newFleetRegistry())
 	t.Cleanup(srv.Close)
-	ref := strings.TrimPrefix(srv.URL, "http://") + "/fleet/idle:1"
+	ref := strings.TrimPrefix(srv.URL, "http://") + "/" + name
 
-	if out, err := exec.Command("docker", "tag", idleImage, ref).CombinedOutput(); err != nil {
+	if out, err := exec.Command("docker", "tag", local, ref).CombinedOutput(); err != nil {
 		t.Fatalf("tag %s: %v\n%s", ref, err, out)
 	}
 	if out, err := exec.Command("docker", "push", ref).CombinedOutput(); err != nil {

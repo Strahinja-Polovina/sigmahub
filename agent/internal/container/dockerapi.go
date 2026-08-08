@@ -791,6 +791,61 @@ func (d *DockerClient) ContainerStatsOnce(ctx context.Context, id string) (cpuPc
 	return cpuPct, int64(mem), nil
 }
 
+// ContainerLogTail returns the last n lines a container wrote, without
+// following. Used when a rollout's health gate fails: the container is about to
+// be removed, and its output is the only evidence of WHY it never became
+// healthy. Without this the deploy reports "health gate timed out" and the
+// stack trace that explains it is destroyed along with the container.
+//
+// Errors are the caller's to ignore — a container that produced nothing, or one
+// already gone, must not turn a health-gate failure into a different failure.
+func (d *DockerClient) ContainerLogTail(ctx context.Context, id string, n int) ([]string, error) {
+	if n <= 0 {
+		n = 100
+	}
+	q := url.Values{}
+	q.Set("stdout", "true")
+	q.Set("stderr", "true")
+	q.Set("tail", fmt.Sprintf("%d", n))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		d.url("/containers/"+url.PathEscape(id)+"/logs?"+q.Encode()), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+
+	var lines []string
+	collect := func(_ string, _ time.Time, line string) {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	stdout := &logLineSplitter{stream: "stdout", fn: collect}
+	stderr := &logLineSplitter{stream: "stderr", fn: collect}
+	// Bound the read: a container that logged megabytes before dying must not
+	// be able to stall the rollout's failure path.
+	if err := demuxDockerStream(io.LimitReader(resp.Body, 1<<20), stdout, stderr); err != nil {
+		// Partial output is still worth reporting — return what was decoded.
+		stdout.flush()
+		stderr.flush()
+		return lines, nil
+	}
+	stdout.flush()
+	stderr.flush()
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, nil
+}
+
 // FollowContainerLogs tails a container's stdout/stderr from `since`, invoking
 // fn per line with the Docker-stamped timestamp. Blocks until ctx is done, the
 // container stops, or the stream errors. Used by the P1-13 log shipper.

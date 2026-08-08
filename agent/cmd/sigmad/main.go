@@ -153,6 +153,15 @@ func run() error {
 		return out, nil
 	}
 	driver := container.NewDriver(docker, cstore, log, secretFetcher)
+	// A health-gate failure removes the container it just started, taking the
+	// output that explains the failure with it. Ship that tail to the deploy log
+	// first, under the "startup" stream, so a crash-on-boot deploy shows the
+	// panic rather than only "health check timed out".
+	driver.SetStartupLogSink(func(ctx context.Context, deploymentID string, lines []string) {
+		if err := c.PostBuildLog(ctx, st.AgentToken, deploymentID, "startup", lines); err != nil {
+			log.Warn("startup log post failed", "err", err, "deployment", deploymentID)
+		}
+	})
 	driver.Register(registry)
 	// Kubernetes (k3s): membership + workload ops behind the same typed
 	// registry. A host that never joins a cluster simply never sees these ops.
