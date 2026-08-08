@@ -371,6 +371,17 @@ func TestFleetMultiServerComposeDeploy(t *testing.T) {
 		}
 	}
 
+	// A secret the placed service must inject. The reference is rendered into
+	// one host's document and the value comes back through a different endpoint,
+	// so a mismatch between the two only shows up here: the container fails to
+	// create and the service never starts.
+	if _, err := st.CreateSecret(ctx, orgID, "test", store.CreateSecretInput{
+		ProjectID: proj.ID, EnvironmentID: env.ID, Name: "DATABASE_URL",
+		Value: "postgres://u:p@db/app", EnvVar: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	// Two prebuilt services, one per host. Nothing builds from source, so no git
 	// access is involved — the deployment exists to carry the per-service status
 	// the cross-server gate reads.
