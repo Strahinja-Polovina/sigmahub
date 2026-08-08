@@ -16,7 +16,7 @@ func TestRenderBackupOpsOrderingAndSecretFreedom(t *testing.T) {
 		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: "abc123"},
 	}
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, runs, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, runs, nil, ACMEConfig{}, clusterRender{}, registryRender{})
 
 	bk, ok := opByID(ops, "bkr:run_b")
 	if !ok || bk.Kind != dsd.KindBackupRun {
@@ -59,7 +59,7 @@ func TestRenderBackupVerifyHeldUntilBackupSha(t *testing.T) {
 		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: ""},
 	}
 	ops, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, held, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, held, nil, ACMEConfig{}, clusterRender{}, registryRender{})
 	if _, ok := opByID(ops, "bkr:run_v"); ok {
 		t.Fatal("verify with an empty (unresolved) same-day sha must not be rendered")
 	}
@@ -73,7 +73,7 @@ func TestRenderBackupVerifyHeldUntilBackupSha(t *testing.T) {
 		{RunID: "run_v", Kind: "verify", ResourceID: "res_db", Engine: "postgres", Database: "shop", Username: "sigma", ExpectedSha: "sha-today"},
 	}
 	ops2, _ := renderOps("srv_t", dbSpecs("postgres"), nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, ready, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, dbTargets("postgres", "database"), nil, nil, ready, nil, ACMEConfig{}, clusterRender{}, registryRender{})
 	vf, ok := opByID(ops2, "bkr:run_v")
 	if !ok || vf.Kind != dsd.KindBackupVerify {
 		t.Fatalf("verify should render once the sha is known: %+v", vf)
@@ -92,7 +92,7 @@ func TestRenderRestorePITROpCarriesTargetTime(t *testing.T) {
 			RecoveryTargetTime: &target},
 	}
 	ops, _ := renderOps("srv_t", nil, nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, nil, runs, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, nil, runs, nil, ACMEConfig{}, clusterRender{}, registryRender{})
 	op, ok := opByID(ops, "bkr:run_p")
 	if !ok || op.Kind != dsd.KindBackupRestorePITR {
 		t.Fatalf("pitr op = %+v", op)
@@ -117,7 +117,7 @@ func TestRenderRestoreOpTargetsNewResource(t *testing.T) {
 			RestoreResourceID: "res_new", RestoreDatabase: "shop_restore", RestoreUsername: "sigma"},
 	}
 	ops, _ := renderOps("srv_t", nil, nil, nil,
-		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, nil, runs, nil, ACMEConfig{}, clusterRender{})
+		store.HostHardening{MeshIP: "10.8.0.5"}, nil, nil, nil, nil, nil, runs, nil, ACMEConfig{}, clusterRender{}, registryRender{})
 	op, ok := opByID(ops, "bkr:run_r")
 	if !ok || op.Kind != dsd.KindBackupRestore {
 		t.Fatalf("restore op = %+v", op)

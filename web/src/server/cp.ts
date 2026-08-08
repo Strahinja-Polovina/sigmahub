@@ -1733,6 +1733,12 @@ export type CpClusterNode = {
   meshIp: string;
   role: string; // control-plane | worker
   joinedAt: string;
+  /** What the node itself reported about k3s on it: pending | ready | error.
+   *  Distinct from `status`, which only says whether the agent is checking in —
+   *  an agent can be perfectly healthy on a host where k3s never installed. */
+  nodeStatus: string;
+  nodeMessage?: string;
+  reportedAt?: string | null;
 };
 
 export type CpCluster = {
@@ -1804,6 +1810,40 @@ export async function cpDeleteCluster(
     { method: "DELETE" },
     { orgId, actor }
   );
+}
+
+// ── Container image registry ────────────────────────────────────────────────
+
+export type CpImageRegistry = {
+  host: string;
+  namespace: string;
+  username: string;
+  /** Whether a credential is stored. The value itself is never returned. */
+  hasPassword: boolean;
+  createdBy: string;
+  updatedAt: string;
+};
+
+export async function cpGetRegistry(
+  orgId: string
+): Promise<{ configured: boolean; registry?: CpImageRegistry; repository?: string }> {
+  return cpFetch(`${org(orgId)}/registry`, undefined, { orgId });
+}
+
+export async function cpSetRegistry(
+  orgId: string,
+  input: { host: string; namespace?: string; username?: string; password?: string },
+  actor: CpActor
+): Promise<{ registry: CpImageRegistry; repository: string }> {
+  return cpFetch(
+    `${org(orgId)}/registry`,
+    { method: "PUT", body: JSON.stringify(input) },
+    { orgId, actor }
+  );
+}
+
+export async function cpDeleteRegistry(orgId: string, actor: CpActor): Promise<void> {
+  await cpFetch(`${org(orgId)}/registry`, { method: "DELETE" }, { orgId, actor });
 }
 
 // ── DNS setup for custom domains ────────────────────────────────────────────

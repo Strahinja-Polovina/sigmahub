@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/build"
 )
 
 // apiVersion pins the Docker Engine API version. 1.43 ships with Docker 24.0+,
@@ -897,7 +900,7 @@ func (d *DockerClient) PutArchive(ctx context.Context, containerID, path string,
 // Like ImagePull, the HTTP status alone does not mean success — the response is
 // a newline-delimited JSON stream and a message carrying "error" means the push
 // failed under a 200.
-func (d *DockerClient) ImagePush(ctx context.Context, ref string, logs io.Writer) error {
+func (d *DockerClient) ImagePush(ctx context.Context, ref string, auth build.RegistryAuth, logs io.Writer) error {
 	name, tag := splitImageRef(ref)
 	q := url.Values{}
 	if tag != "" {
@@ -909,8 +912,17 @@ func (d *DockerClient) ImagePush(ctx context.Context, ref string, logs io.Writer
 		return err
 	}
 	// Docker requires the header to be present even for an anonymous push; an
-	// empty value means "no credentials".
-	req.Header.Set("X-Registry-Auth", "e30=") // base64("{}")
+	// empty value means "no credentials". A hosted registry answers that with a
+	// 401, so a real credential goes here whenever we have one.
+	encoded := "e30=" // base64("{}")
+	if auth.Username != "" || auth.Password != "" {
+		blob, merr := json.Marshal(auth)
+		if merr != nil {
+			return merr
+		}
+		encoded = base64.URLEncoding.EncodeToString(blob)
+	}
+	req.Header.Set("X-Registry-Auth", encoded)
 	resp, err := d.http.Do(req)
 	if err != nil {
 		return err

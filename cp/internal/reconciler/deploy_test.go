@@ -145,7 +145,7 @@ func TestManualForceOnlyWhileInFlight(t *testing.T) {
 			RepoFullName: "acme/app", Ref: "refs/heads/main", SHA: "abcdef1234", ConfigHash: "cfg",
 			Trigger: "manual", Status: status,
 		}
-		ops, _, ok := renderDeployOps(rs, nil, nil, target, "")
+		ops, _, ok := renderDeployOps(rs, nil, nil, target, "", registryRender{})
 		if !ok {
 			t.Fatal("render should succeed")
 		}
@@ -257,7 +257,7 @@ func TestRenderDeployPinnedImageAndVolumes(t *testing.T) {
 		RepoFullName: "acme/app", SHA: "abcdef1234", ConfigHash: "cfg", Trigger: "git",
 		ImagePin: "dep10p",
 	}
-	ops, networkID, ok := renderDeployOps(rs, nil, nil, target, "")
+	ops, networkID, ok := renderDeployOps(rs, nil, nil, target, "", registryRender{})
 	if !ok {
 		t.Fatal("render should succeed")
 	}
@@ -332,7 +332,7 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 		target := base
 		target.DeploymentID, target.Trigger, target.ImagePin = "dep_20", trigger, "src111"
 		target.ImageDigest = dsd.PinnedImageTag("res_r", "abcdef1234", "src111")
-		ops, _, ok := renderDeployOps(rs, nil, nil, target, "")
+		ops, _, ok := renderDeployOps(rs, nil, nil, target, "", registryRender{})
 		if !ok {
 			t.Fatalf("%s render should succeed", trigger)
 		}
@@ -355,8 +355,8 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 	standing.DeploymentID, standing.Trigger, standing.ImagePin = "dep_1", "git", "p1"
 	cfgTarget.DeploymentID, cfgTarget.Trigger, cfgTarget.ImagePin = "dep_2", "config", "p1"
 	cfgTarget.ImageDigest = dsd.PinnedImageTag("res_r", "abcdef1234", "p1")
-	opsA, _, _ := renderDeployOps(rs, nil, nil, standing, "")
-	opsB, _, _ := renderDeployOps(rs, nil, nil, cfgTarget, "")
+	opsA, _, _ := renderDeployOps(rs, nil, nil, standing, "", registryRender{})
+	opsB, _, _ := renderDeployOps(rs, nil, nil, cfgTarget, "", registryRender{})
 	genA, genB := "", ""
 	for _, op := range opsA {
 		if op.ID == "res:res_r" {
@@ -371,7 +371,7 @@ func TestRenderDeployReshipsRetainedImage(t *testing.T) {
 	// A config row with no pinned source (legacy) rebuilds the full pipeline.
 	legacy := base
 	legacy.DeploymentID, legacy.Trigger = "dep_30", "config"
-	ops, _, ok := renderDeployOps(rs, nil, nil, legacy, "")
+	ops, _, ok := renderDeployOps(rs, nil, nil, legacy, "", registryRender{})
 	if !ok {
 		t.Fatal("legacy config render should succeed")
 	}

@@ -21,15 +21,15 @@ import (
 
 // Cluster is a k3s cluster over the org's servers.
 type Cluster struct {
-	ID            string    `json:"id"`
-	OrgID         string    `json:"orgId"`
-	EnvironmentID string    `json:"environmentId"`
-	Name          string    `json:"name"`
-	Status        string    `json:"status"` // provisioning|ready|degraded
-	APIEndpoint   string    `json:"apiEndpoint"`
-	Version       string    `json:"kubernetesVersion"`
-	CreatedBy     string    `json:"createdBy"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ID            string        `json:"id"`
+	OrgID         string        `json:"orgId"`
+	EnvironmentID string        `json:"environmentId"`
+	Name          string        `json:"name"`
+	Status        string        `json:"status"` // provisioning|ready|degraded
+	APIEndpoint   string        `json:"apiEndpoint"`
+	Version       string        `json:"kubernetesVersion"`
+	CreatedBy     string        `json:"createdBy"`
+	CreatedAt     time.Time     `json:"createdAt"`
 	Nodes         []ClusterNode `json:"nodes"`
 }
 
@@ -42,6 +42,14 @@ type ClusterNode struct {
 	MeshIP     string    `json:"meshIp"`
 	Role       string    `json:"role"` // control-plane|worker
 	JoinedAt   time.Time `json:"joinedAt"`
+	// NodeStatus is what the node itself last reported about k3s on it:
+	// pending|ready|error. Distinct from Status, which is only whether the
+	// AGENT is checking in — an agent can be perfectly healthy on a host where
+	// the k3s install failed, and reading one as the other is how a cluster ends
+	// up looking fine while nothing can be scheduled on it.
+	NodeStatus  string     `json:"nodeStatus"`
+	NodeMessage string     `json:"nodeMessage,omitempty"`
+	ReportedAt  *time.Time `json:"reportedAt,omitempty"`
 }
 
 // Cluster node roles.
@@ -298,7 +306,8 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 		ids = append(ids, c.ID)
 	}
 	nodeRows, err := s.Pool.Query(ctx, `
-		SELECT n.cluster_id, n.server_id, s.name, s.type, s.status, COALESCE(s.mesh_ip,''), n.role, n.joined_at
+		SELECT n.cluster_id, n.server_id, s.name, s.type, s.status, COALESCE(s.mesh_ip,''), n.role, n.joined_at,
+		       n.node_status, n.node_message, n.reported_at
 		  FROM cluster_nodes n JOIN servers s ON s.id = n.server_id
 		 WHERE n.cluster_id = ANY($1)
 		 ORDER BY n.role, s.name`, ids)
@@ -310,7 +319,8 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 		var clusterID string
 		var n ClusterNode
 		if err := nodeRows.Scan(&clusterID, &n.ServerID, &n.ServerName, &n.ServerType,
-			&n.Status, &n.MeshIP, &n.Role, &n.JoinedAt); err != nil {
+			&n.Status, &n.MeshIP, &n.Role, &n.JoinedAt,
+			&n.NodeStatus, &n.NodeMessage, &n.ReportedAt); err != nil {
 			return nil, err
 		}
 		if i, ok := index[clusterID]; ok {
@@ -402,14 +412,145 @@ func (s *Store) ClusterMembershipForServer(ctx context.Context, serverID string)
 	return m, true, nil
 }
 
-// SetClusterReady records that the control-plane node reported the API server
-// up, with the endpoint workers and kubectl dial.
-func (s *Store) SetClusterReady(ctx context.Context, clusterID, apiEndpoint, version string) error {
-	_, err := s.Pool.Exec(ctx, `
-		UPDATE clusters SET status = 'ready', api_endpoint = $2,
-		       kubernetes_version = COALESCE(NULLIF($3,''), kubernetes_version), updated_at = now()
-		 WHERE id = $1`, clusterID, apiEndpoint, version)
-	return err
+// Node-report states. A node is 'pending' from the moment it is told to join
+// until it says otherwise, so a cluster nobody has provisioned reads as
+// provisioning rather than as ready.
+const (
+	NodeStatusPending = "pending"
+	NodeStatusReady   = "ready"
+	NodeStatusError   = "error"
+)
+
+// ClusterNodeReport is what one node says about k3s on it. Only the control
+// plane fills APIEndpoint/Version — a worker has no API server to describe.
+type ClusterNodeReport struct {
+	Ready       bool
+	Message     string
+	APIEndpoint string
+	Version     string
+}
+
+// ReportClusterNode records a node's own account of its k3s state and rederives
+// the cluster's status from the node rows.
+//
+// Before this, `clusters.status` was written once as 'provisioning' and never
+// moved: the only thing that could have advanced it had no caller at all, so a
+// cluster that came up perfectly and one whose control plane never installed
+// were indistinguishable in the product. Deriving the cluster status here — in
+// the same transaction as the node row — means the two can never disagree.
+//
+// Scoped by serverID, which the caller has already authenticated from the agent
+// token: a node can only ever report about itself.
+func (s *Store) ReportClusterNode(ctx context.Context, serverID string, rep ClusterNodeReport) (clusterID, status string, err error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var role string
+	err = tx.QueryRow(ctx, `
+		SELECT n.cluster_id, n.role FROM cluster_nodes n WHERE n.server_id = $1 FOR UPDATE`,
+		serverID).Scan(&clusterID, &role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The server left the cluster between rendering the op and reporting on
+		// it. Not an error: the node is being torn down and its report is stale.
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	nodeStatus := NodeStatusError
+	if rep.Ready {
+		nodeStatus = NodeStatusReady
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE cluster_nodes SET node_status = $3, node_message = $4, reported_at = now()
+		 WHERE cluster_id = $1 AND server_id = $2`,
+		clusterID, serverID, nodeStatus, strings.TrimSpace(rep.Message)); err != nil {
+		return "", "", err
+	}
+
+	// The control plane is the only node that can describe the API server, and
+	// only while it is actually up — a stale endpoint on a broken control plane
+	// is worse than none, because it is what kubectl would be told to dial.
+	if role == NodeRoleControlPlane && rep.Ready {
+		if _, err := tx.Exec(ctx, `
+			UPDATE clusters
+			   SET api_endpoint = COALESCE(NULLIF($2,''), api_endpoint),
+			       kubernetes_version = COALESCE(NULLIF($3,''), kubernetes_version)
+			 WHERE id = $1`, clusterID, strings.TrimSpace(rep.APIEndpoint), strings.TrimSpace(rep.Version)); err != nil {
+			return "", "", err
+		}
+	}
+
+	status, err = rederiveClusterStatusTx(ctx, tx, clusterID)
+	if err != nil {
+		return "", "", err
+	}
+	return clusterID, status, tx.Commit(ctx)
+}
+
+// rederiveClusterStatusTx computes a cluster's status from its node rows.
+//
+//	ready       — the control plane is up and every node reported ready
+//	degraded    — the control plane is up but some node did not
+//	provisioning— the control plane has not reported ready yet
+//
+// Nothing else writes clusters.status, so the derivation is the definition.
+func rederiveClusterStatusTx(ctx context.Context, tx pgx.Tx, clusterID string) (string, error) {
+	var cpReady bool
+	var notReady int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(bool_or(role = 'control-plane' AND node_status = 'ready'), false),
+		       COUNT(*) FILTER (WHERE node_status <> 'ready')
+		  FROM cluster_nodes WHERE cluster_id = $1`, clusterID).Scan(&cpReady, &notReady); err != nil {
+		return "", err
+	}
+	status := "provisioning"
+	switch {
+	case cpReady && notReady == 0:
+		status = "ready"
+	case cpReady:
+		status = "degraded"
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE clusters SET status = $2, updated_at = now() WHERE id = $1`, clusterID, status); err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
+// ClusterBuildSpecsForServer returns cluster-deployed resources whose current
+// deployment names this server as the build server.
+//
+// A cluster workload has no server of its own, so it never appears in
+// ResourceSpecsForServer and its clone+build ops landed in no document at all —
+// the manifest pointed at an image tag nothing had ever built. The build has to
+// happen SOMEWHERE, and a build server is the only place the product models.
+func (s *Store) ClusterBuildSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT r.id, r.project_id, r.kind, r.spec, r.ephemeral
+		  FROM resources r
+		  JOIN deployments d ON d.resource_id = r.id
+		 WHERE r.cluster_id IS NOT NULL
+		   AND d.build_server_id = $1
+		   AND d.status IN ('queued','building','deploying')
+		 ORDER BY r.id`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ResourceSpec{}
+	for rows.Next() {
+		var r ResourceSpec
+		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ResourceSpecsForCluster returns the resources deployed INTO a cluster. They

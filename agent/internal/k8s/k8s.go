@@ -45,7 +45,10 @@ type NodeSpec struct {
 
 // ApplySpec is one workload reconciled through the API server.
 type ApplySpec struct {
-	ResourceID   string            `json:"resourceId"`
+	ResourceID string `json:"resourceId"`
+	// Service is the Compose service this workload came from, empty for a
+	// single-container app.
+	Service      string            `json:"service,omitempty"`
 	Name         string            `json:"name"`
 	Namespace    string            `json:"namespace"`
 	Image        string            `json:"image"`
@@ -55,6 +58,15 @@ type ApplySpec struct {
 	SecretRefs   []SecretRef       `json:"secretRefs,omitempty"`
 	Hosts        []string          `json:"hosts,omitempty"`
 	DeploymentID string            `json:"deploymentId,omitempty"`
+	// RegistryHost, when set, means the image lives in a private registry: the
+	// agent fetches the credential over its own authenticated channel and
+	// renders it as an imagePullSecret. The DSD never carries the password.
+	RegistryHost string `json:"registryHost,omitempty"`
+	// Workloads is every workload name this resource should currently have.
+	// Manifests for this resource that are not in the list are removed, so a
+	// service deleted from a Compose file stops running instead of outliving
+	// its own definition.
+	Workloads []string `json:"workloads,omitempty"`
 }
 
 // SecretRef is a secret the CP resolves at apply time; the DSD carries only the
@@ -75,6 +87,31 @@ type Secret struct {
 // channel, exactly as the container driver does.
 type SecretFetcher func(ctx context.Context, resourceID string) ([]Secret, error)
 
+// RegistryCredential authenticates an image pull from a private registry.
+type RegistryCredential struct {
+	Host     string
+	Username string
+	Password string
+}
+
+// RegistryFetcher resolves the org's registry credential over the authenticated
+// agent channel. Nil on a host that never pulls a private image.
+type RegistryFetcher func(ctx context.Context) (RegistryCredential, error)
+
+// NodeReport is what this node tells the control plane about k3s on it.
+type NodeReport struct {
+	ClusterID   string
+	Ready       bool
+	Message     string
+	APIEndpoint string
+	Version     string
+}
+
+// NodeReporter delivers a NodeReport to the control plane. Without one a
+// cluster has no way to leave 'provisioning': the node is the only thing that
+// knows whether k3s actually came up on it.
+type NodeReporter func(ctx context.Context, rep NodeReport) error
+
 // Driver applies the k8s ops. runner and installer are swapped in tests.
 type Driver struct {
 	// runner executes a binary with args (never a shell).
@@ -84,7 +121,11 @@ type Driver struct {
 	installScript func(ctx context.Context, env []string, args ...string) error
 	writeFile     func(path string, data []byte, perm os.FileMode) error
 	mkdirAll      func(path string, perm os.FileMode) error
+	removeFile    func(path string) error
+	readDir       func(path string) ([]string, error)
 	fetchSecrets  SecretFetcher
+	fetchRegistry RegistryFetcher
+	report        NodeReporter
 	euid          int
 	// binDir is where k3s and kubectl live; overridable for tests.
 	binDir string
@@ -95,7 +136,7 @@ type Driver struct {
 }
 
 // NewDriver builds a driver bound to the real host.
-func NewDriver(fetchSecrets SecretFetcher) *Driver {
+func NewDriver(fetchSecrets SecretFetcher, fetchRegistry RegistryFetcher, report NodeReporter) *Driver {
 	return &Driver{
 		runner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
@@ -103,7 +144,23 @@ func NewDriver(fetchSecrets SecretFetcher) *Driver {
 		installScript: installK3s,
 		writeFile:     os.WriteFile,
 		mkdirAll:      os.MkdirAll,
+		removeFile:    os.Remove,
+		readDir: func(path string) ([]string, error) {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return nil, err
+			}
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				if !e.IsDir() {
+					names = append(names, e.Name())
+				}
+			}
+			return names, nil
+		},
 		fetchSecrets:  fetchSecrets,
+		fetchRegistry: fetchRegistry,
+		report:        report,
 		euid:          os.Geteuid(),
 		binDir:        "/usr/local/bin",
 		manifestDir:   "/var/lib/rancher/k3s/server/manifests",
@@ -119,11 +176,32 @@ func (d *Driver) Register(reg *apply.Registry) {
 // applyNode converges this host into its cluster role. Idempotent: an already
 // installed node with the same role and server URL is left alone, so a resync
 // does not restart the API server under running workloads.
-func (d *Driver) applyNode(ctx context.Context, op dsd.Op) error {
+//
+// Every path through here reports back. Before that, a cluster was written as
+// 'provisioning' at creation and nothing ever moved it: a cluster that came up
+// perfectly and one whose install failed on the first line looked identical in
+// the dashboard, and the only way to tell them apart was to SSH in. The report
+// is the node's own account — installed, service running, and on the control
+// plane the API server actually answering — not an inference from "the op did
+// not return an error".
+func (d *Driver) applyNode(ctx context.Context, op dsd.Op) (err error) {
 	var spec NodeSpec
-	if err := json.Unmarshal(op.Spec, &spec); err != nil {
-		return fmt.Errorf("decode k8s.node spec: %w", err)
+	if jerr := json.Unmarshal(op.Spec, &spec); jerr != nil {
+		return fmt.Errorf("decode k8s.node spec: %w", jerr)
 	}
+	// Report on the way out, whatever happened. A failure the control plane
+	// never hears about is the exact state this is here to end.
+	defer func() {
+		if spec.ClusterID == "" {
+			return
+		}
+		if err != nil {
+			d.reportNode(ctx, NodeReport{ClusterID: spec.ClusterID, Ready: false, Message: err.Error()})
+			return
+		}
+		d.reportNode(ctx, d.probeNode(ctx, spec))
+	}()
+
 	if spec.JoinToken == "" || spec.AdvertiseIP == "" {
 		return fmt.Errorf("k8s.node requires a join token and an advertise address")
 	}
@@ -134,13 +212,9 @@ func (d *Driver) applyNode(ctx context.Context, op dsd.Op) error {
 		return fmt.Errorf("installing a cluster node requires root")
 	}
 
-	service := "k3s"
-	if spec.Role != RoleControlPlane {
-		service = "k3s-agent"
-	}
 	// Already converged? The unit exists and is active, so nothing to do. This
 	// is the common case on every resync and must not disturb the cluster.
-	if d.serviceActive(ctx, service) {
+	if d.serviceActive(ctx, nodeService(spec.Role)) {
 		return nil
 	}
 
@@ -171,6 +245,76 @@ func (d *Driver) applyNode(ctx context.Context, op dsd.Op) error {
 		return fmt.Errorf("install k3s %s: %w", spec.Role, err)
 	}
 	return nil
+}
+
+// nodeService is the systemd unit for a role.
+func nodeService(role string) string {
+	if role == RoleControlPlane {
+		return "k3s"
+	}
+	return "k3s-agent"
+}
+
+// probeNode asks the host what state k3s is actually in.
+//
+// A worker can only say whether its unit is running — it has no API server to
+// interrogate, and dialling the control plane's would prove something about
+// that node, not this one. The control plane goes further: an active unit is
+// not the same as a serving API server (k3s is "active" while it is still
+// starting), so it asks kubectl for the version and reports ready only when it
+// gets an answer.
+func (d *Driver) probeNode(ctx context.Context, spec NodeSpec) NodeReport {
+	rep := NodeReport{ClusterID: spec.ClusterID}
+	if !d.serviceActive(ctx, nodeService(spec.Role)) {
+		rep.Message = "k3s is installed but its service is not running"
+		return rep
+	}
+	if spec.Role != RoleControlPlane {
+		rep.Ready = true
+		return rep
+	}
+	rep.APIEndpoint = "https://" + spec.AdvertiseIP + ":6443"
+	out, err := d.runner(ctx, filepath.Join(d.binDir, "kubectl"), "version", "-o", "json")
+	if err != nil {
+		rep.Message = "the API server is not answering yet: " + firstLine(string(out))
+		return rep
+	}
+	var ver struct {
+		ServerVersion struct {
+			GitVersion string `json:"gitVersion"`
+		} `json:"serverVersion"`
+	}
+	if jerr := json.Unmarshal(out, &ver); jerr != nil || ver.ServerVersion.GitVersion == "" {
+		// kubectl answered but said nothing about a server: it reached the
+		// client only, so there is no cluster to schedule onto.
+		rep.Message = "the API server did not report a version"
+		return rep
+	}
+	rep.Ready = true
+	rep.Version = ver.ServerVersion.GitVersion
+	return rep
+}
+
+// reportNode delivers a report, logging nothing on failure: the reporter itself
+// owns retry, and a node whose report is lost is re-reported on the next resync
+// because applyNode runs again.
+func (d *Driver) reportNode(ctx context.Context, rep NodeReport) {
+	if d.report == nil || rep.ClusterID == "" {
+		return
+	}
+	_ = d.report(ctx, rep)
+}
+
+// firstLine trims command output down to something a status field can hold.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 300 {
+		s = s[:300]
+	}
+	return s
 }
 
 // serviceActive reports whether a systemd unit is running.
@@ -219,19 +363,97 @@ func (d *Driver) applyWorkload(ctx context.Context, op dsd.Op) error {
 		}
 	}
 
-	manifest, err := renderManifests(spec, ns, secrets)
+	// A private registry needs credentials on the NODE that runs the pod, not
+	// just on whoever built the image, so they ride into the manifest as an
+	// imagePullSecret. Fetched here, at apply time, so the DSD never held them.
+	var pull *RegistryCredential
+	if spec.RegistryHost != "" && d.fetchRegistry != nil {
+		cred, err := d.fetchRegistry(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve registry credential: %w", err)
+		}
+		if cred.Username != "" || cred.Password != "" {
+			if cred.Host == "" {
+				cred.Host = spec.RegistryHost
+			}
+			pull = &cred
+		}
+	}
+
+	manifest, err := renderManifests(spec, ns, secrets, pull)
 	if err != nil {
 		return err
 	}
 	if err := d.ensureDir(d.manifestDir, 0o700); err != nil {
 		return fmt.Errorf("create manifest dir: %w", err)
 	}
-	path := filepath.Join(d.manifestDir, "sigmahub-"+spec.ResourceID+".yaml")
 	// 0600: the manifest embeds resolved secret values.
-	if err := d.writeFile(path, []byte(manifest), 0o600); err != nil {
+	if err := d.writeFile(filepath.Join(d.manifestDir, manifestFile(spec.Name)), []byte(manifest), 0o600); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
+	// Reconcile the resource's manifests down to the workloads it should have.
+	// A Compose service removed from the file has to stop running; k3s keeps
+	// applying whatever is in this directory, so leaving the file behind leaves
+	// the Deployment alive with nothing in the product describing it.
+	d.pruneManifests(spec)
 	return nil
+}
+
+// manifestFile is the manifest a workload owns. Keyed by the workload's own
+// name, which is unique per Compose service — one file per service, so two
+// services of the same app do not overwrite each other.
+func manifestFile(name string) string { return name + ".yaml" }
+
+// pruneManifests removes manifests belonging to this resource that are not in
+// the spec's Workloads set. Every op for a resource carries the same set, so
+// the result is the same whichever one runs last, and an op with no set (an
+// older control plane) prunes nothing.
+func (d *Driver) pruneManifests(spec ApplySpec) {
+	if len(spec.Workloads) == 0 || d.readDir == nil || d.removeFile == nil {
+		return
+	}
+	keep := make(map[string]bool, len(spec.Workloads))
+	for _, w := range spec.Workloads {
+		keep[manifestFile(w)] = true
+	}
+	// A resource's workload names all start with its own name, and identifiers
+	// are fixed-length, so no other resource's manifests can match this prefix.
+	prefix := manifestFile(spec.Name)
+	prefix = strings.TrimSuffix(prefix, ".yaml")
+	if spec.Service != "" {
+		// This op is one service, so the shared prefix is the resource part —
+		// everything up to the service suffix.
+		prefix = strings.TrimSuffix(prefix, "-"+sanitizedService(spec))
+	}
+	names, err := d.readDir(d.manifestDir)
+	if err != nil {
+		return // nothing to prune against; the next resync tries again
+	}
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".yaml") || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if keep[name] {
+			continue
+		}
+		_ = d.removeFile(filepath.Join(d.manifestDir, name))
+	}
+}
+
+// sanitizedService is the service suffix as it appears in the workload name.
+// The control plane builds the name from the same service string, rewriting
+// anything not [a-z0-9-]; mirroring that here is what lets the resource prefix
+// be recovered from the workload name.
+func sanitizedService(spec ApplySpec) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(spec.Service) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	return b.String()
 }
 
 func (d *Driver) ensureDir(path string, perm os.FileMode) error {

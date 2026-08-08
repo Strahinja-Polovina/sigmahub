@@ -3,6 +3,7 @@ import { getActiveOrgId, getSessionUser, hasFullOrgVisibility } from "@/server/a
 import { getMembers, getOrg, getPendingInvites } from "@/server/queries";
 import { getAuditLog } from "@/server/audit";
 import { cpEnabled, cpListAudit, cpGetGitIntegration } from "@/server/cp";
+import { getRegistry } from "@/server/actions/registry";
 import { SettingsView } from "@/components/dashboard/settings/settings-view";
 
 export default async function SettingsPage() {
@@ -16,7 +17,7 @@ export default async function SettingsPage() {
   // org visibility (org admins and zero-grant legacy users) — SIGMA-97.
   const canViewAudit = await hasFullOrgVisibility(orgId);
 
-  const [org, members, pendingInvites, audit, sessionUser, cpAudit, gitIntegration] =
+  const [org, members, pendingInvites, audit, sessionUser, cpAudit, gitIntegration, registry] =
     await Promise.all([
     getOrg(orgId),
     getMembers(orgId),
@@ -31,6 +32,9 @@ export default async function SettingsPage() {
       cpEnabled()
         ? cpGetGitIntegration(orgId).catch(() => null)
         : Promise.resolve(null),
+      // The org's container registry — what makes an image built on one machine
+      // runnable on another. Already degrades to "not configured" on failure.
+      getRegistry({ orgId }),
     ]);
   if (!org) redirect("/login");
 
@@ -78,6 +82,7 @@ export default async function SettingsPage() {
         (sessionUser as { twoFactorEnabled?: boolean | null }).twoFactorEnabled
       )}
       gitIntegration={gitIntegration}
+      registry={registry}
     />
   );
 }

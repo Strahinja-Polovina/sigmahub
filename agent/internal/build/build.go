@@ -31,9 +31,23 @@ type ImageBuilder interface {
 	ImageDigest(ctx context.Context, ref string) (string, error)
 	// ImagePush publishes a built image so another host can pull it. Only used
 	// by a dedicated build server, which builds for machines that cannot read
-	// its local Docker daemon.
-	ImagePush(ctx context.Context, ref string, logs io.Writer) error
+	// its local Docker daemon. auth carries the registry credential; a zero
+	// value pushes anonymously.
+	ImagePush(ctx context.Context, ref string, auth RegistryAuth, logs io.Writer) error
 }
+
+// RegistryAuth is the credential a push authenticates with. A zero value means
+// an anonymous push — which every hosted registry refuses, and which is exactly
+// what this used to do unconditionally.
+type RegistryAuth struct {
+	Host     string `json:"serveraddress,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+// RegistryFetcher resolves the org's registry credential from the control
+// plane. Nil on a host that never pushes.
+type RegistryFetcher func(ctx context.Context) (RegistryAuth, error)
 
 // LogSink streams a build/orchestration log line (to the control plane). Nil-safe
 // via Builder.stream.
@@ -43,6 +57,7 @@ type LogSink func(ctx context.Context, deploymentID, stream, line string)
 type Builder struct {
 	runner   Runner
 	cred     CredentialFetcher
+	registry RegistryFetcher
 	docker   ImageBuilder
 	workRoot string
 	log      *slog.Logger
@@ -50,8 +65,9 @@ type Builder struct {
 }
 
 // NewBuilder wires the default os/exec runner. workRoot is the base directory for
-// per-resource build contexts.
-func NewBuilder(docker ImageBuilder, cred CredentialFetcher, workRoot string, log *slog.Logger, sink LogSink) *Builder {
+// per-resource build contexts. registry resolves the push credential and may be
+// nil on a host that never builds for another machine.
+func NewBuilder(docker ImageBuilder, cred CredentialFetcher, registry RegistryFetcher, workRoot string, log *slog.Logger, sink LogSink) *Builder {
 	return &Builder{
 		runner: func(ctx context.Context, dir string, extraEnv []string, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
@@ -59,7 +75,7 @@ func NewBuilder(docker ImageBuilder, cred CredentialFetcher, workRoot string, lo
 			cmd.Env = append(os.Environ(), extraEnv...)
 			return cmd.CombinedOutput()
 		},
-		cred: cred, docker: docker, workRoot: workRoot, log: log, sink: sink,
+		cred: cred, registry: registry, docker: docker, workRoot: workRoot, log: log, sink: sink,
 	}
 }
 
@@ -226,8 +242,26 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 	// "successful" build whose image nobody can pull would leave the rollout
 	// waiting on an image that never arrives.
 	if spec.PushImage {
+		// Authenticate. An anonymous push to a hosted registry is a 401, so a
+		// missing credential has to fail the op here with a message that names
+		// the cause rather than surfacing later as an unexplained pull failure
+		// on whichever machine was supposed to run the image.
+		var auth RegistryAuth
+		if spec.RegistryHost != "" {
+			if b.registry == nil {
+				return fmt.Errorf("push to %s needs a registry credential and this agent has no way to fetch one", spec.RegistryHost)
+			}
+			got, err := b.registry(ctx)
+			if err != nil {
+				return fmt.Errorf("resolve registry credential for %s: %w", spec.RegistryHost, err)
+			}
+			auth = got
+			if auth.Host == "" {
+				auth.Host = spec.RegistryHost
+			}
+		}
 		b.stream(ctx, spec.DeploymentID, "build", "pushing "+spec.ImageTag+" for the deploy target")
-		if err := b.docker.ImagePush(ctx, spec.ImageTag, logs); err != nil {
+		if err := b.docker.ImagePush(ctx, spec.ImageTag, auth, logs); err != nil {
 			return fmt.Errorf("push image %s: %w", spec.ImageTag, err)
 		}
 	}

@@ -56,6 +56,7 @@ type capture struct {
 	files    map[string][]byte
 	perms    map[string]os.FileMode
 	active   map[string]bool
+	removed  []string
 }
 
 func nodeOp(t *testing.T, spec NodeSpec) dsd.Op {
@@ -163,7 +164,7 @@ func TestWorkloadManifestCarriesSecretsSafely(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	manifest := string(cap.files["/manifests/sigmahub-res_1.yaml"])
+	manifest := string(cap.files["/manifests/api.yaml"])
 	if manifest == "" {
 		t.Fatalf("no manifest written: %v", keys(cap.files))
 	}
@@ -186,7 +187,7 @@ func TestWorkloadManifestCarriesSecretsSafely(t *testing.T) {
 		}
 	}
 	// The manifest embeds secret material, so it must not be world-readable.
-	if p := cap.perms["/manifests/sigmahub-res_1.yaml"]; p != 0o600 {
+	if p := cap.perms["/manifests/api.yaml"]; p != 0o600 {
 		t.Fatalf("manifest perms = %v, want 0600", p)
 	}
 }
@@ -205,12 +206,12 @@ func TestManifestIsDeterministic(t *testing.T) {
 		ResourceID: "r", Name: "api", Namespace: "ns", Image: "img", Ports: []int{80},
 		Env: map[string]string{"B": "2", "A": "1", "C": "3"},
 	}
-	first, err := renderManifests(spec, "ns", nil)
+	first, err := renderManifests(spec, "ns", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 20; i++ {
-		again, err := renderManifests(spec, "ns", nil)
+		again, err := renderManifests(spec, "ns", nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

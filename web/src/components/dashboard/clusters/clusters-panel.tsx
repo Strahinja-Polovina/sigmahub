@@ -53,7 +53,22 @@ import {
 import type { CpCluster } from "@/server/cp";
 
 export type ClusterServer = { id: string; name: string; type: string; status: string };
+
 export type ClusterEnvironment = { id: string; name: string; projectName: string };
+
+/** What a node last reported about Kubernetes on it. Kept separate from the
+ *  server's own status: the agent checking in says nothing about whether k3s
+ *  installed, joined, or is serving. */
+const nodeTone: Record<string, Status> = {
+  ready: "running",
+  pending: "provisioning",
+  error: "degraded",
+};
+const nodeLabel: Record<string, string> = {
+  ready: "Kubernetes ready",
+  pending: "joining",
+  error: "not joined",
+};
 
 const KIND_LABEL: Record<string, string> = {
   postgres: "PostgreSQL",
@@ -241,23 +256,38 @@ function ClusterCard({
                 key={node.serverId}
                 className="flex flex-wrap items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0"
               >
-                <div className="flex min-w-0 items-center gap-2">
-                  <StatusDot status={node.status as Status} />
-                  <span className="truncate text-sm font-medium text-foreground">
-                    {node.serverName}
-                  </span>
-                  {isControlPlane ? (
-                    <Badge variant="outline" className="gap-1 text-[10px]">
-                      <Crown className="size-3" />
-                      control plane
-                    </Badge>
-                  ) : (
+                <div className="flex min-w-0 flex-col gap-1">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    {/* The node's own report about Kubernetes, not the agent's
+                        heartbeat: an agent can be checking in perfectly on a
+                        host where k3s never installed, and showing one as the
+                        other is how a cluster looks fine while nothing can be
+                        scheduled on it. */}
+                    <StatusDot status={nodeTone[node.nodeStatus] ?? "unknown"} />
+                    <span className="truncate text-sm font-medium text-foreground">
+                      {node.serverName}
+                    </span>
+                    {isControlPlane ? (
+                      <Badge variant="outline" className="gap-1 text-[10px]">
+                        <Crown className="size-3" />
+                        control plane
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="text-[10px]">
+                        worker
+                      </Badge>
+                    )}
                     <Badge variant="outline" className="text-[10px]">
-                      worker
+                      {nodeLabel[node.nodeStatus] ?? node.nodeStatus}
                     </Badge>
-                  )}
-                  {node.meshIp && (
-                    <span className="font-mono text-xs text-muted-foreground">{node.meshIp}</span>
+                    {node.meshIp && (
+                      <span className="font-mono text-xs text-muted-foreground">{node.meshIp}</span>
+                    )}
+                  </div>
+                  {node.nodeMessage && (
+                    <p className="text-xs text-amber-700 dark:text-amber-500">
+                      {node.nodeMessage}
+                    </p>
                   )}
                 </div>
                 {canManage && !isControlPlane && (

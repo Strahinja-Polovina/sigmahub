@@ -24,6 +24,17 @@ func manualForce(target store.DeployTarget) bool {
 	}
 }
 
+// crossHostRegistryHost is the registry to authenticate against, but only for a
+// build whose image actually leaves this machine. A same-host build pushes
+// nothing, so naming a registry there would make the agent fetch a credential
+// it has no use for.
+func crossHostRegistryHost(crossHost bool, registry registryRender) string {
+	if !crossHost {
+		return ""
+	}
+	return registry.host
+}
+
 // gitCloneOpSpec / buildImageOpSpec / rolloutOpSpec mirror the agent's build +
 // container package JSON exactly — the wire contract for the deploy pipeline.
 
@@ -53,6 +64,10 @@ type buildImageOpSpec struct {
 	// deploy target can't read another host's Docker daemon, so the image has to
 	// reach a registry both can see.
 	PushImage bool `json:"pushImage,omitempty"`
+	// RegistryHost is the host to authenticate the push against. The agent
+	// fetches the credential over its own channel — the DSD carries the
+	// coordinates, never the password.
+	RegistryHost string `json:"registryHost,omitempty"`
 }
 
 type healthProbe struct {
@@ -125,7 +140,7 @@ func reshipsRetainedImage(target store.DeployTarget, requirePin bool) bool {
 // built skips clone+build and renders only the rollout). The rollout container
 // runs the built image, publishes NO host ports (Traefik routes it internally so
 // two generations never conflict), and carries the router labels + health probe.
-func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget, serverID string) (ops []dsd.Op, networkID string, ok bool) {
+func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget, serverID string, registry registryRender) (ops []dsd.Op, networkID string, ok bool) {
 	var spec appResourceSpec
 	if err := json.Unmarshal(rs.Spec, &spec); err != nil {
 		return nil, "", false
@@ -138,11 +153,23 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 
 	networkName := dsd.NetworkName(rs.ProjectID)
 	networkID = "net:" + rs.ProjectID
+	// A dedicated build server means the build and the run happen on different
+	// Docker daemons, so the image has to travel through the org's registry and
+	// its tag has to name that registry. Without one the push would go to
+	// docker.io under a namespace nobody owns and be answered with a 401 — so
+	// render nothing rather than a pipeline that cannot complete.
+	crossHost := target.BuildServerID != "" && target.BuildServerID != target.ServerID
+	if crossHost && registry.repository == "" {
+		return nil, "", false
+	}
 	// Per-deployment pinned tag (SIGMA-173): a building trigger tags under its
 	// own pin, so no tag is ever rebuilt in place; rollback/config rows carry
 	// their SOURCE release's pin, so this resolves to the exact image that
 	// release built. Legacy rows (empty pin) keep the bare mutable SHA tag.
 	imageTag := dsd.PinnedImageTag(rs.ResourceID, target.SHA, target.ImagePin)
+	if crossHost {
+		imageTag = dsd.QualifyImage(registry.repository, imageTag)
+	}
 
 	// Container spec for the rollout: the built image, no host-port publishing.
 	cs := containerOpSpec{
@@ -254,7 +281,8 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		// Where the built image must end up. On a dedicated build server the
 		// deploy target cannot read the local Docker daemon of another host, so
 		// the image is pushed to the registry the target then pulls from.
-		PushImage: target.BuildServerID != "" && target.BuildServerID != target.ServerID,
+		PushImage:    crossHost,
+		RegistryHost: crossHostRegistryHost(crossHost, registry),
 	})
 
 	// Dedicated build server: the clone + build land in ITS document, and the
@@ -300,6 +328,10 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 // service container joins the app's per-resource network under its service name
 // so siblings resolve each other; depends_on becomes op ordering. Op ids carry
 // the service (`build:<res>:<svc>`, `res:<res>:<svc>`) so status routes per service.
+// Note on registries: a Compose service builds on the server that RUNS it (each
+// document clones the repo and builds its own services), so no image crosses a
+// host boundary here and no registry is involved. The dedicated build server is
+// a single-container-path option for the same reason.
 func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget, serverID string) (ops []dsd.Op, networkID string, ok bool) {
 	// Compose services share a PER-RESOURCE network (docker-compose semantics):
 	// bare service-name aliases ("db") stay scoped to this app instead of
