@@ -20,6 +20,7 @@ import {
   Power,
   ScrollText,
   Loader2,
+  CircleAlert,
 } from "lucide-react";
 
 import {
@@ -162,9 +163,16 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
       // its progress shows live in the Deployments tab, so there's nothing to
       // simulate here.
       if ("cp" in res && res.cp) {
-        toast.info("Deployment queued", {
-          description: "Building & rolling out — watch the Deployments tab.",
-        });
+        if (res.reapplied) {
+          toast.info("Re-apply queued", {
+            description:
+              "No build pipeline for this resource — the agent re-runs its setup with the last known config.",
+          });
+        } else {
+          toast.info("Deployment queued", {
+            description: "Building & rolling out — watch the Deployments tab.",
+          });
+        }
         return;
       }
       toast.info("Deployment queued", { description: "Building the image…" });
@@ -303,9 +311,14 @@ export function ResourceDetail({
   backupRuns = [],
   environmentId = "",
   cpTelemetry = null,
+  statusError = null,
 }: {
   detail: Detail;
   orgId?: string;
+  /** The live per-resource failure the agent reported (mesh bind, image pull,
+   *  health-check timeout…). Rendered as a banner so an errored resource
+   *  explains itself. */
+  statusError?: string | null;
   domains?: DomainRow[];
   /** True only when the control plane backs custom domains; the panel is hidden
    *  in demo mode where the attach/detach actions would error. */
@@ -433,6 +446,22 @@ export function ResourceDetail({
           </div>
         </div>
       </div>
+
+      {statusError && (
+        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0 text-sm">
+            <p className="font-medium text-destructive">This resource is failing</p>
+            <p className="mt-0.5 break-words font-mono text-xs text-destructive/90">
+              {statusError}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Fix the cause, then press Deploy to re-apply. Logs and metrics
+              stay empty until the container starts.
+            </p>
+          </div>
+        </div>
+      )}
 
       <Tabs defaultValue="overview">
         <TabsList variant="line" className="w-full justify-start overflow-x-auto">

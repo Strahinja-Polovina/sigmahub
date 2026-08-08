@@ -35,6 +35,9 @@ type DomainAPI interface {
 	CreateResource(ctx context.Context, orgID string, in store.CreateResourceInput, actor string) (store.Resource, error)
 	ListResources(ctx context.Context, orgID, envID string) ([]store.Resource, error)
 	DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
+	// ForceReapplyResource backs the unconditional Redeploy for resources with
+	// no git deployment to replay (db/s3/registry apps).
+	ForceReapplyResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	SetProxyRole(ctx context.Context, orgID, serverID string, proxy bool, actor string) error
 	SetHardeningConfig(ctx context.Context, orgID, serverID string, keepPublicSSH, cisEnabled bool, extraPorts []store.PortException, actor string) error
 	ListAudit(ctx context.Context, orgID string, limit int) ([]store.AuditEntry, error)

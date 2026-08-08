@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -73,20 +74,39 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, dep)
 }
 
-// handleRedeploy queues a manual redeploy of a git-deployed resource, reusing its
-// last deployment's git coordinates (a fresh clone→build→rollout of the same
-// commit). Project Admin+.
+// handleRedeploy retriggers a resource's deploy UNCONDITIONALLY. A git-deployed
+// resource with history replays its last deployment (fresh clone→build→rollout
+// of the same commit); anything else — databases, object storage, registry
+// apps, or an errored first apply — falls back to a forced DSD re-issue so the
+// agent re-runs the resource's ops with the last known config. "Redeploy did
+// nothing" must not be a reachable outcome. Project Admin+.
 func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
-	dep, serverID, err := s.domain.CreateManualRedeploy(r.Context(), orgID, r.PathValue("resourceId"), principalFrom(r).Name)
-	if err != nil {
+	resourceID := r.PathValue("resourceId")
+	actor := principalFrom(r).Name
+	dep, serverID, err := s.domain.CreateManualRedeploy(r.Context(), orgID, resourceID, actor)
+	if err == nil {
+		if s.reconcile != nil && serverID != "" {
+			s.reconcile.ReconcileAsync(orgID, serverID)
+		}
+		writeJSON(w, http.StatusCreated, dep)
+		return
+	}
+	var inv store.ErrInvalid
+	if !errors.As(err, &inv) {
 		s.writeStoreErr(w, err, "redeploy")
+		return
+	}
+	// No deployment history to replay — force a re-apply instead.
+	serverID, ferr := s.domain.ForceReapplyResource(r.Context(), orgID, resourceID, actor)
+	if ferr != nil {
+		s.writeStoreErr(w, ferr, "redeploy (force re-apply)")
 		return
 	}
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
-	writeJSON(w, http.StatusCreated, dep)
+	writeJSON(w, http.StatusCreated, map[string]string{"id": "", "trigger": "reapply", "status": "queued"})
 }
 
 // deployLogStreamTimeout bounds an SSE log stream so a stuck deployment can't

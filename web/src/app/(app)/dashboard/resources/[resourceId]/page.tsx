@@ -7,6 +7,7 @@ import {
   cpEnabled,
   cpListDomains,
   cpListDeployments,
+  cpListResources,
   cpRollbackTargets,
   cpGetDatabase,
   cpGetS3,
@@ -110,6 +111,27 @@ async function loadS3(
   }
 }
 
+/** The live per-resource failure the agent reported (mesh bind, image pull,
+ *  health-check timeout…). The web mirror only stores a coarse status string,
+ *  so the actionable reason lives in the CP resource's status object — surface
+ *  it so an errored resource explains itself instead of showing a blank logs
+ *  panel. A CP failure degrades to null. */
+async function loadStatusError(
+  orgId: string,
+  resourceId: string,
+  environmentId: string
+): Promise<string | null> {
+  if (!cpEnabled()) return null;
+  try {
+    const resources = await cpListResources(orgId, environmentId);
+    const st = resources.find((r) => r.id === resourceId)?.status;
+    const err = st && typeof st === "object" ? (st as Record<string, unknown>).error : undefined;
+    return typeof err === "string" && err.trim() ? err : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
  *  the explicit not-configured state — CP mode never shows synthetic data. */
 async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
@@ -190,10 +212,16 @@ export default async function ResourceDetailPage({
   const s3 = await loadS3(orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null);
   const telemetry = await loadTelemetry(orgId, resourceId);
+  const statusError = await loadStatusError(
+    orgId,
+    resourceId,
+    detail.resource.environmentId
+  );
 
   return (
     <ResourceDetail
       detail={{ ...detail, secrets, canManage }}
+      statusError={statusError}
       orgId={orgId}
       domains={domains}
       domainsEnabled={cpEnabled()}

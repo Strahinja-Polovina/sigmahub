@@ -173,7 +173,9 @@ export async function deployResource(input: { resourceId: string }) {
     await writeAudit({ orgId, actor: user.name, action: "Redeployed resource", target: resource.name });
     revalidatePath("/dashboard", "layout");
     revalidatePath(`/dashboard/resources/${input.resourceId}`);
-    return { deploymentId: dep.id, cp: true as const };
+    // An empty id marks the forced re-apply path (db/s3/no-history resources):
+    // no build pipeline — the agent re-runs the resource's ops instead.
+    return { deploymentId: dep.id, cp: true as const, reapplied: !dep.id };
   }
   const id = rid("dep");
   const now = new Date();

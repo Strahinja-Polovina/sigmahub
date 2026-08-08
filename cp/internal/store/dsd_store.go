@@ -165,6 +165,47 @@ func (s *Store) CurrentDSDVersion(ctx context.Context, serverID string) (int64, 
 // document and whether it changed (false → nothing to deliver). One audit row
 // is written per issued (changed) DSD. The row is created lazily on first
 // render (INSERT ... ON CONFLICT), so the reconciler needs no pre-seeding.
+// ForceReapplyResource makes "Redeploy" unconditional for resources with no
+// git deployment to replay (databases, object storage, registry apps): it
+// clears the server's DSD hash + re-drive budget so the next render issues a
+// fresh version even when nothing changed, and the agent re-runs every op —
+// handlers are idempotent, and a previously-failed op (the reason the operator
+// is clicking Redeploy) gets its retry. Returns the server to re-render.
+func (s *Store) ForceReapplyResource(ctx context.Context, orgID, resourceID, actor string) (string, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var serverID *string
+	var name string
+	err = tx.QueryRow(ctx,
+		`SELECT server_id, name FROM resources WHERE org_id = $1 AND id = $2`,
+		orgID, resourceID).Scan(&serverID, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if serverID == nil || *serverID == "" {
+		return "", ErrInvalid{Msg: "resource is not scheduled on a server"}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE server_dsd SET doc_hash = '', redrive_count = 0
+		 WHERE org_id = $1 AND server_id = $2`, orgID, *serverID); err != nil {
+		return "", err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Redeploy forced (re-apply)", name); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return *serverID, nil
+}
+
 func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
