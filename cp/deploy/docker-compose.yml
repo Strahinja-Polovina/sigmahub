@@ -105,6 +105,47 @@ services:
     ports:
       - "3000:3000"
 
+  # ── Telemetry sinks (optional; enable with COMPOSE_PROFILES=telemetry) ──────
+  # Gives the dashboard real resource logs (Loki) and metrics (VictoriaMetrics
+  # cluster — the CP's tenant-scoped /insert/<t>/… and /select/<t>/… paths need
+  # the cluster layout, not the single binary). Wire the CP at them with:
+  #   CP_LOKI_URL=http://loki:3100
+  #   CP_VM_WRITE_URL=http://vminsert:8480
+  #   CP_VM_READ_URL=http://vmselect:8481
+  loki:
+    image: grafana/loki:2.9.8
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki-data:/loki
+
+  vmstorage:
+    image: victoriametrics/vmstorage:v1.102.1-cluster
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    command: ["-storageDataPath=/storage"]
+    volumes:
+      - vm-data:/storage
+
+  vminsert:
+    image: victoriametrics/vminsert:v1.102.1-cluster
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    command: ["-storageNode=vmstorage:8400"]
+    depends_on:
+      - vmstorage
+
+  vmselect:
+    image: victoriametrics/vmselect:v1.102.1-cluster
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    command: ["-storageNode=vmstorage:8401"]
+    depends_on:
+      - vmstorage
+
 volumes:
   db-data:
   cp-data:
+  loki-data:
+  vm-data:
