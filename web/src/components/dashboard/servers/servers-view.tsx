@@ -27,6 +27,11 @@ import { StatusBadge } from "@/components/dashboard/status-indicator";
 import type { ServerType, Status } from "@/lib/mock";
 import type { ServerWithCount } from "@/server/queries";
 import { agentCheckIn } from "@/server/actions/servers";
+import {
+  ClustersPanel,
+  type ClusterEnvironment,
+} from "@/components/dashboard/clusters/clusters-panel";
+import type { CpCluster } from "@/server/cp";
 import { ConnectServerDialog } from "./connect-server-dialog";
 import { SERVER_TYPE_LABELS, SERVER_TYPE_ORDER } from "./server-meta";
 
@@ -124,24 +129,31 @@ export function ServersView({
   orgSlug,
   servers,
   cpMode,
+  clusters = [],
+  clusterExcludedKinds = [],
+  clusterEnvironments = [],
 }: {
   orgId: string;
   orgName: string;
   orgSlug: string;
   servers: ServerWithCount[];
   cpMode?: boolean;
+  /** Kubernetes clusters built from these servers (CP mode). */
+  clusters?: CpCluster[];
+  clusterExcludedKinds?: string[];
+  clusterEnvironments?: ClusterEnvironment[];
 }) {
   const [filter, setFilter] = React.useState<Filter>("all");
 
   const counts = React.useMemo(() => {
-    const c: Record<Filter, number> = {
-      all: servers.length,
-      general: 0,
-      database: 0,
-      storage: 0,
-      gpu: 0,
-    };
-    for (const sv of servers) c[sv.type as ServerType] += 1;
+    // Seeded from SERVER_TYPE_ORDER so adding a server type can't leave a
+    // counter undefined (and crash the filter row) the way a hand-written
+    // literal would. An unknown type still counts toward "all".
+    const c = { all: servers.length } as Record<Filter, number>;
+    for (const t of SERVER_TYPE_ORDER) c[t] = 0;
+    for (const sv of servers) {
+      if (sv.type in c) c[sv.type as Filter] += 1;
+    }
     return c;
   }, [servers]);
 
@@ -225,6 +237,22 @@ export function ServersView({
           )}
         </CardContent>
       </Card>
+
+      {cpMode && (
+        <ClustersPanel
+          orgId={orgId}
+          clusters={clusters}
+          excludedKinds={clusterExcludedKinds}
+          servers={servers.map((sv) => ({
+            id: sv.id,
+            name: sv.name,
+            type: sv.type,
+            status: sv.status,
+          }))}
+          environments={clusterEnvironments}
+          canManage
+        />
+      )}
     </div>
   );
 }

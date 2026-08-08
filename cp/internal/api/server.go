@@ -70,8 +70,15 @@ type Server struct {
 	store               StoreAPI
 	domain              DomainAPI
 	git                 GitAPI
+	gitIntegration      GitIntegrationAPI
+	compose             ComposeAPI
+	clusters            ClusterAPI
+	llm                 LLMAPI
+	dns                 DNSAPI
 	inspector           RepoInspector
+	repoLister          RepoLister
 	installTokens       InstallationTokenSource
+	installAccounts     InstallationAccountSource
 	githubAppSlug       string
 	dsdStore            DSDStore
 	dsdWaiter           DSDWaiter
@@ -126,6 +133,21 @@ type Options struct {
 	// the https://github.com/apps/<slug>/installations/new install link.
 	InstallationTokens InstallationTokenSource
 	GitHubAppSlug      string
+	// GitIntegration backs the org-level GitHub integration (connect once,
+	// then pick repos). Nil → those endpoints answer "not configured".
+	GitIntegration GitIntegrationAPI
+	// RepoLister lists the repos an installation grants — the picker's source.
+	RepoLister RepoLister
+	// Compose backs per-service placement for multi-service apps.
+	Compose ComposeAPI
+	// Clusters backs Kubernetes cluster setup and membership.
+	Clusters ClusterAPI
+	// LLM backs GPU model-hosting endpoints.
+	LLM LLMAPI
+	// DNS derives and verifies the records a custom domain needs.
+	DNS DNSAPI
+	// InstallationAccounts names an installation's account for the dashboard.
+	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
 	GitHubWebhookSecret string
 	// PublicURL is the CP's own public base URL (e.g. https://cp.example.com).
@@ -160,7 +182,14 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		log: log, db: db, store: st, domain: dom,
 		git:                 opts.Git,
 		inspector:           opts.Inspector,
+		repoLister:          opts.RepoLister,
 		installTokens:       opts.InstallationTokens,
+		installAccounts:     opts.InstallationAccounts,
+		gitIntegration:      opts.GitIntegration,
+		compose:             opts.Compose,
+		clusters:            opts.Clusters,
+		llm:                 opts.LLM,
+		dns:                 opts.DNS,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -322,6 +351,32 @@ func (s *Server) routes() {
 	// an installation to a connection mutates it, so Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/app", s.requireService(store.RoleDeveloper, s.handleGitAppInfo))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/connections/{connId}/installation", s.requireService(store.RoleProjectAdmin, s.handleSetInstallation))
+	// Org-level GitHub integration: connect the App once, then SELECT repos per
+	// resource instead of connecting each one by hand. Reading the integration
+	// and the repo list is member-visible; changing it is Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/integration", s.requireService(store.RoleDeveloper, s.handleGetGitIntegration))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/integration", s.requireService(store.RoleProjectAdmin, s.handleConnectGitIntegration))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/integration/{installationId}", s.requireService(store.RoleProjectAdmin, s.handleDisconnectGitIntegration))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/repos", s.requireService(store.RoleDeveloper, s.handleListGitRepos))
+	// Compose placement: reading the service graph is member-visible; moving a
+	// service between servers changes what runs where, so Project Admin+.
+	// Kubernetes clusters: reading is member-visible; building one out of the
+	// org's servers changes what runs where, so Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/clusters", s.requireService(store.RoleDeveloper, s.handleListClusters))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateCluster)))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/clusters/{clusterId}/nodes", s.requireService(store.RoleProjectAdmin, s.handleAddClusterNode))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}/nodes/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleRemoveClusterNode))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/clusters/{clusterId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteCluster))
+	// GPU model hosting: the endpoint readout is member-visible, as are the
+	// runtimes this control plane can actually render.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/llm", s.requireService(store.RoleDeveloper, s.handleGetLLM))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/engines", s.requireService(store.RoleDeveloper, s.handleListLLMEngines))
+	// DNS setup for a custom domain: which record to create and whether it is
+	// live. Member-visible — knowing why a domain doesn't route isn't a mutation.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/domains/{domainId}/dns", s.requireService(store.RoleDeveloper, s.handleDomainDNS))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/compose", s.requireService(store.RoleDeveloper, s.handleGetComposeServices))
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/compose/placements", s.requireService(store.RoleProjectAdmin, s.handleSetComposePlacements))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))
 	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
 	// environment list is member-visible.
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))

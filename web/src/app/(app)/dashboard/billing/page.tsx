@@ -27,15 +27,29 @@ export default async function BillingPage() {
   // CP mode: real metered usage + Paddle subscription state (P2-4). A CP
   // failure degrades to the computed demo summary rather than breaking billing.
   let subscription;
+  let summary = billing;
   if (cpEnabled()) {
     try {
       const b = await cpGetBilling(orgId);
       subscription = {
         configured: b.configured,
         status: b.subscription.status,
-        billableServers: b.billableServers,
+        billableUnits: b.billableUnits,
         serverHoursThisMonth: b.serverHoursThisMonth,
         orgId,
+      };
+      // Prefer the CP's own unit arithmetic — it is what Paddle is charged with,
+      // so the preview must never disagree with the invoice over a mirror lag.
+      summary = {
+        connected: b.connected,
+        units: b.units,
+        billableUnits: b.billableUnits,
+        breakdown: b.breakdown,
+        freeTier: b.freeTier,
+        unitPrice: b.unitPrice,
+        currency: b.currency,
+        amount: b.amount,
+        isFree: b.billableUnits === 0,
       };
     } catch {
       subscription = undefined;
@@ -45,7 +59,7 @@ export default async function BillingPage() {
   return (
     <BillingView
       orgName={orgName}
-      billing={billing}
+      billing={summary}
       servers={serverItems}
       subscription={subscription}
     />

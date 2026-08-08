@@ -398,6 +398,23 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 	if spec.MemoryMB > 0 {
 		hostConfig["Memory"] = spec.MemoryMB * 1024 * 1024
 	}
+	if spec.ShmSizeMB > 0 {
+		hostConfig["ShmSize"] = spec.ShmSizeMB * 1024 * 1024
+	}
+	// GPU passthrough via the NVIDIA container runtime. Count -1 is Docker's
+	// "every device"; a positive count requests exactly that many. Capability
+	// "gpu" is what the runtime hook matches on.
+	if spec.GPUs != 0 {
+		count := spec.GPUs
+		if count < 0 {
+			count = -1
+		}
+		hostConfig["DeviceRequests"] = []map[string]any{{
+			"Driver":       "nvidia",
+			"Count":        count,
+			"Capabilities": [][]string{{"gpu"}},
+		}}
+	}
 	restart := spec.Restart
 	if restart == "" {
 		restart = "unless-stopped"

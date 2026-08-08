@@ -70,9 +70,12 @@ type Activity = {
 type Billing = {
   amount: number;
   isFree: boolean;
+  /** Free allowance, in units. */
   freeTier: number;
   unitPrice: number;
   connected: number;
+  /** Weighted total actually billed. */
+  units: number;
   currency: string;
 };
 
@@ -213,10 +216,10 @@ export function Overview({
             billing.isFree ? (
               <span className="inline-flex items-center gap-1.5">
                 <StatusDot status="running" />
-                Free tier · up to {billing.freeTier} servers
+                Free tier · up to {billing.freeTier} units
               </span>
             ) : (
-              `${billing.connected} × ${formatCurrency(billing.unitPrice, billing.currency)} per server`
+              `${billing.units} × ${formatCurrency(billing.unitPrice, billing.currency)} per unit`
             )
           }
           icon={CreditCard}

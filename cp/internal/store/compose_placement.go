@@ -1,0 +1,176 @@
+package store
+
+// Per-service placement and environment for a Compose app.
+//
+// A Compose app is a graph of services, and there is no reason every service has
+// to share one host: a database wants a database server, a worker wants CPU, the
+// web tier wants the proxy edge. Placement lives in the resource spec (the same
+// document the reconciler renders from) so there is exactly one source of truth,
+// and the reconciler gates a service on any dependency placed elsewhere.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ComposePlacement is one service's placement + environment override.
+type ComposePlacement struct {
+	Service  string            `json:"service"`
+	ServerID string            `json:"serverId"`
+	Env      map[string]string `json:"env,omitempty"`
+}
+
+// ComposeServiceView is what the dashboard renders: the declared service plus
+// where it runs and what it depends on.
+type ComposeServiceView struct {
+	Name      string            `json:"name"`
+	Build     string            `json:"build,omitempty"`
+	Image     string            `json:"image,omitempty"`
+	Ports     []int             `json:"ports,omitempty"`
+	Rollout   string            `json:"rollout,omitempty"`
+	DependsOn []string          `json:"dependsOn,omitempty"`
+	ServerID  string            `json:"serverId,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+}
+
+// composeSpecShape is the slice of a resource spec this file rewrites. Only the
+// compose block is touched; everything else round-trips untouched so an unknown
+// field added elsewhere is never dropped by a placement edit.
+type composeSpecShape struct {
+	Compose *struct {
+		Services []ComposeServiceView `json:"services"`
+	} `json:"compose"`
+}
+
+// ComposeServicesForResource returns the app's declared services with their
+// current placement, or ErrNotFound when the resource isn't a Compose app.
+func (s *Store) ComposeServicesForResource(ctx context.Context, orgID, resourceID string) ([]ComposeServiceView, string, error) {
+	var raw []byte
+	var homeServer string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT spec, COALESCE(server_id, '') FROM resources
+		 WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&raw, &homeServer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", ErrNotFound
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	var shape composeSpecShape
+	if err := json.Unmarshal(raw, &shape); err != nil || shape.Compose == nil {
+		return nil, homeServer, ErrNotFound
+	}
+	return shape.Compose.Services, homeServer, nil
+}
+
+// SetComposePlacements rewrites the placement and env of the named services.
+// Services not mentioned keep whatever they had, so a partial edit is safe.
+//
+// Returns every server the app now touches (including the ones it just left),
+// so the caller can re-render each affected document — dropping the OLD server
+// would leave an orphan container running there with nothing describing it.
+func (s *Store) SetComposePlacements(ctx context.Context, orgID, resourceID string, placements []ComposePlacement, actor string) (affected []string, err error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var raw []byte
+	var homeServer string
+	err = tx.QueryRow(ctx, `
+		SELECT spec, COALESCE(server_id, '') FROM resources
+		 WHERE org_id = $1 AND id = $2 FOR UPDATE`, orgID, resourceID).Scan(&raw, &homeServer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Decode into a generic map so unrelated spec fields survive the rewrite.
+	var full map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &full); err != nil {
+		return nil, ErrInvalid{Msg: "resource spec is not an object"}
+	}
+	composeRaw, hasCompose := full["compose"]
+	if !hasCompose {
+		return nil, ErrInvalid{Msg: "this resource is not a Compose app"}
+	}
+	var compose struct {
+		Services []ComposeServiceView `json:"services"`
+	}
+	if err := json.Unmarshal(composeRaw, &compose); err != nil {
+		return nil, ErrInvalid{Msg: "compose spec is malformed"}
+	}
+
+	byName := map[string]int{}
+	for i, svc := range compose.Services {
+		byName[svc.Name] = i
+	}
+	// Every server the app touches BEFORE the edit — the ones it may leave.
+	seen := map[string]bool{}
+	for _, svc := range compose.Services {
+		if svc.ServerID != "" {
+			seen[svc.ServerID] = true
+		}
+	}
+	if homeServer != "" {
+		seen[homeServer] = true
+	}
+
+	for _, p := range placements {
+		idx, ok := byName[strings.TrimSpace(p.Service)]
+		if !ok {
+			return nil, ErrInvalid{Msg: "unknown service: " + p.Service}
+		}
+		serverID := strings.TrimSpace(p.ServerID)
+		if serverID != "" {
+			// The server must belong to this org — otherwise a placement could
+			// plant a container on another tenant's host.
+			var owned bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL)`,
+				orgID, serverID).Scan(&owned); err != nil {
+				return nil, err
+			}
+			if !owned {
+				return nil, ErrNotFound
+			}
+			seen[serverID] = true
+		}
+		compose.Services[idx].ServerID = serverID
+		compose.Services[idx].Env = p.Env
+	}
+
+	updated, err := json.Marshal(compose)
+	if err != nil {
+		return nil, err
+	}
+	full["compose"] = updated
+	newSpec, err := json.Marshal(full)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE resources SET spec = $3, updated_at = now() WHERE org_id = $1 AND id = $2`,
+		orgID, resourceID, newSpec); err != nil {
+		return nil, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Compose placement updated", resourceID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	affected = make([]string, 0, len(seen))
+	for id := range seen {
+		affected = append(affected, id)
+	}
+	return affected, nil
+}

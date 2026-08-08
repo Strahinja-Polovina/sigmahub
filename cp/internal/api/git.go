@@ -16,7 +16,7 @@ type GitAPI interface {
 	ListGitConnections(ctx context.Context, orgID, projectID string) ([]store.GitConnection, error)
 	GetGitConnection(ctx context.Context, orgID, connID string) (store.GitConnection, error)
 	DeleteGitConnection(ctx context.Context, orgID, connID, actor string) error
-	SetBranchMap(ctx context.Context, orgID, connID, branch, envID, policy, actor string) (store.BranchMap, error)
+	SetBranchMap(ctx context.Context, orgID, connID, branch, envID, policy, buildServerID, actor string) (store.BranchMap, error)
 	ListBranchMaps(ctx context.Context, orgID, connID string) ([]store.BranchMap, error)
 	DeleteBranchMap(ctx context.Context, orgID, mapID, actor string) error
 	PromoteBranch(ctx context.Context, orgID, mapID, actor string) (store.DeployRequest, error)
@@ -291,6 +291,8 @@ func (s *Server) handleSetBranchMap(w http.ResponseWriter, r *http.Request) {
 		Branch        string `json:"branch"`
 		EnvironmentID string `json:"environmentId"`
 		Policy        string `json:"policy"`
+		// BuildServerID moves the image build off the deploy target.
+		BuildServerID string `json:"buildServerId"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -299,7 +301,7 @@ func (s *Server) handleSetBranchMap(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	actor := principalFrom(r).Name
 	m, err := s.git.SetBranchMap(r.Context(), orgID, r.PathValue("connId"),
-		req.Branch, req.EnvironmentID, req.Policy, actor)
+		req.Branch, req.EnvironmentID, req.Policy, req.BuildServerID, actor)
 	if err != nil {
 		s.writeStoreErr(w, err, "map branch")
 		return

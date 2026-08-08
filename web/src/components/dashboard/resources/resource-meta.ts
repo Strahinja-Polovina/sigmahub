@@ -32,9 +32,12 @@ export const KIND_LABELS: Record<ResourceKind, string> = {
 // Human-readable labels for server types.
 export const SERVER_TYPE_LABELS: Record<ServerType, string> = {
   general: "General",
+  vps: "VPS",
   database: "Database",
   storage: "Storage",
   gpu: "GPU",
+  k8s: "Cluster node",
+  build: "Build",
 };
 
 export function formatDate(iso: string | Date) {

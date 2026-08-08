@@ -49,6 +49,10 @@ type buildImageOpSpec struct {
 	// Force skips the build-dedup short-circuit so a manual redeploy rebuilds the
 	// same commit (e.g. to pick up base-image changes) instead of reusing the cached image.
 	Force bool `json:"force,omitempty"`
+	// PushImage is set when the build runs on a DEDICATED build server: the
+	// deploy target can't read another host's Docker daemon, so the image has to
+	// reach a registry both can see.
+	PushImage bool `json:"pushImage,omitempty"`
 }
 
 type healthProbe struct {
@@ -121,7 +125,7 @@ func reshipsRetainedImage(target store.DeployTarget, requirePin bool) bool {
 // built skips clone+build and renders only the rollout). The rollout container
 // runs the built image, publishes NO host ports (Traefik routes it internally so
 // two generations never conflict), and carries the router labels + health probe.
-func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget) (ops []dsd.Op, networkID string, ok bool) {
+func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget, serverID string) (ops []dsd.Op, networkID string, ok bool) {
 	var spec appResourceSpec
 	if err := json.Unmarshal(rs.Spec, &spec); err != nil {
 		return nil, "", false
@@ -129,7 +133,7 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	// A Compose app deploys its service graph: one shared clone, then a build +
 	// rollout/recreate op per service.
 	if spec.Compose != nil && len(spec.Compose.Services) > 0 {
-		return renderComposeDeployOps(rs, spec, refs, domains, target)
+		return renderComposeDeployOps(rs, spec, refs, domains, target, serverID)
 	}
 
 	networkName := dsd.NetworkName(rs.ProjectID)
@@ -247,7 +251,40 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		// A manual redeploy forces a rebuild of the same commit; git-triggered
 		// deploys keep the warm-cache dedup.
 		Force: manualForce(target),
+		// Where the built image must end up. On a dedicated build server the
+		// deploy target cannot read the local Docker daemon of another host, so
+		// the image is pushed to the registry the target then pulls from.
+		PushImage: target.BuildServerID != "" && target.BuildServerID != target.ServerID,
 	})
+
+	// Dedicated build server: the clone + build land in ITS document, and the
+	// deploy target renders only the rollout. Splitting the pipeline this way
+	// keeps a build — the most CPU- and disk-hungry thing we run — off the
+	// machine that is serving traffic.
+	if bs := target.BuildServerID; bs != "" && bs != target.ServerID {
+		if serverID == bs {
+			return []dsd.Op{
+				{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},
+				{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build},
+			}, "", true
+		}
+		// The deploy target. The build op lives in another document, so it can't
+		// be an op dependency here (a dangling reference would wedge the apply):
+		// hold the rollout until the deployment has moved past building, exactly
+		// as a cross-server Compose dependency is gated.
+		if target.Status == "queued" || target.Status == "building" {
+			return nil, "", false
+		}
+		// Pull the image the build server pushed, then roll out.
+		pullID := "pull:" + rs.ResourceID
+		pull, _ := json.Marshal(map[string]string{"image": imageTag})
+		ops = append(ops,
+			dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull},
+			dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: append(rolloutDeps, pullID), Spec: rolloutBytes},
+		)
+		return ops, networkID, true
+	}
+
 	ops = append(ops,
 		dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},
 		dsd.Op{ID: buildID, Kind: dsd.KindImageBuild, DependsOn: []string{cloneID}, Spec: build},
@@ -263,7 +300,7 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 // service container joins the app's per-resource network under its service name
 // so siblings resolve each other; depends_on becomes op ordering. Op ids carry
 // the service (`build:<res>:<svc>`, `res:<res>:<svc>`) so status routes per service.
-func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget) (ops []dsd.Op, networkID string, ok bool) {
+func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []store.SecretRefMeta, domains []store.Domain, target store.DeployTarget, serverID string) (ops []dsd.Op, networkID string, ok bool) {
 	// Compose services share a PER-RESOURCE network (docker-compose semantics):
 	// bare service-name aliases ("db") stay scoped to this app instead of
 	// colliding across apps on the shared project network. Traefik reaches the
@@ -298,15 +335,7 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 	// UI promised "no rebuild".
 	reship := reshipsRetainedImage(target, true)
 
-	// Clone the whole repo once — the shared build-context root for all services.
 	cloneID := "clone:" + rs.ResourceID
-	if !reship {
-		clone, _ := json.Marshal(gitCloneOpSpec{
-			ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
-			Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
-		})
-		ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
-	}
 
 	// The web-facing service carries the Traefik router labels when a domain is
 	// attached: prefer the first source-built blue-green service with a port (the
@@ -328,13 +357,84 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		}
 	}
 
-	// The rendered-service set backs depends_on validation below.
-	rendered := map[string]bool{}
+	// Placement. A service with no explicit serverId lives on the deployment's
+	// own server, so a plain single-server Compose app renders exactly as before.
+	homeServer := target.ServerID
+	placedOn := func(svc composeServiceSpec) string {
+		if svc.ServerID != "" {
+			return svc.ServerID
+		}
+		return homeServer
+	}
+	// declared is every runnable service across the WHOLE app (all servers) —
+	// depends_on is validated against it so a dependency on a service hosted
+	// elsewhere is honoured rather than silently dropped.
+	declared := map[string]bool{}
+	// local is what THIS document renders; only these can be ordered with
+	// op-level DependsOn, because ops in another server's document are invisible
+	// to this one's dependency graph.
+	local := map[string]bool{}
 	for _, s := range services {
-		rendered[s.Name] = true
+		declared[s.Name] = true
+		if placedOn(s) == serverID {
+			local[s.Name] = true
+		}
 	}
 
+	// Which of this server's services may render right now.
+	//
+	// Cross-server dependency gate: within one document depends_on is op
+	// ordering, but across documents there is no ordering to express, so the
+	// control plane holds a dependent service back until its remote dependencies
+	// report success. Status ingest re-triggers a reconcile, so the service
+	// renders on a later pass — an app is never started against a database that
+	// isn't up yet.
+	var renderable []composeServiceSpec
 	for _, s := range services {
+		if placedOn(s) != serverID {
+			continue // another server's document renders it
+		}
+		gated := false
+		for _, d := range s.DependsOn {
+			if !declared[d] || local[d] {
+				continue // unknown (ignored, as before) or ordered locally
+			}
+			if target.ServiceStatus[d] != "success" {
+				gated = true
+				break
+			}
+		}
+		if !gated {
+			renderable = append(renderable, s)
+		}
+	}
+	// Nothing to do here: no services placed on this server, or every one of
+	// them is still waiting on a remote dependency. Report not-ok so the caller
+	// falls through to its stub instead of emitting a clone and a bare network.
+	if len(renderable) == 0 {
+		return nil, "", false
+	}
+
+	// Clone the repo once — the shared build-context root. Only when something
+	// here actually builds from source: a server hosting only prebuilt images
+	// has no reason to pull the repo (or to need a git credential).
+	needsClone := false
+	for _, s := range renderable {
+		if s.Build != "" {
+			needsClone = true
+			break
+		}
+	}
+	if !reship && needsClone {
+		clone, _ := json.Marshal(gitCloneOpSpec{
+			ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
+			Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
+		})
+		ops = append(ops, dsd.Op{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone})
+	}
+
+	for _, s := range renderable {
+
 		svcKey := rs.ResourceID + ":" + s.Name
 		cs := containerOpSpec{
 			ResourceID:     rs.ResourceID,
@@ -342,7 +442,7 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 			Name:           dsd.ServiceContainerName(rs.ResourceID, s.Name),
 			Network:        networkName,
 			NetworkAliases: []string{s.Name},
-			Env:            spec.Env,
+			Env:            mergeEnv(spec.Env, s.Env),
 			Restart:        spec.Restart,
 			SecretRefs:     refsSpec,
 		}
@@ -414,17 +514,35 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		if imageDep != "" {
 			deps = append(deps, imageDep)
 		}
-		// depends_on ordering — only for services that are actually rendered, so a
-		// typo'd or filtered-out dependency can't produce a dangling op reference
-		// (which would wedge the whole apply).
+		// depends_on ordering — only for services rendered in THIS document, so a
+		// typo'd, filtered-out or remotely-placed dependency can't produce a
+		// dangling op reference (which would wedge the whole apply). Remote ones
+		// were already gated above.
 		for _, d := range s.DependsOn {
-			if rendered[d] {
+			if local[d] {
 				deps = append(deps, "res:"+rs.ResourceID+":"+d)
 			}
 		}
 		ops = append(ops, dsd.Op{ID: "res:" + svcKey, Kind: kind, DependsOn: deps, Spec: swap})
 	}
 	return ops, networkID, true
+}
+
+// mergeEnv layers a service's own environment over the resource-level one.
+// Services on different hosts need different values for the same key (a DB
+// host, a queue URL), which a single shared map cannot express.
+func mergeEnv(base, override map[string]string) map[string]string {
+	if len(override) == 0 {
+		return base
+	}
+	out := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
 
 // gitRolloutRecreate mirrors gitdetect.RolloutRecreate without importing it.

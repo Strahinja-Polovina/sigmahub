@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -886,4 +887,56 @@ func (d *DockerClient) PutArchive(ctx context.Context, containerID, path string,
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// ImagePush publishes a locally built image to its registry, streaming the
+// progress into logs. Used by a dedicated build server: the deploy target
+// cannot read this host's Docker daemon, so the image has to travel through a
+// registry both can see.
+//
+// Like ImagePull, the HTTP status alone does not mean success — the response is
+// a newline-delimited JSON stream and a message carrying "error" means the push
+// failed under a 200.
+func (d *DockerClient) ImagePush(ctx context.Context, ref string, logs io.Writer) error {
+	name, tag := splitImageRef(ref)
+	q := url.Values{}
+	if tag != "" {
+		q.Set("tag", tag)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		d.url("/images/"+url.PathEscape(name)+"/push?"+q.Encode()), nil)
+	if err != nil {
+		return err
+	}
+	// Docker requires the header to be present even for an anonymous push; an
+	// empty value means "no credentials".
+	req.Header.Set("X-Registry-Auth", "e30=") // base64("{}")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return &apiError{Status: resp.StatusCode, Message: decodeDockerMessage(b)}
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("push %s: %s", ref, msg.Error)
+		}
+		if logs != nil && msg.Status != "" {
+			_, _ = io.WriteString(logs, msg.Status+"\n")
+		}
+	}
 }

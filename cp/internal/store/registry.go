@@ -174,6 +174,13 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	if typ == "" {
 		typ = "general"
 	}
+	// A typo'd type would enroll a host nothing can ever be scheduled onto (the
+	// availability matrix would match no kind), and it would bill at the default
+	// weight rather than its real one. Fail at enrollment instead.
+	if !IsServerType(typ) {
+		return "", ErrInvalid{Msg: fmt.Sprintf("unknown server type %q; expected one of %s",
+			typ, strings.Join(ServerTypes(), ", "))}
+	}
 	meshIP, err := allocateMeshIP(ctx, tx, orgID)
 	if err != nil {
 		return "", err

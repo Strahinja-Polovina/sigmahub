@@ -14,9 +14,12 @@ export const KIND_LABELS: Record<ResourceKind, string> = {
 
 export const SERVER_TYPE_LABELS: Record<ServerType, string> = {
   general: "General",
+  vps: "VPS",
   storage: "Storage",
   database: "Database",
   gpu: "GPU",
+  k8s: "Cluster node",
+  build: "Build",
 };
 
 export function KindBadge({ kind }: { kind: ResourceKind }) {

@@ -21,6 +21,11 @@ import (
 // Store is the slice of the persistence layer the reconciler needs.
 type Store interface {
 	ResourceSpecsForServer(ctx context.Context, serverID string) ([]store.ResourceSpec, error)
+	// Kubernetes: a server's cluster membership, and the workloads deployed into
+	// that cluster (rendered only into the control-plane node's document).
+	ClusterMembershipForServer(ctx context.Context, serverID string) (store.ClusterMembership, bool, error)
+	ResourceSpecsForCluster(ctx context.Context, clusterID string) ([]store.ResourceSpec, error)
+	DeployTargetForResource(ctx context.Context, resourceID string) (store.DeployTarget, error)
 	PendingDestructiveOpsForServer(ctx context.Context, orgID, serverID string) ([]store.PendingDestructiveOp, error)
 	SecretRefsForServer(ctx context.Context, serverID string) (map[string][]store.SecretRefMeta, error)
 	HostHardeningForServer(ctx context.Context, serverID string) (store.HostHardening, error)
@@ -28,6 +33,7 @@ type Store interface {
 	DeployTargetsForServer(ctx context.Context, serverID string) (map[string]store.DeployTarget, error)
 	DBTargetsForServer(ctx context.Context, serverID string) (map[string]store.DBTarget, error)
 	S3TargetsForServer(ctx context.Context, serverID string) (map[string]store.S3Target, error)
+	LLMTargetsForServer(ctx context.Context, serverID string) (map[string]store.LLMTarget, error)
 	PendingS3OpsForServer(ctx context.Context, serverID string) ([]store.S3OpSpec, error)
 	BackupRunsForServer(ctx context.Context, serverID string) ([]store.BackupRunSpec, error)
 	StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.Op, docHash string, priv ed25519.PrivateKey) (dsd.Signed, bool, error)
@@ -58,20 +64,58 @@ func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 // injected for e2e). Called at boot before serving.
 func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
 
+// clusterRender is a server's Kubernetes context for one render pass.
+type clusterRender struct {
+	member     bool
+	membership store.ClusterMembership
+	// workloads are the resources deployed into the cluster. Populated only for
+	// the control-plane node, which is the single applier.
+	workloads []store.ResourceSpec
+}
+
 // renderOps builds the ordered op list for a server. "app" resources fan into
 // container ops (network.ensure → image.pull → volume.ensure → container.apply);
 // database kinds (P1-10) render their engine container bound to the mesh
 // address; the remaining kinds (s3/llm) keep the P1-2 no-op "resource.sync"
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender) ([]dsd.Op, string) {
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
+
+	// Kubernetes membership comes first: every cluster workload depends on this
+	// node being up, and a worker that hasn't joined has nothing to schedule.
+	nodeOpID := ""
+	if cluster.member {
+		if nodeOp, ok := renderClusterNodeOp(cluster.membership, hardening.MeshIP); ok {
+			resourceOps = append(resourceOps, nodeOp)
+			nodeOpID = nodeOp.ID
+		}
+	}
+	// Cluster workloads render into the CONTROL-PLANE node only: kubectl talks
+	// to the API server and the scheduler picks the node, so rendering them per
+	// node would create competing appliers of the same Deployment.
+	if cluster.member && cluster.membership.Role == store.NodeRoleControlPlane && nodeOpID != "" {
+		for _, rs := range cluster.workloads {
+			wl, ok := renderClusterWorkloadOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID],
+				deployTargets[rs.ResourceID], cluster.membership, nodeOpID)
+			if ok {
+				resourceOps = append(resourceOps, wl...)
+			}
+		}
+	}
 
 	for _, rs := range specs {
 		if target, isDB := dbTargets[rs.ResourceID]; isDB {
 			if dbOps, netID, ok := renderDatabaseOps(rs, target, hardening.MeshIP); ok {
 				resourceOps = append(resourceOps, dbOps...)
+				networks[netID] = dsd.NetworkName(rs.ProjectID)
+				continue
+			}
+		}
+		if target, isLLM := llmTargets[rs.ResourceID]; isLLM {
+			if llmOps, netID, ok := renderLLMOps(rs, hardening.MeshIP, target.Port, secretRefs[rs.ResourceID]); ok {
+				resourceOps = append(resourceOps, llmOps...)
 				networks[netID] = dsd.NetworkName(rs.ProjectID)
 				continue
 			}
@@ -87,7 +131,7 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 			// A git-deployed app (has a deploy target) renders the build pipeline;
 			// a registry-image app keeps the direct container.apply path.
 			if target, isGit := deployTargets[rs.ResourceID]; isGit {
-				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target); ok {
+				if depOps, netID, ok := renderDeployOps(rs, secretRefs[rs.ResourceID], domains[rs.ResourceID], target, serverID); ok {
 					resourceOps = append(resourceOps, depOps...)
 					// A Compose app deploys onto its own per-resource network
 					// ("net:res:<id>"); a single-container app shares the project network.
@@ -208,7 +252,35 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
+	// Kubernetes context. A server in no cluster renders exactly as before.
+	var cluster clusterRender
+	membership, isMember, err := r.st.ClusterMembershipForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if isMember {
+		cluster.member = true
+		cluster.membership = membership
+		if membership.Role == store.NodeRoleControlPlane {
+			workloads, werr := r.st.ResourceSpecsForCluster(ctx, membership.ClusterID)
+			if werr != nil {
+				return werr
+			}
+			cluster.workloads = workloads
+			// Cluster workloads need their deploy targets, secrets and domains
+			// too; they are keyed by resource id, so merging is enough.
+			for _, w := range workloads {
+				if t, terr := r.st.DeployTargetForResource(ctx, w.ResourceID); terr == nil && t.DeploymentID != "" {
+					deployTargets[w.ResourceID] = t
+				}
+			}
+		}
+	}
 	dbTargets, err := r.st.DBTargetsForServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	llmTargets, err := r.st.LLMTargetsForServer(ctx, serverID)
 	if err != nil {
 		return err
 	}
@@ -224,7 +296,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, backupRuns, s3Ops, r.acme)
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster)
 	signed, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err

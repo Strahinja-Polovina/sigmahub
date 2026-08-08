@@ -42,7 +42,12 @@ type BranchMap struct {
 	LastRef       string     `json:"lastRef,omitempty"`
 	LastSHA       string     `json:"lastSha,omitempty"`
 	LastPushedAt  *time.Time `json:"lastPushedAt,omitempty"`
-	CreatedAt     time.Time  `json:"createdAt"`
+	// BuildServerID names a dedicated server to build on. Empty means "build on
+	// the deploy target", which is the existing behaviour. Building saturates
+	// CPU and disk for minutes; on a busy host that lands on the machine serving
+	// traffic, so this lets the build move off it.
+	BuildServerID string    `json:"buildServerId,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // DeployRequest is an enqueued deploy (drained by P1-9) or a recorded PR routing
@@ -67,6 +72,9 @@ type CreateGitConnectionInput struct {
 	InstallationID string
 	RepoFullName   string // owner/name
 	Token          string // provider token, stored KMS-wrapped (may be empty)
+	// AutoConnected marks a connection derived from the org's GitHub integration
+	// (the repo picker) rather than assembled by hand in the Git panel.
+	AutoConnected bool
 }
 
 // GitWebhookEvent is the provider-agnostic, already-signature-verified shape the
@@ -167,10 +175,10 @@ func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in Create
 		InstallationID: in.InstallationID, RepoFullName: repo, CreatedBy: actor,
 	}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, token_wrapped, created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, token_wrapped, created_by, auto_connected)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		RETURNING created_at`,
-		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy).Scan(&c.CreatedAt)
+		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy, in.AutoConnected).Scan(&c.CreatedAt)
 	if isUniqueViolation(err) {
 		// Uniqueness is org-scoped (SIGMA-174), so this can only be the caller's
 		// own org's connection — the message discloses nothing cross-tenant.
@@ -355,7 +363,7 @@ func (s *Store) DeleteGitConnection(ctx context.Context, orgID, connID, actor st
 
 // SetBranchMap upserts a branch→environment route with a deploy policy. The
 // connection and environment must both belong to the org.
-func (s *Store) SetBranchMap(ctx context.Context, orgID, connID, branch, envID, policy, actor string) (BranchMap, error) {
+func (s *Store) SetBranchMap(ctx context.Context, orgID, connID, branch, envID, policy, buildServerID, actor string) (BranchMap, error) {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return BranchMap{}, ErrInvalid{Msg: "branch is required"}
@@ -387,14 +395,23 @@ func (s *Store) SetBranchMap(ctx context.Context, orgID, connID, branch, envID, 
 	if !envExists {
 		return BranchMap{}, ErrInvalid{Msg: "environment does not belong to this org"}
 	}
+	buildServerID = strings.TrimSpace(buildServerID)
+	if buildServerID != "" {
+		// The build server must be this org's, or a mapping could send a clone
+		// (with its credential) to another tenant's host.
+		if err := assertServerInOrg(ctx, tx, orgID, buildServerID); err != nil {
+			return BranchMap{}, err
+		}
+	}
 
 	m, err := scanBranchMap(tx.QueryRow(ctx, `
-		INSERT INTO git_branch_map (id, connection_id, branch, environment_id, policy)
-		VALUES ($1,$2,$3,$4,$5)
+		INSERT INTO git_branch_map (id, connection_id, branch, environment_id, policy, build_server_id)
+		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''))
 		ON CONFLICT (connection_id, branch)
-		DO UPDATE SET environment_id = EXCLUDED.environment_id, policy = EXCLUDED.policy
-		RETURNING id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, created_at`,
-		newID("gbm"), connID, branch, envID, policy))
+		DO UPDATE SET environment_id = EXCLUDED.environment_id, policy = EXCLUDED.policy,
+		              build_server_id = EXCLUDED.build_server_id
+		RETURNING id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, build_server_id, created_at`,
+		newID("gbm"), connID, branch, envID, policy, buildServerID))
 	if err != nil {
 		return BranchMap{}, err
 	}
@@ -902,7 +919,7 @@ func gitConnectionForDeliveryTx(ctx context.Context, tx pgx.Tx, provider, repo, 
 
 func branchMapTx(ctx context.Context, tx pgx.Tx, connID, branch string) (BranchMap, error) {
 	m, err := scanBranchMap(tx.QueryRow(ctx, `
-		SELECT id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, created_at
+		SELECT id, connection_id, branch, environment_id, policy, last_ref, last_sha, last_pushed_at, build_server_id, created_at
 		  FROM git_branch_map WHERE connection_id = $1 AND branch = $2`, connID, branch))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BranchMap{}, ErrNotFound
@@ -914,8 +931,11 @@ func branchMapTx(ctx context.Context, tx pgx.Tx, connID, branch string) (BranchM
 // branch that has not yet seen a push). Works for both pgx.Row and pgx.Rows.
 func scanBranchMap(row pgx.Row) (BranchMap, error) {
 	var m BranchMap
-	var lastRef, lastSHA *string
-	err := row.Scan(&m.ID, &m.ConnectionID, &m.Branch, &m.EnvironmentID, &m.Policy, &lastRef, &lastSHA, &m.LastPushedAt, &m.CreatedAt)
+	var lastRef, lastSHA, buildServer *string
+	err := row.Scan(&m.ID, &m.ConnectionID, &m.Branch, &m.EnvironmentID, &m.Policy, &lastRef, &lastSHA, &m.LastPushedAt, &buildServer, &m.CreatedAt)
+	if buildServer != nil {
+		m.BuildServerID = *buildServer
+	}
 	if lastRef != nil {
 		m.LastRef = *lastRef
 	}

@@ -11,6 +11,8 @@ import {
   cpRollbackTargets,
   cpGetDatabase,
   cpGetS3,
+  cpGetComposeServices,
+  cpListServers,
   cpListBackupTargets,
   cpListBackupRuns,
   cpQueryResourceMetrics,
@@ -218,6 +220,22 @@ export default async function ResourceDetailPage({
     detail.resource.environmentId
   );
 
+  // Compose apps can spread their services across servers, so load the graph
+  // and the org's servers to offer as placement targets. Not a Compose app (or
+  // demo mode) → both stay empty and the panel doesn't render.
+  const [compose, placementServers] = await Promise.all([
+    cpEnabled() && detail.resource.kind === "app"
+      ? cpGetComposeServices(orgId, detail.resource.id).catch(() => null)
+      : Promise.resolve(null),
+    cpEnabled()
+      ? cpListServers(orgId)
+          .then((list) =>
+            list.map((sv) => ({ id: sv.id, name: sv.name, type: sv.type }))
+          )
+          .catch(() => [])
+      : Promise.resolve([]),
+  ]);
+
   return (
     <ResourceDetail
       detail={{ ...detail, secrets, canManage }}
@@ -230,6 +248,8 @@ export default async function ResourceDetailPage({
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
       database={database}
       s3={s3}
+      compose={compose}
+      placementServers={placementServers}
       backupTargets={backups.targets}
       backupRuns={backups.runs}
       environmentId={detail.resource.environmentId}

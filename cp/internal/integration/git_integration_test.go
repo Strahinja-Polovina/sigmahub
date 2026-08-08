@@ -107,10 +107,10 @@ func TestGitWebhookRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	// main → prod (auto), release → staging (manual).
-	if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", envProd.ID, "auto", "test"); err != nil {
+	if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", envProd.ID, "auto", "", "test"); err != nil {
 		t.Fatal(err)
 	}
-	manualMap, err := st.SetBranchMap(ctx, orgID, conn.ID, "release", envStg.ID, "manual", "test")
+	manualMap, err := st.SetBranchMap(ctx, orgID, conn.ID, "release", envStg.ID, "manual", "", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestWebhookDeliveryOrgScoped(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "auto", "test"); err != nil {
+		if _, err := st.SetBranchMap(ctx, orgID, conn.ID, "main", env.ID, "auto", "", "test"); err != nil {
 			t.Fatal(err)
 		}
 		return conn

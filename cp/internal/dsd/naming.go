@@ -48,6 +48,12 @@ const (
 	// a bucket, set a quota, mint a per-bucket key, measure usage). Name must
 	// match the agent's s3ops package byte-for-byte.
 	KindS3Configure = "s3.configure"
+	// Kubernetes (k3s). k8s.node brings a server up as a cluster member — the
+	// control plane (which runs the API server) or a worker joining it with the
+	// cluster token. k8s.apply reconciles one workload's manifests through the
+	// control-plane node. Names must match the agent's k8s package byte-for-byte.
+	KindK8sNode  = "k8s.node"
+	KindK8sApply = "k8s.apply"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

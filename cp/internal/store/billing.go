@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -16,9 +17,14 @@ import (
 
 // Pricing constants — kept in sync with the web read model (a test asserts
 // the two agree, like the hosting matrix).
+//
+// The billed quantity is UNITS, not servers: an ordinary server is one unit, a
+// k8s node two and a GPU server four (server_units.go). An all-general fleet
+// therefore prices exactly as it did before units existed, including the free
+// tier — "your first three servers are free" stays literally true.
 const (
-	BillingUnitPrice  = 5 // per connected server / month
-	BillingFreeTier   = 3 // first N servers free
+	BillingUnitPrice  = 5 // per unit / month
+	BillingFreeTier   = 3 // first N units free
 	BillingCurrency   = "EUR"
 	BillingHoursMonth = 730 // ~hours in a month, for server-months from server-hours
 )
@@ -40,6 +46,38 @@ func (s *Store) SweepServerHours(ctx context.Context, now time.Time) (int, error
 	return int(tag.RowsAffected()), nil
 }
 
+// ConnectedServerUnits returns the org's live fleet as a billing breakdown:
+// one line per server type (sorted by type for a stable UI), the plain server
+// count, and the weighted unit total the subscription bills.
+//
+// Counting happens per type in SQL and the weighting in Go, so the weight table
+// stays the only place a weight is written down.
+func (s *Store) ConnectedServerUnits(ctx context.Context, orgID string) (lines []ServerUnitLine, servers, units int, err error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT type, COUNT(*) FROM servers
+		 WHERE org_id = $1 AND deleted_at IS NULL AND status = 'running'
+		 GROUP BY type ORDER BY type`, orgID)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var l ServerUnitLine
+		if err := rows.Scan(&l.Type, &l.Count); err != nil {
+			return nil, 0, 0, err
+		}
+		l.Weight = ServerUnitWeight(l.Type)
+		l.Units = l.Count * l.Weight
+		servers += l.Count
+		units += l.Units
+		lines = append(lines, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, 0, err
+	}
+	return lines, servers, units, nil
+}
+
 // BillingStatus is the subscription state for an org.
 type BillingStatus struct {
 	OrgID          string `json:"orgId"`
@@ -54,14 +92,20 @@ type BillingSummary struct {
 	// Configured is false when no Paddle credentials are set — the UI shows an
 	// explicit not-configured state instead of pretending to charge.
 	Configured bool `json:"configured"`
-	// Connected is the point-in-time connected-server count right now.
+	// Connected is the point-in-time connected-server count right now. It stays
+	// a SERVER count (what the fleet looks like); Units is what it bills as.
 	Connected int `json:"connected"`
-	// BillableServers = max(0, connected - free tier).
-	BillableServers int    `json:"billableServers"`
-	FreeTier        int    `json:"freeTier"`
-	UnitPrice       int    `json:"unitPrice"`
-	Currency        string `json:"currency"`
-	// Amount is the current monthly charge (billableServers * unitPrice).
+	// Units is the weighted total across connected servers.
+	Units int `json:"units"`
+	// BillableUnits = max(0, units - free tier) — the Paddle quantity.
+	BillableUnits int `json:"billableUnits"`
+	// Breakdown explains Units per server type so the dashboard can show why a
+	// fleet of N servers bills as M units instead of asserting a number.
+	Breakdown []ServerUnitLine `json:"breakdown"`
+	FreeTier  int              `json:"freeTier"`
+	UnitPrice int              `json:"unitPrice"`
+	Currency  string           `json:"currency"`
+	// Amount is the current monthly charge (billableUnits * unitPrice).
 	Amount int `json:"amount"`
 	// ServerHoursThisMonth is the accrued connected time (reconciliation: what
 	// was actually used vs what the subscription quantity is charging).
@@ -104,11 +148,11 @@ func (s *Store) GetBillingStatus(ctx context.Context, orgID string) (BillingStat
 // BillingSummaryForOrg computes the current usage + charge readout. configured
 // reflects whether Paddle is wired (passed in by the handler from config).
 func (s *Store) BillingSummaryForOrg(ctx context.Context, orgID string, now time.Time, configured bool) (BillingSummary, error) {
-	connected, err := s.ConnectedServerCount(ctx, orgID)
+	breakdown, connected, units, err := s.ConnectedServerUnits(ctx, orgID)
 	if err != nil {
 		return BillingSummary{}, err
 	}
-	billable := connected - BillingFreeTier
+	billable := units - BillingFreeTier
 	if billable < 0 {
 		billable = 0
 	}
@@ -126,7 +170,9 @@ func (s *Store) BillingSummaryForOrg(ctx context.Context, orgID string, now time
 	return BillingSummary{
 		Configured:           configured,
 		Connected:            connected,
-		BillableServers:      billable,
+		Units:                units,
+		BillableUnits:        billable,
+		Breakdown:            breakdown,
 		FreeTier:             BillingFreeTier,
 		UnitPrice:            BillingUnitPrice,
 		Currency:             BillingCurrency,
@@ -292,7 +338,10 @@ type SubscriptionDrift struct {
 // worse failure than one month's minimum line — dropping to the free tier stays
 // a deliberate act through the customer portal.
 func (s *Store) SubscriptionsNeedingQuantitySync(ctx context.Context, now time.Time) ([]SubscriptionDrift, error) {
-	rows, err := s.Pool.Query(ctx, `
+	// Both branches of the high-water mark are weighted by server type, so a
+	// fleet that swaps a general server for a GPU one drifts and re-syncs even
+	// though its server COUNT never moved.
+	query := fmt.Sprintf(`
 		WITH counts AS (
 			SELECT b.org_id,
 			       b.paddle_subscription_id,
@@ -300,21 +349,26 @@ func (s *Store) SubscriptionsNeedingQuantitySync(ctx context.Context, now time.T
 			       b.synced_quantity,
 			       b.quantity_synced_at,
 			       GREATEST(
-			         (SELECT COUNT(*) FROM servers sv
+			         (SELECT COALESCE(SUM(%[1]s), 0) FROM servers sv
 			           WHERE sv.org_id = b.org_id AND sv.deleted_at IS NULL AND sv.status = 'running'),
-			         (SELECT COUNT(DISTINCT sh.server_id) FROM server_hours sh
-			           WHERE sh.org_id = b.org_id AND sh.hour >= $1)
-			       ) AS connected
+			         (SELECT COALESCE(SUM(%[2]s), 0)
+			            FROM (SELECT DISTINCT sh.server_id FROM server_hours sh
+			                   WHERE sh.org_id = b.org_id AND sh.hour >= $1) d
+			            JOIN servers sv2 ON sv2.id = d.server_id)
+			       ) AS units
 			  FROM org_billing b
 			 WHERE b.status = 'active' AND b.paddle_subscription_id <> ''
 		)
 		SELECT org_id, paddle_subscription_id, quantity,
-		       GREATEST(1, connected - $2) AS want
+		       GREATEST(1, units - $2) AS want
 		  FROM counts
-		 WHERE GREATEST(1, connected - $2) <> quantity
+		 WHERE GREATEST(1, units - $2) <> quantity
 		   AND (quantity_synced_at IS NULL
 		        OR quantity_synced_at < $3
-		        OR synced_quantity IS DISTINCT FROM GREATEST(1, connected - $2))`,
+		        OR synced_quantity IS DISTINCT FROM GREATEST(1, units - $2))`,
+		unitWeightSQL("sv.type"), unitWeightSQL("sv2.type"))
+
+	rows, err := s.Pool.Query(ctx, query,
 		now.UTC().Add(-quantitySyncWindow), BillingFreeTier, now.UTC().Add(-quantitySyncDebounce))
 	if err != nil {
 		return nil, err

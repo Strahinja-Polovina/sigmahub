@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { getActiveOrgId, getSessionUser, hasFullOrgVisibility } from "@/server/active-org";
 import { getMembers, getOrg, getPendingInvites } from "@/server/queries";
 import { getAuditLog } from "@/server/audit";
-import { cpEnabled, cpListAudit } from "@/server/cp";
+import { cpEnabled, cpListAudit, cpGetGitIntegration } from "@/server/cp";
 import { SettingsView } from "@/components/dashboard/settings/settings-view";
 
 export default async function SettingsPage() {
@@ -16,7 +16,8 @@ export default async function SettingsPage() {
   // org visibility (org admins and zero-grant legacy users) — SIGMA-97.
   const canViewAudit = await hasFullOrgVisibility(orgId);
 
-  const [org, members, pendingInvites, audit, sessionUser, cpAudit] = await Promise.all([
+  const [org, members, pendingInvites, audit, sessionUser, cpAudit, gitIntegration] =
+    await Promise.all([
     getOrg(orgId),
     getMembers(orgId),
     getPendingInvites(orgId),
@@ -25,7 +26,12 @@ export default async function SettingsPage() {
     // CP mode: merge the control plane's audit stream (register, tokens,
     // status flips, domain mutations) with the local web audit.
     canViewAudit && cpEnabled() ? cpListAudit(orgId).catch(() => []) : Promise.resolve([]),
-  ]);
+      // Org-level GitHub integration. A CP failure degrades the tab to the
+      // not-connected state rather than breaking the whole settings page.
+      cpEnabled()
+        ? cpGetGitIntegration(orgId).catch(() => null)
+        : Promise.resolve(null),
+    ]);
   if (!org) redirect("/login");
 
   const currentUserId = sessionUser.id;
@@ -71,6 +77,7 @@ export default async function SettingsPage() {
       twoFactorEnabled={Boolean(
         (sessionUser as { twoFactorEnabled?: boolean | null }).twoFactorEnabled
       )}
+      gitIntegration={gitIntegration}
     />
   );
 }

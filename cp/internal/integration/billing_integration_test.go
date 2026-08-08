@@ -15,8 +15,15 @@ import (
 
 func connectServer(t *testing.T, st *store.Store, orgID, name string) string {
 	t.Helper()
+	return connectTypedServer(t, st, orgID, name, "general")
+}
+
+// connectTypedServer enrolls a server of an explicit type — the billing weight
+// keys off it, so unit tests need to vary it.
+func connectTypedServer(t *testing.T, st *store.Store, orgID, name, serverType string) string {
+	t.Helper()
 	ctx := context.Background()
-	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, name, "general", "", "", "test", time.Hour)
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, name, serverType, "", "", "test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,8 +70,11 @@ func TestBillingMeterAndSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Connected != 4 || summary.BillableServers != 1 {
-		t.Fatalf("summary counts = connected %d billable %d", summary.Connected, summary.BillableServers)
+	// All four are general servers → 4 units, 3 free, 1 billable. An all-general
+	// fleet must price exactly as it did before units existed.
+	if summary.Connected != 4 || summary.Units != 4 || summary.BillableUnits != 1 {
+		t.Fatalf("summary counts = connected %d units %d billable %d",
+			summary.Connected, summary.Units, summary.BillableUnits)
 	}
 	if summary.Amount != store.BillingUnitPrice || summary.Currency != "EUR" {
 		t.Fatalf("summary charge = %d %s", summary.Amount, summary.Currency)
@@ -85,8 +95,64 @@ func TestBillingMeterAndSummary(t *testing.T) {
 	orgSmall := "org_small"
 	connectServer(t, st, orgSmall, "only1")
 	small, _ := st.BillingSummaryForOrg(ctx, orgSmall, time.Now(), true)
-	if small.BillableServers != 0 || small.Amount != 0 {
+	if small.BillableUnits != 0 || small.Amount != 0 {
 		t.Fatalf("free-tier org billed: %+v", small)
+	}
+}
+
+// TestBillingUnitWeights covers the unit model end to end: a GPU server weighs
+// four units, so one GPU box alone leaves the free tier while three ordinary
+// servers do not, and the breakdown explains the total per type.
+func TestBillingUnitWeights(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_units"
+
+	// 2 general + 1 GPU = 2 + 4 = 6 units → 3 billable after the free tier.
+	connectServer(t, st, orgID, "app-1")
+	connectServer(t, st, orgID, "app-2")
+	connectTypedServer(t, st, orgID, "gpu-1", "gpu")
+
+	lines, servers, units, err := st.ConnectedServerUnits(ctx, orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servers != 3 || units != 6 {
+		t.Fatalf("units = %d servers over %d units, want 3/6", servers, units)
+	}
+	byType := map[string]store.ServerUnitLine{}
+	for _, l := range lines {
+		byType[l.Type] = l
+	}
+	if g := byType["general"]; g.Count != 2 || g.Weight != 1 || g.Units != 2 {
+		t.Fatalf("general line = %+v", g)
+	}
+	if g := byType["gpu"]; g.Count != 1 || g.Weight != 4 || g.Units != 4 {
+		t.Fatalf("gpu line = %+v", g)
+	}
+
+	summary, err := st.BillingSummaryForOrg(ctx, orgID, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Connected != 3 || summary.Units != 6 || summary.BillableUnits != 3 {
+		t.Fatalf("summary = connected %d units %d billable %d",
+			summary.Connected, summary.Units, summary.BillableUnits)
+	}
+	if summary.Amount != 3*store.BillingUnitPrice {
+		t.Fatalf("amount = %d, want %d", summary.Amount, 3*store.BillingUnitPrice)
+	}
+
+	// A lone GPU server already exceeds the 3-unit free tier — the most valuable
+	// use case is never given away, which is the whole point of the weights.
+	orgGPU := "org_gpu_only"
+	connectTypedServer(t, st, orgGPU, "h100", "gpu")
+	gpuOnly, err := st.BillingSummaryForOrg(ctx, orgGPU, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gpuOnly.Connected != 1 || gpuOnly.Units != 4 || gpuOnly.BillableUnits != 1 {
+		t.Fatalf("gpu-only summary = %+v", gpuOnly)
 	}
 }
 

@@ -151,3 +151,76 @@ func (a *AppAuth) InstallationToken(ctx context.Context, installationID string) 
 	a.mu.Unlock()
 	return out.Token, nil
 }
+
+// InstallationAccount is the GitHub account an App installation belongs to.
+type InstallationAccount struct {
+	Login string `json:"login"`
+	Type  string `json:"type"` // User|Organization
+}
+
+// Account reads the account an installation is installed on, so the dashboard
+// can name the integration ("Connected to acme-corp") rather than showing a
+// bare numeric id. Uses the App JWT (not an installation token), which is why
+// it lives on AppAuth.
+func (a *AppAuth) Account(ctx context.Context, installationID string) (InstallationAccount, error) {
+	if !isNumeric(installationID) {
+		return InstallationAccount{}, fmt.Errorf("installation id must be numeric")
+	}
+	jwt, err := a.appJWT(a.nowOrDefault())
+	if err != nil {
+		return InstallationAccount{}, err
+	}
+	base := a.APIBase
+	if base == "" {
+		base = DefaultAPIBase
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/app/installations/"+installationID, nil)
+	if err != nil {
+		return InstallationAccount{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+
+	client := a.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return InstallationAccount{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return InstallationAccount{}, fmt.Errorf("read installation: %s: %s", resp.Status, string(snippet))
+	}
+	var payload struct {
+		Account InstallationAccount `json:"account"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return InstallationAccount{}, fmt.Errorf("decode installation: %w", err)
+	}
+	return payload.Account, nil
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// nowOrDefault is the injectable clock, defaulted.
+func (a *AppAuth) nowOrDefault() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}

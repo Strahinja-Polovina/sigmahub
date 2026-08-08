@@ -8,6 +8,7 @@ import {
   Layers,
   Link2,
   Loader2,
+  Plus,
   Server as ServerIcon,
   Trash2,
   X,
@@ -22,6 +23,8 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import { Button } from "@/components/ui/button";
+import { DeployWizard } from "@/components/dashboard/resources/deploy-wizard";
+import type { DeployTarget } from "@/components/dashboard/resources/resource-meta";
 import {
   Card,
   CardContent,
@@ -211,18 +214,42 @@ function AttachedServers({
   );
 }
 
-function ResourcesSummary({ resources }: { resources: EnvPanel["resources"] }) {
+function ResourcesSummary({
+  resources,
+  onAdd,
+}: {
+  resources: EnvPanel["resources"];
+  /** Opens the deploy wizard scoped to this environment. Absent in demo mode
+   *  and in the not-found view, where there is nothing to deploy into. */
+  onAdd?: () => void;
+}) {
   return (
     <Card className="lg:col-span-2">
-      <CardHeader className="border-b">
-        <CardTitle className="text-sm">Resources</CardTitle>
-        <CardDescription>Apps, databases and services deployed here.</CardDescription>
+      <CardHeader className="flex-row items-start justify-between gap-2 border-b">
+        <div className="grid gap-1">
+          <CardTitle className="text-sm">Resources</CardTitle>
+          <CardDescription>Apps, databases and services deployed here.</CardDescription>
+        </div>
+        {onAdd && (
+          <Button variant="outline" size="sm" className="gap-1.5" onClick={onAdd}>
+            <Plus className="size-3.5" />
+            Add resource
+          </Button>
+        )}
       </CardHeader>
       <CardContent className="px-0">
         {resources.length === 0 ? (
-          <p className="px-4 py-6 text-sm text-muted-foreground">
-            No resources deployed in this environment.
-          </p>
+          <div className="flex flex-col items-start gap-2 px-4 py-6">
+            <p className="text-sm text-muted-foreground">
+              No resources deployed in this environment.
+            </p>
+            {onAdd && (
+              <Button variant="outline" size="sm" className="gap-1.5" onClick={onAdd}>
+                <Plus className="size-3.5" />
+                Deploy the first one
+              </Button>
+            )}
+          </div>
         ) : (
           <Table>
             <TableHeader>
@@ -237,10 +264,13 @@ function ResourcesSummary({ resources }: { resources: EnvPanel["resources"] }) {
               {resources.map((r) => (
                 <TableRow key={r.id}>
                   <TableCell className="pl-4 font-medium text-foreground">
-                    <span className="inline-flex items-center gap-2">
+                    <Link
+                      href={`/dashboard/resources/${r.id}`}
+                      className="inline-flex items-center gap-2 hover:underline"
+                    >
                       <StatusDot status={r.status as Status} />
                       {r.name}
-                    </span>
+                    </Link>
                   </TableCell>
                   <TableCell>
                     <KindBadge kind={r.kind as ResourceKind} />
@@ -375,9 +405,11 @@ function DeleteEnvironmentButton({
 function EnvironmentPanel({
   panel,
   orgServers,
+  onAddResource,
 }: {
   panel: EnvPanel;
   orgServers: OrgServer[];
+  onAddResource?: () => void;
 }) {
   return (
     <div className="flex flex-col gap-4 pt-4">
@@ -390,7 +422,7 @@ function EnvironmentPanel({
           servers={panel.servers}
           orgServers={orgServers}
         />
-        <ResourcesSummary resources={panel.resources} />
+        <ResourcesSummary resources={panel.resources} onAdd={onAddResource} />
         <RecentDeploys resources={panel.resources} />
       </div>
     </div>
@@ -436,6 +468,7 @@ export function ProjectDetailView({
   pendingInstallationId,
   projectMembers,
   canManageMembers = false,
+  cpMode = false,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
@@ -450,11 +483,41 @@ export function ProjectDetailView({
   /** P2-7 per-project roles; undefined hides the panel (e.g. not-found view). */
   projectMembers?: ProjectMemberRow[];
   canManageMembers?: boolean;
+  /** CP mode enables in-place resource creation from this page. */
+  cpMode?: boolean;
 }) {
+  // Deploy wizard scoped to one environment of this project, so a resource can
+  // be added where you are already standing instead of navigating to Resources
+  // and re-choosing the project you just came from.
+  const [wizardEnvId, setWizardEnvId] = React.useState<string | null>(null);
+
   if (!project) return <NotFound />;
 
   const environments = panels.map((p) => ({ id: p.env.id, name: p.env.name }));
   const showGit = Boolean(gitEnabled && orgId && gitConnections);
+
+  // One target: this project, with only the environment the user clicked from.
+  const wizardTargets: DeployTarget[] = wizardEnvId
+    ? [
+        {
+          id: project.id,
+          name: project.name,
+          environments: panels
+            .filter((p) => p.env.id === wizardEnvId)
+            .map((p) => ({
+              id: p.env.id,
+              name: p.env.name,
+              servers: p.servers.map((sv) => ({
+                id: sv.id,
+                name: sv.name,
+                type: sv.type,
+                provider: sv.provider ?? "",
+                region: sv.region ?? "",
+              })),
+            })),
+        },
+      ]
+    : [];
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -526,10 +589,24 @@ export function ProjectDetailView({
           </TabsList>
           {panels.map((panel) => (
             <TabsContent key={panel.env.id} value={panel.env.id}>
-              <EnvironmentPanel panel={panel} orgServers={orgServers} />
+              <EnvironmentPanel
+                panel={panel}
+                orgServers={orgServers}
+                onAddResource={() => setWizardEnvId(panel.env.id)}
+              />
             </TabsContent>
           ))}
         </Tabs>
+      )}
+
+      {wizardEnvId && (
+        <DeployWizard
+          open
+          onOpenChange={(o) => !o && setWizardEnvId(null)}
+          targets={wizardTargets}
+          cpMode={cpMode}
+          orgId={orgId ?? ""}
+        />
       )}
 
       {showGit && (

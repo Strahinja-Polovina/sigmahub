@@ -42,4 +42,8 @@ type BuildImageSpec struct {
 	// Force skips the ImageExists dedup short-circuit so a manual redeploy rebuilds
 	// the same commit (picking up base-image changes) instead of reusing the cache.
 	Force bool `json:"force,omitempty"`
+	// PushImage is set when this host builds for ANOTHER host (a dedicated build
+	// server). The deploy target cannot read this machine's Docker daemon, so
+	// the image has to reach a registry both can see.
+	PushImage bool `json:"pushImage,omitempty"`
 }

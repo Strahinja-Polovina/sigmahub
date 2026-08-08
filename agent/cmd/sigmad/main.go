@@ -25,6 +25,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/facts"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/host"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/k8s"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/metrics"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/s3ops"
@@ -153,6 +154,20 @@ func run() error {
 	}
 	driver := container.NewDriver(docker, cstore, log, secretFetcher)
 	driver.Register(registry)
+	// Kubernetes (k3s): membership + workload ops behind the same typed
+	// registry. A host that never joins a cluster simply never sees these ops.
+	k8sDriver := k8s.NewDriver(func(ctx context.Context, resourceID string) ([]k8s.Secret, error) {
+		res, err := c.FetchSecrets(ctx, st.AgentToken, resourceID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]k8s.Secret, 0, len(res.Secrets))
+		for _, s := range res.Secrets {
+			out = append(out, k8s.Secret{Name: s.Name, Value: s.Value, EnvVar: s.EnvVar})
+		}
+		return out, nil
+	})
+	k8sDriver.Register(registry)
 	// Git deploy build path (P1-9): git.clone + image.build behind the same
 	// registry (the no-shell enforcement point). The clone credential is fetched
 	// into memory per deployment (never persisted); build/orchestration logs stream

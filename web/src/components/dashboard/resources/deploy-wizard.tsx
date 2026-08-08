@@ -44,6 +44,8 @@ import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
+import Link from "next/link";
+import { RepoPicker } from "./repo-picker";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
 import { detectRepo, wireRepoToEnvironment } from "@/server/actions/git";
@@ -185,6 +187,11 @@ export function DeployWizard({
   // Optional token for private repos (CP mode): used for detection here and
   // stored by auto-connecting the repo to the project on create.
   const [repoToken, setRepoToken] = React.useState("");
+  // Org-level GitHub integration: when repos can be listed the wizard SELECTS
+  // one; `pickerEmpty` flips to the manual owner/repo + token form so an org
+  // without the App (or with the App unable to see a repo) is never stuck.
+  const [pickerEmpty, setPickerEmpty] = React.useState(false);
+  const [pickedInstallation, setPickedInstallation] = React.useState<string | undefined>();
   // Managed-service mode: a picked engine kind replaces the git repo as the
   // source (databases/object storage never had a repo to detect).
   const [serviceKind, setServiceKind] = React.useState<ResourceKind | null>(null);
@@ -296,15 +303,20 @@ export function DeployWizard({
 
   // CP mode: real repo detection for step 1 (the CP inspects the repo's
   // Dockerfile/compose over the provider API; no mock list).
-  function runDetect() {
-    const fullName = repoQuery.trim();
+  function runDetect(explicitRepo?: string, installationId?: string) {
+    const fullName = (explicitRepo ?? repoQuery).trim();
     if (!fullName.includes("/")) {
       toast.error("Enter the repository as owner/name.");
       return;
     }
     setDetecting(true);
     setRepo(null);
-    detectRepo({ orgId, repoFullName: fullName, token: repoToken.trim() || undefined })
+    detectRepo({
+      orgId,
+      repoFullName: fullName,
+      installationId: installationId ?? pickedInstallation,
+      token: repoToken.trim() || undefined,
+    })
       .then((d) => {
         if (!d.deployable) {
           toast.error("Repository is not deployable", {
@@ -370,6 +382,7 @@ export function DeployWizard({
             name: resourceName || "resource",
             kind: kind ?? "app",
             repo: serviceKind ? undefined : repo?.fullName,
+            installationId: serviceKind ? undefined : pickedInstallation,
             detected: serviceKind ? undefined : repo?.detected,
           });
           // Wire push-to-deploy for the golden path in ONE resilient call:
@@ -384,6 +397,7 @@ export function DeployWizard({
               projectId,
               repoFullName: repo.fullName,
               token: repoToken.trim() || undefined,
+              installationId: pickedInstallation,
               branch: repo.defaultBranch,
               environmentId,
             });
@@ -677,40 +691,72 @@ export function DeployWizard({
           {/* Step 1 (app) — pick repository. CP mode: real detection; demo: mock list. */}
           {step === 1 && !serviceKind && cpMode && (
             <div className="flex flex-col gap-3">
-              <div className="flex gap-2">
-                <Input
-                  value={repoQuery}
-                  onChange={(e) => setRepoQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && runDetect()}
-                  placeholder="owner/repository"
-                  className="font-mono"
+              {/* Org-level GitHub integration: pick a repo the App already
+                  grants. Falls back to the manual form when the org hasn't
+                  connected GitHub (or the App can't see the repo). */}
+              {!pickerEmpty && (
+                <RepoPicker
+                  orgId={orgId}
+                  value={repo?.fullName ?? null}
+                  onUnavailable={() => setPickerEmpty(true)}
+                  onSelect={(picked) => {
+                    setRepoQuery(picked.fullName);
+                    setPickedInstallation(picked.installationId);
+                    runDetect(picked.fullName, picked.installationId);
+                  }}
                 />
-                <Button size="sm" className="h-9" onClick={runDetect} disabled={detecting}>
-                  {detecting ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
-                  Detect
-                </Button>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="wizard-repo-token" className="text-xs text-muted-foreground">
-                  Access token <span className="opacity-70">(only for private repositories)</span>
-                </Label>
-                <Input
-                  id="wizard-repo-token"
-                  type="password"
-                  value={repoToken}
-                  onChange={(e) => setRepoToken(e.target.value)}
-                  placeholder="github_pat_… / ghp_…"
-                  className="font-mono"
-                  autoComplete="off"
-                />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Public GitHub repositories detect directly. For a private one,
-                paste a token with read access (Contents) — it is stored
-                encrypted and connects the repository to the project on deploy.
-                Repositories already connected in the project’s Git panel need
-                no token here.
-              </p>
+              )}
+
+              {pickerEmpty && (
+                <>
+                  <div className="flex gap-2">
+                    <Input
+                      value={repoQuery}
+                      onChange={(e) => setRepoQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && runDetect()}
+                      placeholder="owner/repository"
+                      className="font-mono"
+                    />
+                    <Button size="sm" className="h-9" onClick={() => runDetect()} disabled={detecting}>
+                      {detecting ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
+                      Detect
+                    </Button>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="wizard-repo-token" className="text-xs text-muted-foreground">
+                      Access token <span className="opacity-70">(only for private repositories)</span>
+                    </Label>
+                    <Input
+                      id="wizard-repo-token"
+                      type="password"
+                      value={repoToken}
+                      onChange={(e) => setRepoToken(e.target.value)}
+                      placeholder="github_pat_… / ghp_…"
+                      className="font-mono"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Connect GitHub once in{" "}
+                    <Link
+                      href="/dashboard/settings?tab=integrations"
+                      className="underline underline-offset-2 hover:text-foreground"
+                    >
+                      Settings › Integrations
+                    </Link>{" "}
+                    and your repositories appear here to pick from. Until then, enter a
+                    public repository, or paste a token with read access (Contents) for a
+                    private one — it is stored encrypted.
+                  </p>
+                </>
+              )}
+
+              {detecting && !pickerEmpty && (
+                <p className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  Reading the repository…
+                </p>
+              )}
               {repo && (
                 <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
                   <CircleCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />

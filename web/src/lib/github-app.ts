@@ -6,6 +6,9 @@
 // different target.
 
 export type GitAppInstallTarget =
+  // Org-level: the App is connected once for the whole organization and repos
+  // are picked from it afterwards. This is the normal path.
+  | { kind: "org" }
   | { kind: "project"; projectId: string }
   | { kind: "connection"; projectId: string; connectionId: string };
 
@@ -13,15 +16,21 @@ export type GitAppInstallTarget =
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export function encodeInstallState(target: GitAppInstallTarget): string {
-  return target.kind === "project"
-    ? `proj:${target.projectId}`
-    : `conn:${target.projectId}:${target.connectionId}`;
+  switch (target.kind) {
+    case "org":
+      return "org";
+    case "project":
+      return `proj:${target.projectId}`;
+    case "connection":
+      return `conn:${target.projectId}:${target.connectionId}`;
+  }
 }
 
 export function parseInstallState(
   state: string | undefined | null
 ): GitAppInstallTarget | null {
   if (!state) return null;
+  if (state === "org") return { kind: "org" };
   const parts = state.split(":");
   if (parts[0] === "proj" && parts.length === 2 && ID.test(parts[1])) {
     return { kind: "project", projectId: parts[1] };

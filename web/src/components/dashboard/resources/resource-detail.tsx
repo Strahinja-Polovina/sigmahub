@@ -77,10 +77,12 @@ import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 import { DatabasePanel } from "./database-panel";
 import { S3Panel } from "./s3-panel";
+import { ComposeServicesPanel, type PlacementServer } from "./compose-services-panel";
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import type {
   CpDatabaseInfo,
   CpS3Info,
+  CpComposeServices,
   CpBackupTarget,
   CpBackupRun,
   CpTelemetryPoint,
@@ -307,6 +309,8 @@ export function ResourceDetail({
   deploymentsEnabled = false,
   database = null,
   s3 = null,
+  compose = null,
+  placementServers = [],
   backupTargets = [],
   backupRuns = [],
   environmentId = "",
@@ -334,6 +338,10 @@ export function ResourceDetail({
   database?: CpDatabaseInfo | null;
   /** P2-1 S3 endpoint metadata (CP mode, s3 kind only). */
   s3?: CpS3Info | null;
+  /** Compose service graph + placement (CP mode, multi-service apps only). */
+  compose?: CpComposeServices | null;
+  /** Servers a compose service may be placed on. */
+  placementServers?: PlacementServer[];
   /** P1-11 backups (CP mode, database kinds only). */
   backupTargets?: CpBackupTarget[];
   backupRuns?: CpBackupRun[];
@@ -521,6 +529,16 @@ export function ResourceDetail({
             </Card>
 
             <div className="flex flex-col gap-4 lg:col-span-2">
+              {compose && compose.services.length > 0 && orgId && (
+                <ComposeServicesPanel
+                  orgId={orgId}
+                  resourceId={resource.id}
+                  services={compose.services}
+                  homeServerId={compose.homeServerId}
+                  servers={placementServers}
+                  canManage={canManage}
+                />
+              )}
               {database && orgId && (
                 <DatabasePanel
                   orgId={orgId}

@@ -320,21 +320,27 @@ function ConnectRepoDialog({
   );
 }
 
-/** Add-a-mapping row: branch text, environment, policy. */
+/** Add-a-mapping row: branch text, environment, policy, and where to build. */
 function AddMappingRow({
   orgId,
   projectId,
   connectionId,
   environments,
+  buildServers = [],
 }: {
   orgId: string;
   projectId: string;
   connectionId: string;
   environments: EnvOption[];
+  /** Servers offered as a dedicated build host. Any server can build; a
+   *  "build" type just advertises that this is what it is for. */
+  buildServers?: ServerOption[];
 }) {
   const [branch, setBranch] = React.useState("");
   const [envId, setEnvId] = React.useState(environments[0]?.id ?? "");
   const [policy, setPolicy] = React.useState<"auto" | "manual">("auto");
+  // "" = build on the deploy target, which is the existing behaviour.
+  const [buildServerId, setBuildServerId] = React.useState("");
   const [pending, startTransition] = React.useTransition();
 
   function add() {
@@ -348,7 +354,15 @@ function AddMappingRow({
     }
     startTransition(async () => {
       try {
-        await setBranchMapping({ orgId, projectId, connectionId, branch: branch.trim(), environmentId: envId, policy });
+        await setBranchMapping({
+          orgId,
+          projectId,
+          connectionId,
+          branch: branch.trim(),
+          environmentId: envId,
+          policy,
+          buildServerId: buildServerId || undefined,
+        });
         toast.success(`Mapped ${branch.trim()} → ${policy}`);
         setBranch("");
       } catch (err) {
@@ -398,10 +412,40 @@ function AddMappingRow({
           </SelectContent>
         </Select>
       </div>
+      {buildServers.length > 0 && (
+        <div className="flex min-w-36 flex-col gap-1">
+          <Label className="text-xs text-muted-foreground">Build on</Label>
+          <Select value={buildServerId} onValueChange={(v) => setBuildServerId((v as string) ?? "")}>
+            <SelectTrigger className="h-8 w-full">
+              <SelectValue>
+                {(v) =>
+                  !v
+                    ? "Deploy target"
+                    : (buildServers.find((s) => s.id === (v as string))?.name ?? "Select")
+                }
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="">Deploy target (default)</SelectItem>
+              {buildServers.map((s) => (
+                <SelectItem key={s.id} value={s.id}>
+                  {s.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
       <Button size="sm" variant="outline" onClick={add} disabled={pending} className="h-8">
         {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
         Map
       </Button>
+      {buildServers.length > 0 && (
+        <p className="w-full text-xs text-muted-foreground">
+          A build saturates CPU and disk for minutes. Pointing it at another server keeps
+          that load off the machine serving traffic — only the finished image travels.
+        </p>
+      )}
     </div>
   );
 }
@@ -711,6 +755,7 @@ function ConnectionCard({
           projectId={projectId}
           connectionId={panel.connection.id}
           environments={environments}
+          buildServers={servers}
         />
         <PreviewsSection
           orgId={orgId}
