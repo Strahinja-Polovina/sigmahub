@@ -271,6 +271,28 @@ func assertClusterInOrg(ctx context.Context, tx pgx.Tx, orgID, clusterID string)
 	return nil
 }
 
+// ControlPlaneServerForCluster returns the server running the cluster's API
+// server.
+//
+// It is the only node a workload renders into (see reconciler/k8s.go: the
+// scheduler picks the pod's host, so rendering the same Deployment per node
+// would create N competing appliers). A cluster resource carries no server_id,
+// so a mutation that lands one has nothing to point a re-render at — without
+// this the workload first appeared at the next 60-second fleet resync, which
+// looks exactly like a create that silently did nothing.
+func (s *Store) ControlPlaneServerForCluster(ctx context.Context, orgID, clusterID string) (string, error) {
+	var serverID string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT n.server_id
+		  FROM cluster_nodes n JOIN clusters c ON c.id = n.cluster_id
+		 WHERE c.org_id = $1 AND c.id = $2 AND n.role = $3`,
+		orgID, clusterID, NodeRoleControlPlane).Scan(&serverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return serverID, err
+}
+
 // ListClusters returns the org's clusters with their nodes.
 func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) ([]Cluster, error) {
 	rows, err := s.Pool.Query(ctx, `

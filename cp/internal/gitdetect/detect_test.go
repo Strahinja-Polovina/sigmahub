@@ -107,7 +107,7 @@ func TestDetectCompose(t *testing.T) {
 		t.Fatalf("expected 2 services, got %d: %+v", len(d.Services), d.Services)
 	}
 	web := svcByName(d.Services, "web")
-	if web == nil || web.Build != "." || web.Rollout != RolloutRecreate {
+	if web == nil || web.Build != "." || web.Rollout != RolloutBlueGreen {
 		t.Errorf("web service = %+v", web)
 	}
 	worker := svcByName(d.Services, "worker")

@@ -44,6 +44,13 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { canHost, HOSTS_NOTHING_REASON } from "@/lib/server-catalog.generated";
+import {
+  ROLLOUT_BLUE_GREEN,
+  ROLLOUT_RECREATE,
+  recreateSummary,
+  ignoredHostPorts,
+  type DetectedComposeService,
+} from "@/lib/deploy-spec";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import Link from "next/link";
 import { RepoPicker } from "./repo-picker";
@@ -70,16 +77,23 @@ type Repo = {
   port: number;
   /** Full inspector output, carried so the create call can persist it into the
    *  resource spec — otherwise the rollout has no ports and its health probe
-   *  targets a port the app doesn't listen on (SIGMA-160). Absent in demo mode. */
+   *  targets a port the app doesn't listen on (SIGMA-160), and a Compose repo
+   *  is created as a single container (SIGMA-199). */
   detected?: {
     ports?: number[];
     healthCheck?: { type: string; path?: string; port?: number };
+    services?: DetectedComposeService[];
   };
   /** Variable KEYS detected from the repo (.env.example, Dockerfile ENV/ARG,
    *  compose environment) — seeds the Variables step. */
   envKeys?: string[];
 };
 
+// Demo mode has no control plane to inspect a repository, so these stand in for
+// the inspector's output. `acme/api` carries a real multi-service graph —
+// including one service that can only be recreated — because a demo where every
+// repo is a single container is a demo of the bug this flow was built around
+// (SIGMA-199): the multi-service path would never be exercised offline.
 const MOCK_REPOS: Repo[] = [
   {
     fullName: "acme/storefront",
@@ -90,6 +104,7 @@ const MOCK_REPOS: Repo[] = [
     build: "Dockerfile",
     buildDetail: "node:20-alpine · 3 stages",
     port: 3000,
+    detected: { ports: [3000], healthCheck: { type: "http", path: "/healthz", port: 3000 } },
   },
   {
     fullName: "acme/api",
@@ -98,8 +113,31 @@ const MOCK_REPOS: Repo[] = [
     defaultBranch: "main",
     detectedKind: "app",
     build: "docker-compose.yml",
-    buildDetail: "api + worker services",
+    buildDetail: "4 services: api, worker, cache, db",
     port: 8080,
+    detected: {
+      ports: [8080],
+      healthCheck: { type: "http", path: "/health", port: 8080 },
+      services: [
+        {
+          name: "api",
+          build: ".",
+          dockerfile: "Dockerfile",
+          ports: [8080],
+          dependsOn: ["db", "cache"],
+          rollout: ROLLOUT_BLUE_GREEN,
+        },
+        { name: "worker", build: "./worker", rollout: ROLLOUT_BLUE_GREEN },
+        { name: "cache", image: "redis:7.4", ports: [6379], rollout: ROLLOUT_BLUE_GREEN },
+        {
+          name: "db",
+          image: "postgres:16",
+          ports: [5432],
+          namedVolumes: ["pgdata"],
+          rollout: ROLLOUT_RECREATE,
+        },
+      ],
+    },
   },
   {
     fullName: "acme/ml-inference",
@@ -120,6 +158,30 @@ const MOCK_REPOS: Repo[] = [
     build: "docker-compose.yml",
     buildDetail: "redis:7.4",
     port: 6379,
+    // A repo the demo presents as Compose has to CARRY a graph, or demo mode
+    // shows the one shape SIGMA-199 exists to prevent: a compose repo that
+    // renders no services and creates a single container. This one also carries
+    // a published host port, which is the only way the ignored-binding notice
+    // is reachable offline.
+    detected: {
+      ports: [6379],
+      services: [
+        {
+          name: "cache",
+          image: "redis:7.4",
+          ports: [6379],
+          publishedPorts: [6379],
+          namedVolumes: ["cachedata"],
+          rollout: ROLLOUT_RECREATE,
+        },
+        {
+          name: "warmer",
+          build: "./warmer",
+          dependsOn: ["cache"],
+          rollout: ROLLOUT_BLUE_GREEN,
+        },
+      ],
+    },
   },
 ];
 
@@ -341,6 +403,7 @@ export function DeployWizard({
           });
           return;
         }
+        const services = d.services ?? [];
         setRepo({
           fullName,
           description: d.hasCompose ? `compose: ${d.composePath ?? "docker-compose.yml"}` : `dockerfile: ${d.dockerfilePath ?? "Dockerfile"}`,
@@ -348,13 +411,21 @@ export function DeployWizard({
           defaultBranch: d.defaultBranch || "main",
           detectedKind: "app",
           build: d.hasCompose ? "docker-compose.yml" : "Dockerfile",
-          buildDetail: d.ports.length ? `ports ${d.ports.join(", ")}` : "no ports detected",
+          // Service COUNT is the headline for a Compose repo: it is the number
+          // the operator can check against their own compose file, and the one
+          // that used to be silently wrong (always 1).
+          buildDetail: services.length
+            ? `${services.length} services: ${services.map((s) => s.name).join(", ")}`
+            : d.ports.length
+              ? `ports ${d.ports.join(", ")}`
+              : "no ports detected",
           port: d.ports[0] ?? 0,
           detected: {
             ports: d.ports,
             healthCheck: d.healthCheck?.type
               ? { type: d.healthCheck.type, path: d.healthCheck.path, port: d.healthCheck.port }
               : undefined,
+            services,
           },
           envKeys: d.env,
         });
@@ -494,6 +565,9 @@ export function DeployWizard({
           name: resourceName || "resource",
           kind: kind ?? "app",
           repo: serviceKind ? undefined : repo?.fullName,
+          // Demo mode takes the same create path, detection and all, so the
+          // compose branch is exercised offline instead of only against a CP.
+          detected: serviceKind ? undefined : repo?.detected,
           llm: serviceKind === "llm" ? { engine: llmEngine, model: llmModel.trim() } : undefined,
         })
           .then(() => {
@@ -867,6 +941,82 @@ export function DeployWizard({
                   <p className="text-xs text-muted-foreground">{repo.buildDetail}</p>
                 </div>
               </div>
+
+              {/* The Compose graph. Showing it is the point: the operator has to
+                  be able to see that every service was understood, and
+                  which of them cannot swap without going down — the product
+                  makes a zero-downtime promise that a named volume or a fixed
+                  host port quietly exempts a service from. */}
+              {(repo.detected?.services?.length ?? 0) > 0 && (
+                <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
+                  <p className="text-xs text-muted-foreground">
+                    {repo.detected!.services!.length} services will be deployed, each as its own
+                    container.
+                  </p>
+                  <ul className="flex flex-col gap-1.5">
+                    {repo.detected!.services!.map((svc) => (
+                      <li key={svc.name} className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-sm text-foreground">{svc.name}</span>
+                        <Badge variant="outline" className="font-mono text-[10px]">
+                          {svc.build ? `build ${svc.build === "." ? "." : svc.build}` : svc.image}
+                        </Badge>
+                        {(svc.ports?.length ?? 0) > 0 && (
+                          <span className="text-xs text-muted-foreground tabular-nums">
+                            :{svc.ports!.join(", :")}
+                          </span>
+                        )}
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "text-[10px]",
+                            svc.rollout === ROLLOUT_RECREATE && "border-amber-500/40 text-amber-600"
+                          )}
+                        >
+                          {svc.rollout === ROLLOUT_RECREATE ? ROLLOUT_RECREATE : ROLLOUT_BLUE_GREEN}
+                        </Badge>
+                      </li>
+                    ))}
+                  </ul>
+                  {recreateSummary(repo.detected?.services).length > 0 && (
+                    <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2.5">
+                      <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+                      <div className="min-w-0 text-xs text-muted-foreground">
+                        <p className="font-medium text-foreground">
+                          Not every service deploys with zero downtime.
+                        </p>
+                        <ul className="mt-1 flex flex-col gap-0.5">
+                          {recreateSummary(repo.detected?.services).map((svc) => (
+                            <li key={svc.name}>
+                              <span className="font-mono text-foreground">{svc.name}</span> is
+                              stopped before its replacement starts, because {svc.reason}.
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  )}
+                  {ignoredHostPorts(repo.detected?.services).length > 0 && (
+                    <div className="flex items-start gap-2 rounded-md border border-border bg-muted/40 p-2.5">
+                      <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 text-xs text-muted-foreground">
+                        <p className="font-medium text-foreground">
+                          Host port bindings are not used.
+                        </p>
+                        <ul className="mt-1 flex flex-col gap-0.5">
+                          {ignoredHostPorts(repo.detected?.services).map((svc) => (
+                            <li key={svc.name}>
+                              <span className="font-mono text-foreground">{svc.name}</span> asks for
+                              host port{svc.ports.length > 1 ? "s" : ""} {svc.ports.join(", ")}.
+                              Traefik routes to the container instead, so nothing binds the host —
+                              attach a domain to reach it from outside.
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border border-border bg-card p-3 text-sm">
                 <div className="flex flex-col gap-0.5">

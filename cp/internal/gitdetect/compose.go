@@ -19,17 +19,19 @@ type ComposeService struct {
 	Image      string `json:"image,omitempty"`
 	// Ports are the container ports the service exposes (target side).
 	Ports []int `json:"ports,omitempty"`
-	// PublishedPorts are fixed host ports the service binds (host:container). A
-	// non-empty set forces the recreate rollout class — a fixed host port can't be
-	// held by two generations at once.
+	// PublishedPorts are the fixed host ports the compose file asks for
+	// (host:container). SigmaHub does NOT bind them — ingress is Traefik's job
+	// and a host binding would collide the moment two apps published the same
+	// port — so this is carried for one reason: to tell the operator which
+	// bindings were ignored, instead of silently dropping a line they wrote.
 	PublishedPorts []int `json:"publishedPorts,omitempty"`
 	// NamedVolumes are docker named volumes the service mounts (source is a bare
 	// name, not a ./ or / path). A named volume implies exclusive state → recreate.
 	NamedVolumes []string `json:"namedVolumes,omitempty"`
 	DependsOn    []string `json:"dependsOn,omitempty"`
 	// Rollout is the swap class: "blue-green" for stateless services, "recreate"
-	// for services holding exclusive resources (named volume or fixed host port) —
-	// the documented per-service exception to the zero-downtime guarantee.
+	// for services holding an exclusive resource (a named volume) — the
+	// documented per-service exception to the zero-downtime guarantee.
 	Rollout string `json:"rollout"`
 }
 
@@ -218,7 +220,21 @@ func ParseComposeServices(b []byte) []ComposeService {
 		s := &services[i]
 		sort.Ints(s.Ports)
 		sort.Ints(s.PublishedPorts)
-		if len(s.NamedVolumes) > 0 || len(s.PublishedPorts) > 0 {
+		// Only a named volume forces recreate. A fixed host port used to force it
+		// too, on the reasoning that two generations cannot bind the same port —
+		// but SigmaHub never binds it: compose ports are EXPOSED, not published
+		// (the renderer emits portMapping{Container} with no Host), because
+		// Traefik fronts the service and two apps publishing 3000 would collide
+		// on the host anyway.
+		//
+		// So that rule protected against a conflict that cannot happen, and it
+		// cost two real defects. It told the operator a service would take
+		// downtime "because it binds host port 3000" — a binding the delivered
+		// container does not have. And because the web-facing service is chosen
+		// among non-recreate services, the most ordinary compose file there is —
+		// a web tier declaring "3000:3000" — disqualified its own web service and
+		// routed the domain to whatever came next.
+		if len(s.NamedVolumes) > 0 {
 			s.Rollout = RolloutRecreate
 		} else {
 			s.Rollout = RolloutBlueGreen

@@ -132,6 +132,14 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	}
 
 	for _, rs := range specs {
+		// A cluster workload reaches this node's spec read (its secrets and
+		// domains have to), but Kubernetes runs it — on whichever node the
+		// scheduler chose. Rendering it here as a plain container would put a
+		// second, unscheduled copy on EVERY node of the cluster, under the same
+		// `res:<id>` op id the control plane's k8s.apply already uses.
+		if rs.ClusterID != "" {
+			continue
+		}
 		if target, isDB := dbTargets[rs.ResourceID]; isDB {
 			if dbOps, netID, ok := renderDatabaseOps(rs, target, hardening.MeshIP); ok {
 				resourceOps = append(resourceOps, dbOps...)

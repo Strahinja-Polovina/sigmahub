@@ -14,6 +14,7 @@ import "server-only";
 import { createHmac } from "node:crypto";
 import { db, client } from "./db";
 import * as schema from "./db/schema";
+import { createResourceBody } from "@/lib/deploy-spec";
 import type * as s from "./db/schema";
 
 /** The acting user forwarded to the CP on mutations. */
@@ -497,7 +498,13 @@ export async function cpCreateResource(
   orgId: string,
   input: {
     environmentId: string;
-    serverId: string;
+    /** Run this on one server. Exactly one of serverId / clusterId. */
+    serverId?: string;
+    /** Run this INSIDE a Kubernetes cluster; the scheduler picks the node, so
+     *  there is no server to name. The store and the whole cluster render path
+     *  have always accepted it — this client just never sent it, which is what
+     *  made cluster deploys unreachable from the dashboard (SIGMA-200). */
+    clusterId?: string;
     name: string;
     kind: string;
     spec?: Record<string, unknown>;
@@ -506,7 +513,7 @@ export async function cpCreateResource(
 ): Promise<CpResource> {
   return cpFetch(`${org(orgId)}/resources`, {
     method: "POST",
-    body: JSON.stringify({ ...input, spec: input.spec ?? {} }),
+    body: JSON.stringify(createResourceBody(input)),
   }, { orgId, actor });
 }
 
@@ -975,6 +982,37 @@ export type CpHealthCheck = {
   source: string; // "dockerfile" | "compose" | "default"
 };
 
+/** One service of a detected Compose file.
+ *
+ *  A faithful mirror of `gitdetect.ComposeService`
+ *  (cp/internal/gitdetect/compose.go) — every field that struct emits, none it
+ *  doesn't. The CP has always returned this graph from /git/detect; the web type
+ *  simply had no field for it, so `d.services` was parsed off the wire and
+ *  thrown away, and a repo describing five services deployed as one container
+ *  with nothing anywhere saying so (SIGMA-199). */
+export type CpDetectedComposeService = {
+  name: string;
+  /** Build context (".", or a subdirectory) when the service builds from
+   *  source; absent when it runs a prebuilt `image`. */
+  build?: string;
+  /** Dockerfile path, relative to the build context. */
+  dockerfile?: string;
+  /** Prebuilt image reference (present instead of `build`). */
+  image?: string;
+  /** Container ports the service exposes (the target side of a mapping). */
+  ports?: number[];
+  /** Fixed host ports the service binds. Two generations cannot hold the same
+   *  host port, which is half of why `rollout` may be "recreate". */
+  publishedPorts?: number[];
+  /** Docker named volumes the service mounts — exclusive state, the other half
+   *  of why `rollout` may be "recreate". */
+  namedVolumes?: string[];
+  dependsOn?: string[];
+  /** Swap class the CP derived: "blue-green" (stateless) or "recreate" (holds
+   *  an exclusive resource, so it goes down during the swap). */
+  rollout: string;
+};
+
 /** Deploy config detected from a repo's root files — a wizard pre-fill. */
 export type CpDetected = {
   hasDockerfile: boolean;
@@ -983,6 +1021,9 @@ export type CpDetected = {
   composePath?: string;
   ports: number[];
   env: string[];
+  /** The Compose service graph; absent/empty for a plain Dockerfile app. This
+   *  is what makes a multi-service deploy possible — see CpDetectedComposeService. */
+  services?: CpDetectedComposeService[];
   healthCheck: CpHealthCheck;
   deployable: boolean;
   reason?: string;
@@ -1725,8 +1766,13 @@ export async function cpSelectGitRepo(
 export type CpComposeService = {
   name: string;
   build?: string;
+  dockerfile?: string;
   image?: string;
   ports?: number[];
+  /** Why `rollout` is "recreate", when it is: a fixed host port cannot be held
+   *  by two generations at once, and a named volume is exclusive state. */
+  publishedPorts?: number[];
+  namedVolumes?: string[];
   rollout?: string;
   dependsOn?: string[];
   /** Explicit placement; empty means the resource's own server. */

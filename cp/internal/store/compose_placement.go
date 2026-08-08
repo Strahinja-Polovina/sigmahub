@@ -26,15 +26,30 @@ type ComposePlacement struct {
 
 // ComposeServiceView is what the dashboard renders: the declared service plus
 // where it runs and what it depends on.
+//
+// It is ALSO the round-trip shape SetComposePlacements re-marshals the compose
+// block through, so every field gitdetect writes into the spec has to appear
+// here. A missing one is not a display gap — it is deleted from the stored spec
+// the first time anyone drags a service to another server. `dockerfile` was
+// exactly that: written at create, consumed by the build op, and silently
+// dropped by the first placement save, after which the service rebuilt from the
+// context's default Dockerfile.
 type ComposeServiceView struct {
-	Name      string            `json:"name"`
-	Build     string            `json:"build,omitempty"`
-	Image     string            `json:"image,omitempty"`
-	Ports     []int             `json:"ports,omitempty"`
-	Rollout   string            `json:"rollout,omitempty"`
-	DependsOn []string          `json:"dependsOn,omitempty"`
-	ServerID  string            `json:"serverId,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
+	Name       string `json:"name"`
+	Build      string `json:"build,omitempty"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+	Image      string `json:"image,omitempty"`
+	Ports      []int  `json:"ports,omitempty"`
+	// PublishedPorts and NamedVolumes are the EVIDENCE for Rollout: they are why
+	// a service is recreate rather than blue-green. The reconciler needs only the
+	// verdict, but the dashboard has to be able to say which exclusive resource
+	// forced it, or "recreate" reads as an arbitrary product decision.
+	PublishedPorts []int             `json:"publishedPorts,omitempty"`
+	NamedVolumes   []string          `json:"namedVolumes,omitempty"`
+	Rollout        string            `json:"rollout,omitempty"`
+	DependsOn      []string          `json:"dependsOn,omitempty"`
+	ServerID       string            `json:"serverId,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
 }
 
 // composeSpecShape is the slice of a resource spec this file rewrites. Only the

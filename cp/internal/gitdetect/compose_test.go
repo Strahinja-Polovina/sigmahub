@@ -60,9 +60,17 @@ volumes:
 	if !reflect.DeepEqual(web.DependsOn, []string{"db", "cache"}) {
 		t.Fatalf("web depends_on = %v", web.DependsOn)
 	}
-	// A published host port forces recreate.
-	if web.Rollout != RolloutRecreate {
-		t.Fatalf("web with a fixed host port must be recreate, got %q", web.Rollout)
+	// A published host port is RECORDED but does not force recreate: SigmaHub
+	// never binds it (compose ports are exposed, Traefik fronts the service), so
+	// the two-generations-cannot-share-a-port argument does not apply. Forcing
+	// recreate here told the operator a service would take downtime for a
+	// binding the container does not have, and disqualified the web tier from
+	// holding its own domain.
+	if !reflect.DeepEqual(web.PublishedPorts, []int{8080}) {
+		t.Fatalf("web published ports = %v, want the binding recorded", web.PublishedPorts)
+	}
+	if web.Rollout != RolloutBlueGreen {
+		t.Fatalf("a host port must not cost zero-downtime, got %q", web.Rollout)
 	}
 
 	api := svcByName(svcs, "api")
@@ -123,8 +131,8 @@ services:
 	if !reflect.DeepEqual(app.DependsOn, []string{"redis"}) {
 		t.Fatalf("app depends_on = %v", app.DependsOn)
 	}
-	if app.Rollout != RolloutRecreate {
-		t.Fatalf("app has a host port → recreate, got %q", app.Rollout)
+	if app.Rollout != RolloutBlueGreen {
+		t.Fatalf("a host port alone must stay blue-green, got %q", app.Rollout)
 	}
 }
 
@@ -216,5 +224,49 @@ services:
 func TestParseComposeNoServices(t *testing.T) {
 	if got := ParseComposeServices([]byte("version: '3'\n")); len(got) != 0 {
 		t.Fatalf("expected no services, got %+v", got)
+	}
+}
+
+// The most ordinary compose file there is — a web tier that publishes its port
+// — must keep its web service eligible to hold the app's domain.
+//
+// The renderer picks the web-facing service among services whose rollout is not
+// recreate. While a fixed host port forced recreate, a `web` service declaring
+// "3000:3000" disqualified itself and the domain landed on whatever service
+// came next in the file. Nothing reported it: the app answered on the wrong
+// tier and looked like a routing bug in the user's own code.
+func TestPublishedPortKeepsAServiceEligibleForTheDomain(t *testing.T) {
+	compose := []byte(`
+services:
+  web:
+    build: .
+    ports: ["3000:3000"]
+    depends_on: [api]
+  api:
+    build: ./api
+    ports: ["8080"]
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+`)
+	svcs := ParseComposeServices(compose)
+	web, api, db := svcByName(svcs, "web"), svcByName(svcs, "api"), svcByName(svcs, "db")
+	if web == nil || api == nil || db == nil {
+		t.Fatalf("services = %+v", svcs)
+	}
+	// web is the first service with ports AND a non-recreate rollout, which is
+	// what makes it the one the domain routes to.
+	if web.Rollout != RolloutBlueGreen {
+		t.Fatalf("web rollout = %q; a published port must not disqualify the web tier", web.Rollout)
+	}
+	if api.Rollout != RolloutBlueGreen {
+		t.Fatalf("api rollout = %q", api.Rollout)
+	}
+	// A named volume is a real exclusivity claim and still costs the swap.
+	if db.Rollout != RolloutRecreate {
+		t.Fatalf("db holds a named volume and must be recreate, got %q", db.Rollout)
 	}
 }
