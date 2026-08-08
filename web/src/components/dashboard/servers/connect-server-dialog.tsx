@@ -37,7 +37,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { connectServer, provisionServer } from "@/server/actions/servers";
-import { SERVER_TYPE_LABELS, SERVER_TYPE_ORDER } from "./server-meta";
+import { SERVER_TYPE_LABELS, CONNECTABLE_SERVER_TYPES } from "./server-meta";
 
 const DISTROS = [
   { id: "ubuntu-24.04", label: "Ubuntu 24.04 LTS" },
@@ -223,7 +223,7 @@ export function ConnectServerDialog({
               <div className="flex flex-col gap-1.5">
                 <Label className="text-xs text-muted-foreground">Type</Label>
                 <div className="flex flex-wrap gap-1.5">
-                  {SERVER_TYPE_ORDER.map((t) => (
+                  {CONNECTABLE_SERVER_TYPES.map((t) => (
                     <Button
                       key={t}
                       type="button"
@@ -397,16 +397,22 @@ export function ConnectServerDialog({
         </div>
 
         <DialogFooter>
-          <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
-            {issued ? "Done" : "Cancel"}
-          </DialogClose>
-          <Button
-            onClick={connect}
-            disabled={!name.trim() || pending || Boolean(issued)}
-          >
-            {pending && <Loader2 className="size-4 animate-spin" />}
-            Connect server
-          </Button>
+          {issued ? (
+            // Once the install command is issued there is nothing left to
+            // submit — a single Done closes the dialog instead of leaving a
+            // permanently disabled "Connect server" next to it.
+            <DialogClose render={<Button type="button" />}>Done</DialogClose>
+          ) : (
+            <>
+              <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+                Cancel
+              </DialogClose>
+              <Button onClick={connect} disabled={!name.trim() || pending}>
+                {pending && <Loader2 className="size-4 animate-spin" />}
+                Connect server
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

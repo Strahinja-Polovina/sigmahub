@@ -292,6 +292,65 @@ func (s *Store) ProvisionServer(ctx context.Context, orgID string, in ProvisionI
 	return ProvisionResult{ServerID: serverID, Token: token, ExpiresAt: expiresAt, BootstrapPubkey: authorizedKey}, nil
 }
 
+// ReissueBootstrapToken mints a fresh bootstrap keypair + single-use token for
+// an EXISTING pre-created server that never finished onboarding (a lost or
+// expired install command). Only `provisioning` servers qualify: a registered
+// host already holds an agent token, and silently re-arming its bootstrap
+// path would let a second machine take over the record.
+func (s *Store) ReissueBootstrapToken(ctx context.Context, orgID, serverID, createdBy string, ttl time.Duration) (ProvisionResult, error) {
+	pub, seed, err := generateEd25519Seed()
+	if err != nil {
+		return ProvisionResult{}, err
+	}
+	wrapped, err := s.custody.Wrap(ctx, "srv_bootstrap:"+orgID, seed)
+	if err != nil {
+		return ProvisionResult{}, fmt.Errorf("wrap bootstrap key: %w", err)
+	}
+	authorizedKey := sshEd25519AuthorizedKey(pub)
+
+	expiresAt := time.Now().Add(ttl)
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return ProvisionResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var name, status string
+	err = tx.QueryRow(ctx, `
+		SELECT name, status FROM servers
+		 WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL
+		 FOR UPDATE`, serverID, orgID).Scan(&name, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProvisionResult{}, ErrNotFound
+	}
+	if err != nil {
+		return ProvisionResult{}, fmt.Errorf("load server: %w", err)
+	}
+	if status != "provisioning" {
+		return ProvisionResult{}, fmt.Errorf("%w: server %q is %s — a new install command can only be issued while it is still provisioning", ErrConflict, name, status)
+	}
+
+	// One active install command at a time: outstanding unredeemed tokens for
+	// this server die with the re-issue.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM bootstrap_tokens WHERE server_id = $1 AND used_at IS NULL`, serverID); err != nil {
+		return ProvisionResult{}, fmt.Errorf("invalidate old tokens: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE servers SET bootstrap_pubkey = $1, bootstrap_key_wrapped = $2 WHERE id = $3`,
+		authorizedKey, wrapped, serverID); err != nil {
+		return ProvisionResult{}, fmt.Errorf("store bootstrap key: %w", err)
+	}
+	token, err := s.issueTokenTx(ctx, tx, orgID, serverID, name, createdBy, expiresAt)
+	if err != nil {
+		return ProvisionResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProvisionResult{}, err
+	}
+	return ProvisionResult{ServerID: serverID, Token: token, ExpiresAt: expiresAt, BootstrapPubkey: authorizedKey}, nil
+}
+
 // generateEd25519Seed returns a new ed25519 public key and its 32-byte seed
 // (the wrappable private half).
 func generateEd25519Seed() (ed25519.PublicKey, []byte, error) {

@@ -1,0 +1,66 @@
+name: Deploy staging
+
+# Auto-deploys the full stack (cp + web + db) to the staging server on every
+# push to main. The server keeps its own cp/deploy/.env (secrets never leave
+# the box) and the shared edge (sj-caddy + self-heal cron) stays untouched —
+# rsync excludes both .env and the edge/ dir from deletion.
+#
+# Required repo secret:
+#   STAGING_SSH_KEY — private half of the dedicated CI deploy key installed
+#   for deploy@159.195.215.228 (see /home/deploy/.ssh/authorized_keys).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  STAGING_HOST: 159.195.215.228
+  STAGING_USER: deploy
+  STAGING_DIR: /home/deploy/sigmahub
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned host key — no TOFU on the runner.
+          echo "159.195.215.228 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHtZrueOK6f47D6QQ2tcHF5zyvJkcqHkwmw4mzOAOxjU" >> ~/.ssh/known_hosts
+
+      - name: Sync sources
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.idea' \
+            --exclude 'node_modules' \
+            --exclude '.next' \
+            --exclude 'cp/deploy/.env' \
+            --exclude 'edge/' \
+            ./ "$STAGING_USER@$STAGING_HOST:$STAGING_DIR/"
+
+      - name: Build + roll out
+        run: |
+          ssh "$STAGING_USER@$STAGING_HOST" bash -s <<'EOS'
+          set -euo pipefail
+          cd /home/deploy/sigmahub
+          docker compose -f cp/deploy/docker-compose.yml build
+          docker compose -f cp/deploy/docker-compose.yml up -d
+          docker image prune -f >/dev/null
+          # Wait for the control plane to come back healthy.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/readyz >/dev/null && { echo "cp ready"; break; }
+            [ "$i" = 30 ] && { echo "cp not ready after rollout" >&2; exit 1; }
+            sleep 2
+          done
+          curl -sf -o /dev/null http://localhost:3000/ && echo "web ready"
+          EOS

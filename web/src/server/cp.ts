@@ -258,6 +258,20 @@ export async function cpProvisionServer(
   }, { orgId, actor });
 }
 
+/** Re-issue the install command for an existing still-provisioning server
+ *  (lost/expired token). The CP 409s once the server has registered. */
+export async function cpReissueBootstrapToken(
+  orgId: string,
+  serverId: string,
+  actor: CpActor
+): Promise<{ serverId: string; token: string; expiresAt: string; bootstrapPubkey: string }> {
+  return cpFetch(
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/reissue-token`,
+    { method: "POST", body: JSON.stringify({}) },
+    { orgId, actor }
+  );
+}
+
 /** Set a server's proxy/edge role. Opens 80/443 in the firewall and makes the
  *  reconciler render Traefik on this host — the precondition for any custom
  *  domain to route. Project Admin+ on the CP; audited (SIGMA-178). */

@@ -27,6 +27,14 @@ export const SERVER_TYPE_ORDER: ServerType[] = [
   "gpu",
 ];
 
+// Types offered when connecting a NEW server. GPU hosting isn't onboardable
+// yet, but stays in SERVER_TYPE_ORDER so existing gpu servers still render.
+export const CONNECTABLE_SERVER_TYPES: ServerType[] = [
+  "general",
+  "database",
+  "storage",
+];
+
 export function formatDate(iso: string | Date) {
   return new Date(iso).toLocaleDateString("en-GB", {
     day: "numeric",

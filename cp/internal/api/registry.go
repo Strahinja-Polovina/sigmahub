@@ -117,6 +117,25 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleReissueBootstrapToken regenerates the bootstrap keypair + single-use
+// token for an existing still-provisioning server, so a lost or expired
+// install command doesn't force the operator to create (and then delete) a
+// duplicate server record. Project Admin+.
+func (s *Server) handleReissueBootstrapToken(w http.ResponseWriter, r *http.Request) {
+	res, err := s.store.ReissueBootstrapToken(
+		r.Context(), r.PathValue("orgId"), r.PathValue("serverId"), principalFrom(r).Name, defaultBootstrapTTL)
+	if err != nil {
+		s.writeStoreErr(w, err, "reissue bootstrap token")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"serverId":        res.ServerID,
+		"token":           res.Token,
+		"expiresAt":       res.ExpiresAt,
+		"bootstrapPubkey": res.BootstrapPubkey,
+	})
+}
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
 	if err := decodeJSON(w, r, &req); err != nil {

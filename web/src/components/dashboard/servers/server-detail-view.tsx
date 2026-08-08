@@ -18,6 +18,9 @@ import {
   Unplug,
   Activity,
   Loader2,
+  KeyRound,
+  Copy,
+  Check,
 } from "lucide-react";
 
 import {
@@ -46,9 +49,24 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogClose,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
-import { disconnectServer, setServerHardening, setServerProxyRole } from "@/server/actions/servers";
+import {
+  disconnectServer,
+  setServerHardening,
+  setServerProxyRole,
+  reissueInstallCommand,
+} from "@/server/actions/servers";
 import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
 import {
@@ -108,17 +126,63 @@ function SpecItem({
   );
 }
 
+function CommandField({ value, ariaLabel }: { value: string; ariaLabel: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const copy = React.useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // clipboard can be unavailable in sandboxes; the toast still confirms intent
+    }
+    setCopied(true);
+    toast.success("Copied to clipboard");
+    window.setTimeout(() => setCopied(false), 1500);
+  }, [value]);
+
+  return (
+    <div className="flex items-stretch gap-2">
+      <div className="flex min-w-0 flex-1 items-center overflow-x-auto rounded-lg border border-border bg-muted/50 px-3 py-2 font-mono text-xs text-foreground">
+        <span className="whitespace-nowrap">{value}</span>
+      </div>
+      <Button variant="outline" size="icon-sm" className="self-center" aria-label={ariaLabel} onClick={copy}>
+        {copied ? <Check className="text-emerald-600" /> : <Copy className="text-muted-foreground" />}
+      </Button>
+    </div>
+  );
+}
+
 function ServerActions({
   serverId,
   serverName,
   cpMode,
+  provisioning,
 }: {
   serverId: string;
   serverName: string;
   cpMode?: boolean;
+  provisioning?: boolean;
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
+  // A freshly re-issued install command (CP mode), shown once in a dialog.
+  const [reissued, setReissued] = React.useState<{
+    command: string;
+    bootstrapPubkey: string;
+    expiresAt: string;
+  } | null>(null);
+
+  function reissue() {
+    startTransition(async () => {
+      try {
+        const res = await reissueInstallCommand({ serverId });
+        setReissued(res);
+      } catch (err) {
+        toast.error("Couldn’t issue a new install command", {
+          description: err instanceof Error ? err.message : "Please try again.",
+        });
+      }
+    });
+  }
 
   function disconnect() {
     startTransition(async () => {
@@ -137,6 +201,7 @@ function ServerActions({
   }
 
   return (
+    <>
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
@@ -165,19 +230,55 @@ function ServerActions({
           <MinusCircle className="size-4 text-muted-foreground" />
           Cordon
         </DropdownMenuItem>
-        {/* CP-managed servers are deregistered host-side (stop sigmad); the
-            control plane has no delete endpoint yet. */}
-        {!cpMode && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
-              <Unplug className="size-4" />
-              Disconnect
-            </DropdownMenuItem>
-          </>
+        {/* A provisioning server never redeemed its one-time token — offer a
+            fresh install command instead of forcing a duplicate record. */}
+        {cpMode && provisioning && (
+          <DropdownMenuItem className="gap-2" onClick={reissue}>
+            <KeyRound className="size-4 text-muted-foreground" />
+            New install command
+          </DropdownMenuItem>
         )}
+        {/* The control plane refuses deletion only while resources are still
+            bound to the host (409 with the offending names) — so a server
+            stuck in provisioning with nothing on it can always be removed. */}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
+          <Unplug className="size-4" />
+          Disconnect
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+
+    <Dialog open={Boolean(reissued)} onOpenChange={(next) => { if (!next) setReissued(null); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>New install command</DialogTitle>
+          <DialogDescription>
+            The previous token is now invalid. Run this on {serverName} — it is
+            shown once and expires at{" "}
+            {reissued ? new Date(reissued.expiresAt).toLocaleTimeString() : ""}.
+          </DialogDescription>
+        </DialogHeader>
+        {reissued && (
+          <div className="flex flex-col gap-2">
+            <CommandField value={reissued.command} ariaLabel="Copy install command" />
+            {reissued.bootstrapPubkey && (
+              <>
+                <Label className="pt-1 text-xs text-muted-foreground">
+                  Or, for hands-off SSH provisioning, authorize this one-time
+                  key (the installer removes it afterward):
+                </Label>
+                <CommandField value={reissued.bootstrapPubkey} ariaLabel="Copy bootstrap key" />
+              </>
+            )}
+          </div>
+        )}
+        <DialogFooter>
+          <DialogClose render={<Button type="button" />}>Done</DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    </>
   );
 }
 
@@ -371,7 +472,12 @@ export function ServerDetailView({
           </div>
           <div className="flex items-center gap-2">
             {!cpMode && provisioning && <CheckInButton serverId={server.id} />}
-            <ServerActions serverId={server.id} serverName={server.name} cpMode={cpMode} />
+            <ServerActions
+              serverId={server.id}
+              serverName={server.name}
+              cpMode={cpMode}
+              provisioning={provisioning}
+            />
           </div>
         </div>
       </div>

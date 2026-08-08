@@ -18,6 +18,8 @@ import {
   CircleAlert,
   ArrowRight,
   Search,
+  Database,
+  HardDrive,
 } from "lucide-react";
 
 import {
@@ -127,12 +129,22 @@ const envKeyValid = (key: string) => {
 };
 
 const STEPS = [
-  { id: 1, label: "Repository" },
+  { id: 1, label: "Source" },
   { id: 2, label: "Build" },
   { id: 3, label: "Target" },
   { id: 4, label: "Variables" },
   { id: 5, label: "Deploy" },
 ] as const;
+
+// Managed services created straight from an engine image — no git repo, no
+// build step. llm stays out until GPU onboarding ships.
+const SERVICE_KINDS: { kind: ResourceKind; icon: React.ElementType; detail: string }[] = [
+  { kind: "postgres", icon: Database, detail: "Managed PostgreSQL" },
+  { kind: "mysql", icon: Database, detail: "Managed MySQL" },
+  { kind: "mongo", icon: Database, detail: "Managed MongoDB" },
+  { kind: "redis", icon: Database, detail: "Managed Redis" },
+  { kind: "s3", icon: HardDrive, detail: "S3-compatible object storage" },
+];
 
 const DEPLOY_PHASES = [
   "Cloning repository",
@@ -167,6 +179,10 @@ export function DeployWizard({
   const [step, setStep] = React.useState(1);
   const [repoQuery, setRepoQuery] = React.useState("");
   const [repo, setRepo] = React.useState<Repo | null>(null);
+  // Managed-service mode: a picked engine kind replaces the git repo as the
+  // source (databases/object storage never had a repo to detect).
+  const [serviceKind, setServiceKind] = React.useState<ResourceKind | null>(null);
+  const [serviceName, setServiceName] = React.useState("");
   // CP mode: real repo detection state.
   const [detecting, setDetecting] = React.useState(false);
   // CP mode: honest create outcome for step 5 (no simulated pipeline).
@@ -181,7 +197,12 @@ export function DeployWizard({
   const [deploying, setDeploying] = React.useState(false);
 
   const projects = targets;
-  const kind = repo?.detectedKind;
+  const kind = serviceKind ?? repo?.detectedKind;
+  // What lands in the resource record + step-5 copy.
+  const resourceName = serviceKind
+    ? serviceName.trim()
+    : (repo?.fullName.split("/").pop() ?? "resource");
+  const sourceLabel = serviceKind ? serviceName.trim() || KIND_LABELS[serviceKind] : repo?.fullName;
 
   const environments = React.useMemo(
     () => projects.find((p) => p.id === projectId)?.environments ?? [],
@@ -249,6 +270,8 @@ export function DeployWizard({
       setStep(1);
       setRepoQuery("");
       setRepo(null);
+      setServiceKind(null);
+      setServiceName("");
       setDetecting(false);
       setCreateState("idle");
       setCreatedId(null);
@@ -327,10 +350,10 @@ export function DeployWizard({
             projectId,
             environmentId,
             serverId,
-            name: repo?.fullName.split("/").pop() ?? "resource",
-            kind: repo?.detectedKind ?? "app",
-            repo: repo?.fullName,
-            detected: repo?.detected,
+            name: resourceName || "resource",
+            kind: kind ?? "app",
+            repo: serviceKind ? undefined : repo?.fullName,
+            detected: serviceKind ? undefined : repo?.detected,
           });
           // The resource now exists. Persist env vars as secrets separately: a
           // secret failure must NOT be reported as a failed create (SIGMA-151),
@@ -355,12 +378,14 @@ export function DeployWizard({
           setDeploying(false);
           router.refresh();
           if (failedKeys.length > 0) {
-            toast.warning(`${repo?.fullName ?? "Resource"} created — some variables need attention`, {
+            toast.warning(`${sourceLabel ?? "Resource"} created — some variables need attention`, {
               description: `Couldn't save ${failedKeys.length} variable(s): ${failedKeys.join(", ")}. Add them from the resource's Secrets panel.`,
             });
           } else {
-            toast.success(`${repo?.fullName ?? "Resource"} created`, {
-              description: "Connect the repository in the project's Git panel to enable push-to-deploy.",
+            toast.success(`${sourceLabel ?? "Resource"} created`, {
+              description: serviceKind
+                ? "The agent pulls the engine image and starts it on the target server."
+                : "Connect the repository in the project's Git panel to enable push-to-deploy.",
             });
           }
         } catch (err) {
@@ -384,14 +409,14 @@ export function DeployWizard({
           projectId,
           environmentId,
           serverId,
-          name: repo?.fullName.split("/").pop() ?? "resource",
-          kind: repo?.detectedKind ?? "app",
-          repo: repo?.fullName,
+          name: resourceName || "resource",
+          kind: kind ?? "app",
+          repo: serviceKind ? undefined : repo?.fullName,
         })
           .then(() => {
             setDeploying(false);
             router.refresh();
-            toast.success(`${repo?.fullName ?? "Resource"} deployed`, {
+            toast.success(`${sourceLabel ?? "Resource"} deployed`, {
               description: "Health checks passed · now serving traffic.",
             });
           })
@@ -412,7 +437,7 @@ export function DeployWizard({
   const canNext = React.useMemo(() => {
     switch (step) {
       case 1:
-        return Boolean(repo);
+        return serviceKind ? Boolean(serviceName.trim()) : Boolean(repo);
       case 2:
         return Boolean(repo);
       case 3:
@@ -429,11 +454,12 @@ export function DeployWizard({
       default:
         return false;
     }
-  }, [step, repo, projectId, environmentId, serverId, incompatibility, envVars]);
+  }, [step, repo, serviceKind, serviceName, projectId, environmentId, serverId, incompatibility, envVars]);
 
   function next() {
     if (step < 5 && canNext) {
-      const target = step + 1;
+      // Managed services have no build step — jump straight to the target.
+      const target = serviceKind && step === 1 ? 3 : step + 1;
       setStep(target);
       if (target === 5) {
         // Prime the deploy animation state here (an event handler) so the
@@ -444,7 +470,7 @@ export function DeployWizard({
     }
   }
   function back() {
-    if (step > 1 && step < 5) setStep((s) => s - 1);
+    if (step > 1 && step < 5) setStep((s) => (serviceKind && s === 3 ? 1 : s - 1));
   }
 
   function addEnvVar() {
@@ -472,10 +498,11 @@ export function DeployWizard({
         <DialogHeader className="gap-1 border-b p-4">
           <DialogTitle className="flex items-center gap-2">
             <GitBranch className="size-4" />
-            Deploy from Git
+            New resource
           </DialogTitle>
           <DialogDescription>
-            Connect a repository and ship it to one of your environments.
+            Deploy an app from Git, or provision a managed database / object
+            storage on one of your servers.
           </DialogDescription>
         </DialogHeader>
 
@@ -515,8 +542,81 @@ export function DeployWizard({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {/* Step 1 — pick repository. CP mode: real detection; demo: mock list. */}
-          {step === 1 && cpMode && (
+          {/* Step 1 — pick the source: an app built from a git repo, or a
+              managed service provisioned from its engine image (no repo). */}
+          {step === 1 && (
+            <div className="mb-4 flex flex-col gap-1.5">
+              <Label className="text-xs text-muted-foreground">What are you deploying?</Label>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setServiceKind(null)}
+                  className={cn(
+                    "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
+                    serviceKind === null
+                      ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                      : "border-border bg-card hover:bg-muted/50"
+                  )}
+                >
+                  <GitBranch className="size-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0 flex-1">
+                    <span className="text-sm font-medium text-foreground">App from Git</span>
+                    <p className="truncate text-xs text-muted-foreground">
+                      Build and deploy a repository
+                    </p>
+                  </div>
+                  {serviceKind === null && <Check className="size-4 shrink-0 text-primary" />}
+                </button>
+                {SERVICE_KINDS.map(({ kind: k, icon: Icon, detail }) => {
+                  const selected = serviceKind === k;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => {
+                        setServiceKind(k);
+                        setRepo(null);
+                        if (!serviceName.trim()) setServiceName(k);
+                      }}
+                      className={cn(
+                        "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
+                        selected
+                          ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                          : "border-border bg-card hover:bg-muted/50"
+                      )}
+                    >
+                      <Icon className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 flex-1">
+                        <span className="text-sm font-medium text-foreground">{KIND_LABELS[k]}</span>
+                        <p className="truncate text-xs text-muted-foreground">{detail}</p>
+                      </div>
+                      {selected && <Check className="size-4 shrink-0 text-primary" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {step === 1 && serviceKind && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="wizard-service-name" className="text-xs text-muted-foreground">
+                Resource name
+              </Label>
+              <Input
+                id="wizard-service-name"
+                value={serviceName}
+                onChange={(e) => setServiceName(e.target.value)}
+                placeholder={serviceKind}
+                className="font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                Provisioned from the official {KIND_LABELS[serviceKind]} image on
+                a compatible server — no repository or build needed.
+              </p>
+            </div>
+          )}
+          {/* Step 1 (app) — pick repository. CP mode: real detection; demo: mock list. */}
+          {step === 1 && !serviceKind && cpMode && (
             <div className="flex flex-col gap-3">
               <div className="flex gap-2">
                 <Input
@@ -548,7 +648,7 @@ export function DeployWizard({
               )}
             </div>
           )}
-          {step === 1 && !cpMode && (
+          {step === 1 && !serviceKind && !cpMode && (
             <div className="flex flex-col gap-3">
               <div className="relative">
                 <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -656,7 +756,7 @@ export function DeployWizard({
           )}
 
           {/* Step 3 — target environment + server (availability matrix) */}
-          {step === 3 && repo && (
+          {step === 3 && (repo || serviceKind) && (
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="wizard-project">
@@ -859,7 +959,7 @@ export function DeployWizard({
           )}
 
           {/* Step 5 (CP mode) — one honest create; the pipeline runs on the CP. */}
-          {step === 5 && repo && cpMode && (
+          {step === 5 && (repo || serviceKind) && cpMode && (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-3">
                 <span
@@ -889,16 +989,27 @@ export function DeployWizard({
                         : "Creating resource…"}
                   </p>
                   <p className="truncate font-mono text-xs text-muted-foreground">
-                    {repo.fullName} → {selectedServer?.name}
+                    {sourceLabel} → {selectedServer?.name}
                   </p>
                 </div>
               </div>
               {createState === "done" && (
                 <p className="rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
-                  The resource starts as <span className="font-medium">provisioning</span>.
-                  Connect <span className="font-mono">{repo.fullName}</span> in the
-                  project’s Git panel and map a branch to this environment — every
-                  push then builds and rolls out with zero downtime.
+                  {serviceKind ? (
+                    <>
+                      The resource starts as <span className="font-medium">provisioning</span>.
+                      The server’s agent pulls the {KIND_LABELS[serviceKind]} image,
+                      starts it, and reports it as running — credentials appear on
+                      the resource page.
+                    </>
+                  ) : (
+                    <>
+                      The resource starts as <span className="font-medium">provisioning</span>.
+                      Connect <span className="font-mono">{repo?.fullName}</span> in the
+                      project’s Git panel and map a branch to this environment — every
+                      push then builds and rolls out with zero downtime.
+                    </>
+                  )}
                 </p>
               )}
               {createState === "done" && createdId && (
@@ -919,7 +1030,7 @@ export function DeployWizard({
           )}
 
           {/* Step 5 (demo) — simulated deploy progress */}
-          {step === 5 && repo && !cpMode && (
+          {step === 5 && (repo || serviceKind) && !cpMode && (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-3">
                 <span
@@ -941,7 +1052,7 @@ export function DeployWizard({
                     {deployDone ? "Deployment complete" : "Deploying…"}
                   </p>
                   <p className="truncate font-mono text-xs text-muted-foreground">
-                    {repo.fullName} → {selectedServer?.name}
+                    {sourceLabel} → {selectedServer?.name}
                   </p>
                 </div>
               </div>

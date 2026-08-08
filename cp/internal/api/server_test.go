@@ -37,6 +37,13 @@ func (f *fakeStore) ProvisionServer(_ context.Context, orgID string, in store.Pr
 	}, nil
 }
 
+func (f *fakeStore) ReissueBootstrapToken(_ context.Context, orgID, serverID, createdBy string, ttl time.Duration) (store.ProvisionResult, error) {
+	return store.ProvisionResult{
+		ServerID: serverID, Token: "sbt_test2", ExpiresAt: time.Now().Add(ttl),
+		BootstrapPubkey: "ssh-ed25519 AAAB sigmahub-bootstrap",
+	}, nil
+}
+
 func (f *fakeStore) RegisterServer(_ context.Context, tok, name, ver string, facts json.RawMessage, pubkey string) (store.RegisterResult, error) {
 	if f.registerErr != nil {
 		return store.RegisterResult{}, f.registerErr

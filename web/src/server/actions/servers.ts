@@ -14,6 +14,7 @@ import {
   cpSetProxyRole,
   cpPublicUrl,
   cpDeleteServer,
+  cpReissueBootstrapToken,
 } from "../cp";
 
 /** GitHub repo whose releases host install.sh + the pinned sigmad assets. */
@@ -225,6 +226,40 @@ export async function provisionServer(input: {
   return {
     mode: "cp",
     serverId: res.serverId,
+    command: installCommand(res.token),
+    bootstrapPubkey: res.bootstrapPubkey,
+    expiresAt: res.expiresAt,
+  };
+}
+
+/** Regenerate the install command for a server stuck in `provisioning` (lost
+ *  or expired bootstrap token). The CP invalidates any outstanding token,
+ *  mints a fresh keypair + token bound to the SAME server record, and 409s if
+ *  the server already registered. Project Admin+. */
+export async function reissueInstallCommand(input: { serverId: string }): Promise<{
+  command: string;
+  bootstrapPubkey: string;
+  expiresAt: string;
+}> {
+  if (!cpEnabled()) throw new Error("Re-issuing an install command needs a control plane.");
+  const [server] = await db
+    .select()
+    .from(s.servers)
+    .where(eq(s.servers.id, input.serverId));
+  // Same org resolution as disconnectServer: unattached CP servers have no
+  // local mirror row.
+  const orgId = server?.orgId ?? (await getActiveOrgId());
+  if (!orgId) throw new Error("No active organization.");
+  const { user, role } = await requireProjectAdmin(orgId);
+  const res = await cpReissueBootstrapToken(orgId, input.serverId, { name: user.name, role });
+  await writeAudit({
+    orgId,
+    actor: user.name,
+    action: "Re-issued install command",
+    target: server?.name ?? input.serverId,
+  });
+  revalidatePath("/dashboard", "layout");
+  return {
     command: installCommand(res.token),
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
