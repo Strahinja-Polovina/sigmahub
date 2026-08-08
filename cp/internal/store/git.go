@@ -53,16 +53,23 @@ type BranchMap struct {
 // DeployRequest is an enqueued deploy (drained by P1-9) or a recorded PR routing
 // hook (kind='pr_hook', which carries no deploy semantics — that is P1-12).
 type DeployRequest struct {
-	ID            string    `json:"id"`
-	OrgID         string    `json:"orgId"`
-	ConnectionID  string    `json:"connectionId"`
-	EnvironmentID string    `json:"environmentId,omitempty"`
-	Kind          string    `json:"kind"` // "deploy" | "pr_hook"
-	Ref           string    `json:"ref"`
-	SHA           string    `json:"sha"`
-	Branch        string    `json:"branch,omitempty"`
-	Status        string    `json:"status"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ID            string `json:"id"`
+	OrgID         string `json:"orgId"`
+	ConnectionID  string `json:"connectionId"`
+	EnvironmentID string `json:"environmentId,omitempty"`
+	Kind          string `json:"kind"` // "deploy" | "pr_hook"
+	Ref           string `json:"ref"`
+	SHA           string `json:"sha"`
+	Branch        string `json:"branch,omitempty"`
+	// Status is queued | drained | no_targets. 'no_targets' is a push that
+	// resolved to nothing deployable — the normal state right after connecting a
+	// repo, and previously indistinguishable from a successful drain.
+	Status string `json:"status"`
+	// DeploymentsCreated is how many deployments the drain produced, and Detail
+	// says why when that is zero.
+	DeploymentsCreated int       `json:"deploymentsCreated"`
+	Detail             string    `json:"detail,omitempty"`
+	CreatedAt          time.Time `json:"createdAt"`
 }
 
 // CreateGitConnectionInput is the payload for connecting a repo to a project.
@@ -730,7 +737,8 @@ func (s *Store) ListDeployRequests(ctx context.Context, orgID string, limit int)
 		limit = 50
 	}
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, org_id, connection_id, environment_id, kind, ref, sha, branch, status, created_at
+		SELECT id, org_id, connection_id, environment_id, kind, ref, sha, branch, status,
+		       deployments_created, detail, created_at
 		  FROM deploy_requests WHERE org_id = $1
 		 ORDER BY created_at DESC, id DESC LIMIT $2`, orgID, limit)
 	if err != nil {
@@ -741,7 +749,8 @@ func (s *Store) ListDeployRequests(ctx context.Context, orgID string, limit int)
 	for rows.Next() {
 		var d DeployRequest
 		var env, branch *string
-		if err := rows.Scan(&d.ID, &d.OrgID, &d.ConnectionID, &env, &d.Kind, &d.Ref, &d.SHA, &branch, &d.Status, &d.CreatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.OrgID, &d.ConnectionID, &env, &d.Kind, &d.Ref, &d.SHA, &branch, &d.Status,
+			&d.DeploymentsCreated, &d.Detail, &d.CreatedAt); err != nil {
 			return nil, err
 		}
 		if env != nil {

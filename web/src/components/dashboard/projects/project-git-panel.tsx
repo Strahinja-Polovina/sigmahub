@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import {
+  AlertTriangle,
   GitBranch,
   GitFork,
   Loader2,
@@ -13,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -768,6 +770,17 @@ function ConnectionCard({
   );
 }
 
+/** A push the control plane received, with what it produced. */
+export type PushActivity = {
+  id: string;
+  ref: string;
+  sha: string;
+  status: string;
+  deploymentsCreated: number;
+  detail?: string;
+  createdAt: string;
+};
+
 export function ProjectGitPanel({
   orgId,
   projectId,
@@ -776,6 +789,7 @@ export function ProjectGitPanel({
   servers = [],
   gitApp,
   pendingInstallationId,
+  pushes = [],
 }: {
   orgId: string;
   projectId: string;
@@ -785,6 +799,8 @@ export function ProjectGitPanel({
   gitApp?: GitAppInfo;
   /** Installation id bounced back from the GitHub App install flow. */
   pendingInstallationId?: string;
+  /** Recent pushes for this project's repositories, newest first. */
+  pushes?: PushActivity[];
 }) {
   return (
     <Card>
@@ -824,7 +840,63 @@ export function ProjectGitPanel({
             />
           ))
         )}
+
+        {pushes.length > 0 && <RecentPushes pushes={pushes} />}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * What recent pushes actually did.
+ *
+ * A push that resolves to nothing looked exactly like one that deployed: the
+ * webhook was accepted and the request was drained. This is where "I pushed and
+ * nothing happened" gets an answer instead of silence — the normal cause is an
+ * environment with no app resources yet, which is precisely the state you are in
+ * right after connecting a repo.
+ */
+function RecentPushes({ pushes }: { pushes: PushActivity[] }) {
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <p className="mb-2 text-xs font-medium text-muted-foreground">Recent pushes</p>
+      <ul className="flex flex-col gap-2">
+        {pushes.slice(0, 5).map((p) => {
+          const nothing = p.status === "no_targets" || p.deploymentsCreated === 0;
+          return (
+            <li key={p.id} className="flex flex-col gap-0.5">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-mono text-foreground">{p.sha.slice(0, 8)}</span>
+                <span className="text-muted-foreground">{p.ref.replace(/^refs\/heads\//, "")}</span>
+                {p.status === "queued" ? (
+                  <Badge variant="outline" className="text-[10px]">
+                    queued
+                  </Badge>
+                ) : nothing ? (
+                  <Badge
+                    variant="outline"
+                    className="gap-1 text-[10px] text-amber-700 dark:text-amber-500"
+                  >
+                    <AlertTriangle className="size-3" />
+                    nothing deployed
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="text-[10px]">
+                    {p.deploymentsCreated}{" "}
+                    {p.deploymentsCreated === 1 ? "deploy" : "deploys"}
+                  </Badge>
+                )}
+                <span className="text-muted-foreground">
+                  {new Date(p.createdAt).toLocaleString()}
+                </span>
+              </div>
+              {nothing && p.detail && (
+                <p className="text-xs text-muted-foreground">{p.detail}</p>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
