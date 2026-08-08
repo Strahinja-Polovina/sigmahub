@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -826,5 +827,98 @@ func TestClusterDeploymentBuildsAndReports(t *testing.T) {
 	}
 	if nudged[buildServer] {
 		t.Fatal("the reporting server has just been rendered and must not be nudged again")
+	}
+}
+
+// TestDeployLogsAcceptedFromEveryServerThatRunsTheDeploy pins the last member of
+// the render/report asymmetry family, and the one that hurts most in practice:
+// the logs. A deploy log line is written by whichever server executed the op —
+// the build server for the build output, a cluster node or a Compose placement
+// host for the rollout and its startup logs. Matching those writes against the
+// deploy TARGET alone silently discarded every one of them, so the deploy view
+// for a build-server or cluster deploy showed nothing at all: a failure with no
+// output is the one thing an operator cannot act on (SIGMA-181).
+func TestDeployLogsAcceptedFromEveryServerThatRunsTheDeploy(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_deploylogs"
+
+	proj, err := st.CreateProject(ctx, orgID, "web", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runServer := connectServer(t, st, orgID, "run")
+	buildServer := connectServer(t, st, orgID, "build")
+	placedHost := connectServer(t, st, orgID, "placed")
+	for _, id := range []string{runServer, buildServer, placedHost} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A Compose app whose 'db' service is placed on a third host.
+	spec := fmt.Sprintf(`{"compose":{"services":[{"name":"web","build":"."},{"name":"db","image":"postgres:16","serverId":%q}]}}`, placedHost)
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: runServer, Name: "api", Kind: "app",
+		Spec: json.RawMessage(spec),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: runServer,
+		Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, buildServer); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, w := range []struct {
+		server, stream, line string
+	}{
+		{runServer, "startup", "listening on :8080"},
+		{buildServer, "build", "step 2/7 : COPY go.mod ."},
+		{placedHost, "startup", "FATAL: database files are incompatible"},
+	} {
+		if err := st.AppendDeployLog(ctx, w.server, dep.ID, w.stream, w.line); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logs, err := st.DeployLogsSince(ctx, dep.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := ""
+	for _, l := range logs {
+		seen += l.Stream + ":" + l.Line + "\n"
+	}
+	if len(logs) != 3 {
+		t.Fatalf("deploy logs = %+v, want one line from each of the three servers that ran part of this deploy", logs)
+	}
+	if !strings.Contains(seen, "build:step 2/7 : COPY go.mod .") {
+		t.Errorf("the build server's output was dropped — a build-server deploy shows an empty log:\n%s", seen)
+	}
+	if !strings.Contains(seen, "startup:FATAL: database files are incompatible") {
+		t.Errorf("the placement host's startup logs were dropped — the crash reason is lost:\n%s", seen)
+	}
+
+	// The guard still holds: a server with no part in this deployment cannot
+	// write into its log, forged stream or not.
+	other := connectServer(t, st, orgID, "elsewhere")
+	if err := st.AppendDeployLog(ctx, other, dep.ID, "build", "injected"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := st.DeployLogsSince(ctx, dep.ID, 0, 100)
+	if len(after) != 3 {
+		t.Fatalf("an unrelated server wrote into another deployment's log: %+v", after)
 	}
 }

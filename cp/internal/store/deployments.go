@@ -1360,18 +1360,30 @@ func resourceServiceCountTx(ctx context.Context, tx pgx.Tx, orgID, resourceID st
 }
 
 // AppendDeployLog appends one build/orchestration log line, scoped to the
-// reporting server: the row is written only when the deployment targets that
-// server (BOLA guard — an agent can't forge or read into another host's deploy
-// logs). A line for a deployment not on this server is silently dropped.
+// reporting server (BOLA guard — an agent can't forge or read into another
+// host's deploy logs). A line for a deployment this server owns no part of is
+// silently dropped.
+//
+// "Owns a part of" is deploymentReporterClause, not `server_id`: the servers
+// that produce these lines are exactly the servers that render the ops. A
+// dedicated build server holds the clone+build ops, so every build log comes
+// from a host that is not the deploy target; a cluster workload's rollout runs
+// on a node; a placed Compose service's startup logs come from its host. Match
+// on the deploy target alone and each of those streams is written by a server
+// the predicate rejects — the deploy view then shows an empty log for the one
+// deployment whose failure you most need to read.
 func (s *Store) AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error {
 	if stream == "" {
 		stream = "build"
 	}
 	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO deploy_logs (deployment_id, stream, line)
-		SELECT $1, $2, $3
-		 WHERE EXISTS (SELECT 1 FROM deployments WHERE id = $1 AND server_id = $4)`,
-		deploymentID, stream, line, serverID)
+		SELECT $2, $3, $4
+		 WHERE EXISTS (
+		   SELECT 1 FROM deployments d
+		     JOIN resources r ON r.id = d.resource_id
+		    WHERE d.id = $2 AND`+deploymentReporterClause+`)`,
+		serverID, deploymentID, stream, line)
 	return err
 }
 

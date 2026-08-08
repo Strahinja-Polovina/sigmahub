@@ -27,6 +27,10 @@ type Driver struct {
 	// secrets resolves a resource's secret values from the control plane at
 	// container-create; nil disables secret injection (e.g. in tests).
 	secrets SecretFetcher
+	// startup ships a failed generation's own output to the deploy log. Nil
+	// leaves the behaviour as it was: the container is removed and its account
+	// of why it never started goes with it.
+	startup startupSink
 	// mu serialises the reconcile loop's per-container converge against GC's
 	// prune+remove, so a container GC just removed cannot be resurrected by a
 	// concurrent reconcile working from a stale desired snapshot.
@@ -43,6 +47,14 @@ func NewDriver(docker *DockerClient, store *Store, log *slog.Logger, fetcher Sec
 		limiter: newRateLimiter(20, 5), // burst 20, 5 ops/sec sustained
 		secrets: fetcher,
 	}
+}
+
+// SetStartupLogSink installs the channel a failed generation's output is shipped
+// on. Separate from NewDriver because the control-plane client is built after
+// the driver, and a host with no sink still deploys — it just cannot explain a
+// crash-on-boot.
+func (d *Driver) SetStartupLogSink(sink func(ctx context.Context, deploymentID string, lines []string)) {
+	d.startup = sink
 }
 
 // Register wires every container op kind into the apply registry. This is the
