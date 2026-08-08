@@ -1,33 +1,33 @@
-// Billing units — the web mirror of the CP's weight table
-// (cp/internal/store/server_units.go). A test asserts the two agree, the same
-// way the hosting matrix is kept honest across the two codebases.
+// Billing units — the read model behind the dashboard's bill.
+//
+// The weights, the unit price and the free tier are GENERATED from the control
+// plane (cp/internal/store/server_catalog.go via server-catalog.generated.ts);
+// this module holds only the arithmetic the dashboard does on top of them. It
+// used to keep its own copy of the weight table, which is how `vps` and `build`
+// came to be missing from both sides at once (SIGMA-198).
 //
 // A server bills as a number of UNITS whose weight tracks how expensive it is
 // to MANAGE, never what the hardware costs — customers always bring their own
 // infrastructure and we never mark it up.
 
 import type { ServerType } from "@/lib/mock";
+import {
+  CURRENCY,
+  DEFAULT_UNIT_WEIGHT,
+  FREE_TIER_UNITS,
+  SERVER_UNIT_WEIGHTS,
+  UNIT_PRICE,
+  serverUnitWeight,
+} from "@/lib/server-catalog.generated";
 
-/** Price of one unit per month. */
-export const UNIT_PRICE = 5;
-/** Units included for free. Three ordinary servers still cost nothing. */
-export const FREE_TIER_UNITS = 3;
-export const CURRENCY = "EUR";
-
-/** Weight of an unknown/legacy type: bill as an ordinary server, never zero. */
-export const DEFAULT_UNIT_WEIGHT = 1;
-
-export const SERVER_UNIT_WEIGHTS: Record<string, number> = {
-  general: 1,
-  database: 1,
-  storage: 1,
-  k8s: 2,
-  gpu: 4,
+export {
+  CURRENCY,
+  DEFAULT_UNIT_WEIGHT,
+  FREE_TIER_UNITS,
+  SERVER_UNIT_WEIGHTS,
+  UNIT_PRICE,
+  serverUnitWeight,
 };
-
-export function serverUnitWeight(serverType: string): number {
-  return SERVER_UNIT_WEIGHTS[serverType] ?? DEFAULT_UNIT_WEIGHT;
-}
 
 /** One line of the billing breakdown: what a server type contributes. */
 export type ServerUnitLine = {

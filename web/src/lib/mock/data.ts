@@ -48,7 +48,7 @@ export const resources: Resource[] = [
   { id: "res_worker", projectId: "proj_api", environmentId: "env_api_dev", serverId: "srv_gen_2", name: "worker", kind: "app", status: "degraded", lastDeployAt: "2027-03-01T16:45:00Z", repo: "acme/api", version: "v451" },
   { id: "res_llm", projectId: "proj_mllab", environmentId: "env_mllab_prod", serverId: "srv_gpu_1", name: "llama-3-70b", kind: "llm", status: "degraded", lastDeployAt: "2027-03-01T11:00:00Z", version: "vllm 0.6" },
   { id: "res_site", projectId: "proj_site", environmentId: "env_site_prod", serverId: "srv_nw_1", name: "marketing", kind: "app", status: "running", lastDeployAt: "2027-03-02T07:00:00Z", repo: "nw/site", domain: "northwind.com", version: "v33" },
-  { id: "res_siteblog", projectId: "proj_site", environmentId: "env_site_prod", serverId: "srv_nw_1", name: "blog-mongo", kind: "mongo", status: "running", lastDeployAt: "2027-02-15T09:00:00Z", version: "7.0" },
+  { id: "res_siteblog", projectId: "proj_site", environmentId: "env_site_prod", serverId: "srv_nw_1", name: "blog-mongo", kind: "mongodb", status: "running", lastDeployAt: "2027-02-15T09:00:00Z", version: "7.0" },
 ];
 
 export const members: Member[] = [

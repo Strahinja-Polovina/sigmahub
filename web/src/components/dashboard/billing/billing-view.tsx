@@ -38,14 +38,8 @@ import { Progress } from "@/components/ui/progress";
 import { StatusDot } from "@/components/dashboard/status-indicator";
 import type { Status } from "@/lib/mock";
 import { serverUnitWeight, type ServerUnitLine } from "@/lib/billing-units";
+import { serverTypeLabel } from "@/lib/server-catalog.generated";
 
-const SERVER_TYPE_LABELS: Record<string, string> = {
-  general: "General",
-  database: "Database",
-  storage: "Storage",
-  k8s: "Kubernetes node",
-  gpu: "GPU",
-};
 
 type Billing = {
   /** Connected SERVER count — what the fleet looks like. */
@@ -381,7 +375,7 @@ export function BillingView({
                 {billing.breakdown.map((line) => (
                   <TableRow key={line.type}>
                     <TableCell className="pl-4 font-medium text-foreground">
-                      {SERVER_TYPE_LABELS[line.type] ?? line.type}
+                      {serverTypeLabel(line.type)}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{line.count}</TableCell>
                     <TableCell className="text-right text-muted-foreground tabular-nums">
@@ -525,7 +519,7 @@ function InvoiceRow({
       </TableCell>
       <TableCell>
         <Badge variant="outline" className="font-mono">
-          {SERVER_TYPE_LABELS[server.type] ?? server.type}
+          {serverTypeLabel(server.type)}
         </Badge>
       </TableCell>
       <TableCell className="text-muted-foreground">{server.region}</TableCell>

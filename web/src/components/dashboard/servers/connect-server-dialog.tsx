@@ -37,13 +37,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { connectServer, provisionServer } from "@/server/actions/servers";
-import { SERVER_TYPE_LABELS, CONNECTABLE_SERVER_TYPES } from "./server-meta";
+import {
+  SERVER_CATALOG,
+  SERVER_TYPE_LABELS,
+  CONNECTABLE_SERVER_TYPES,
+  SUPPORTED_DISTROS,
+} from "@/lib/server-catalog.generated";
 
-const DISTROS = [
-  { id: "ubuntu-24.04", label: "Ubuntu 24.04 LTS" },
-  { id: "ubuntu-22.04", label: "Ubuntu 22.04 LTS" },
-  { id: "debian-12", label: "Debian 12" },
-];
+// The distro list comes from the catalog, not from here. It used to be a third
+// hand-written copy, and it had already drifted: this dropdown said "Ubuntu
+// 24.04 LTS" while the requirement checklist rendered three lines below it —
+// in this same component — said "Ubuntu 24.04", for the same distro. A list the
+// control plane rejects on is not a list the dialog gets to invent.
+const DISTROS = SUPPORTED_DISTROS;
 
 function bootstrapCommand(orgSlug: string) {
   // The real one-time token is minted server-side on connect; never render a
@@ -105,6 +111,9 @@ export function ConnectServerDialog({
   const [name, setName] = React.useState("");
   const [ip, setIp] = React.useState("");
   const [type, setType] = React.useState<string>("general");
+  // Undefined for a type the catalog has never heard of, so a stale value can
+  // only cost the hint, never crash the dialog.
+  const selectedType = SERVER_CATALOG[type as keyof typeof SERVER_CATALOG];
   const [provider, setProvider] = React.useState("");
   const [region, setRegion] = React.useState("");
   const [distro, setDistro] = React.useState("ubuntu-24.04");
@@ -235,6 +244,22 @@ export function ConnectServerDialog({
                     </Button>
                   ))}
                 </div>
+                {/* What the type means and what the host has to actually have.
+                    Both come from the control plane's catalog, so the operator
+                    reads the same requirements the registration gate will apply
+                    — before spending ten minutes on an install, not after. */}
+                {selectedType && (
+                  <div className="flex flex-col gap-1 pt-0.5">
+                    <p className="text-xs text-muted-foreground">{selectedType.hint}</p>
+                    <ul className="flex flex-col gap-0.5">
+                      {selectedType.requires.checks.map((c) => (
+                        <li key={c.id} className="text-xs text-muted-foreground">
+                          · {c.text}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="srv-provider" className="text-xs text-muted-foreground">

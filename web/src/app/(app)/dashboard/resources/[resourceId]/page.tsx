@@ -17,7 +17,6 @@ import {
   cpListBackupRuns,
   cpQueryResourceMetrics,
   cpQueryLogs,
-  cpKind,
   type CpDatabaseInfo,
   type CpS3Info,
   type CpBackupTarget,
@@ -111,7 +110,7 @@ async function loadDeployments(
   }
 }
 
-const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongo", "mongodb"]);
+const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongodb"]);
 
 /** Load a database resource's connection metadata (P1-10, CP mode only). A CP
  *  failure degrades to null rather than breaking the page. */
@@ -121,7 +120,7 @@ async function loadDatabase(
   resourceId: string,
   kind: string
 ): Promise<CpDatabaseInfo | null> {
-  if (!cpEnabled() || !DB_KINDS.has(cpKind(kind))) return null;
+  if (!cpEnabled() || !DB_KINDS.has(kind)) return null;
   return attempt(failures, "connection details", () => cpGetDatabase(orgId, resourceId), null);
 }
 

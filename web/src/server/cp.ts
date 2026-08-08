@@ -1515,11 +1515,6 @@ export async function cpDeployLogs(
     undefined, { orgId });
 }
 
-/** The CP kind vocabulary says "mongodb"; the local demo schema says "mongo". */
-export function cpKind(localKind: string): string {
-  return localKind === "mongo" ? "mongodb" : localKind;
-}
-
 /** Mirror a CP-owned server into the local `servers` table so the mirror
  *  env_servers/resources rows (which FK to servers.id) stay referentially
  *  intact in CP mode, where servers live only in the control plane. Returns

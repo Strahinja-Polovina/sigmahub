@@ -10,31 +10,22 @@ import {
   summarizeUnits,
   billableUnits,
 } from "./billing-units";
+import { SERVER_TYPES } from "./server-catalog.generated";
 
-// The weight table is duplicated across two codebases on purpose (the CP bills,
-// the dashboard explains the bill). These tests parse the Go source so a weight
-// changed on one side and not the other fails here rather than in production —
-// the same guard the hosting matrix uses.
-const GO_UNITS = readFileSync(
-  join(process.cwd(), "..", "cp", "internal", "store", "server_units.go"),
-  "utf8"
-);
+// The weight table is no longer duplicated: it is a FIELD of each server type in
+// the CP catalog, generated into server-catalog.generated.ts, and the staleness
+// of that file is guarded in hosting.test.ts. What is left to check here is that
+// billing reads the generated table (rather than growing a copy back), that the
+// pricing scalars still agree with billing.go, and the arithmetic on top.
+//
+// This used to regex-parse `var serverUnitWeights` out of server_units.go — a
+// guard that proved the two maps matched but could say nothing about the types
+// missing from BOTH of them, which is exactly how `vps` and `build` came to bill
+// at the fallback weight (SIGMA-198).
 const GO_BILLING = readFileSync(
   join(process.cwd(), "..", "cp", "internal", "store", "billing.go"),
   "utf8"
 );
-
-function goWeights(): Record<string, number> {
-  const block = GO_UNITS.match(
-    /var serverUnitWeights = map\[string\]int\{([\s\S]*?)\n\}/
-  );
-  if (!block) throw new Error("serverUnitWeights not found in server_units.go");
-  const out: Record<string, number> = {};
-  for (const [, type, weight] of block[1].matchAll(/"([a-z0-9_]+)":\s*(\d+)/g)) {
-    out[type] = Number(weight);
-  }
-  return out;
-}
 
 function goConst(name: string): number {
   const m = GO_BILLING.match(new RegExp(`${name}\\s*=\\s*(\\d+)`));
@@ -42,9 +33,14 @@ function goConst(name: string): number {
   return Number(m[1]);
 }
 
-describe("billing units mirror the control plane", () => {
-  it("has the same weight for every server type", () => {
-    expect(SERVER_UNIT_WEIGHTS).toEqual(goWeights());
+describe("billing units come from the control plane's catalog", () => {
+  it("prices every server type the control plane knows", () => {
+    // A type with no weight bills at the fallback — invisible until an invoice
+    // disagrees with the dashboard.
+    for (const type of SERVER_TYPES) {
+      expect(SERVER_UNIT_WEIGHTS[type], `${type} has no weight`).toBeGreaterThan(0);
+    }
+    expect(Object.keys(SERVER_UNIT_WEIGHTS).sort()).toEqual([...SERVER_TYPES].sort());
   });
 
   it("agrees on the unit price and free tier", () => {
@@ -53,6 +49,10 @@ describe("billing units mirror the control plane", () => {
   });
 
   it("agrees on the default weight for unknown types", () => {
+    const GO_UNITS = readFileSync(
+      join(process.cwd(), "..", "cp", "internal", "store", "server_units.go"),
+      "utf8"
+    );
     const m = GO_UNITS.match(/DefaultServerUnitWeight = (\d+)/);
     expect(DEFAULT_UNIT_WEIGHT).toBe(Number(m?.[1]));
   });
@@ -62,6 +62,13 @@ describe("serverUnitWeight", () => {
   it("weighs a GPU server four times an ordinary one", () => {
     expect(serverUnitWeight("gpu")).toBe(4);
     expect(serverUnitWeight("general")).toBe(1);
+  });
+
+  it("bills a VPS and a build server as ordinary servers", () => {
+    // Both were absent from the old standalone weight map, so both reached the
+    // fallback by accident rather than by decision.
+    expect(serverUnitWeight("vps")).toBe(1);
+    expect(serverUnitWeight("build")).toBe(1);
   });
 
   it("bills an unknown type as an ordinary server, never as free", () => {

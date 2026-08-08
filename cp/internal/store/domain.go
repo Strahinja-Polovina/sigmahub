@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -59,59 +58,9 @@ type Resource struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// resourceServerTypes is the availability matrix: which server types may host
-// which resource kind. Enforced in the store, not just the UI.
-//
-// The rules behind it, so a future edit is a decision rather than a guess:
-//   - "vps" is a general-purpose host that happens to be virtualized. It hosts
-//     whatever a general server hosts; the difference is disclosure (shared
-//     tenancy, burst CPU, no nested virt), not capability.
-//   - "k8s" nodes host nothing directly. Their workloads arrive through the
-//     cluster's control plane, so aiming a resource at a node individually is
-//     always a mistake and is refused rather than quietly scheduled.
-//   - "build" servers compile images and ship them to a registry; they run no
-//     long-lived workloads of their own.
-//   - "llm" needs a GPU. Serving a model on CPU is technically possible and
-//     practically useless, so it is not offered.
-var resourceServerTypes = map[string][]string{
-	"app":      {"general", "vps", "gpu"},
-	"postgres": {"database", "general", "vps"},
-	"mysql":    {"database", "general", "vps"},
-	"redis":    {"database", "general", "vps"},
-	"mongodb":  {"database", "general", "vps"},
-	"s3":       {"storage"},
-	"llm":      {"gpu"},
-}
-
-// serverTypes is every type a server may declare. A type outside this set is a
-// typo, and typos must fail at enrollment rather than producing a host nothing
-// can be scheduled onto.
-var serverTypes = map[string]bool{
-	"general":  true,
-	"vps":      true,
-	"database": true,
-	"storage":  true,
-	"gpu":      true,
-	"k8s":      true,
-	"build":    true,
-}
-
-// IsServerType reports whether a server type is known.
-func IsServerType(t string) bool { return serverTypes[t] }
-
-// ServerTypes lists the known server types, for the API to publish.
-func ServerTypes() []string {
-	out := make([]string, 0, len(serverTypes))
-	for t := range serverTypes {
-		out = append(out, t)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// AllowedServerTypes returns the server types a resource kind may run on,
-// or nil for an unknown kind.
-func AllowedServerTypes(kind string) []string { return resourceServerTypes[kind] }
+// The server-type list, the availability matrix and the per-type enrollment
+// requirements all live in server_catalog.go — one definition the dashboard is
+// generated from. IsServerType / ServerTypes / AllowedServerTypes are there.
 
 func isUniqueViolation(err error) bool {
 	// 23505 = unique_violation; matching by SQLSTATE text keeps us off

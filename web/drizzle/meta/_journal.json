@@ -36,6 +36,13 @@
       "when": 1786096469965,
       "tag": "0004_iteration8_scoping_flags",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786530000000,
+      "tag": "0005_mongodb_kind_vocabulary",
+      "breakpoints": true
     }
   ]
 }

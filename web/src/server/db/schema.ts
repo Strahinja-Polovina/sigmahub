@@ -181,7 +181,7 @@ export const resources = pgTable("resources", {
     onDelete: "set null",
   }),
   name: text("name").notNull(),
-  kind: text("kind").notNull(), // app | postgres | mysql | mongo | redis | s3 | llm
+  kind: text("kind").notNull(), // app | postgres | mysql | mongodb | redis | s3 | llm
   status: text("status").notNull().default("provisioning"),
   repo: text("repo"),
   domain: text("domain"),

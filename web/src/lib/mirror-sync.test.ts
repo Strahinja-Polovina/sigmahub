@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   environmentMirrorRow,
   localDeployStatus,
-  localResourceKind,
   projectMirrorRow,
   resourceMirrorRow,
   resourceStatusText,
@@ -39,9 +38,13 @@ describe("staleIds", () => {
 });
 
 describe("resource mapping", () => {
-  it("maps the CP kind vocabulary onto the local one", () => {
-    expect(localResourceKind("mongodb")).toBe("mongo");
-    expect(localResourceKind("postgres")).toBe("postgres");
+  // There is no kind translation any more: the mirror stores the control
+  // plane's vocabulary verbatim (SIGMA-198). The pair of opposite-facing
+  // translators this replaced were also routinely bypassed — three call sites
+  // accepted both spellings rather than trust either one.
+  it("stores the CP kind verbatim", () => {
+    expect(resourceMirrorRow(cpResource({ kind: "mongodb" })).kind).toBe("mongodb");
+    expect(resourceMirrorRow(cpResource({ kind: "postgres" })).kind).toBe("postgres");
   });
 
   it("prefers CP status.state, then the existing mirror value", () => {
@@ -76,7 +79,7 @@ describe("resource mapping", () => {
     );
     expect(row).toMatchObject({
       id: "res_1",
-      kind: "mongo",
+      kind: "mongodb",
       serverId: null,
       status: "running",
       repo: "acme/api",

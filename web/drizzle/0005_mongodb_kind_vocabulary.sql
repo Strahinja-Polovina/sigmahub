@@ -1,0 +1,14 @@
+-- SIGMA-198: the dashboard adopts the control plane's kind vocabulary.
+--
+-- The mirror stored "mongo" while the control plane, the agent, every backup
+-- engine and both CP migrations that mention the kind stored "mongodb". Two
+-- translators bridged the two — one per direction, in different modules — and
+-- three call sites bypassed both by accepting either spelling, which is what
+-- kept the split alive rather than surfacing it.
+--
+-- "mongodb" wins because it is what is actually persisted on the side that owns
+-- the data; only these local mirror/demo rows carry the loser. There is no CHECK
+-- constraint or enum on the column (schema.ts declares plain text, as do the CP's
+-- 0007_domain.sql and 0019_databases.sql), so nothing has to be dropped and
+-- recreated — this UPDATE is the whole migration.
+UPDATE "resources" SET "kind" = 'mongodb' WHERE "kind" = 'mongo';

@@ -4,14 +4,16 @@ package store
 // tracks how expensive that server is to manage, not what the hardware costs —
 // customers always bring their own infrastructure and we never mark it up.
 //
-// The weights live here and nowhere else: the summary, the checkout quantity
-// and the drift sweep all derive from this map (the sweep through the generated
-// SQL CASE below), and a web-side test asserts the dashboard read model agrees.
+// The weight is a FIELD of the server type (server_catalog.go), not a table
+// beside it: `vps` and `build` used to be missing from the separate weight map
+// entirely and billed at the fallback weight by accident, because adding a
+// server type and adding its price were two edits in two files and only the
+// first one was obvious. The summary, the checkout quantity and the drift sweep
+// all read the catalog (the sweep through the generated SQL CASE below).
 
 import (
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -20,68 +22,41 @@ import (
 // string should never silently make a server free.
 const DefaultServerUnitWeight = 1
 
-// serverUnitWeights maps a server type to its billing weight.
-//
-//   - general/database/storage: an ordinary Docker host. One unit — today's
-//     price, unchanged.
-//   - k8s: cluster lifecycle, upgrades and networking on top of the host.
-//   - gpu: drivers, CUDA, the model runtime and metering — the most expensive
-//     management profile we run, and the one that replaces an MLOps hire.
-var serverUnitWeights = map[string]int{
-	"general":  1,
-	"database": 1,
-	"storage":  1,
-	"k8s":      2,
-	"gpu":      4,
-}
-
-// serverTypePattern is what a weight key may contain. Enforced at init so
-// unitWeightSQL can inline the keys as SQL literals by construction rather than
-// by trust.
+// serverTypePattern is what a server type may contain. Enforced when the
+// catalog is indexed so unitWeightSQL can inline the types as SQL literals by
+// construction rather than by trust.
 var serverTypePattern = regexp.MustCompile(`^[a-z0-9_]+$`)
-
-func init() {
-	for t := range serverUnitWeights {
-		if !serverTypePattern.MatchString(t) {
-			panic("store: invalid server type in serverUnitWeights: " + t)
-		}
-	}
-}
 
 // ServerUnitWeight returns the billing weight for a server type.
 func ServerUnitWeight(serverType string) int {
-	if w, ok := serverUnitWeights[serverType]; ok {
-		return w
+	if spec, ok := ServerTypeSpecFor(serverType); ok {
+		return spec.UnitWeight
 	}
 	return DefaultServerUnitWeight
 }
 
-// ServerUnitWeights returns a copy of the weight table (for the API to publish
-// to the dashboard, so the breakdown never hardcodes its own copy).
+// ServerUnitWeights returns the weight table (for the API to publish to the
+// dashboard, so the breakdown never hardcodes its own copy).
 func ServerUnitWeights() map[string]int {
-	out := make(map[string]int, len(serverUnitWeights))
-	for t, w := range serverUnitWeights {
-		out[t] = w
+	out := make(map[string]int, len(serverCatalog))
+	for _, spec := range serverCatalog {
+		out[spec.Type] = spec.UnitWeight
 	}
 	return out
 }
 
 // unitWeightSQL renders the weight table as a SQL CASE over a server-type
 // column. Some billing arithmetic (the drift sweep's correlated subqueries) has
-// to happen in the database; generating the expression from the same map keeps
+// to happen in the database; generating the expression from the catalog keeps
 // one source of truth instead of a hand-copied second one that can drift.
 func unitWeightSQL(col string) string {
-	types := make([]string, 0, len(serverUnitWeights))
-	for t := range serverUnitWeights {
-		types = append(types, t)
-	}
-	sort.Strings(types) // deterministic query text (statement-cache friendly)
-
 	var b strings.Builder
 	b.WriteString("CASE " + col)
-	for _, t := range types {
-		// Safe by construction: init() rejects any key outside [a-z0-9_].
-		fmt.Fprintf(&b, " WHEN '%s' THEN %d", t, serverUnitWeights[t])
+	// Sorted, not catalog order: the query text must be stable across a
+	// reordering of the catalog so the statement cache keeps hitting.
+	for _, t := range sortedTypes() {
+		// Safe by construction: the catalog rejects any type outside [a-z0-9_].
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", t, ServerUnitWeight(t))
 	}
 	fmt.Fprintf(&b, " ELSE %d END", DefaultServerUnitWeight)
 	return b.String()

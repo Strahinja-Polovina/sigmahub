@@ -15,7 +15,7 @@ describe("formatDuration", () => {
 
 describe("resource kind labels", () => {
   it("covers every kind the availability matrix knows", () => {
-    for (const kind of ["app", "postgres", "mysql", "mongo", "redis", "s3", "llm"]) {
+    for (const kind of ["app", "postgres", "mysql", "mongodb", "redis", "s3", "llm"]) {
       expect(KIND_LABELS[kind as keyof typeof KIND_LABELS]).toBeTruthy();
     }
   });
