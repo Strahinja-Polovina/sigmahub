@@ -274,6 +274,161 @@ func TestDeploymentReportersMatchWhoRendersTheOps(t *testing.T) {
 	}
 }
 
+// Everything a server needs to render a PLACED Compose service has to agree on
+// which resources it hosts. These are read separately and combined, so when
+// only some of them included placed resources the placement host got a deploy
+// target for a resource it had no spec for, rendered nothing, and the service
+// never started — with no error anywhere.
+func TestPlacedComposeServiceIsVisibleToItsHost(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_placement"
+
+	proj, err := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := connectServer(t, st, orgID, "owner")
+	placed := connectServer(t, st, orgID, "placed")
+	stranger := connectServer(t, st, orgID, "stranger")
+	for _, id := range []string{owner, placed, stranger} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	spec, err := json.Marshal(map[string]any{"compose": map[string]any{"services": []map[string]any{
+		{"name": "db", "image": "postgres:16", "serverId": placed},
+		{"name": "web", "image": "nginx:1.27", "dependsOn": []string{"db"}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: owner, Name: "shopapp", Kind: "app", Spec: spec,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateSecret(ctx, orgID, "admin", store.CreateSecretInput{
+		ProjectID: proj.ID, EnvironmentID: env.ID, Name: "DATABASE_PASSWORD", Value: "hunter2", EnvVar: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The host of a placed service must see the resource, or it has nothing to
+	// render the service from.
+	for _, c := range []struct {
+		name   string
+		server string
+		want   bool
+	}{
+		{"owner", owner, true},
+		{"placement host", placed, true},
+		{"unrelated server", stranger, false},
+	} {
+		specs, err := st.ResourceSpecsForServer(ctx, c.server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, s := range specs {
+			if s.ResourceID == res.ID {
+				found = true
+			}
+		}
+		if found != c.want {
+			t.Fatalf("%s sees the resource = %v, want %v", c.name, found, c.want)
+		}
+	}
+
+	// And its secrets, or the service starts without the credentials it needs.
+	refs, err := st.SecretRefsForServer(ctx, placed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs[res.ID]) == 0 {
+		t.Fatalf("the placement host got no secret refs for the resource: %+v", refs)
+	}
+	if strangerRefs, _ := st.SecretRefsForServer(ctx, stranger); len(strangerRefs[res.ID]) != 0 {
+		t.Fatal("an unrelated server must not be handed the resource's secret refs")
+	}
+}
+
+// A Compose deploy completes when every declared service succeeds, so the
+// denominator has to be recorded when the deployment is created. The webhook
+// path computed it and the manual path did not, so a manual deploy or a
+// rollback ran perfectly and then sat in 'deploying' forever — which also keeps
+// the release out of the rollback targets, since those require a success.
+func TestComposeDeploymentRecordsItsServiceCount(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_svccount"
+
+	proj, err := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := connectServer(t, st, orgID, "host")
+	if err := st.AttachServer(ctx, orgID, env.ID, server, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := json.Marshal(map[string]any{"compose": map[string]any{"services": []map[string]any{
+		{"name": "db", "image": "postgres:16"},
+		{"name": "web", "image": "nginx:1.27"},
+		// Neither a build context nor an image: not runnable, so it must not be
+		// counted or the deployment waits on a service nothing renders.
+		{"name": "broken"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: server, Name: "shopapp", Kind: "app", Spec: spec,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res.ID, EnvironmentID: env.ID, ServerID: server, ConnectionID: conn.ID,
+		Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep.ServiceCount != 2 {
+		t.Fatalf("service count = %d, want 2 runnable services", dep.ServiceCount)
+	}
+
+	// The whole point of the count: it is what lets the deployment finish.
+	for _, svc := range []string{"db", "web"} {
+		if err := st.AdvanceDeploymentService(ctx, server, res.ID, svc, "rollout", true, "", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.GetDeployment(ctx, orgID, dep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "success" {
+		t.Fatalf("every service succeeded but the deployment is %q", got.Status)
+	}
+}
+
 // A cluster workload has no server of its own, so its nodes must be able to
 // report on it and its build server must be able to render the build.
 func TestClusterDeploymentBuildsAndReports(t *testing.T) {

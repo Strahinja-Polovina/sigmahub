@@ -29,7 +29,7 @@ func (s *Store) SecretRefsForServer(ctx context.Context, serverID string) (map[s
 		  JOIN secrets s
 		    ON s.org_id = r.org_id AND s.project_id = r.project_id
 		   AND (s.environment_id = r.environment_id OR s.environment_id IS NULL)
-		 WHERE r.server_id = $1
+		 WHERE`+ResourceHostedHereClause+`
 		 ORDER BY r.id, (s.environment_id IS NULL), s.name`, serverID)
 	if err != nil {
 		return nil, err

@@ -87,6 +87,48 @@ jobs:
           CGO_ENABLED: "0"
         run: go build ./...
 
+  fleet-e2e:
+    name: fleet (real CP + real agents + real Docker)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cp
+    # Every other test stops at the CP boundary — it speaks the agent's protocol
+    # from the test itself — which leaves the bugs that only exist BETWEEN the
+    # two halves uncovered. Three shipped that way: a placement host that was
+    # given a deploy target for a resource it had no spec for, a status report
+    # the store refused from the host that had done the work, and a Compose
+    # deploy with no service count that could never complete. Each one ran
+    # perfectly on both sides and produced nothing.
+    #
+    # This builds the real sigmad, runs two of them as separate processes
+    # against a real control plane and a real Docker daemon, and lets them
+    # converge on their own.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sigmahub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cp/go.mod
+          cache-dependency-path: cp/go.sum
+      - name: Fleet e2e
+        env:
+          SIGMAHUB_FLEET_E2E: "1"
+          CP_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sigmahub_test
+        run: go test ./internal/integration/ -run TestFleet -v -timeout 15m
+
   agent-k8s-e2e:
     name: agent (real Kubernetes API server)
     runs-on: ubuntu-latest

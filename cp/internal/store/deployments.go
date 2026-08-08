@@ -260,10 +260,13 @@ func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDep
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// The resource must belong to the org; capture its server if not supplied.
+	// The resource must belong to the org; capture its server if not supplied,
+	// and how many Compose services have to succeed before the deploy is done.
 	var serverID string
+	var resourceSpec []byte
 	err = tx.QueryRow(ctx,
-		`SELECT COALESCE(server_id,'') FROM resources WHERE org_id = $1 AND id = $2`, orgID, in.ResourceID).Scan(&serverID)
+		`SELECT COALESCE(server_id,''), spec FROM resources WHERE org_id = $1 AND id = $2`,
+		orgID, in.ResourceID).Scan(&serverID, &resourceSpec)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -273,12 +276,21 @@ func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDep
 	if in.ServerID != "" {
 		serverID = in.ServerID
 	}
+	// Without this a Compose deploy can never finish: completion is "every
+	// declared service succeeded", and with a denominator of zero the check
+	// `success >= service_count` is gated behind `service_count > 0` and never
+	// fires. The webhook path computed it; this one — manual deploys, redeploys
+	// and rollbacks — did not, so those ran perfectly and then sat in
+	// 'deploying' forever, which also keeps the release out of the rollback
+	// targets that require a success.
+	svcCount := composeServiceCount(resourceSpec)
 
 	d := Deployment{
 		ID: newID("dep"), OrgID: orgID, ResourceID: in.ResourceID, EnvironmentID: in.EnvironmentID,
 		ServerID: serverID, ConnectionID: in.ConnectionID, Trigger: trigger, GitRef: in.GitRef,
 		GitSHA: in.GitSHA, ConfigHash: in.ConfigHash, ImageDigest: in.ImageDigest,
 		RollbackOf: in.RollbackOf, Status: "queued", CreatedBy: actor,
+		ServiceCount: svcCount,
 	}
 	// A building trigger gets its own pin (its images are tagged under it); a
 	// rollback ships an existing image and derives nothing (SIGMA-173).
@@ -288,11 +300,12 @@ func (s *Store) CreateDeployment(ctx context.Context, orgID string, in CreateDep
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, image_pin, config_hash, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,$8,$9,NULLIF($10,''),$11,$12,NULLIF($13,''),'queued',$14)
+		                         git_ref, git_sha, image_digest, image_pin, config_hash, rollback_of, status, created_by,
+		                         service_count)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,$8,$9,NULLIF($10,''),$11,$12,NULLIF($13,''),'queued',$14,$15)
 		RETURNING created_at`,
 		d.ID, orgID, in.ResourceID, in.EnvironmentID, serverID, in.ConnectionID, trigger,
-		in.GitRef, in.GitSHA, in.ImageDigest, pin, in.ConfigHash, in.RollbackOf, actor).Scan(&d.CreatedAt)
+		in.GitRef, in.GitSHA, in.ImageDigest, pin, in.ConfigHash, in.RollbackOf, actor, svcCount).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, err
 	}
