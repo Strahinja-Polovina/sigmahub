@@ -32,6 +32,10 @@ type Detected struct {
 	// file; Reason then carries an actionable message for the UI.
 	Deployable bool   `json:"deployable"`
 	Reason     string `json:"reason,omitempty"`
+	// DefaultBranch is the repo's default branch as reported by the provider
+	// (set by the inspector, not by file detection) — the wizard's auto
+	// branch-mapping target.
+	DefaultBranch string `json:"defaultBranch,omitempty"`
 }
 
 // HealthCheck is the resource's readiness probe. Type is "http" when a path was
@@ -59,6 +63,10 @@ type healthAccum struct {
 var (
 	dockerfileNames = []string{"Dockerfile", "dockerfile"}
 	composeNames    = []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
+	// EnvExampleNames are repo-root env templates whose KEYS pre-fill the
+	// wizard's Variables step (values are placeholders and are never read).
+	// Presence never affects deployability.
+	EnvExampleNames = []string{".env.example", ".env.sample", ".env.template"}
 )
 
 // Detect derives the deploy configuration from a repo's root file set, keyed by
@@ -96,6 +104,12 @@ func Detect(files map[string][]byte) Detected {
 	if d.HasCompose {
 		parseCompose(compose, portSet, envSet, &hc)
 		d.Services = ParseComposeServices(compose)
+	}
+	for _, name := range EnvExampleNames {
+		if b, ok := files[name]; ok {
+			parseEnvExample(b, envSet)
+			break
+		}
 	}
 
 	for p := range portSet {
@@ -286,6 +300,26 @@ func joinContinuations(lines []string) []string {
 		out = append(out, strings.TrimRight(buf.String(), " "))
 	}
 	return out
+}
+
+// parseEnvExample collects the variable names from a dotenv-style template:
+// `KEY=…` / `export KEY=…` lines; comments, blanks and malformed lines are
+// ignored. Values are placeholders by definition and are never read.
+func parseEnvExample(b []byte, env map[string]bool) {
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(strings.TrimRight(raw, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		i := strings.Index(line, "=")
+		if i <= 0 {
+			continue
+		}
+		if name := strings.TrimSpace(line[:i]); envNameRe.MatchString(name) {
+			env[name] = true
+		}
+	}
 }
 
 func addPort(ports map[int]bool, tok string) {

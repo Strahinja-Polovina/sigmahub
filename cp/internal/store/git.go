@@ -732,10 +732,15 @@ func (s *Store) gitCloneToken(ctx context.Context, orgID, connID string) (string
 
 // GitTokenForRepo resolves the credential to READ an org's connected repo:
 // the connection's App installation token or stored PAT (same resolution as a
-// clone). "" with nil error = connected public repo; ErrNotFound = the repo is
-// not connected in this org. Lets repo detection see a private repo that was
-// already connected in the Git panel instead of failing tokenless (the wizard
-// never carries a token).
+// clone). "" with nil error = connected public repo; ErrNotFound = nothing
+// usable in this org. Lets repo detection see a private repo without the
+// wizard carrying a token.
+//
+// Fallback: when THIS repo isn't connected, the newest connection for the
+// same provider owner (e.g. any other SigmaJunction/* repo) is used — a PAT
+// or App installation is owner-scoped in practice, so one connected repo
+// makes its sibling repos detectable org-wide. Tokens never cross sigmahub
+// orgs: every lookup is org_id-scoped.
 func (s *Store) GitTokenForRepo(ctx context.Context, orgID, repoFullName string) (string, error) {
 	repo := strings.Trim(strings.TrimSpace(repoFullName), "/")
 	var connID string
@@ -743,7 +748,18 @@ func (s *Store) GitTokenForRepo(ctx context.Context, orgID, repoFullName string)
 		`SELECT id FROM git_connections WHERE org_id = $1 AND repo_full_name = $2`,
 		orgID, repo).Scan(&connID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
+		owner, _, _ := strings.Cut(repo, "/")
+		if owner == "" {
+			return "", ErrNotFound
+		}
+		err = s.Pool.QueryRow(ctx, `
+			SELECT id FROM git_connections
+			 WHERE org_id = $1 AND repo_full_name LIKE $2 || '/%'
+			 ORDER BY created_at DESC LIMIT 1`,
+			orgID, owner).Scan(&connID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
 	}
 	if err != nil {
 		return "", err

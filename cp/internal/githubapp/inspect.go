@@ -35,11 +35,13 @@ func NewInspector() *Inspector {
 }
 
 // candidateFiles are the root files the detector understands; each is fetched
-// independently so a repo with only some of them still resolves.
-var candidateFiles = []string{
+// independently so a repo with only some of them still resolves. Env templates
+// (.env.example & co) contribute variable KEYS to the wizard pre-fill and never
+// affect deployability.
+var candidateFiles = append([]string{
 	"Dockerfile", "dockerfile",
 	"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml",
-}
+}, gitdetect.EnvExampleNames...)
 
 // Inspect fetches the candidate root files and runs detection. Missing files are
 // skipped (a 404 is normal); a transport or unexpected-status error aborts. The
@@ -55,6 +57,24 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 		base = DefaultAPIBase
 	}
 
+	// Repo-level probe FIRST: it distinguishes "no Dockerfile" from "repo
+	// invisible" (GitHub 404s every path of a private repo when the token is
+	// missing/unauthorized) and yields the default branch for the wizard's
+	// auto branch-mapping.
+	visible, defaultBranch, err := i.repoMeta(ctx, base, repo, token)
+	if err != nil {
+		return gitdetect.Detected{}, err
+	}
+	if !visible {
+		return gitdetect.Detected{
+			Ports: []int{}, Env: []string{},
+			HealthCheck: gitdetect.HealthCheck{Type: "tcp", IntervalSec: 10, Source: "default"},
+			Deployable:  false,
+			Reason: "repository not found or not accessible — if it is private, connect it with an access token " +
+				"or GitHub App and try again",
+		}, nil
+	}
+
 	files := map[string][]byte{}
 	for _, name := range candidateFiles {
 		content, found, err := i.fetchFile(ctx, base, repo, name, token)
@@ -65,36 +85,18 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 			files[name] = content
 		}
 	}
-	// Nothing found can mean two very different things: the repo really has no
-	// Dockerfile/Compose at its root, or the repo is invisible to us — GitHub
-	// answers 404 for EVERY path of a private repo when the token is missing or
-	// unauthorized. Distinguish them with one repo-level probe so the UI can say
-	// "connect the private repo" instead of the misleading "no Dockerfile".
-	if len(files) == 0 {
-		visible, err := i.repoVisible(ctx, base, repo, token)
-		if err != nil {
-			return gitdetect.Detected{}, err
-		}
-		if !visible {
-			return gitdetect.Detected{
-				Ports: []int{}, Env: []string{},
-				HealthCheck: gitdetect.HealthCheck{Type: "tcp", IntervalSec: 10, Source: "default"},
-				Deployable:  false,
-				Reason: "repository not found or not accessible — if it is private, connect it in the project's Git panel " +
-					"(access token or GitHub App) and try again",
-			}, nil
-		}
-	}
-	return gitdetect.Detect(files), nil
+	d := gitdetect.Detect(files)
+	d.DefaultBranch = defaultBranch
+	return d, nil
 }
 
-// repoVisible reports whether the repo itself resolves with the given
-// credentials (GET /repos/{owner}/{name}); a 404 here means the repo does not
-// exist or is private and unreadable with this token.
-func (i *Inspector) repoVisible(ctx context.Context, base, repo, token string) (bool, error) {
+// repoMeta resolves the repo itself (GET /repos/{owner}/{name}): whether it is
+// visible with the given credentials, and its default branch. A 404 means the
+// repo does not exist or is private and unreadable with this token.
+func (i *Inspector) repoMeta(ctx context.Context, base, repo, token string) (visible bool, defaultBranch string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/repos/%s", base, repo), nil)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -103,17 +105,35 @@ func (i *Inspector) repoVisible(ctx context.Context, base, repo, token string) (
 	}
 	resp, err := i.Client.Do(req)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return true, nil
-	case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden:
-		return false, nil
+		var meta struct {
+			DefaultBranch string `json:"default_branch"`
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return false, "", err
+		}
+		if err := json.Unmarshal(body, &meta); err != nil {
+			// Metadata decode trouble must not block detection; branch is a nicety.
+			return true, "", nil
+		}
+		return true, meta.DefaultBranch, nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		// GitHub also 403s here when the UNAUTHENTICATED rate limit is spent —
+		// that failure has a fix the operator should hear about.
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return false, "", fmt.Errorf(
+				"github API rate limit exceeded — connect the repo with an access token or GitHub App (much higher limit), or retry later")
+		}
+		return false, "", nil
+	case http.StatusNotFound:
+		return false, "", nil
 	default:
-		return false, fmt.Errorf("github repo %s: unexpected status %s", repo, resp.Status)
+		return false, "", fmt.Errorf("github repo %s: unexpected status %s", repo, resp.Status)
 	}
 }
 

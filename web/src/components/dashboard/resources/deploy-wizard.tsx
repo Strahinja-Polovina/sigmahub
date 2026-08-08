@@ -46,7 +46,7 @@ import { canHost } from "@/lib/hosting";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
-import { detectRepo, connectRepo } from "@/server/actions/git";
+import { detectRepo, connectRepo, setBranchMapping } from "@/server/actions/git";
 import {
   KIND_LABELS,
   SERVER_TYPE_LABELS,
@@ -72,6 +72,9 @@ type Repo = {
     ports?: number[];
     healthCheck?: { type: string; path?: string; port?: number };
   };
+  /** Variable KEYS detected from the repo (.env.example, Dockerfile ENV/ARG,
+   *  compose environment) — seeds the Variables step. */
+  envKeys?: string[];
 };
 
 const MOCK_REPOS: Repo[] = [
@@ -313,7 +316,7 @@ export function DeployWizard({
           fullName,
           description: d.hasCompose ? `compose: ${d.composePath ?? "docker-compose.yml"}` : `dockerfile: ${d.dockerfilePath ?? "Dockerfile"}`,
           private: false,
-          defaultBranch: "main",
+          defaultBranch: d.defaultBranch || "main",
           detectedKind: "app",
           build: d.hasCompose ? "docker-compose.yml" : "Dockerfile",
           buildDetail: d.ports.length ? `ports ${d.ports.join(", ")}` : "no ports detected",
@@ -324,7 +327,17 @@ export function DeployWizard({
               ? { type: d.healthCheck.type, path: d.healthCheck.path, port: d.healthCheck.port }
               : undefined,
           },
+          envKeys: d.env,
         });
+        // Pre-fill the Variables step with the repo's own variable names
+        // (.env.example / Dockerfile ENV / compose environment) — the operator
+        // fills in values instead of retyping keys.
+        if (d.env?.length) {
+          setEnvVars([
+            ...d.env.map((key) => ({ id: newId(), key, value: "" })),
+            { id: newId(), key: "", value: "" },
+          ]);
+        }
       })
       .catch((err) => {
         toast.error("Detection failed", {
@@ -359,22 +372,37 @@ export function DeployWizard({
             repo: serviceKind ? undefined : repo?.fullName,
             detected: serviceKind ? undefined : repo?.detected,
           });
-          // A token was supplied for a private repo: persist it by connecting
-          // the repo to the project now, so the build pipeline (and future
-          // detections) can read it without re-entering the token. An
-          // already-connected repo conflicts — that's fine, keep going.
-          if (!serviceKind && repo && repoToken.trim()) {
+          // Wire push-to-deploy for the golden path: connect the repo to the
+          // project (persisting the token, if one was supplied for a private
+          // repo) and auto-map its default branch to the chosen environment.
+          // An already-connected repo conflicts on connect — fine, the Git
+          // panel owns it then; mapping failures are non-fatal and reported.
+          if (!serviceKind && repo) {
             try {
-              await connectRepo({
+              const conn = await connectRepo({
                 orgId,
                 projectId,
                 repoFullName: repo.fullName,
-                token: repoToken.trim(),
+                token: repoToken.trim() || undefined,
               });
+              try {
+                await setBranchMapping({
+                  orgId,
+                  projectId,
+                  connectionId: conn.id,
+                  branch: repo.defaultBranch,
+                  environmentId,
+                  policy: "auto",
+                });
+              } catch {
+                toast.warning("Branch not mapped", {
+                  description: `Map ${repo.defaultBranch} to this environment in the project's Git panel to enable push-to-deploy.`,
+                });
+              }
             } catch (err) {
               const msg = err instanceof Error ? err.message : "";
               if (!msg.toLowerCase().includes("already connected")) {
-                toast.warning("Repository token was not saved", {
+                toast.warning("Repository not connected", {
                   description:
                     "The resource was created, but connecting the repository failed. Connect it in the project's Git panel.",
                 });
@@ -576,7 +604,13 @@ export function DeployWizard({
               <div className="grid gap-1.5 sm:grid-cols-2">
                 <button
                   type="button"
-                  onClick={() => setServiceKind(null)}
+                  onClick={() => {
+                    setServiceKind(null);
+                    setEnvVars([
+                      { id: newId(), key: "NODE_ENV", value: "production" },
+                      { id: newId(), key: "", value: "" },
+                    ]);
+                  }}
                   className={cn(
                     "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
                     serviceKind === null
@@ -603,6 +637,9 @@ export function DeployWizard({
                         setServiceKind(k);
                         setRepo(null);
                         if (!serviceName.trim()) setServiceName(k);
+                        // Engine credentials (user/password/db) are generated
+                        // by the control plane — no fake defaults here.
+                        setEnvVars([{ id: newId(), key: "", value: "" }]);
                       }}
                       className={cn(
                         "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
@@ -951,9 +988,24 @@ export function DeployWizard({
           {/* Step 4 — environment variables */}
           {step === 4 && (
             <div className="flex flex-col gap-3">
-              <p className="text-sm text-muted-foreground">
-                Injected into the container at runtime. Values are encrypted at rest.
-              </p>
+              {serviceKind ? (
+                <div className="flex items-start gap-2.5 rounded-lg border border-border bg-muted/40 p-3">
+                  <CircleCheck className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {serviceKind === "s3"
+                      ? "Access keys are generated automatically and shown on the resource's Storage panel."
+                      : "The user, password and database name are generated automatically and shown on the resource's Database panel."}{" "}
+                    Add variables below only if this service needs something extra.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Injected into the container at runtime. Values are encrypted at rest.
+                  {repo?.envKeys?.length
+                    ? " Keys were pre-filled from the repository (.env.example / Dockerfile / compose) — fill in the values."
+                    : ""}
+                </p>
+              )}
               <div className="flex flex-col gap-2">
                 {envVars.map((ev) => (
                   <div key={ev.id} className="flex items-center gap-2">
@@ -1047,10 +1099,11 @@ export function DeployWizard({
                     </>
                   ) : (
                     <>
-                      The resource starts as <span className="font-medium">provisioning</span>.
-                      Connect <span className="font-mono">{repo?.fullName}</span> in the
-                      project’s Git panel and map a branch to this environment — every
-                      push then builds and rolls out with zero downtime.
+                      The resource starts as <span className="font-medium">provisioning</span> until
+                      its first build. The repository is connected and{" "}
+                      <span className="font-mono">{repo?.defaultBranch}</span> is mapped to this
+                      environment — push to it and the build rolls out with zero
+                      downtime (adjust the mapping in the project’s Git panel).
                     </>
                   )}
                 </p>

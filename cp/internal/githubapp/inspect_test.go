@@ -22,7 +22,7 @@ func stubContents(files map[string]string, wantAuth string) *httptest.Server {
 		if len(parts) != 2 {
 			// Repo-level probe (GET /repos/{owner}/{name}): the repo exists in
 			// these fixtures; only its files vary.
-			_ = json.NewEncoder(w).Encode(map[string]string{"full_name": parts[0]})
+			_ = json.NewEncoder(w).Encode(map[string]string{"full_name": parts[0], "default_branch": "main"})
 			return
 		}
 		content, ok := files[parts[1]]
@@ -64,9 +64,12 @@ func TestInspectAuthForwarded(t *testing.T) {
 	defer srv.Close()
 
 	insp := &Inspector{Client: srv.Client(), APIBase: srv.URL}
-	// Without the token → 401 surfaces as an error.
-	if _, err := insp.Inspect(context.Background(), "o/r", ""); err == nil {
-		t.Error("expected auth error without token")
+	// Without the token the repo is invisible → an actionable non-deployable
+	// result (NOT an opaque error) so the UI can say "connect it with a token".
+	if d, err := insp.Inspect(context.Background(), "o/r", ""); err != nil {
+		t.Fatalf("tokenless inspect of an invisible repo must not error: %v", err)
+	} else if d.Deployable || !strings.Contains(d.Reason, "not accessible") {
+		t.Errorf("expected not-accessible result without token, got %+v", d)
 	}
 	// With the token → detection succeeds.
 	d, err := insp.Inspect(context.Background(), "o/r", "tok123")
@@ -129,6 +132,10 @@ func TestInspectBadRepo(t *testing.T) {
 // Dockerfile in the same repo is still detected.
 func TestInspectSkipsOversizeCandidate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/contents/") {
+			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/contents/Dockerfile") {
 			enc := base64.StdEncoding.EncodeToString([]byte("FROM x\nEXPOSE 3000\n"))
 			_ = json.NewEncoder(w).Encode(map[string]string{"type": "file", "encoding": "base64", "content": enc})

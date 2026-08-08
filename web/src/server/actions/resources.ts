@@ -159,7 +159,17 @@ export async function deployResource(input: { resourceId: string }) {
   // CP mode: queue a real manual redeploy (fresh clone→build→rollout). The CP
   // drives the pipeline status, so there's no client-side simulation to advance.
   if (cpEnabled()) {
-    const dep = await cpRedeploy(orgId, input.resourceId, { name: user.name, role });
+    // A CP refusal (e.g. 422 "nothing to redeploy — connect a repo and push
+    // first") must reach the user as-is: thrown server-action errors get
+    // their messages redacted by Next.js in production, so return it instead.
+    let dep;
+    try {
+      dep = await cpRedeploy(orgId, input.resourceId, { name: user.name, role });
+    } catch (err) {
+      return {
+        error: err instanceof Error ? err.message : "Deploy failed. Please try again.",
+      };
+    }
     await writeAudit({ orgId, actor: user.name, action: "Redeployed resource", target: resource.name });
     revalidatePath("/dashboard", "layout");
     revalidatePath(`/dashboard/resources/${input.resourceId}`);

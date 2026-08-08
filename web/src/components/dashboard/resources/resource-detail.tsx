@@ -153,6 +153,10 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
     setBusy(true);
     try {
       const res = await deployResource({ resourceId });
+      if ("error" in res) {
+        toast.error("Deploy failed", { description: res.error });
+        return;
+      }
       router.refresh();
       // CP mode: the control plane drives the real clone→build→rollout pipeline;
       // its progress shows live in the Deployments tab, so there's nothing to

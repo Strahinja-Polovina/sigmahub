@@ -942,6 +942,8 @@ export type CpDetected = {
   healthCheck: CpHealthCheck;
   deployable: boolean;
   reason?: string;
+  /** The provider-reported default branch — the wizard's auto-mapping target. */
+  defaultBranch?: string;
 };
 
 export type CpGitConnection = {
