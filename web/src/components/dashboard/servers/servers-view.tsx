@@ -33,7 +33,10 @@ import {
 } from "@/components/dashboard/clusters/clusters-panel";
 import type { CpCluster } from "@/server/cp";
 import { ConnectServerDialog } from "./connect-server-dialog";
-import { SERVER_TYPE_LABELS, SERVER_TYPE_ORDER } from "./server-meta";
+import {
+  SERVER_TYPE_LABELS,
+  SERVER_TYPES,
+} from "@/lib/server-catalog.generated";
 
 type Filter = "all" | ServerType;
 
@@ -146,11 +149,11 @@ export function ServersView({
   const [filter, setFilter] = React.useState<Filter>("all");
 
   const counts = React.useMemo(() => {
-    // Seeded from SERVER_TYPE_ORDER so adding a server type can't leave a
-    // counter undefined (and crash the filter row) the way a hand-written
-    // literal would. An unknown type still counts toward "all".
+    // Seeded from the control plane's own type list so adding a server type
+    // can't leave a counter undefined (and crash the filter row) the way a
+    // hand-written literal would. An unknown type still counts toward "all".
     const c = { all: servers.length } as Record<Filter, number>;
-    for (const t of SERVER_TYPE_ORDER) c[t] = 0;
+    for (const t of SERVER_TYPES) c[t] = 0;
     for (const sv of servers) {
       if (sv.type in c) c[sv.type as Filter] += 1;
     }
@@ -191,7 +194,7 @@ export function ServersView({
           <Tabs value={filter} onValueChange={(v) => setFilter(v as Filter)} className="w-fit">
             <TabsList>
               <TabsTrigger value="all">All ({counts.all})</TabsTrigger>
-              {SERVER_TYPE_ORDER.map((t) => (
+              {SERVER_TYPES.map((t) => (
                 <TabsTrigger key={t} value={t} disabled={counts[t] === 0}>
                   {SERVER_TYPE_LABELS[t]} ({counts[t]})
                 </TabsTrigger>

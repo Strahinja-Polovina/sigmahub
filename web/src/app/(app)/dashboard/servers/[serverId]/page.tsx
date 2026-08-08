@@ -46,7 +46,7 @@ export default async function ServerDetailPage({
           return {
             id: r.id,
             name: r.name,
-            kind: r.kind === "mongodb" ? "mongo" : r.kind,
+            kind: r.kind,
             // CP status.state is authoritative once the P1-2 reconciler
             // populates it; until then fall back to the local mirror's status
             // so the detail page agrees with the project pages.

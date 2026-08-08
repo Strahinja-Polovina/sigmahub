@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/dialog";
 import { StatusDot } from "@/components/dashboard/status-indicator";
 import type { Status } from "@/lib/mock";
+import { resourceKindLabel } from "@/lib/server-catalog.generated";
 import {
   createCluster,
   addClusterNode,
@@ -70,13 +71,6 @@ const nodeLabel: Record<string, string> = {
   error: "not joined",
 };
 
-const KIND_LABEL: Record<string, string> = {
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  redis: "Redis",
-  mongodb: "MongoDB",
-  s3: "object storage",
-};
 
 /**
  * Kubernetes clusters built from the org's own servers.
@@ -153,7 +147,7 @@ export function ClustersPanel({
           <AlertTitle>Databases run outside the cluster, on purpose</AlertTitle>
           <AlertDescription>
             {excludedKinds
-              .map((k) => KIND_LABEL[k] ?? k)
+              .map((k) => resourceKindLabel(k))
               .sort()
               .join(", ")}{" "}
             stay on their own server. A stateful engine rescheduled onto a node without its

@@ -43,7 +43,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { canHost } from "@/lib/hosting";
+import { canHost, HOSTS_NOTHING_REASON } from "@/lib/server-catalog.generated";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 import Link from "next/link";
 import { RepoPicker } from "./repo-picker";
@@ -147,7 +147,7 @@ const STEPS = [
 const SERVICE_KINDS: { kind: ResourceKind; icon: React.ElementType; detail: string }[] = [
   { kind: "postgres", icon: Database, detail: "Managed PostgreSQL" },
   { kind: "mysql", icon: Database, detail: "Managed MySQL" },
-  { kind: "mongo", icon: Database, detail: "Managed MongoDB" },
+  { kind: "mongodb", icon: Database, detail: "Managed MongoDB" },
   { kind: "redis", icon: Database, detail: "Managed Redis" },
   { kind: "s3", icon: HardDrive, detail: "S3-compatible object storage" },
   { kind: "llm", icon: Cpu, detail: "Model endpoint on a GPU server" },
@@ -256,10 +256,14 @@ export function DeployWizard({
   const incompatibility = React.useMemo(() => {
     if (!kind) return null;
     if (selectedServer && !canHost(selectedServer.type as ServerType, kind)) {
+      // Types that host NOTHING get the catalog's reason appended: "a Build
+      // server cannot host an App" is true but reads like a bug, and the
+      // operator's next move is to pick a different server, not to retry.
+      const why = HOSTS_NOTHING_REASON[selectedServer.type as ServerType];
       return {
         code: 422,
         type: "resource_kind_unsupported",
-        message: `A ${SERVER_TYPE_LABELS[selectedServer.type as ServerType]} server cannot host a ${KIND_LABELS[kind]} resource.`,
+        message: `A ${SERVER_TYPE_LABELS[selectedServer.type as ServerType]} server cannot host a ${KIND_LABELS[kind]} resource.${why ? ` ${why}` : ""}`,
       };
     }
     if (

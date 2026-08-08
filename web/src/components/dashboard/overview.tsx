@@ -37,16 +37,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, Status } from "@/lib/mock";
+import { RESOURCE_KIND_LABELS as KIND_LABELS } from "@/lib/server-catalog.generated";
 
-const KIND_LABELS: Record<ResourceKind, string> = {
-  app: "App",
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mongo: "MongoDB",
-  redis: "Redis",
-  s3: "Object storage",
-  llm: "LLM",
-};
 
 type OverviewResource = {
   id: string;

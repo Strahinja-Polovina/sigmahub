@@ -1,0 +1,328 @@
+package store
+
+// The catalog is the only definition of a server type, so these tests are the
+// only thing standing between an edit to it and a dashboard, a bill or an API
+// boundary that quietly disagrees with the domain model.
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+const generatedTSPath = "../../../web/src/lib/server-catalog.generated.ts"
+
+// The one that matters: the checked-in TypeScript must be exactly what the
+// current catalog renders. Without it, "adding a server type is a one-file
+// edit" is only true for whoever remembers to run go generate — and the person
+// who forgets ships a dashboard offering types the API rejects, which is the
+// original SIGMA-198 defect wearing a new hat.
+func TestGeneratedTypeScriptIsUpToDate(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatalf("digest %v: %v", CatalogSourceFiles, err)
+	}
+	want := RenderTypeScript(sha)
+	got, err := os.ReadFile(generatedTSPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", generatedTSPath, err)
+	}
+	if string(got) == string(want) {
+		return
+	}
+	// Point at the first differing line: a 12KB diff dump helps nobody.
+	gotLines, wantLines := strings.Split(string(got), "\n"), strings.Split(string(want), "\n")
+	for i := 0; i < len(gotLines) || i < len(wantLines); i++ {
+		g, w := "", ""
+		if i < len(gotLines) {
+			g = gotLines[i]
+		}
+		if i < len(wantLines) {
+			w = wantLines[i]
+		}
+		if g != w {
+			t.Fatalf("%s is stale — run `cd cp && go generate ./...`\nline %d:\n  have: %s\n  want: %s",
+				generatedTSPath, i+1, g, w)
+		}
+	}
+}
+
+// The generated module must actually carry the catalog, not merely parse. A
+// renderer that silently dropped a section would still be byte-identical to
+// itself, so the staleness test above cannot catch it.
+func TestGeneratedTypeScriptCarriesTheCatalog(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := string(RenderTypeScript(sha))
+
+	if !strings.Contains(ts, `export const CATALOG_SOURCE_SHA256 = "`+sha+`";`) {
+		t.Fatal("the source digest is missing; the web-side drift guard has nothing to compare")
+	}
+	for _, spec := range ServerCatalog() {
+		for _, fragment := range []string{
+			`  | "` + spec.Type + `"`,                    // the ServerType union
+			`  ` + spec.Type + `: "` + spec.Label + `",`, // SERVER_TYPE_LABELS
+			`  ` + spec.Type + `: "` + spec.Hint + `",`,  // SERVER_TYPE_HINTS
+		} {
+			if !strings.Contains(ts, fragment) {
+				t.Errorf("server type %q: generated TS is missing %q", spec.Type, fragment)
+			}
+		}
+		// Requirements are the half SIGMA-203 consumes; a type whose checks
+		// never reached the dashboard would show an empty expectations list.
+		for _, req := range spec.Requires.List() {
+			if !strings.Contains(ts, `text: "`+req.Text+`"`) {
+				t.Errorf("server type %q: requirement %q missing from generated TS", spec.Type, req.Text)
+			}
+		}
+	}
+	for _, kind := range ResourceKinds() {
+		if !strings.Contains(ts, `  `+kind+`: "`+ResourceKindLabel(kind)+`",`) {
+			t.Errorf("resource kind %q: label missing from generated TS", kind)
+		}
+	}
+}
+
+// The two directions of the matrix are one table read two ways. A transpose
+// that lost an entry would let the deploy wizard offer a server CreateResource
+// then refuses — the 422 this matrix exists to prevent.
+func TestMatrixTransposeAgrees(t *testing.T) {
+	for _, spec := range ServerCatalog() {
+		for _, kind := range spec.Hosts {
+			if !contains(AllowedServerTypes(kind), spec.Type) {
+				t.Errorf("%s hosts %s, but AllowedServerTypes(%s) omits it", spec.Type, kind, kind)
+			}
+		}
+	}
+	for _, kind := range ResourceKinds() {
+		for _, typ := range AllowedServerTypes(kind) {
+			if !CanHost(typ, kind) {
+				t.Errorf("AllowedServerTypes(%s) contains %s, but CanHost says otherwise", kind, typ)
+			}
+		}
+	}
+}
+
+// AllowedServerTypes distinguishes "unknown kind" (nil) from "known kind
+// nothing hosts" (empty). CreateResource branches on exactly that difference to
+// choose between "unknown resource kind" and the matrix message, so collapsing
+// the two would mislabel a real domain rule as a typo.
+func TestAllowedServerTypesSeparatesUnknownFromUnhostable(t *testing.T) {
+	if AllowedServerTypes("not-a-kind") != nil {
+		t.Fatal("an unknown kind must return nil")
+	}
+	for _, kind := range ResourceKinds() {
+		if AllowedServerTypes(kind) == nil {
+			t.Fatalf("known kind %q returned nil, which reads as a typo to CreateResource", kind)
+		}
+	}
+}
+
+// Domain rules worth restating as tests: each was a deliberate product
+// decision, and each would be silently reversible by a one-word catalog edit.
+func TestCatalogDomainRules(t *testing.T) {
+	if !equalSets(hostsOf(t, "vps"), hostsOf(t, "general")) {
+		t.Error("a VPS must host exactly what a general server hosts — virtualization is a disclosure, not a capability difference")
+	}
+	for _, typ := range ServerTypes() {
+		if CanHost(typ, "llm") != (typ == "gpu") {
+			t.Errorf("llm on %q = %v; models are served on GPU hardware only", typ, CanHost(typ, "llm"))
+		}
+		if CanHost(typ, "s3") != (typ == "storage") {
+			t.Errorf("s3 on %q = %v; object storage belongs on a storage host", typ, CanHost(typ, "s3"))
+		}
+	}
+	for _, kind := range []string{"postgres", "mysql", "mongodb", "redis"} {
+		if CanHost("storage", kind) || CanHost("gpu", kind) {
+			t.Errorf("%s must not land on a storage or gpu server", kind)
+		}
+	}
+	for _, typ := range []string{"k8s", "build"} {
+		spec, ok := ServerTypeSpecFor(typ)
+		if !ok {
+			t.Fatalf("%s is not in the catalog", typ)
+		}
+		if len(spec.Hosts) != 0 {
+			t.Errorf("%s must host nothing directly", typ)
+		}
+		if spec.HostsNothingReason == "" {
+			t.Errorf("%s hosts nothing and does not say why — the UI would show a blank dead end", typ)
+		}
+	}
+	// k8s is deliberately absent from the connect dialog: a node becomes one by
+	// JOINING a cluster, so offering it at enrollment creates a host nothing can
+	// be scheduled onto that nevertheless bills at cluster weight.
+	if contains(ConnectableServerTypes(), "k8s") {
+		t.Error("k8s must not be offered when connecting a new server")
+	}
+	// ...but it is still a canonical type, and the API boundary accepts every
+	// canonical type. That asymmetry is the point: guidance in the UI, not a
+	// second, narrower list at the edge.
+	if !IsServerType("k8s") {
+		t.Error("k8s must remain a known server type")
+	}
+}
+
+// Every type states its own requirements. A type that inherits silence would
+// pass SIGMA-203's gate unconditionally — the failure mode there is a host
+// enrolled as something it cannot be, discovered at first deploy.
+func TestEveryTypeStatesItsRequirements(t *testing.T) {
+	for _, spec := range ServerCatalog() {
+		req, ok := ServerRequirementsFor(spec.Type)
+		if !ok {
+			t.Fatalf("%s: no requirements", spec.Type)
+		}
+		if len(req.Distros) == 0 {
+			t.Errorf("%s: no supported distros", spec.Type)
+		}
+		if len(req.Arches) == 0 {
+			t.Errorf("%s: no supported architectures", spec.Type)
+		}
+		for _, d := range req.Distros {
+			if !DistroSupported(d) {
+				t.Errorf("%s: requires distro %q that the onboarding path rejects", spec.Type, d)
+			}
+		}
+		// Every requirement must render a sentence with the fact it reads, or
+		// the gate can only answer "no" without saying what to change.
+		for _, check := range req.List() {
+			if check.Text == "" || check.Fact == "" {
+				t.Errorf("%s: requirement %q has no text or no fact", spec.Type, check.ID)
+			}
+			if !strings.HasSuffix(check.Text, ".") {
+				t.Errorf("%s: requirement %q is not a sentence: %q", spec.Type, check.ID, check.Text)
+			}
+		}
+	}
+
+	// The requirements that carry real product meaning.
+	gpu, _ := ServerRequirementsFor("gpu")
+	if gpu.GPU == nil || gpu.GPU.Vendor != "nvidia" || !gpu.GPU.Driver {
+		t.Error("a gpu server must require an NVIDIA GPU with a usable driver")
+	}
+	if !strings.Contains(requirementText(gpu, ReqGPU), "usable driver") {
+		t.Errorf("the GPU requirement must name the driver: %q", requirementText(gpu, ReqGPU))
+	}
+	for _, typ := range []string{"database", "storage"} {
+		req, _ := ServerRequirementsFor(typ)
+		if req.MinDiskBytes <= 0 {
+			t.Errorf("%s: needs a minimum disk floor", typ)
+		}
+		if requirementText(req, ReqDisk) == "" {
+			t.Errorf("%s: the disk floor is not stated in words", typ)
+		}
+	}
+	if s, _ := ServerRequirementsFor("storage"); s.MinDiskBytes <= mustDisk(t, "database") {
+		t.Error("a storage host must need more disk than a database host — capacity is the whole promise of the type")
+	}
+	// Types with no accelerator story must not accidentally demand one.
+	for _, typ := range ServerTypes() {
+		req, _ := ServerRequirementsFor(typ)
+		if req.GPU != nil && typ != "gpu" {
+			t.Errorf("%s requires a GPU; only the gpu type should", typ)
+		}
+	}
+}
+
+// The billing weight is a catalog field precisely so it cannot go missing: vps
+// and build were absent from the old standalone weight map and billed at the
+// fallback by accident.
+func TestEveryTypeHasABillingWeight(t *testing.T) {
+	weights := ServerUnitWeights()
+	for _, typ := range ServerTypes() {
+		w, ok := weights[typ]
+		if !ok || w <= 0 {
+			t.Errorf("%s has no billing weight", typ)
+		}
+		if got := ServerUnitWeight(typ); got != w {
+			t.Errorf("%s: ServerUnitWeight = %d, table says %d", typ, got, w)
+		}
+	}
+	if len(weights) != len(ServerTypes()) {
+		t.Errorf("the weight table has %d entries for %d types", len(weights), len(ServerTypes()))
+	}
+	if ServerUnitWeight("totally-unknown") != DefaultServerUnitWeight {
+		t.Error("an unknown type must bill as an ordinary server, never as free")
+	}
+	// The SQL the drift sweep runs is generated from the same table; a type
+	// missing from it bills at the fallback inside the database only, which is
+	// invisible until an invoice disagrees with the dashboard.
+	sql := unitWeightSQL("s.type")
+	for _, typ := range ServerTypes() {
+		if !strings.Contains(sql, "WHEN '"+typ+"'") {
+			t.Errorf("unitWeightSQL omits %q: %s", typ, sql)
+		}
+	}
+}
+
+// The distro sentence is generated so the two rejection messages in the API
+// cannot drift from the list they are describing.
+func TestSupportedDistroSentence(t *testing.T) {
+	got := SupportedDistroSentence()
+	for _, d := range SupportedDistros() {
+		if !DistroSupported(d) {
+			t.Errorf("%q is listed but not supported", d)
+		}
+	}
+	if !strings.Contains(got, " or ") {
+		t.Errorf("the sentence must read as a list of alternatives: %q", got)
+	}
+	if strings.Contains(got, "ubuntu-22.04") {
+		t.Errorf("the operator-facing sentence must use labels, not ids: %q", got)
+	}
+	if DistroSupported("centos-7") {
+		t.Error("an unlisted distro must not be onboardable")
+	}
+}
+
+func requirementText(r ServerRequirements, id RequirementID) string {
+	for _, check := range r.List() {
+		if check.ID == id {
+			return check.Text
+		}
+	}
+	return ""
+}
+
+func mustDisk(t *testing.T, typ string) int64 {
+	t.Helper()
+	req, ok := ServerRequirementsFor(typ)
+	if !ok {
+		t.Fatalf("%s is not in the catalog", typ)
+	}
+	return req.MinDiskBytes
+}
+
+// hostsOf reads a type's hosted kinds, failing the test if the type is unknown
+// — a typo in a test fixture must not read as an empty host list.
+func hostsOf(t *testing.T, typ string) []string {
+	t.Helper()
+	spec, ok := ServerTypeSpecFor(typ)
+	if !ok {
+		t.Fatalf("%s is not in the catalog", typ)
+	}
+	return spec.Hosts
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func equalSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		if !contains(b, x) {
+			return false
+		}
+	}
+	return true
+}

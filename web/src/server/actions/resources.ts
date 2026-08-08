@@ -11,7 +11,6 @@ import {
   cpEnabled,
   cpCreateResource,
   cpDeleteResource,
-  cpKind,
   cpMirrorServer,
   cpSelectGitRepo,
   cpRedeploy,
@@ -114,7 +113,7 @@ export async function createResource(input: {
         environmentId: input.environmentId,
         serverId: input.serverId,
         name,
-        kind: cpKind(input.kind),
+        kind: input.kind,
         spec,
       },
       { name: user.name, role }

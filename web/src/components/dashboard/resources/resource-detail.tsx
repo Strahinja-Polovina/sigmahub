@@ -204,7 +204,7 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
 
 /** Kinds whose deletion also destroys the only copy of their restic repo key,
  *  so the confirm dialog must say so (SIGMA-170/185). */
-const DB_KINDS = ["postgres", "mysql", "redis", "mongo", "mongodb"];
+const DB_KINDS = ["postgres", "mysql", "redis", "mongodb"];
 
 /** Delete is confirm-gated and typed: it cascades the resource's entire
  *  deployment history — every sibling destructive action on this page already

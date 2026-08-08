@@ -1,5 +1,3 @@
-import type { ResourceKind, ServerType } from "@/lib/mock";
-
 // Nested deploy target (project → environment → servers) fed to the wizard.
 export type DeployTargetServer = {
   id: string;
@@ -18,27 +16,14 @@ export type DeployTarget = {
   }[];
 };
 
-// Human-readable labels for resource kinds (matches the Overview page).
-export const KIND_LABELS: Record<ResourceKind, string> = {
-  app: "App",
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mongo: "MongoDB",
-  redis: "Redis",
-  s3: "Object storage",
-  llm: "LLM",
-};
-
-// Human-readable labels for server types.
-export const SERVER_TYPE_LABELS: Record<ServerType, string> = {
-  general: "General",
-  vps: "VPS",
-  database: "Database",
-  storage: "Storage",
-  gpu: "GPU",
-  k8s: "Cluster node",
-  build: "Build",
-};
+// Labels come from the control plane's catalog (generated, SIGMA-198). This
+// module used to keep its own copy — one of four that had to be edited in
+// lockstep to add a resource kind, and the reason MongoDB was labelled under two
+// different keys depending on which screen you were looking at.
+export {
+  RESOURCE_KIND_LABELS as KIND_LABELS,
+  SERVER_TYPE_LABELS,
+} from "@/lib/server-catalog.generated";
 
 export function formatDate(iso: string | Date) {
   return new Date(iso).toLocaleDateString("en-GB", {

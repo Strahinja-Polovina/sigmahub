@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -42,7 +44,29 @@ type registerRequest struct {
 	Pubkey         string          `json:"pubkey"`
 }
 
-var validServerTypes = map[string]bool{"general": true, "database": true, "storage": true, "gpu": true}
+// serverTypeError validates a requested server type against the CANONICAL
+// catalog and returns the message to reject it with, or "" when it is fine.
+//
+// This used to be a fifth hand-written list (`validServerTypes`) holding only
+// general/database/storage/gpu. It ran BEFORE the store's own check, so the
+// store's list was unreachable on these two routes and the boundary refused
+// three types the domain model accepted: the connect dialog's own VPS and Build
+// buttons POSTed here and got a bare 400 "invalid server type" (SIGMA-198).
+// Delegating means the boundary can never again accept less than the store.
+func serverTypeError(typ string) string {
+	if store.IsServerType(typ) {
+		return ""
+	}
+	return fmt.Sprintf("invalid server type %q; expected one of %s",
+		typ, strings.Join(store.ServerTypes(), ", "))
+}
+
+// unsupportedDistroMessage names the onboardable distros from the catalog. The
+// sentence used to be hand-typed at both rejection points, so adding a distro
+// meant editing prose in two places that no test read.
+func unsupportedDistroMessage() string {
+	return "unsupported distro: only " + store.SupportedDistroSentence() + " can be onboarded"
+}
 
 func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
@@ -55,8 +79,8 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 	if typ == "" {
 		typ = "general"
 	}
-	if !validServerTypes[typ] {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid server type"})
+	if msg := serverTypeError(typ); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 	token, serverID, expiresAt, err := s.store.IssueBootstrapToken(
@@ -87,13 +111,12 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 	if typ == "" {
 		typ = "general"
 	}
-	if !validServerTypes[typ] {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid server type"})
+	if msg := serverTypeError(typ); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 	if req.Distro != "" && !store.DistroSupported(req.Distro) {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-			"error": "unsupported distro: only Ubuntu 22.04/24.04 and Debian 12 can be onboarded"})
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": unsupportedDistroMessage()})
 		return
 	}
 	res, err := s.store.ProvisionServer(r.Context(), orgID, store.ProvisionInput{
@@ -101,8 +124,7 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 		ProxyRole: req.ProxyRole, Distro: req.Distro, HostIP: req.HostIP,
 	}, principalFrom(r).Name, defaultBootstrapTTL)
 	if errors.Is(err, store.ErrUnsupportedDistro) {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-			"error": "unsupported distro: only Ubuntu 22.04/24.04 and Debian 12 can be onboarded"})
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": unsupportedDistroMessage()})
 		return
 	}
 	if err != nil {

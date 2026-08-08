@@ -20,11 +20,6 @@ export function slugifyName(x: string): string {
   );
 }
 
-/** The CP kind vocabulary says "mongodb"; the local schema says "mongo". */
-export function localResourceKind(cpKind: string): string {
-  return cpKind === "mongodb" ? "mongo" : cpKind;
-}
-
 /** CP resource status is a JSON doc whose `state` becomes authoritative once
  *  the reconciler populates it; until then keep the existing mirror value.
  *
@@ -119,7 +114,7 @@ export function resourceMirrorRow(
     environmentId: cp.environmentId,
     serverId: cp.serverId || null,
     name: cp.name,
-    kind: localResourceKind(cp.kind),
+    kind: cp.kind,
     status: resourceStatusText(cp.status, existing?.status),
     // repo/domain ride the CP spec for web-created resources; local values
     // win when the spec doesn't carry them (e.g. database resources).

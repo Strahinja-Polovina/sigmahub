@@ -6,6 +6,7 @@ import { db } from "../db";
 import * as s from "../db/schema";
 import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../active-org";
 import { writeAudit } from "../audit";
+import type { ServerType } from "@/lib/server-catalog.generated";
 import {
   cpEnabled,
   cpIssueBootstrapToken,
@@ -60,12 +61,21 @@ function hashNum(str: string, mod: number) {
   return h % mod;
 }
 
-// Reported host capacity by type — simulated at agent check-in.
-const SPEC: Record<string, { cpu: number; memGb: number }> = {
+// Reported host capacity by type — simulated at agent check-in (demo mode only;
+// in CP mode the real agent reports its own facts).
+//
+// Keyed on the generated ServerType union, so adding a server type to the CP
+// catalog fails `tsc` here rather than silently giving the new type a general
+// server's shape. It used to name four types and fall through for the other
+// three, which is how a demo VPS reported 16 GB of RAM.
+const SPEC: Record<ServerType, { cpu: number; memGb: number }> = {
   general: { cpu: 4, memGb: 16 },
+  vps: { cpu: 2, memGb: 8 },
   database: { cpu: 8, memGb: 64 },
   storage: { cpu: 4, memGb: 16 },
   gpu: { cpu: 16, memGb: 128 },
+  k8s: { cpu: 8, memGb: 32 },
+  build: { cpu: 8, memGb: 32 },
 };
 
 export type ConnectServerResult =
@@ -88,7 +98,7 @@ export type ConnectServerResult =
 export async function connectServer(input: {
   orgId: string;
   name: string;
-  type: string; // general | database | storage | gpu
+  type: string; // a ServerType; validated against the CP catalog server-side
   provider: string;
   region: string;
   byoVpn?: boolean;
@@ -358,7 +368,7 @@ export async function agentCheckIn(input: { serverId: string }) {
   if (!server) throw new Error("Server not found.");
   const { user } = await requireMembership(server.orgId);
   if (server.status !== "provisioning") return; // idempotent
-  const spec = SPEC[server.type] ?? SPEC.general;
+  const spec = SPEC[server.type as ServerType] ?? SPEC.general;
   await db
     .update(s.servers)
     .set({

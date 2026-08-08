@@ -73,8 +73,8 @@ import { CheckInButton } from "./servers-view";
 import {
   SERVER_TYPE_LABELS,
   RESOURCE_KIND_LABELS,
-  formatDate,
-} from "./server-meta";
+} from "@/lib/server-catalog.generated";
+import { formatDate } from "@/components/dashboard/resources/resource-meta";
 
 type ServerRowT = {
   id: string;

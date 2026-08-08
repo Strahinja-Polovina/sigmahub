@@ -26,20 +26,11 @@ var (
 	ErrNotFound     = errors.New("not found")
 )
 
-// supportedDistros is the exact set the SSH provisioner accepts; anything else
-// is rejected up front with an actionable error (SIGMA-A-5: Ubuntu 22.04/24.04
-// and Debian 12 only for the hardened onboarding path).
-var supportedDistros = map[string]bool{
-	"ubuntu-22.04": true,
-	"ubuntu-24.04": true,
-	"debian-12":    true,
-}
-
-// ErrUnsupportedDistro is returned when a host's OS is outside supportedDistros.
+// ErrUnsupportedDistro is returned when a host's OS is outside the onboardable
+// set (SIGMA-A-5: the hardened path accepts Ubuntu 22.04/24.04 and Debian 12).
+// The set itself, and each server type's own narrower allow-list, live in
+// server_catalog.go — see DistroSupported / SupportedDistroSentence.
 var ErrUnsupportedDistro = errors.New("unsupported distro")
-
-// DistroSupported reports whether a normalized distro id is onboardable.
-func DistroSupported(distro string) bool { return supportedDistros[distro] }
 
 type Server struct {
 	ID           string          `json:"id"`
@@ -163,7 +154,7 @@ type ProvisionInput struct {
 // bootstrap token binds to a concrete record and the WireGuard config the
 // installer applies can carry this server's mesh IP from the first heartbeat.
 func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in ProvisionInput) (string, error) {
-	if in.Distro != "" && !supportedDistros[in.Distro] {
+	if in.Distro != "" && !DistroSupported(in.Distro) {
 		return "", ErrUnsupportedDistro
 	}
 	name := in.Name
@@ -256,7 +247,7 @@ type ProvisionResult struct {
 // public key is returned so it can be appended to the host's authorized_keys for
 // a single login, then removed by the installer), and issues a bound token.
 func (s *Store) ProvisionServer(ctx context.Context, orgID string, in ProvisionInput, createdBy string, ttl time.Duration) (ProvisionResult, error) {
-	if in.Distro != "" && !supportedDistros[in.Distro] {
+	if in.Distro != "" && !DistroSupported(in.Distro) {
 		return ProvisionResult{}, ErrUnsupportedDistro
 	}
 	pub, seed, err := generateEd25519Seed()

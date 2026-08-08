@@ -1,26 +1,14 @@
 import { Badge } from "@/components/ui/badge";
 import type { ResourceKind, ServerType } from "@/lib/mock";
 
-// Human labels for resource kinds — mirrors the Overview page for consistency.
-export const KIND_LABELS: Record<ResourceKind, string> = {
-  app: "App",
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mongo: "MongoDB",
-  redis: "Redis",
-  s3: "Object storage",
-  llm: "LLM",
-};
+// Labels come from the control plane's catalog (generated, SIGMA-198). Both are
+// re-exported because callers across the project pages import them from here.
+import {
+  RESOURCE_KIND_LABELS as KIND_LABELS,
+  SERVER_TYPE_LABELS,
+} from "@/lib/server-catalog.generated";
 
-export const SERVER_TYPE_LABELS: Record<ServerType, string> = {
-  general: "General",
-  vps: "VPS",
-  storage: "Storage",
-  database: "Database",
-  gpu: "GPU",
-  k8s: "Cluster node",
-  build: "Build",
-};
+export { KIND_LABELS, SERVER_TYPE_LABELS };
 
 export function KindBadge({ kind }: { kind: ResourceKind }) {
   return (
