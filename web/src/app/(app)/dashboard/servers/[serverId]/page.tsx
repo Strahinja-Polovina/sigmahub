@@ -84,5 +84,16 @@ export default async function ServerDetailPage({
   if (!server || server.orgId !== orgId) notFound();
 
   const hosted = await getServerHosted(serverId, visible);
-  return <ServerDetailView server={server} hosted={hosted} />;
+  // orgId reaches demo mode too: renaming a server and the two exits out of an
+  // incompatible enrollment are org-scoped actions, and a demo that could show
+  // the state without offering its exits would be demonstrating a dead end
+  // (SIGMA-202/203).
+  return (
+    <ServerDetailView
+      server={server}
+      hosted={hosted}
+      orgId={orgId}
+      canManage={role === "Org Admin" || role === "Project Admin"}
+    />
+  );
 }

@@ -147,6 +147,12 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
           meshIp: row.meshIp,
           cpu: row.cpu,
           memGb: row.memGb,
+          // Detected facts and the gate's verdict move — a driver appears, a
+          // disk grows, a type is changed — so the mirror has to follow them
+          // like every other mutable column here, or it freezes at whatever
+          // the host looked like the first time it was synced.
+          facts: row.facts,
+          incompatibleReasons: row.incompatibleReasons,
         },
       });
   }

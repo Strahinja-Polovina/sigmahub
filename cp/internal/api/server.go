@@ -254,6 +254,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers", s.requireService(store.RoleDeveloper, s.handleListServers))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleDeveloper, s.handleGetServer))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/servers/{serverId}/metrics", s.requireService(store.RoleDeveloper, s.handleGetMetrics))
+	// The two exits from an incompatible enrollment, and the naming the connect
+	// form no longer asks for (SIGMA-202/203). `type` re-runs the compatibility
+	// gate on the stored facts and answers with the server's new state; the
+	// other exit is the DELETE below.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/type", s.requireService(store.RoleProjectAdmin, s.handleSetServerType))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/rename", s.requireService(store.RoleProjectAdmin, s.handleRenameServer))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/proxy-role", s.requireService(store.RoleProjectAdmin, s.handleProxyRole))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/hardening", s.requireService(store.RoleProjectAdmin, s.handleSetHardening))
 	// Server + token lifecycle (P1-4). Server delete and agent-token revoke are

@@ -36,6 +36,25 @@ export const servers: Server[] = [
   { id: "srv_gpu_1", orgId: "org_acme", name: "gpu-a100-01", type: "gpu", provider: "BYO · bare metal", region: "on-prem · RS", status: "degraded", agentVersion: "1.4.2", ip: "10.8.0.41", cpu: 16, memGb: 128, connectedAt: "2027-02-02", environmentIds: ["env_mllab_prod"], resourceCount: 1, byoVpn: true },
   { id: "srv_gen_3", orgId: "org_acme", name: "ash-general-03", type: "general", provider: "Hetzner", region: "us-east · ASH", status: "provisioning", agentVersion: "1.4.2", ip: "10.8.0.13", cpu: 4, memGb: 16, connectedAt: "2027-03-01", environmentIds: [], resourceCount: 0, byoVpn: false },
   { id: "srv_nw_1", orgId: "org_northwind", name: "ams-general-01", type: "general", provider: "DigitalOcean", region: "eu · AMS3", status: "running", agentVersion: "1.4.2", ip: "10.9.0.11", cpu: 2, memGb: 4, connectedAt: "2027-02-10", environmentIds: ["env_site_prod"], resourceCount: 2, byoVpn: false },
+  // The misfiled host: an ordinary box someone connected as a GPU server. Its
+  // STATUS is not written here — the seed runs the real compatibility gate over
+  // these facts, so the demo shows the same verdict, in the same words, that a
+  // real machine would get (SIGMA-203). It exists because the incompatible
+  // state has to be visible in a demo, and nobody demoing owns a GPU box with
+  // no GPU in it.
+  {
+    id: "srv_gpu_2", orgId: "org_acme", name: "fsn-gpu-02", type: "gpu",
+    provider: "Hetzner", region: "eu-central · FSN1", status: "provisioning",
+    agentVersion: "1.4.2", ip: "203.0.113.44", cpu: 4, memGb: 16,
+    connectedAt: "2027-03-04", environmentIds: [], resourceCount: 0, byoVpn: false,
+    facts: {
+      hostname: "fsn-gpu-02", os: "linux", arch: "amd64", numCpu: 4, memTotalMb: 16384,
+      distro: "ubuntu-24.04", distroName: "Ubuntu 24.04.1 LTS",
+      diskTotalBytes: 480_000_000_000, diskFreeBytes: 402_000_000_000, diskPath: "/",
+      gpu: { vendor: "", count: 0 },
+      dockerAvailable: true, dockerVersion: "27.3.1",
+    },
+  },
 ];
 
 export const resources: Resource[] = [

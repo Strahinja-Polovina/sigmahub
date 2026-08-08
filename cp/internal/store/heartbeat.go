@@ -77,7 +77,15 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 	//
 	// distro tracks the agent's reading for the same reason as at register: the
 	// provisioned value was a guess, this one is the machine's own answer.
-	var orgID, name, prevStatus, status string
+	//
+	// The status transition is NOT decided in this statement any more. It used
+	// to be a CASE over the old status; since SIGMA-203 it also depends on
+	// whether the host still satisfies its type's requirements, which is a walk
+	// over the MERGED facts — the row's own accumulated knowledge, not this
+	// payload. So the merge happens here, the verdict is computed in Go from
+	// what came back, and the status is written below in the same transaction.
+	var orgID, name, serverType, prevStatus string
+	var merged json.RawMessage
 	err = tx.QueryRow(ctx, `
 		UPDATE servers s
 		   SET last_seen_at = now(),
@@ -85,28 +93,43 @@ func (s *Store) RecordHeartbeat(ctx context.Context, serverID string, in Heartbe
 		       facts = s.facts || $3::jsonb,
 		       pubkey = COALESCE(NULLIF($4, ''), s.pubkey),
 		       endpoint = COALESCE(NULLIF($5, ''), s.endpoint),
-		       distro = COALESCE(NULLIF($6, ''), s.distro),
-		       status = CASE WHEN s.status IN ('provisioning', 'unreachable') THEN 'running' ELSE s.status END
+		       distro = COALESCE(NULLIF($6, ''), s.distro)
 		  FROM servers old
 		 WHERE s.id = $1 AND old.id = s.id AND s.deleted_at IS NULL
-		 RETURNING s.org_id, s.name, old.status, s.status`,
+		 RETURNING s.org_id, s.name, s.type, old.status, s.facts`,
 		serverID, in.AgentVersion, facts, in.Pubkey, in.Endpoint, reported.Distro,
-	).Scan(&orgID, &name, &prevStatus, &status)
+	).Scan(&orgID, &name, &serverType, &prevStatus, &merged)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("record heartbeat: %w", err)
 	}
+
+	// Re-running the gate on every heartbeat is what makes the incompatible
+	// state recoverable rather than a dead end: the operator installs the
+	// driver or grows the disk, the next check-in reports it, and the server
+	// comes back on its own. It is also what keeps the verdict honest in the
+	// other direction — a card pulled out of a GPU host stops that host being
+	// billed and scheduled as one.
+	fails := CheckServerCompatibility(serverType, ParseHostFacts(merged))
+	status := compatibilityStatus(prevStatus, fails, true)
+	if err := writeCompatibilityTx(ctx, tx, serverID, status, fails); err != nil {
+		return err
+	}
 	if prevStatus != status {
+		action := "Server running"
+		if status == ServerStatusIncompatible {
+			action = "Server incompatible — " + IncompatibilitySummary(fails)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO cp_audit_log (org_id, actor, action, target)
-			VALUES ($1, 'sigmad', 'Server running', $2)`, orgID, name); err != nil {
+			VALUES ($1, 'sigmad', $3, $2)`, orgID, name, action); err != nil {
 			return fmt.Errorf("audit: %w", err)
 		}
 		// Resolve notification (P2-6): pairs with the sweeper's unreachable
 		// alert. Same cooldown so a flapping agent produces one pair per window.
-		if prevStatus == "unreachable" {
+		if prevStatus == ServerStatusUnreachable && status == ServerStatusRunning {
 			if err := enqueueAlertTx(ctx, tx, orgID, AlertServerRecovered,
 				"srv:"+serverID+":recovered", 30*time.Minute,
 				"Server "+name+" recovered",

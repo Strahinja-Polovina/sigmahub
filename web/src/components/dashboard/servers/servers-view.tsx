@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/dashboard/status-indicator";
 import type { ServerType, Status } from "@/lib/mock";
 import type { ServerWithCount } from "@/server/queries";
-import { agentCheckIn } from "@/server/actions/servers";
+import { agentCheckIn, type DemoHostShape } from "@/server/actions/servers";
 import {
   ClustersPanel,
   type ClusterEnvironment,
@@ -48,7 +48,22 @@ function TypeBadge({ type }: { type: ServerType }) {
   );
 }
 
-export function CheckInButton({ serverId }: { serverId: string }) {
+/** Demo-only agent check-in.
+ *
+ *  `shape` is what the pretend machine turns out to be. "generic" is an
+ *  ordinary box — no accelerator, a small disk — which is what someone actually
+ *  plugs in when they picked GPU or Storage by mistake, and the only way to
+ *  reach (and then recover from) the incompatible state without owning the
+ *  wrong hardware (SIGMA-203/215). */
+export function CheckInButton({
+  serverId,
+  shape = "matching",
+  label = "Simulate check-in",
+}: {
+  serverId: string;
+  shape?: DemoHostShape;
+  label?: string;
+}) {
   const [pending, startTransition] = React.useTransition();
   return (
     <Button
@@ -58,9 +73,12 @@ export function CheckInButton({ serverId }: { serverId: string }) {
       onClick={() =>
         startTransition(async () => {
           try {
-            await agentCheckIn({ serverId });
+            await agentCheckIn({ serverId, shape });
             toast.success("Agent checked in", {
-              description: "The server is now running and billable.",
+              description:
+                shape === "generic"
+                  ? "The host reported an ordinary box — see how it lands against the type you picked."
+                  : "The server is now running and billable.",
             });
           } catch (err) {
             toast.error("Check-in failed", {
@@ -71,7 +89,7 @@ export function CheckInButton({ serverId }: { serverId: string }) {
       }
     >
       {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Radio className="size-3.5" />}
-      Simulate check-in
+      {label}
     </Button>
   );
 }
@@ -99,7 +117,16 @@ function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boole
           <StatusBadge status={server.status as Status} />
           {/* CP mode: the real sigmad checks in — nothing to simulate. */}
           {!cpMode && server.status === "provisioning" && (
-            <CheckInButton serverId={server.id} />
+            <>
+              <CheckInButton serverId={server.id} />
+              <CheckInButton serverId={server.id} shape="generic" label="…as an ordinary box" />
+            </>
+          )}
+          {/* A refused host recovers the moment the machine satisfies the
+              requirement — a driver installed, a disk grown. In demo mode the
+              equivalent is checking in as the machine the type expects. */}
+          {!cpMode && server.status === "incompatible" && (
+            <CheckInButton serverId={server.id} label="…as the right machine" />
           )}
         </div>
       </TableCell>

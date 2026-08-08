@@ -68,6 +68,12 @@ type Server struct {
 	// time (SIGMA-179). Defaults TRUE when no hardening row exists, matching
 	// HostHardeningForServer's fail-safe.
 	KeepPublicSSH bool `json:"keepPublicSsh"`
+	// IncompatibleReasons is why status is 'incompatible' — one entry per
+	// requirement of this server's TYPE that its reported facts violate
+	// (SIGMA-203). Always an array, empty for every other status, so the
+	// dashboard has no null case to invent a meaning for. Populated by
+	// ListServers/GetServer only.
+	IncompatibleReasons []FailedRequirement `json:"incompatibleReasons"`
 }
 
 // readinessExpr is the derived Ready predicate: the server is live (running),
@@ -209,6 +215,48 @@ func normalizeFacts(facts json.RawMessage) json.RawMessage {
 	return out
 }
 
+// reportedHostname extracts the agent's hostname from a normalized facts blob,
+// sanitized for use as a server NAME (SIGMA-202).
+//
+// Deliberately not a field on HostFacts: that struct is the typed view over
+// exactly the facts the catalog's requirements read, and widening it for a
+// value no requirement checks would blur the one rule that keeps the gate
+// honest. This is a different question asked of the same blob.
+//
+// Sanitizing matters because whoever holds the bootstrap token controls this
+// string, and it becomes a display name, an audit target and a search key. A
+// hostname is at most 253 bytes of printable ASCII; anything else is either a
+// broken host or someone trying to write a newline into an audit log.
+func reportedHostname(facts json.RawMessage) string {
+	var f struct {
+		Hostname string `json:"hostname"`
+	}
+	if err := json.Unmarshal(facts, &f); err != nil {
+		return ""
+	}
+	return sanitizeServerName(f.Hostname)
+}
+
+// maxServerNameLen is RFC 1035's limit on a full domain name. A server name can
+// come from a hostname, so the two share a bound rather than the rename path
+// inventing a shorter one that a legitimate auto-assigned name would fail.
+const maxServerNameLen = 253
+
+// sanitizeServerName trims, drops control characters and bounds the length.
+func sanitizeServerName(name string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(name) {
+		if r < ' ' || r == 0x7f {
+			continue
+		}
+		if b.Len() >= maxServerNameLen {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // isZeroJSON reports whether a raw value is absent, null, "", 0 or false — the
 // encodings a Go zero value takes on the wire when an agent serializes a field
 // it could not fill in.
@@ -222,6 +270,11 @@ func isZeroJSON(raw json.RawMessage) bool {
 
 // ProvisionInput describes a server to pre-create during onboarding.
 type ProvisionInput struct {
+	// Name is OPTIONAL since SIGMA-202: the connect form asks for the host
+	// address and the type, and nothing else. An empty name pre-creates the row
+	// under a placeholder (the host address) and marks it machine-assigned, so
+	// registration can replace it with the hostname the machine reports. A name
+	// given here is the operator's and is never overwritten.
 	Name      string
 	Type      string
 	Provider  string
@@ -239,13 +292,27 @@ type ProvisionInput struct {
 // returning the new id. The server exists BEFORE the agent registers, so the
 // bootstrap token binds to a concrete record and the WireGuard config the
 // installer applies can carry this server's mesh IP from the first heartbeat.
-func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in ProvisionInput) (string, error) {
+// Returns the id AND the resolved name, because the name is no longer
+// necessarily the caller's: an empty one becomes a placeholder here, and the
+// bootstrap-token row and the audit entry have to record what the server is
+// actually called rather than the empty string the caller passed.
+func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in ProvisionInput) (string, string, error) {
 	if in.Distro != "" && !DistroSupported(in.Distro) {
-		return "", ErrUnsupportedDistro
+		return "", "", ErrUnsupportedDistro
 	}
-	name := in.Name
+	// A name the operator did not give is a name the MACHINE gets to supply:
+	// registration replaces the placeholder with the reported hostname
+	// (SIGMA-202). Until the agent checks in the row still has to be
+	// identifiable in a list, so the placeholder is the address the operator
+	// typed — the only handle they have on the box at that moment. "server" is
+	// the last resort for the manual/NAT path, which has no address either.
+	name, nameAuto := in.Name, false
 	if name == "" {
-		name = "server"
+		nameAuto = true
+		name = strings.TrimSpace(in.HostIP)
+		if name == "" {
+			name = "server"
+		}
 	}
 	typ := in.Type
 	if typ == "" {
@@ -255,21 +322,21 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	// availability matrix would match no kind), and it would bill at the default
 	// weight rather than its real one. Fail at enrollment instead.
 	if !IsServerType(typ) {
-		return "", ErrInvalid{Msg: fmt.Sprintf("unknown server type %q; expected one of %s",
+		return "", "", ErrInvalid{Msg: fmt.Sprintf("unknown server type %q; expected one of %s",
 			typ, strings.Join(ServerTypes(), ", "))}
 	}
 	meshIP, err := allocateMeshIP(ctx, tx, orgID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	id := newID("srv")
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO servers (id, org_id, name, type, source, proxy_role, provider, region, mesh_ip, distro, endpoint, status)
-		VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), 'provisioning')`,
-		id, orgID, name, typ, in.ProxyRole, in.Provider, in.Region, meshIP, in.Distro, strings.TrimSpace(in.HostIP)); err != nil {
-		return "", fmt.Errorf("pre-create server: %w", err)
+		INSERT INTO servers (id, org_id, name, name_auto, type, source, proxy_role, provider, region, mesh_ip, distro, endpoint, status)
+		VALUES ($1, $2, $3, $4, $5, 'provisioned', $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''), 'provisioning')`,
+		id, orgID, name, nameAuto, typ, in.ProxyRole, in.Provider, in.Region, meshIP, in.Distro, strings.TrimSpace(in.HostIP)); err != nil {
+		return "", "", fmt.Errorf("pre-create server: %w", err)
 	}
-	return id, nil
+	return id, name, nil
 }
 
 // issueTokenTx binds a fresh single-use bootstrap token to an already-created
@@ -303,12 +370,12 @@ func (s *Store) IssueBootstrapToken(ctx context.Context, orgID, serverName, serv
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	serverID, err = precreateServerTx(ctx, tx, orgID, ProvisionInput{
+	serverID, name, err := precreateServerTx(ctx, tx, orgID, ProvisionInput{
 		Name: serverName, Type: serverType, Provider: provider, Region: region})
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	token, err = s.issueTokenTx(ctx, tx, orgID, serverID, serverName, createdBy, expiresAt)
+	token, err = s.issueTokenTx(ctx, tx, orgID, serverID, name, createdBy, expiresAt)
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -353,7 +420,7 @@ func (s *Store) ProvisionServer(ctx context.Context, orgID string, in ProvisionI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	serverID, err := precreateServerTx(ctx, tx, orgID, in)
+	serverID, name, err := precreateServerTx(ctx, tx, orgID, in)
 	if err != nil {
 		return ProvisionResult{}, err
 	}
@@ -361,10 +428,6 @@ func (s *Store) ProvisionServer(ctx context.Context, orgID string, in ProvisionI
 		`UPDATE servers SET bootstrap_pubkey = $1, bootstrap_key_wrapped = $2 WHERE id = $3`,
 		authorizedKey, wrapped, serverID); err != nil {
 		return ProvisionResult{}, fmt.Errorf("store bootstrap key: %w", err)
-	}
-	name := in.Name
-	if name == "" {
-		name = "server"
 	}
 	token, err := s.issueTokenTx(ctx, tx, orgID, serverID, name, createdBy, expiresAt)
 	if err != nil {
@@ -514,16 +577,24 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 	// logged into the machine; /etc/os-release is what the machine actually is
 	// (SIGMA-201). An agent that could not read it reports nothing and the
 	// operator's answer stands.
+	//
+	// The name follows the same principle one step further (SIGMA-202): when
+	// the operator did not name the host, the hostname the machine reports is
+	// the name, and name_auto is cleared so this happens exactly once — a
+	// machine renamed at the OS level later must not silently rename the server
+	// out from under whoever has been calling it something else.
 	var srv Server
 	err = tx.QueryRow(ctx, `
 		UPDATE servers s
 		   SET agent_version = $3,
 		       facts = s.facts || $4::jsonb,
 		       pubkey = NULLIF($5, ''),
-		       distro = COALESCE(NULLIF($6, ''), s.distro)
+		       distro = COALESCE(NULLIF($6, ''), s.distro),
+		       name = CASE WHEN s.name_auto AND NULLIF($7, '') IS NOT NULL THEN $7 ELSE s.name END,
+		       name_auto = CASE WHEN s.name_auto AND NULLIF($7, '') IS NOT NULL THEN FALSE ELSE s.name_auto END
 		 WHERE s.id = $1 AND s.org_id = $2 AND s.deleted_at IS NULL
 		 RETURNING id, org_id, name, type, source, proxy_role, provider, region, status, agent_version, facts, mesh_ip, pubkey, last_seen_at, created_at`,
-		serverID, orgID, agentVersion, facts, pubkey, reported.Distro,
+		serverID, orgID, agentVersion, facts, pubkey, reported.Distro, reportedHostname(facts),
 	).Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -532,6 +603,31 @@ func (s *Store) RegisterServer(ctx context.Context, bootstrapToken, name, agentV
 	}
 	if err != nil {
 		return RegisterResult{}, fmt.Errorf("update server: %w", err)
+	}
+
+	// The compatibility gate (SIGMA-203). It runs on the MERGED facts returned
+	// above, never on the request payload: an agent re-registering a host whose
+	// disk was measured on a previous check-in must be judged on everything
+	// known about the machine, not on whatever this one payload happened to
+	// carry.
+	//
+	// A refusal here is not an error — registration SUCCEEDS, the agent gets
+	// its token and keeps heartbeating. That is deliberate: the host is fine,
+	// the type it was filed under is wrong, and an agent that could not
+	// register would have no way to report the corrected facts that clear the
+	// state. What changes is the status the operator sees and the two exits the
+	// dashboard then offers (change the type, or disconnect).
+	fails := CheckServerCompatibility(srv.Type, ParseHostFacts(srv.Facts))
+	srv.Status = compatibilityStatus(srv.Status, fails, false)
+	srv.IncompatibleReasons = append([]FailedRequirement{}, fails...)
+	if err := writeCompatibilityTx(ctx, tx, srv.ID, srv.Status, fails); err != nil {
+		return RegisterResult{}, err
+	}
+	if len(fails) > 0 {
+		if err := auditTx(ctx, tx, orgID, "sigmad",
+			"Server incompatible — "+IncompatibilitySummary(fails), srv.Name); err != nil {
+			return RegisterResult{}, err
+		}
 	}
 
 	agentTok, digest := s.newToken("sat")
@@ -581,15 +677,24 @@ const serverSelect = `
 	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
 	       s.agent_version, s.facts, s.mesh_ip, s.endpoint, s.pubkey, s.last_seen_at, s.created_at,
 	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked,
-	       COALESCE(h.keep_public_ssh, TRUE), ` + readinessExpr + ` AS ready
+	       COALESCE(h.keep_public_ssh, TRUE), s.incompatible_reasons, ` + readinessExpr + ` AS ready
 	  FROM servers s
 	  LEFT JOIN server_hardening h ON h.server_id = s.id`
 
 func scanServerRow(row pgx.Row, srv *Server) error {
-	return row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
+	if err := row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Endpoint, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
 		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked,
-		&srv.KeepPublicSSH, &srv.Ready)
+		&srv.KeepPublicSSH, &srv.IncompatibleReasons, &srv.Ready); err != nil {
+		return err
+	}
+	// The column is NOT NULL '[]', so this only normalizes JSON's `[]` → Go's
+	// nil round trip; the API contract is "always an array", which encoding/json
+	// gives us for a nil slice only if we say so — see MarshalJSON's null.
+	if srv.IncompatibleReasons == nil {
+		srv.IncompatibleReasons = []FailedRequirement{}
+	}
+	return nil
 }
 
 func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error) {

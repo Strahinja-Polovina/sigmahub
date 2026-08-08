@@ -1,0 +1,35 @@
+-- The registration compatibility gate, and the end of the connect form
+-- (SIGMA-202, SIGMA-203).
+--
+-- 1. `servers.status` gains a fourth value: 'incompatible'. A host that
+--    registers, authenticates and heartbeats perfectly, but whose reported
+--    facts do not satisfy the requirements of the TYPE it was enrolled as, is
+--    neither running nor provisioning. Running would bill it at that type's
+--    weight and schedule workloads onto hardware that cannot run them;
+--    provisioning would show a spinner for a state that never resolves on its
+--    own. The two exits are changing the type or disconnecting, and both are
+--    only offerable if the state is distinguishable. No CHECK constraint is
+--    added: the column has never had one (0002_servers_tokens.sql), and adding
+--    one now would make a future status a migration rather than a code change.
+--
+-- 2. incompatible_reasons carries WHY, as data rather than as prose the UI
+--    reinvents: one object per failed requirement, each with the catalog's
+--    stable requirement id, the agent fact that was read, what the type
+--    requires, what the host reported, and the whole sentence the dashboard
+--    renders verbatim. NOT NULL with an empty-array default so every reader
+--    gets an array — a nullable jsonb would have every call site inventing its
+--    own opinion about what NULL means, which is the class of bug the facts
+--    column already taught us (absent ≠ empty).
+--
+-- 3. name_auto marks a name the PRODUCT chose, not the operator. The connect
+--    form no longer asks for a name — the machine already knows its hostname,
+--    and asking the user to invent one before they have logged in is the same
+--    inversion as asking them which distro it runs. The row is pre-created with
+--    a placeholder (the host address the operator typed) so it is identifiable
+--    while the agent is still installing; registration replaces that with the
+--    reported hostname, and only while this flag is set. An operator who names
+--    the server — at connect time or by renaming later — clears it, so the
+--    agent can never overwrite a human's choice.
+ALTER TABLE servers
+    ADD COLUMN IF NOT EXISTS incompatible_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS name_auto            BOOLEAN NOT NULL DEFAULT FALSE;

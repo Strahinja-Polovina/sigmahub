@@ -21,6 +21,9 @@ import {
   KeyRound,
   Copy,
   Check,
+  Pencil,
+  HardDrive,
+  Cpu as CpuIcon,
 } from "lucide-react";
 
 import {
@@ -59,10 +62,12 @@ import {
   DialogClose,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import {
   disconnectServer,
+  renameServer,
   setServerHardening,
   setServerProxyRole,
   reissueInstallCommand,
@@ -70,10 +75,16 @@ import {
 } from "@/server/actions/servers";
 import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
+import { IncompatiblePanel } from "./connect-server-dialog";
 import {
   SERVER_TYPE_LABELS,
   RESOURCE_KIND_LABELS,
 } from "@/lib/server-catalog.generated";
+import {
+  isIncompatible,
+  type FailedRequirement,
+  type HostFacts,
+} from "@/lib/server-compat";
 import { formatDate } from "@/components/dashboard/resources/resource-meta";
 
 type ServerRowT = {
@@ -94,6 +105,12 @@ type ServerRowT = {
   byoVpn: boolean;
   connectedAt: Date;
   orgId: string;
+  /** What the agent reported (SIGMA-201). This is where the specification
+   *  below now comes from: arch, OS, disk and GPU were things the connect form
+   *  used to ask for or simply never knew. */
+  facts?: HostFacts | null;
+  /** Why the enrollment gate refused this host, rendered verbatim (SIGMA-203). */
+  incompatibleReasons?: FailedRequirement[];
 };
 
 type HostedRow = {
@@ -104,6 +121,19 @@ type HostedRow = {
   projectName: string;
   envName: string;
 };
+
+/** "2 × NVIDIA L40S · 48 GB each", or "" when the host reported no accelerator
+ *  (or was never asked — the two are indistinguishable to a reader here, and
+ *  both mean there is nothing to show). */
+function gpuLabel(facts: HostFacts | null | undefined): string {
+  const gpu = facts?.gpu;
+  if (!gpu || !gpu.count) return "";
+  const model = gpu.model || gpu.vendor || "GPU";
+  const vram = gpu.vramBytesPerGpu
+    ? ` · ${Math.round(gpu.vramBytesPerGpu / 1_000_000_000)} GB each`
+    : "";
+  return `${gpu.count} × ${model}${vram}`;
+}
 
 function SpecItem({
   icon: Icon,
@@ -153,11 +183,13 @@ function CommandField({ value, ariaLabel }: { value: string; ariaLabel: string }
 }
 
 function ServerActions({
+  orgId,
   serverId,
   serverName,
   cpMode,
   provisioning,
 }: {
+  orgId?: string;
   serverId: string;
   serverName: string;
   cpMode?: boolean;
@@ -165,6 +197,25 @@ function ServerActions({
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
+  // Naming a server lives here now: the connect form stopped asking, because
+  // the machine reports its own hostname (SIGMA-202). "Renamable later" is only
+  // true if there is a later.
+  const [renaming, setRenaming] = React.useState<string | null>(null);
+
+  function rename() {
+    const next = renaming?.trim();
+    if (!orgId || !next) return;
+    startTransition(async () => {
+      const res = await renameServer({ orgId, serverId, name: next });
+      if (!res.ok) {
+        toast.error("Couldn’t rename this server", { description: res.error });
+        return;
+      }
+      setRenaming(null);
+      toast.success(`Renamed to ${res.name}`);
+      router.refresh();
+    });
+  }
   // A freshly re-issued install command (CP mode), shown once in a dialog.
   const [reissued, setReissued] = React.useState<{
     command: string;
@@ -227,6 +278,12 @@ function ServerActions({
         }
       />
       <DropdownMenuContent align="end" className="w-48">
+        {orgId && (
+          <DropdownMenuItem className="gap-2" onClick={() => setRenaming(serverName)}>
+            <Pencil className="size-4 text-muted-foreground" />
+            Rename
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem
           className="gap-2"
           onClick={() => toast.success(`Restarting agent on ${serverName}…`)}
@@ -298,6 +355,35 @@ function ServerActions({
         )}
         <DialogFooter>
           <DialogClose render={<Button type="button" />}>Done</DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog open={renaming !== null} onOpenChange={(next) => { if (!next) setRenaming(null); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Rename server</DialogTitle>
+          <DialogDescription>
+            This server is named after the hostname its agent reported. Renaming
+            it makes the name yours — a later re-registration will not overwrite
+            it.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          value={renaming ?? ""}
+          onChange={(e) => setRenaming(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") rename(); }}
+          aria-label="Server name"
+          autoFocus
+        />
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+            Cancel
+          </DialogClose>
+          <Button onClick={rename} disabled={pending || !renaming?.trim()}>
+            {pending && <Loader2 className="size-4 animate-spin" />}
+            Rename
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -444,7 +530,14 @@ export function ServerDetailView({
   orgId?: string;
   canManage?: boolean;
 }) {
+  const router = useRouter();
   const provisioning = server.status === "provisioning";
+  const incompatible = isIncompatible(server.status);
+  const facts = server.facts ?? {};
+  // "Not yet reported" and "reported as absent" are different: a host with no
+  // metrics yet shows —, a host with no GPU shows nothing at all rather than a
+  // row implying the probe failed.
+  const detected = !provisioning;
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -496,6 +589,7 @@ export function ServerDetailView({
           <div className="flex items-center gap-2">
             {!cpMode && provisioning && <CheckInButton serverId={server.id} />}
             <ServerActions
+              orgId={orgId}
               serverId={server.id}
               serverName={server.name}
               cpMode={cpMode}
@@ -503,6 +597,31 @@ export function ServerDetailView({
             />
           </div>
         </div>
+
+        {/* The enrollment gate's verdict and the two exits it implies. It sits
+            at the top because nothing else on this page can be acted on until
+            it is resolved: no metrics arrive, nothing schedules here, and the
+            server is not billed (SIGMA-203). */}
+        {incompatible && orgId && (
+          <IncompatiblePanel
+            orgId={orgId}
+            state={{
+              id: server.id,
+              name: server.name,
+              type: server.type,
+              status: server.status,
+              distro: server.facts?.distroName ?? server.facts?.distro ?? "",
+              arch: server.facts?.arch ?? "",
+              cpu: server.cpu,
+              memGb: server.memGb,
+              diskTotalBytes: server.facts?.diskTotalBytes ?? 0,
+              gpu: gpuLabel(server.facts),
+              incompatibleReasons: server.incompatibleReasons ?? [],
+            }}
+            onChanged={() => router.refresh()}
+            onDisconnected={() => router.push("/dashboard/servers")}
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -515,12 +634,16 @@ export function ServerDetailView({
             <CardDescription>Last 24 hours reported by the agent.</CardDescription>
           </CardHeader>
           <CardContent>
-            {provisioning ? (
+            {provisioning || incompatible ? (
               <div className="flex flex-col items-center gap-2 py-12 text-center">
-                <Loader2 className="size-5 animate-spin text-muted-foreground" />
-                <p className="text-sm font-medium text-foreground">Waiting for the agent</p>
+                {provisioning && <Loader2 className="size-5 animate-spin text-muted-foreground" />}
+                <p className="text-sm font-medium text-foreground">
+                  {provisioning ? "Waiting for the agent" : "Not collecting metrics"}
+                </p>
                 <p className="max-w-sm text-xs text-muted-foreground">
-                  Metrics stream in once the agent checks in.
+                  {provisioning
+                    ? "Metrics stream in once the agent checks in."
+                    : "This host is enrolled as a type it does not match, so nothing runs here yet. Change its type or disconnect it above."}
                 </p>
               </div>
             ) : (
@@ -535,8 +658,30 @@ export function ServerDetailView({
             <CardDescription>Reported host capacity.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            <SpecItem icon={Cpu} label="vCPU" value={provisioning ? "—" : `${server.cpu} cores`} />
-            <SpecItem icon={MemoryStick} label="Memory" value={provisioning ? "—" : `${server.memGb} GB`} />
+            {/* Everything here is READ OFF THE MACHINE (SIGMA-201/202). The
+                connect form used to ask for the OS and knew nothing about
+                architecture, disk size or accelerators, so this card could
+                only ever show two numbers. */}
+            <SpecItem icon={Cpu} label="vCPU" value={detected ? `${server.cpu} cores` : "—"} />
+            <SpecItem icon={MemoryStick} label="Memory" value={detected ? `${server.memGb} GB` : "—"} />
+            {facts.arch && <SpecItem icon={CpuIcon} label="Architecture" value={facts.arch} />}
+            {(facts.distroName || facts.distro) && (
+              <SpecItem icon={Network} label="OS" value={facts.distroName || facts.distro} />
+            )}
+            {facts.diskTotalBytes ? (
+              <SpecItem
+                icon={HardDrive}
+                label="Disk"
+                value={`${Math.round(facts.diskTotalBytes / 1_000_000_000)} GB${
+                  facts.diskFreeBytes
+                    ? ` · ${Math.round(facts.diskFreeBytes / 1_000_000_000)} GB free`
+                    : ""
+                }`}
+              />
+            ) : null}
+            {gpuLabel(server.facts) && (
+              <SpecItem icon={CpuIcon} label="GPU" value={gpuLabel(server.facts)} />
+            )}
             <Separator />
             <SpecItem
               icon={Network}

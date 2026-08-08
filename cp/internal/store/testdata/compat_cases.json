@@ -1,0 +1,211 @@
+{
+  "_comment": [
+    "Shared fixtures for the SIGMA-203 compatibility gate, asserted by BOTH",
+    "implementations: cp/internal/store/compat_fixture_test.go and",
+    "web/src/lib/server-compat.test.ts.",
+    "",
+    "The control plane owns the decision; the dashboard re-implements it only",
+    "so demo mode — which has no control plane and no wrong hardware to plug",
+    "in — can show the state at all. Two implementations of one rule drift,",
+    "and the drift would be invisible: the demo would quietly refuse hosts the",
+    "real gate accepts, or word the same refusal differently.",
+    "",
+    "This file is the referee. Every case names a host, the type it was",
+    "enrolled as, and the EXACT verdict both sides must produce, sentence",
+    "included — the sentence is rendered verbatim to an operator, so changing",
+    "it is a product decision that should have to be made once, here.",
+    "",
+    "Adding a requirement to the catalog means adding cases here (failing AND",
+    "passing) before either side is finished."
+  ],
+  "cases": [
+    {
+      "name": "an ordinary box connected as a GPU server",
+      "type": "gpu",
+      "facts": {
+        "hostname": "plain-box",
+        "arch": "amd64",
+        "distro": "ubuntu-24.04",
+        "distroName": "Ubuntu 24.04.1 LTS",
+        "diskTotalBytes": 1968526655488,
+        "gpu": { "vendor": "", "count": 0 }
+      },
+      "expect": [
+        {
+          "id": "gpu",
+          "fact": "gpu",
+          "expected": "An NVIDIA GPU with a usable driver.",
+          "detected": "none",
+          "reason": "You connected this as a GPU server, but no NVIDIA GPU was detected."
+        }
+      ]
+    },
+    {
+      "name": "a card with no driver behind it",
+      "type": "gpu",
+      "facts": {
+        "hostname": "gpu-nodriver",
+        "arch": "amd64",
+        "distro": "ubuntu-24.04",
+        "diskTotalBytes": 1968526655488,
+        "gpu": { "vendor": "nvidia", "model": "NVIDIA L40S", "count": 1, "vramBytesPerGpu": 48301604864 }
+      },
+      "expect": [
+        {
+          "id": "gpu",
+          "fact": "gpu",
+          "expected": "An NVIDIA GPU with a usable driver.",
+          "detected": "1 × nvidia, no driver",
+          "reason": "You connected this as a GPU server, but its NVIDIA GPU has no usable driver."
+        }
+      ]
+    },
+    {
+      "name": "a GPU host on the wrong CPU architecture",
+      "type": "gpu",
+      "facts": {
+        "hostname": "gh200",
+        "arch": "arm64",
+        "distro": "ubuntu-24.04",
+        "diskTotalBytes": 1968526655488,
+        "gpu": {
+          "vendor": "nvidia",
+          "model": "NVIDIA GH200",
+          "count": 1,
+          "vramBytesPerGpu": 102005473280,
+          "driverVersion": "550.54.15"
+        }
+      },
+      "expect": [
+        {
+          "id": "arch",
+          "fact": "arch",
+          "expected": "amd64 CPU architecture.",
+          "detected": "arm64",
+          "reason": "You connected this as a GPU server, but its CPU architecture is arm64 — that type needs amd64."
+        }
+      ]
+    },
+    {
+      "name": "a 120 GB VPS connected as object storage",
+      "type": "storage",
+      "facts": {
+        "hostname": "vps-3",
+        "arch": "amd64",
+        "distro": "ubuntu-22.04",
+        "distroName": "Ubuntu 22.04.4 LTS",
+        "diskTotalBytes": 120000000000,
+        "gpu": { "vendor": "", "count": 0 }
+      },
+      "expect": [
+        {
+          "id": "disk",
+          "fact": "diskTotalBytes",
+          "expected": "At least 500 GB of disk.",
+          "detected": "120 GB",
+          "reason": "You connected this as a Storage server, but it has 120 GB of disk — that type needs at least 500 GB."
+        }
+      ]
+    },
+    {
+      "name": "a distro outside the onboardable set",
+      "type": "general",
+      "facts": {
+        "hostname": "workstation",
+        "arch": "amd64",
+        "distro": "fedora-41",
+        "distroName": "Fedora Linux 41 (Workstation Edition)",
+        "diskTotalBytes": 1968526655488
+      },
+      "expect": [
+        {
+          "id": "distro",
+          "fact": "distro",
+          "expected": "Runs Ubuntu 22.04 LTS, Ubuntu 24.04 LTS or Debian 12.",
+          "detected": "Fedora Linux 41 (Workstation Edition)",
+          "reason": "You connected this as a General server, but it runs Fedora Linux 41 (Workstation Edition) — that type needs Ubuntu 22.04 LTS, Ubuntu 24.04 LTS or Debian 12."
+        }
+      ]
+    },
+    {
+      "name": "two requirements violated at once, in catalog order",
+      "type": "storage",
+      "facts": {
+        "hostname": "wrong-on-both",
+        "arch": "amd64",
+        "distro": "fedora-41",
+        "distroName": "Fedora Linux 41",
+        "diskTotalBytes": 120000000000
+      },
+      "expect": [
+        {
+          "id": "distro",
+          "fact": "distro",
+          "expected": "Runs Ubuntu 22.04 LTS, Ubuntu 24.04 LTS or Debian 12.",
+          "detected": "Fedora Linux 41",
+          "reason": "You connected this as a Storage server, but it runs Fedora Linux 41 — that type needs Ubuntu 22.04 LTS, Ubuntu 24.04 LTS or Debian 12."
+        },
+        {
+          "id": "disk",
+          "fact": "diskTotalBytes",
+          "expected": "At least 500 GB of disk.",
+          "detected": "120 GB",
+          "reason": "You connected this as a Storage server, but it has 120 GB of disk — that type needs at least 500 GB."
+        }
+      ]
+    },
+    {
+      "name": "a real GPU host",
+      "type": "gpu",
+      "facts": {
+        "hostname": "gpu-box",
+        "arch": "amd64",
+        "distro": "ubuntu-24.04",
+        "distroName": "Ubuntu 24.04.1 LTS",
+        "diskTotalBytes": 1968526655488,
+        "gpu": {
+          "vendor": "nvidia",
+          "model": "NVIDIA L40S",
+          "count": 2,
+          "vramBytesPerGpu": 48301604864,
+          "vramBytesTotal": 96603209728,
+          "driverVersion": "550.54.15"
+        }
+      },
+      "expect": []
+    },
+    {
+      "name": "the same ordinary box, filed as what it is",
+      "type": "general",
+      "facts": {
+        "hostname": "plain-box",
+        "arch": "amd64",
+        "distro": "ubuntu-24.04",
+        "distroName": "Ubuntu 24.04.1 LTS",
+        "diskTotalBytes": 120000000000,
+        "gpu": { "vendor": "", "count": 0 }
+      },
+      "expect": []
+    },
+    {
+      "name": "an agent that predates every one of these facts",
+      "type": "gpu",
+      "facts": { "hostname": "legacy", "os": "linux", "numCpu": 32, "dockerAvailable": true },
+      "expect": []
+    },
+    {
+      "name": "an agent that reported only its architecture",
+      "type": "gpu",
+      "facts": { "hostname": "arm-1", "arch": "arm64" },
+      "expect": [
+        {
+          "id": "arch",
+          "fact": "arch",
+          "expected": "amd64 CPU architecture.",
+          "detected": "arm64",
+          "reason": "You connected this as a GPU server, but its CPU architecture is arm64 — that type needs amd64."
+        }
+      ]
+    }
+  ]
+}

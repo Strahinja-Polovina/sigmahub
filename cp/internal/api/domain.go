@@ -43,6 +43,11 @@ type DomainAPI interface {
 	// no git deployment to replay (db/s3/registry apps).
 	ForceReapplyResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	SetProxyRole(ctx context.Context, orgID, serverID string, proxy bool, actor string) error
+	// SetServerType / RenameServer are the two things the connect form stopped
+	// asking for (SIGMA-202) plus the exit from an incompatible enrollment
+	// (SIGMA-203) — a type re-filing that re-runs the gate on stored facts.
+	SetServerType(ctx context.Context, orgID, serverID, serverType, actor string) error
+	RenameServer(ctx context.Context, orgID, serverID, name, actor string) error
 	SetHardeningConfig(ctx context.Context, orgID, serverID string, keepPublicSSH, cisEnabled bool, extraPorts []store.PortException, actor string) error
 	ListAudit(ctx context.Context, orgID string, limit int) ([]store.AuditEntry, error)
 	IdempotencyLookup(ctx context.Context, orgID, key string) (store.IdempotentResponse, error)

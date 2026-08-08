@@ -15,6 +15,7 @@ import { createHmac } from "node:crypto";
 import { db, client } from "./db";
 import * as schema from "./db/schema";
 import { createResourceBody } from "@/lib/deploy-spec";
+import type { FailedRequirement, HostFacts } from "@/lib/server-compat";
 import type * as s from "./db/schema";
 
 /** The acting user forwarded to the CP on mutations. */
@@ -29,43 +30,11 @@ export type CpServer = {
   region: string;
   status: string;
   agentVersion: string;
-  facts: {
-    hostname?: string;
-    os?: string;
-    arch?: string;
-    kernel?: string;
-    numCpu?: number;
-    memTotalMb?: number;
-    /** SIGMA-201 — reported by the agent at register and on every heartbeat.
-     *  Every field is optional because an agent older than the fact, or one
-     *  whose probe could not answer, simply omits it; the control plane keeps
-     *  the last known value rather than blanking it, so `undefined` here means
-     *  "never established", not "empty". */
-    /** Catalog distro id ("ubuntu-24.04"), read from /etc/os-release — the
-     *  machine's own answer, not the one picked in the connect wizard. */
-    distro?: string;
-    /** os-release PRETTY_NAME, for display only. */
-    distroName?: string;
-    /** Bytes, for the filesystem at diskPath — NOT a percentage. The server
-     *  catalog states disk floors in bytes and a percentage cannot be compared
-     *  against one. */
-    diskTotalBytes?: number;
-    diskFreeBytes?: number;
-    diskPath?: string;
-    /** Accelerator inventory. Present with `count: 0` on a host that was asked
-     *  and has none; absent only when the agent never looked. VRAM is in BYTES
-     *  per card so the LLM fit estimate (SIGMA-214) can do arithmetic with it
-     *  rather than parsing a rounded "24GB" label. */
-    gpu?: {
-      vendor?: string;
-      model?: string;
-      count?: number;
-      vramBytesPerGpu?: number;
-      vramBytesTotal?: number;
-      driverVersion?: string;
-      cards?: { index: number; model: string; vramBytes: number }[];
-    };
-  } | null;
+  /** The agent's host description (SIGMA-201), reported at register and on
+   *  every heartbeat. The shape lives in @/lib/server-compat because the demo
+   *  gate is evaluated against exactly these fields — one declaration, so the
+   *  two modes cannot disagree about what a host looks like. */
+  facts: HostFacts | null;
   meshIp: string | null;
   /** Public ip:port — the connect wizard's host IP, refreshed by the agent's
    *  STUN probe. Distinct from the private 10.8.x.x meshIp (SIGMA-187). */
@@ -86,6 +55,11 @@ export type CpServer = {
    *  the operator asked for. */
   keepPublicSsh?: boolean;
   proxyRole?: boolean;
+  /** Why status is 'incompatible' — one entry per requirement of this server's
+   *  TYPE that its reported facts violate (SIGMA-203). Always an array from a
+   *  current control plane; optional here so an older CP that predates the gate
+   *  simply reads as "no reasons" rather than crashing the servers page. */
+  incompatibleReasons?: FailedRequirement[];
 };
 
 export type CpMetricPoint = {
@@ -270,14 +244,16 @@ export async function cpIssueBootstrapToken(
 export async function cpProvisionServer(
   orgId: string,
   input: {
-    name: string;
+    /** Optional since SIGMA-202: the connect form asks for the address and the
+     *  type only, and registration names the server from the hostname the
+     *  machine reports. A name here is the operator's and is never overwritten. */
+    name?: string;
     type: string;
     provider: string;
     region: string;
     proxyRole: boolean;
-    distro?: string;
-    /** The wizard's "Host IP" — stored as the server's initial public endpoint
-     *  instead of being silently discarded (SIGMA-187). */
+    /** The connect form's host address — the server's initial public endpoint,
+     *  and its placeholder name until the agent checks in (SIGMA-187/202). */
     hostIp?: string;
   },
   actor: CpActor
@@ -1616,6 +1592,10 @@ export async function cpMirrorServer(
         meshIp: row.meshIp,
         cpu: row.cpu,
         memGb: row.memGb,
+        // Same reason as cp-sync's upsert: these change over a host's life and
+        // a mirror that never updates them is a stale answer, not an old one.
+        facts: row.facts,
+        incompatibleReasons: row.incompatibleReasons,
       },
     });
   return row;
@@ -1658,7 +1638,45 @@ export function cpServerToRow(cp: CpServer): ServerRow {
     memGb: memTotalMb ? Math.round(memTotalMb / 1024) : 0,
     byoVpn: false,
     connectedAt: new Date(cp.createdAt),
+    // The detected host, carried through so the detail page reads one shape in
+    // both modes. Facts are what the connect form stopped asking the operator
+    // for (SIGMA-202); the reasons are why the gate refused this host, and the
+    // UI renders those sentences verbatim (SIGMA-203).
+    facts: cp.facts ?? {},
+    incompatibleReasons: cp.incompatibleReasons ?? [],
+    nameAuto: false,
   };
+}
+
+/** Re-file a server under a different type. The control plane re-runs the
+ *  compatibility gate against the facts it already has and answers with the
+ *  server's NEW state — so a change that does not help says so immediately
+ *  rather than after another heartbeat. Project Admin+; 409 when hosted
+ *  resources could not run on the new type (SIGMA-203). */
+export async function cpSetServerType(
+  orgId: string,
+  serverId: string,
+  serverType: string,
+  actor: CpActor
+): Promise<CpServer> {
+  return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/type`, {
+    method: "POST",
+    body: JSON.stringify({ type: serverType }),
+  }, { orgId, actor });
+}
+
+/** Rename a server. The connect form no longer asks for a name — registration
+ *  takes the reported hostname — so this is where naming lives (SIGMA-202). */
+export async function cpRenameServer(
+  orgId: string,
+  serverId: string,
+  name: string,
+  actor: CpActor
+): Promise<CpServer> {
+  return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  }, { orgId, actor });
 }
 
 /** CP metrics → the chart's point shape (last 24h, oldest first upstream). */

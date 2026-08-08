@@ -8,6 +8,14 @@ import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../activ
 import { writeAudit } from "../audit";
 import type { ServerType } from "@/lib/server-catalog.generated";
 import {
+  checkServerCompatibility,
+  nextServerStatus,
+  statusAfterTypeChange,
+  SERVER_STATUS,
+  type FailedRequirement,
+  type HostFacts,
+} from "@/lib/server-compat";
+import {
   cpEnabled,
   cpIssueBootstrapToken,
   cpProvisionServer,
@@ -15,7 +23,10 @@ import {
   cpSetProxyRole,
   cpPublicUrl,
   cpDeleteServer,
+  cpGetServer,
   cpReissueBootstrapToken,
+  cpRenameServer,
+  cpSetServerType,
   cpUpdateServerAgent,
 } from "../cp";
 
@@ -68,15 +79,86 @@ function hashNum(str: string, mod: number) {
 // catalog fails `tsc` here rather than silently giving the new type a general
 // server's shape. It used to name four types and fall through for the other
 // three, which is how a demo VPS reported 16 GB of RAM.
-const SPEC: Record<ServerType, { cpu: number; memGb: number }> = {
-  general: { cpu: 4, memGb: 16 },
-  vps: { cpu: 2, memGb: 8 },
-  database: { cpu: 8, memGb: 64 },
-  storage: { cpu: 4, memGb: 16 },
-  gpu: { cpu: 16, memGb: 128 },
-  k8s: { cpu: 8, memGb: 32 },
-  build: { cpu: 8, memGb: 32 },
+//
+// diskGb and gpu were added with SIGMA-201/203: the demo host has to describe
+// itself the way a real one does, because the compatibility gate reads those
+// facts and demo mode has to be able to show its verdict.
+const SPEC: Record<ServerType, { cpu: number; memGb: number; diskGb: number; gpu?: boolean }> = {
+  general: { cpu: 4, memGb: 16, diskGb: 480 },
+  vps: { cpu: 2, memGb: 8, diskGb: 160 },
+  database: { cpu: 8, memGb: 64, diskGb: 2000 },
+  storage: { cpu: 4, memGb: 16, diskGb: 8000 },
+  gpu: { cpu: 16, memGb: 128, diskGb: 2000, gpu: true },
+  k8s: { cpu: 8, memGb: 32, diskGb: 480 },
+  build: { cpu: 8, memGb: 32, diskGb: 960 },
 };
+
+/** How a demo check-in describes the host (SIGMA-215 parity).
+ *
+ *  "matching" is the machine the operator meant to connect — a host that meets
+ *  the type's requirements, which is what a demo should show most of the time.
+ *
+ *  "generic" is an ordinary 4-vCPU / 60 GB box with no accelerator: exactly
+ *  what someone actually plugs in when they pick GPU or Storage by mistake. It
+ *  is the only way to reach the `incompatible` state without owning the wrong
+ *  hardware, and it recovers the moment the server is re-filed as a type the
+ *  box does satisfy — which is the whole flow SIGMA-203 added. */
+export type DemoHostShape = "matching" | "generic";
+
+const GB = 1_000_000_000;
+
+function simulatedFacts(serverId: string, type: string, shape: DemoHostShape): HostFacts {
+  const spec = SPEC[type as ServerType] ?? SPEC.general;
+  const n = 20 + hashNum(serverId, 200);
+  if (shape === "generic") {
+    return {
+      hostname: `sigma-host-${n}`,
+      os: "linux",
+      arch: "amd64",
+      numCpu: 4,
+      memTotalMb: 16 * 1024,
+      distro: "ubuntu-24.04",
+      distroName: "Ubuntu 24.04.1 LTS",
+      diskTotalBytes: 60 * GB,
+      diskFreeBytes: 41 * GB,
+      diskPath: "/",
+      // Present and empty: the host was asked and has no accelerator. Absent
+      // would mean "nobody looked", which the gate treats as unknown — and a
+      // demo that could not distinguish the two could not demonstrate it.
+      gpu: { vendor: "", count: 0 },
+      dockerAvailable: true,
+      dockerVersion: "27.3.1",
+    };
+  }
+  return {
+    hostname: `sigma-${type}-${n}`,
+    os: "linux",
+    arch: "amd64",
+    numCpu: spec.cpu,
+    memTotalMb: spec.memGb * 1024,
+    distro: "ubuntu-24.04",
+    distroName: "Ubuntu 24.04.1 LTS",
+    diskTotalBytes: spec.diskGb * GB,
+    diskFreeBytes: Math.round(spec.diskGb * 0.7) * GB,
+    diskPath: "/var/lib/sigmad",
+    gpu: spec.gpu
+      ? {
+          vendor: "nvidia",
+          model: "NVIDIA L40S",
+          count: 2,
+          vramBytesPerGpu: 48_301_604_864,
+          vramBytesTotal: 96_603_209_728,
+          driverVersion: "550.54.15",
+          cards: [
+            { index: 0, model: "NVIDIA L40S", vramBytes: 48_301_604_864 },
+            { index: 1, model: "NVIDIA L40S", vramBytes: 48_301_604_864 },
+          ],
+        }
+      : { vendor: "", count: 0 },
+    dockerAvailable: true,
+    dockerVersion: "27.3.1",
+  };
+}
 
 export type ConnectServerResult =
   | {
@@ -86,6 +168,14 @@ export type ConnectServerResult =
       expiresAt: string;
     }
   | { mode: "sim"; id: string; bootstrapToken: string };
+
+/** The placeholder a server carries until its agent reports a hostname. The
+ *  address is the only handle the operator has on the box at that moment, so a
+ *  row named for it is identifiable in a list; "server" is the last resort for
+ *  the manual/NAT path, which has no address either (SIGMA-202). */
+function placeholderName(hostIp: string): string {
+  return hostIp.trim() || "server";
+}
 
 /** Register a BYO host.
  *
@@ -97,10 +187,10 @@ export type ConnectServerResult =
  *  button flips to running. */
 export async function connectServer(input: {
   orgId: string;
-  name: string;
   type: string; // a ServerType; validated against the CP catalog server-side
-  provider: string;
-  region: string;
+  hostIp: string;
+  provider?: string;
+  region?: string;
   byoVpn?: boolean;
 }): Promise<ConnectServerResult> {
   // Registering a host issues a real one-time bootstrap token, so gate it at
@@ -108,15 +198,21 @@ export async function connectServer(input: {
   // (SIGMA-82). The CP already enforces this; matching it here fails closed and
   // keeps the three server-lifecycle actions consistent.
   const { user, role } = await requireProjectAdmin(input.orgId);
-  const name = input.name.trim();
-  if (!name) throw new Error("Server name is required.");
+  // The connect form asks for two things, and the address is one of them —
+  // it is where the install command is going to run.
+  const hostIp = input.hostIp.trim();
+  if (!hostIp) throw new Error("The host's IP address or hostname is required.");
+  const name = placeholderName(hostIp);
 
   if (cpEnabled()) {
     const { token, expiresAt } = await cpIssueBootstrapToken(input.orgId, {
-      name,
+      // No name: the control plane pre-creates the row under a placeholder and
+      // replaces it with the hostname the agent reports, the same rule the SSH
+      // path follows (SIGMA-202).
+      name: "",
       type: input.type,
-      provider: input.provider.trim(),
-      region: input.region.trim(),
+      provider: input.provider?.trim() ?? "",
+      region: input.region?.trim() ?? "",
     }, { name: user.name, role });
     await writeAudit({
       orgId: input.orgId,
@@ -127,7 +223,7 @@ export async function connectServer(input: {
     revalidatePath("/dashboard", "layout");
     return {
       mode: "cp",
-      command: `sigmad --endpoint ${cpPublicUrl()} --bootstrap-token ${token} --name ${name}`,
+      command: `sigmad --endpoint ${cpPublicUrl()} --bootstrap-token ${token}`,
       expiresAt,
     };
   }
@@ -137,13 +233,17 @@ export async function connectServer(input: {
     id,
     orgId: input.orgId,
     name,
+    // The name came from the address, not from the operator: the simulated
+    // check-in replaces it with the reported hostname, exactly as registration
+    // does in CP mode.
+    nameAuto: true,
     type: input.type,
     source: "byo",
-    provider: input.provider.trim() || "BYO",
-    region: input.region.trim() || "—",
-    status: "provisioning",
+    provider: input.provider?.trim() || "BYO",
+    region: input.region?.trim() || "—",
+    status: SERVER_STATUS.provisioning,
     agentVersion: "",
-    ip: "",
+    ip: hostIp,
     cpu: 0,
     memGb: 0,
     byoVpn: Boolean(input.byoVpn),
@@ -165,26 +265,31 @@ export type ProvisionResult =
     }
   | { mode: "sim"; id: string };
 
-/** SSH-onboarding wizard: pre-create the server (with type + proxy role +
- *  detected distro), mint the per-server bootstrap keypair, and return the
- *  cosign-verified install command. keepPublicSsh opts out of the SSH lockdown
- *  (a warned choice). Project Admin+ — provisioning is a privileged action. */
+/** The connect flow: pre-create the server from the two things the operator
+ *  actually knows — the host's address and what they want it to be — mint the
+ *  per-server bootstrap keypair, and return the cosign-verified install command
+ *  immediately, so the dialog can show it while it waits for the agent.
+ *
+ *  It no longer takes a name or a distro. The machine reports its hostname and
+ *  reads its own /etc/os-release; asking the operator to guess either before
+ *  they have logged in is the inversion SIGMA-202 removes. Provider and region
+ *  stay as optional metadata. keepPublicSsh opts out of the SSH lockdown (a
+ *  warned choice). Project Admin+ — provisioning is a privileged action. */
 export async function provisionServer(input: {
   orgId: string;
-  name: string;
   type: string;
-  provider: string;
-  region: string;
-  proxyRole: boolean;
-  distro?: string;
+  /** The host's public address. Becomes the server's initial endpoint and its
+   *  placeholder name until the agent checks in (SIGMA-187/202). */
+  hostIp: string;
+  provider?: string;
+  region?: string;
+  proxyRole?: boolean;
   keepPublicSsh?: boolean;
-  /** The wizard's "Host IP" — becomes the server's initial public endpoint
-   *  instead of being collected and silently discarded (SIGMA-187). */
-  hostIp?: string;
 }): Promise<ProvisionResult> {
   const { user, role } = await requireProjectAdmin(input.orgId);
-  const name = input.name.trim();
-  if (!name) throw new Error("Server name is required.");
+  const hostIp = input.hostIp.trim();
+  if (!hostIp) throw new Error("The host's IP address or hostname is required.");
+  const name = placeholderName(hostIp);
 
   if (!cpEnabled()) {
     // Demo mode: fall back to a simulated provisioning row.
@@ -193,13 +298,14 @@ export async function provisionServer(input: {
       id,
       orgId: input.orgId,
       name,
+      nameAuto: true,
       type: input.type,
       source: "byo",
-      provider: input.provider.trim() || "BYO",
-      region: input.region.trim() || "—",
-      status: "provisioning",
+      provider: input.provider?.trim() || "BYO",
+      region: input.region?.trim() || "—",
+      status: SERVER_STATUS.provisioning,
       agentVersion: "",
-      ip: "",
+      ip: hostIp,
       cpu: 0,
       memGb: 0,
       byoVpn: false,
@@ -213,13 +319,13 @@ export async function provisionServer(input: {
   const res = await cpProvisionServer(
     input.orgId,
     {
-      name,
+      // No name: the control plane pre-creates the row under the address and
+      // replaces it with the hostname the agent reports.
       type: input.type,
-      provider: input.provider.trim(),
-      region: input.region.trim(),
-      proxyRole: input.proxyRole,
-      distro: input.distro,
-      hostIp: input.hostIp?.trim() || undefined,
+      provider: input.provider?.trim() ?? "",
+      region: input.region?.trim() ?? "",
+      proxyRole: Boolean(input.proxyRole),
+      hostIp,
     },
     actor
   );
@@ -241,6 +347,175 @@ export async function provisionServer(input: {
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
   };
+}
+
+/** What the connect dialog is waiting for: the live state of the row the
+ *  install command is going to fill in.
+ *
+ *  The dialog polls this while it shows the command, so "waiting for agent…"
+ *  turns into the machine's own name, or into the gate's verdict, without the
+ *  operator refreshing anything. Read-only and member-visible: it says nothing
+ *  a member cannot already see on the servers page. */
+export type ServerConnectionState = {
+  id: string;
+  name: string;
+  type: string;
+  status: string;
+  /** Empty until the agent registers. */
+  distro: string;
+  arch: string;
+  cpu: number;
+  memGb: number;
+  diskTotalBytes: number;
+  gpu: string;
+  /** Rendered verbatim when status is `incompatible` (SIGMA-203). */
+  incompatibleReasons: FailedRequirement[];
+};
+
+function connectionStateFromFacts(row: {
+  id: string;
+  name: string;
+  type: string;
+  status: string;
+  cpu: number;
+  memGb: number;
+  facts: HostFacts | null;
+  incompatibleReasons: FailedRequirement[];
+}): ServerConnectionState {
+  const f = row.facts ?? {};
+  const gpu = f.gpu;
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    status: row.status,
+    distro: f.distroName || f.distro || "",
+    arch: f.arch ?? "",
+    cpu: f.numCpu ?? row.cpu,
+    memGb: f.memTotalMb ? Math.round(f.memTotalMb / 1024) : row.memGb,
+    diskTotalBytes: f.diskTotalBytes ?? 0,
+    gpu: gpu && (gpu.count ?? 0) > 0 ? `${gpu.count} × ${gpu.model || gpu.vendor}` : "",
+    incompatibleReasons: row.incompatibleReasons ?? [],
+  };
+}
+
+export async function serverConnectionState(input: {
+  orgId: string;
+  serverId: string;
+}): Promise<ServerConnectionState | null> {
+  await requireMembership(input.orgId);
+  if (cpEnabled()) {
+    const cp = await cpGetServer(input.orgId, input.serverId);
+    if (!cp) return null;
+    return connectionStateFromFacts({
+      id: cp.id,
+      name: cp.name,
+      type: cp.type,
+      status: cp.status,
+      cpu: 0,
+      memGb: 0,
+      facts: cp.facts,
+      incompatibleReasons: cp.incompatibleReasons ?? [],
+    });
+  }
+  const [row] = await db.select().from(s.servers).where(eq(s.servers.id, input.serverId));
+  if (!row || row.orgId !== input.orgId) return null;
+  return connectionStateFromFacts(row);
+}
+
+/** Exit 1 from an incompatible enrollment: re-file the server under a type it
+ *  can actually be. The gate is re-run against the facts already on record, so
+ *  the answer is immediate — including when the new type does not help either,
+ *  which is reported rather than hidden behind an optimistic toast.
+ *
+ *  Returns a readable result instead of throwing: this is rendered inside a
+ *  panel that is already explaining a failure, and a redacted server-action
+ *  error there would replace a real explanation with "An error occurred". */
+export async function changeServerType(input: {
+  orgId: string;
+  serverId: string;
+  type: string;
+}): Promise<{ ok: true; state: ServerConnectionState | null } | { ok: false; error: string }> {
+  try {
+    const { user, role } = await requireProjectAdmin(input.orgId);
+    if (cpEnabled()) {
+      const cp = await cpSetServerType(input.orgId, input.serverId, input.type, { name: user.name, role });
+      await writeAudit({
+        orgId: input.orgId,
+        actor: user.name,
+        action: `Changed server type to ${input.type}`,
+        target: cp.name,
+      });
+      revalidatePath("/dashboard", "layout");
+      return {
+        ok: true,
+        state: connectionStateFromFacts({
+          id: cp.id, name: cp.name, type: cp.type, status: cp.status, cpu: 0, memGb: 0,
+          facts: cp.facts, incompatibleReasons: cp.incompatibleReasons ?? [],
+        }),
+      };
+    }
+
+    const [row] = await db.select().from(s.servers).where(eq(s.servers.id, input.serverId));
+    if (!row || row.orgId !== input.orgId) throw new Error("Server not found.");
+    // Demo mode re-runs the same gate the control plane would, against the
+    // facts the simulated check-in reported — so the exit behaves identically
+    // in both modes rather than always "succeeding" here.
+    const reasons = checkServerCompatibility(input.type, row.facts);
+    // connectedAt is the only liveness stamp the demo schema carries; a demo
+    // host is "seen" for as long as it is connected. What matters either way is
+    // the half this fixes: an unreachable row is never revived by a re-file.
+    const status = statusAfterTypeChange(row.status, reasons, row.connectedAt);
+    await db
+      .update(s.servers)
+      .set({ type: input.type, status, incompatibleReasons: reasons })
+      .where(eq(s.servers.id, input.serverId));
+    await writeAudit({
+      orgId: input.orgId,
+      actor: user.name,
+      action: `Changed server type to ${input.type}`,
+      target: row.name,
+    });
+    revalidatePath("/dashboard", "layout");
+    return {
+      ok: true,
+      state: connectionStateFromFacts({ ...row, type: input.type, status, incompatibleReasons: reasons }),
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Couldn’t change the server type." };
+  }
+}
+
+/** Name a server. The connect form stopped asking (the machine reports its
+ *  hostname), so this is where naming lives — and renaming clears the
+ *  machine-assigned flag for good (SIGMA-202). */
+export async function renameServer(input: {
+  orgId: string;
+  serverId: string;
+  name: string;
+}): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+  try {
+    const { user, role } = await requireProjectAdmin(input.orgId);
+    const name = input.name.trim();
+    if (!name) throw new Error("A server name is required.");
+    if (cpEnabled()) {
+      const cp = await cpRenameServer(input.orgId, input.serverId, name, { name: user.name, role });
+      await writeAudit({ orgId: input.orgId, actor: user.name, action: "Renamed server", target: name });
+      revalidatePath("/dashboard", "layout");
+      return { ok: true, name: cp.name };
+    }
+    const [row] = await db.select().from(s.servers).where(eq(s.servers.id, input.serverId));
+    if (!row || row.orgId !== input.orgId) throw new Error("Server not found.");
+    await db
+      .update(s.servers)
+      .set({ name, nameAuto: false })
+      .where(eq(s.servers.id, input.serverId));
+    await writeAudit({ orgId: input.orgId, actor: user.name, action: "Renamed server", target: name });
+    revalidatePath("/dashboard", "layout");
+    return { ok: true, name };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Couldn’t rename the server." };
+  }
 }
 
 /** Regenerate the install command for a server stuck in `provisioning` (lost
@@ -354,12 +629,21 @@ export async function setServerProxyRole(input: {
   revalidatePath("/dashboard", "layout");
 }
 
-/** Simulated agent check-in: flips provisioning → running and fills in the
- *  runtime details the agent would report (version, IP, CPU, memory). Demo-only
- *  — in CP mode real agents report their own status, so fabricating mirror facts
- *  here would be fake state. The button is hidden in CP mode, but the action can
- *  be invoked directly, so guard it server-side too (SIGMA-82). */
-export async function agentCheckIn(input: { serverId: string }) {
+/** Simulated agent check-in: reports the host's facts, names the server from
+ *  its hostname, runs the compatibility gate over the result and lands the row
+ *  in whatever status that produces. Demo-only — in CP mode real agents report
+ *  their own status, so fabricating mirror facts here would be fake state. The
+ *  button is hidden in CP mode, but the action can be invoked directly, so
+ *  guard it server-side too (SIGMA-82).
+ *
+ *  `shape` is what the pretend machine turns out to be. "generic" is an
+ *  ordinary box with no accelerator and a small disk — the machine someone
+ *  actually plugs in when they picked GPU or Storage by mistake — and it is the
+ *  only way to see the incompatible state, and the exits out of it, without
+ *  owning the wrong hardware (SIGMA-203/215). It is not a re-check either: it
+ *  is what the agent found this time, so running it after a "matching" check-in
+ *  is the card being pulled, and vice versa is the driver being installed. */
+export async function agentCheckIn(input: { serverId: string; shape?: DemoHostShape }) {
   if (cpEnabled()) return;
   const [server] = await db
     .select()
@@ -367,20 +651,34 @@ export async function agentCheckIn(input: { serverId: string }) {
     .where(eq(s.servers.id, input.serverId));
   if (!server) throw new Error("Server not found.");
   const { user } = await requireMembership(server.orgId);
-  if (server.status !== "provisioning") return; // idempotent
-  const spec = SPEC[server.type as ServerType] ?? SPEC.general;
+  if (server.status === SERVER_STATUS.running && !input.shape) return; // idempotent
+
+  const shape = input.shape ?? "matching";
+  const facts = simulatedFacts(server.id, server.type, shape);
+  const reasons = checkServerCompatibility(server.type, facts);
+  const status = nextServerStatus(server.status, reasons, true);
   await db
     .update(s.servers)
     .set({
-      status: "running",
+      status,
       agentVersion: "1.4.2",
-      ip: `10.8.0.${20 + hashNum(server.id, 200)}`,
-      cpu: spec.cpu,
-      memGb: spec.memGb,
+      // The machine's own name replaces the address we filed it under, once.
+      name: server.nameAuto && facts.hostname ? facts.hostname : server.name,
+      nameAuto: server.nameAuto && facts.hostname ? false : server.nameAuto,
+      meshIp: `10.8.0.${20 + hashNum(server.id, 200)}`,
+      facts,
+      incompatibleReasons: reasons,
+      cpu: facts.numCpu ?? 0,
+      memGb: facts.memTotalMb ? Math.round(facts.memTotalMb / 1024) : 0,
       connectedAt: new Date(),
     })
     .where(eq(s.servers.id, input.serverId));
-  await writeAudit({ orgId: server.orgId, actor: user.name, action: "Agent checked in", target: server.name });
+  await writeAudit({
+    orgId: server.orgId,
+    actor: user.name,
+    action: reasons.length > 0 ? `Server incompatible — ${reasons[0].reason}` : "Agent checked in",
+    target: facts.hostname ?? server.name,
+  });
   revalidatePath("/dashboard", "layout");
 }
 
