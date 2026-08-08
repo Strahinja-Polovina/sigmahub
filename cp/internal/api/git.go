@@ -32,6 +32,9 @@ type GitAPI interface {
 	// GitTokenForRepo resolves the stored credential for an org's already-
 	// connected repo ("" = public; ErrNotFound = not connected).
 	GitTokenForRepo(ctx context.Context, orgID, repoFullName string) (string, error)
+	// EnqueueBranchDeploy enqueues a deploy of a known commit on a mapped
+	// branch — the initial-deploy path that doesn't wait for a webhook push.
+	EnqueueBranchDeploy(ctx context.Context, orgID, mapID, ref, sha, actor string) (store.DeployRequest, error)
 }
 
 // claimInstallation binds a client-supplied installation id to the acting org
@@ -89,6 +92,11 @@ func (s *Server) handleListPreviews(w http.ResponseWriter, r *http.Request) {
 // RepoInspector derives the deploy config from a connected repo's files.
 type RepoInspector interface {
 	Inspect(ctx context.Context, repoFullName, token string) (gitdetect.Detected, error)
+	// BranchHead returns the branch's head commit sha — the initial-deploy input.
+	BranchHead(ctx context.Context, repoFullName, branch, token string) (string, error)
+	// RegisterPushWebhook idempotently creates the push/PR webhook that drives
+	// push-to-deploy; requires a token with webhook permission.
+	RegisterPushWebhook(ctx context.Context, repoFullName, hookURL, secret, token string) error
 }
 
 // effectiveGitToken picks the credential detect/connect read the repo with:
@@ -206,7 +214,26 @@ func (s *Server) handleGitConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "connect repo")
 		return
 	}
-	writeJSON(w, http.StatusCreated, conn)
+
+	// Push-to-deploy needs a webhook on the repo; registering it here (best
+	// effort) closes the "connected but pushes do nothing" gap. Failure (token
+	// without webhook permission, GitHub outage) never fails the connect — the
+	// response says so and the webhook can be added manually.
+	webhookRegistered := false
+	if s.inspector != nil && s.publicURL != "" && s.githubWebhookSecret != "" {
+		if token := s.effectiveGitToken(r.Context(), req.Token, req.InstallationID); token != "" {
+			hookURL := s.publicURL + "/v1/webhooks/github"
+			if err := s.inspector.RegisterPushWebhook(r.Context(), conn.RepoFullName, hookURL, s.githubWebhookSecret, token); err != nil {
+				s.log.Warn("register push webhook", "repo", conn.RepoFullName, "err", err)
+			} else {
+				webhookRegistered = true
+			}
+		}
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		store.GitConnection
+		WebhookRegistered bool `json:"webhookRegistered"`
+	}{conn, webhookRegistered})
 }
 
 func (s *Server) handleListGitConnections(w http.ResponseWriter, r *http.Request) {
@@ -269,13 +296,36 @@ func (s *Server) handleSetBranchMap(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	m, err := s.git.SetBranchMap(r.Context(), r.PathValue("orgId"), r.PathValue("connId"),
-		req.Branch, req.EnvironmentID, req.Policy, principalFrom(r).Name)
+	orgID := r.PathValue("orgId")
+	actor := principalFrom(r).Name
+	m, err := s.git.SetBranchMap(r.Context(), orgID, r.PathValue("connId"),
+		req.Branch, req.EnvironmentID, req.Policy, actor)
 	if err != nil {
 		s.writeStoreErr(w, err, "map branch")
 		return
 	}
-	writeJSON(w, http.StatusOK, m)
+
+	// Initial deploy: an auto-mapped branch that has never seen a push would
+	// otherwise sit idle until the first webhook delivery. Fetch the branch
+	// head from the provider and enqueue its build now (best effort — the map
+	// itself always succeeds).
+	initialDeploy := false
+	if s.inspector != nil && req.Policy == "auto" && m.LastSHA == "" {
+		if conn, err := s.git.GetGitConnection(r.Context(), orgID, m.ConnectionID); err == nil {
+			token, _ := s.git.GitTokenForRepo(r.Context(), orgID, conn.RepoFullName)
+			if sha, err := s.inspector.BranchHead(r.Context(), conn.RepoFullName, m.Branch, token); err != nil {
+				s.log.Warn("initial deploy: branch head", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
+			} else if _, err := s.git.EnqueueBranchDeploy(r.Context(), orgID, m.ID, "refs/heads/"+m.Branch, sha, actor); err != nil {
+				s.log.Warn("initial deploy: enqueue", "repo", conn.RepoFullName, "branch", m.Branch, "err", err)
+			} else {
+				initialDeploy = true
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		store.BranchMap
+		InitialDeploy bool `json:"initialDeploy"`
+	}{m, initialDeploy})
 }
 
 func (s *Server) handleDeleteBranchMap(w http.ResponseWriter, r *http.Request) {

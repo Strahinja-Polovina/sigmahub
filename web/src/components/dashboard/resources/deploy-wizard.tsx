@@ -386,7 +386,7 @@ export function DeployWizard({
                 token: repoToken.trim() || undefined,
               });
               try {
-                await setBranchMapping({
+                const map = await setBranchMapping({
                   orgId,
                   projectId,
                   connectionId: conn.id,
@@ -394,6 +394,17 @@ export function DeployWizard({
                   environmentId,
                   policy: "auto",
                 });
+                if (map.initialDeploy) {
+                  toast.success("First build started", {
+                    description: `Deploying ${repo.defaultBranch}@HEAD — watch the Deployments tab.`,
+                  });
+                }
+                if (conn.webhookRegistered === false) {
+                  toast.info("Push webhook not registered", {
+                    description:
+                      "Pushes won't auto-deploy yet — the token may lack webhook permission. Add the webhook on GitHub or reconnect with a token that can manage webhooks.",
+                  });
+                }
               } catch {
                 toast.warning("Branch not mapped", {
                   description: `Map ${repo.defaultBranch} to this environment in the project's Git panel to enable push-to-deploy.`,

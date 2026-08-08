@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,9 @@ func (f *fakeGit) ClaimInstallation(_ context.Context, _, installationID string)
 func (f *fakeGit) GitTokenForRepo(_ context.Context, _, _ string) (string, error) {
 	return "", store.ErrNotFound
 }
+func (f *fakeGit) EnqueueBranchDeploy(_ context.Context, _, mapID, ref, sha, _ string) (store.DeployRequest, error) {
+	return store.DeployRequest{ID: "dr_test", Ref: ref, SHA: sha}, nil
+}
 
 // fakeInspector returns a scripted detection.
 type fakeInspector struct {
@@ -92,6 +96,14 @@ type fakeInspector struct {
 
 func (f fakeInspector) Inspect(context.Context, string, string) (gitdetect.Detected, error) {
 	return f.det, f.err
+}
+
+func (f fakeInspector) BranchHead(context.Context, string, string, string) (string, error) {
+	return "", errors.New("branch head not scripted")
+}
+
+func (f fakeInspector) RegisterPushWebhook(context.Context, string, string, string, string) error {
+	return errors.New("webhook registration not scripted")
 }
 
 func sign(secret, body string) string {

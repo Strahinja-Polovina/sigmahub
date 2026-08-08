@@ -90,6 +90,101 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 	return d, nil
 }
 
+// BranchHead returns the branch's head commit sha (GET /repos/{r}/branches/{b})
+// — the input for an initial deploy that must not wait for a webhook push.
+func (i *Inspector) BranchHead(ctx context.Context, repoFullName, branch, token string) (string, error) {
+	repo := strings.Trim(strings.TrimSpace(repoFullName), "/")
+	base := i.APIBase
+	if base == "" {
+		base = DefaultAPIBase
+	}
+	u := fmt.Sprintf("%s/repos/%s/branches/%s", base, repo, branch)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := i.Client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return "", fmt.Errorf("github branch %s@%s: status %s", repo, branch, resp.Status)
+	}
+	var out struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", err
+	}
+	if out.Commit.SHA == "" {
+		return "", fmt.Errorf("github branch %s@%s: no head commit in response", repo, branch)
+	}
+	return out.Commit.SHA, nil
+}
+
+// RegisterPushWebhook idempotently creates the push/pull_request webhook that
+// drives push-to-deploy (POST /repos/{r}/hooks). GitHub answers 422 when an
+// identical hook already exists — treated as success. Requires a token with
+// webhook (admin:repo_hook) permission.
+func (i *Inspector) RegisterPushWebhook(ctx context.Context, repoFullName, hookURL, secret, token string) error {
+	repo := strings.Trim(strings.TrimSpace(repoFullName), "/")
+	base := i.APIBase
+	if base == "" {
+		base = DefaultAPIBase
+	}
+	payload, err := json.Marshal(map[string]any{
+		"name":   "web",
+		"active": true,
+		"events": []string{"push", "pull_request"},
+		"config": map[string]string{
+			"url":          hookURL,
+			"content_type": "json",
+			"secret":       secret,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/repos/%s/hooks", base, repo), strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := i.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	switch {
+	case resp.StatusCode == http.StatusCreated:
+		return nil
+	case resp.StatusCode == http.StatusUnprocessableEntity && strings.Contains(string(body), "already exists"):
+		return nil
+	default:
+		return fmt.Errorf("github create webhook %s: status %s (the token needs webhook/admin:repo_hook permission)", repo, resp.Status)
+	}
+}
+
 // repoMeta resolves the repo itself (GET /repos/{owner}/{name}): whether it is
 // visible with the given credentials, and its default branch. A 404 means the
 // repo does not exist or is private and unreadable with this token.

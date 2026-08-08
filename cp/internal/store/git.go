@@ -498,6 +498,53 @@ func (s *Store) PromoteBranch(ctx context.Context, orgID, mapID, actor string) (
 	return dr, nil
 }
 
+// EnqueueBranchDeploy enqueues a deploy of a KNOWN commit on a mapped branch —
+// the initial-deploy path: the head sha was just fetched from the provider, so
+// the first build doesn't have to wait for a webhook push. Records the sha on
+// the map (so the UI and Promote see it) and audits.
+func (s *Store) EnqueueBranchDeploy(ctx context.Context, orgID, mapID, ref, sha, actor string) (DeployRequest, error) {
+	if strings.TrimSpace(sha) == "" {
+		return DeployRequest{}, ErrInvalid{Msg: "commit sha is required"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var connID, envID, branch string
+	err = tx.QueryRow(ctx, `
+		SELECT m.connection_id, m.environment_id, m.branch
+		  FROM git_branch_map m
+		  JOIN git_connections c ON c.id = m.connection_id
+		 WHERE c.org_id = $1 AND m.id = $2`, orgID, mapID).Scan(&connID, &envID, &branch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeployRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	if ref == "" {
+		ref = "refs/heads/" + branch
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE git_branch_map SET last_ref = $1, last_sha = $2, last_pushed_at = now() WHERE id = $3`,
+		ref, sha, mapID); err != nil {
+		return DeployRequest{}, err
+	}
+	dr, err := enqueueDeployTx(ctx, tx, orgID, connID, envID, ref, sha, branch)
+	if err != nil {
+		return DeployRequest{}, err
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Git initial deploy enqueued ("+branch+")", envID); err != nil {
+		return DeployRequest{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeployRequest{}, err
+	}
+	return dr, nil
+}
+
 // HandleGitWebhook processes one already-signature-verified delivery atomically:
 // it dedupes on the provider delivery id (a redelivery is a no-op), resolves the
 // repo to a connection, and — for a push on an 'auto' mapped branch — enqueues

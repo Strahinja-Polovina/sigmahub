@@ -41,6 +41,9 @@ services:
       CP_KMS_KEY_FILE: /data/cp-kms.key
       CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN:?set CP_PROVISION_TOKEN in .env}
       CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
+      # CP's own public base URL (e.g. https://cp.example.com). With the
+      # webhook secret set, connecting a repo auto-registers its push webhook.
+      CP_PUBLIC_URL: ${CP_PUBLIC_URL:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
       # uncomment the volume below; the key is imported into KMS custody on

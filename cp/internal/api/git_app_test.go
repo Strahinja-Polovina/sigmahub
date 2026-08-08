@@ -25,6 +25,15 @@ func (r *recordingInspector) Inspect(_ context.Context, _, token string) (gitdet
 	return r.det, nil
 }
 
+func (r *recordingInspector) BranchHead(_ context.Context, _, _, token string) (string, error) {
+	r.lastToken = token
+	return "", errors.New("branch head not scripted")
+}
+
+func (r *recordingInspector) RegisterPushWebhook(context.Context, string, string, string, string) error {
+	return errors.New("webhook registration not scripted")
+}
+
 // fakeTokenSource is a scripted InstallationTokenSource.
 type fakeTokenSource struct {
 	err   error

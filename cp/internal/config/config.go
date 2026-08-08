@@ -30,6 +30,9 @@ type Config struct {
 	// org-scoped web credential). Defaults in dev; required in prod for the
 	// provisioning endpoint to be usable.
 	ProvisionToken string
+	// PublicURL is the CP's own public base URL; with GitHubWebhookSecret set,
+	// connecting a repo auto-registers its push webhook against it.
+	PublicURL string
 	// GitHubWebhookSecret verifies inbound GitHub webhook deliveries
 	// (X-Hub-Signature-256 HMAC-SHA256). Empty disables the webhook receiver
 	// (returns 503) rather than accepting unverifiable deliveries.
@@ -87,6 +90,7 @@ func FromEnv() (Config, error) {
 		Env:                     getenv("CP_ENV", "dev"),
 		ServiceToken:            os.Getenv("CP_SERVICE_TOKEN"),
 		ProvisionToken:          os.Getenv("CP_PROVISION_TOKEN"),
+		PublicURL:               os.Getenv("CP_PUBLIC_URL"),
 		GitHubWebhookSecret:     os.Getenv("CP_GITHUB_WEBHOOK_SECRET"),
 		GitHubAppID:             os.Getenv("CP_GITHUB_APP_ID"),
 		GitHubAppPrivateKeyFile: os.Getenv("CP_GITHUB_APP_PRIVATE_KEY_FILE"),

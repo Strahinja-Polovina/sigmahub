@@ -955,6 +955,8 @@ export type CpGitConnection = {
   repoFullName: string;
   createdBy: string;
   createdAt: string;
+  /** True when the CP auto-registered the push-to-deploy webhook on connect. */
+  webhookRegistered?: boolean;
   previewsEnabled: boolean;
   previewServerId?: string;
 };
@@ -1003,6 +1005,8 @@ export type CpBranchMap = {
   lastSha?: string;
   lastPushedAt?: string;
   createdAt: string;
+  /** True when mapping enqueued the branch head as the first build. */
+  initialDeploy?: boolean;
 };
 
 export type CpDeployRequest = {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
@@ -78,6 +79,7 @@ type Server struct {
 	devServiceToken     string
 	provisionToken      string
 	githubWebhookSecret string
+	publicURL           string
 	// telemetry forwards metrics/logs to VictoriaMetrics/Loki and proxies
 	// tenant-isolated queries (P1-13); tel is its store slice. Nil in handler
 	// unit tests → telemetry endpoints answer "not configured".
@@ -125,6 +127,10 @@ type Options struct {
 	GitHubAppSlug      string
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
 	GitHubWebhookSecret string
+	// PublicURL is the CP's own public base URL (e.g. https://cp.example.com).
+	// With GitHubWebhookSecret set, connecting a repo auto-registers the
+	// push-to-deploy webhook pointing at <PublicURL>/v1/webhooks/github.
+	PublicURL string
 	DSDStore            DSDStore
 	DSDWaiter           DSDWaiter
 	Reconcile           ReconcileTrigger
@@ -162,6 +168,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		devServiceToken:     opts.DevServiceToken,
 		provisionToken:      opts.ProvisionToken,
 		githubWebhookSecret: opts.GitHubWebhookSecret,
+		publicURL:           strings.TrimRight(opts.PublicURL, "/"),
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
 		alertSender:         opts.AlertSender,

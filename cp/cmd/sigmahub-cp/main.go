@@ -353,6 +353,7 @@ func run() error {
 			InstallationTokens:  installTokens,
 			GitHubAppSlug:       cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
+			PublicURL:           cfg.PublicURL,
 			DSDStore:            st,
 			DSDWaiter:           rec,
 			Reconcile:           rec,
