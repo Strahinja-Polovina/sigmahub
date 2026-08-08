@@ -147,6 +147,12 @@ func (i *Inspector) fetchFile(ctx context.Context, base, repo, path, token strin
 	case http.StatusNotFound:
 		return nil, false, nil
 	case http.StatusUnauthorized, http.StatusForbidden:
+		// GitHub uses 403 both for permissions AND for the (60/hr per IP)
+		// unauthenticated rate limit — tell the operator which one it was.
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return nil, false, fmt.Errorf(
+				"github API rate limit exceeded reading %s — connect the repo with an access token or GitHub App (much higher limit), or retry later", path)
+		}
 		return nil, false, fmt.Errorf("github contents %s: %s (check installation token/permissions)", path, resp.Status)
 	default:
 		return nil, false, fmt.Errorf("github contents %s: unexpected status %s", path, resp.Status)

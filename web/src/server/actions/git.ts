@@ -43,7 +43,13 @@ async function requireConnectionAdmin(orgId: string, connectionId: string) {
 }
 
 /** Preview the deploy config sigmahub detects for a repo. Read-only; any member
- *  can run it to see whether a repo is deployable before connecting. */
+ *  can run it to see whether a repo is deployable before connecting.
+ *
+ *  A CP/GitHub failure (bad token, rate limit, outage) is returned as a
+ *  non-deployable result with the real reason instead of being thrown:
+ *  Next.js redacts thrown server-action error messages in production, so a
+ *  throw would reach the user as the useless "Server Components render"
+ *  digest message rather than anything actionable. */
 export async function detectRepo(input: {
   orgId: string;
   repoFullName: string;
@@ -52,11 +58,23 @@ export async function detectRepo(input: {
 }): Promise<CpDetected> {
   ensureCp();
   const { user, role } = await requireMembership(input.orgId);
-  return cpDetectRepo(
-    input.orgId,
-    { repoFullName: input.repoFullName.trim(), installationId: input.installationId, token: input.token },
-    { name: user.name, role }
-  );
+  try {
+    return await cpDetectRepo(
+      input.orgId,
+      { repoFullName: input.repoFullName.trim(), installationId: input.installationId, token: input.token },
+      { name: user.name, role }
+    );
+  } catch (err) {
+    return {
+      hasDockerfile: false,
+      hasCompose: false,
+      ports: [],
+      env: [],
+      healthCheck: { type: "tcp", intervalSec: 10, source: "default" },
+      deployable: false,
+      reason: err instanceof Error ? err.message : "Could not read the repository. Please try again.",
+    };
+  }
 }
 
 /** Connect a repo to a project. Project Admin+ — it stores a provider token and
