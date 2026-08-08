@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getActiveOrgId } from "@/server/active-org";
-import { linkInstallation } from "@/server/actions/git";
+import { linkInstallation, connectGitIntegration } from "@/server/actions/git";
 import { isInstallationId, parseInstallState } from "@/lib/github-app";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -28,6 +28,16 @@ export default async function GitHubSetupPage({
     error = "GitHub did not send a valid installation id.";
   } else if (!target) {
     error = "The install link's state is missing or malformed, so the installation can't be routed to a project.";
+  } else if (target.kind === "org") {
+    // Org-level install: claim it for the organization, then land on the
+    // integrations tab where the connected account is now listed.
+    try {
+      await connectGitIntegration({ orgId, installationId });
+    } catch (err) {
+      error = err instanceof Error ? err.message : "Connecting the integration failed.";
+      return <SetupError message={error} />;
+    }
+    redirect("/dashboard/settings?tab=integrations");
   } else if (target.kind === "project") {
     redirect(
       `/dashboard/projects/${target.projectId}?installation_id=${installationId}`

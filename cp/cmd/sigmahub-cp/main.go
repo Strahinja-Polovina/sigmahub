@@ -246,11 +246,17 @@ func run() error {
 		return err
 	}
 	var installTokens api.InstallationTokenSource
+	// Kept as a separate interface variable rather than assigning appAuth
+	// directly: a nil *AppAuth stored in an interface is NOT a nil interface, so
+	// the "is the App configured?" checks in the API would all read true.
+	var installAccounts api.InstallationAccountSource
 	if appAuth != nil {
 		st.SetInstallationTokens(appAuth)
 		installTokens = appAuth
+		installAccounts = appAuth
 		log.Info("github app configured", "appId", cfg.GitHubAppID, "slug", cfg.GitHubAppSlug)
 	}
+	inspector := githubapp.NewInspector()
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
 	go rec.Run(ctx, 60*time.Second)
@@ -349,9 +355,12 @@ func run() error {
 			DevServiceToken:     cfg.ServiceToken,
 			ProvisionToken:      cfg.ProvisionToken,
 			Git:                 st,
-			Inspector:           githubapp.NewInspector(),
+			Inspector:           inspector,
+			RepoLister:          inspector,
 			InstallationTokens:  installTokens,
-			GitHubAppSlug:       cfg.GitHubAppSlug,
+			InstallationAccounts: installAccounts,
+			GitIntegration:       st,
+			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 			PublicURL:           cfg.PublicURL,
 			DSDStore:            st,

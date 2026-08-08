@@ -1585,3 +1585,90 @@ export function cpMetricsToPoints(points: CpMetricPoint[]) {
     disk: Math.round(p.diskPct),
   }));
 }
+
+// ── GitHub as an org-level integration ──────────────────────────────────────
+// Connect the App once per organization, then SELECT repos per resource. The
+// git connection push-to-deploy needs is derived by the CP, so nobody has to
+// assemble one by hand for every repo.
+
+export type CpGitHubInstallation = {
+  installationId: string;
+  orgId: string;
+  accountLogin: string;
+  accountType: string; // User | Organization
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CpGitIntegration = {
+  /** The App is configured on this control plane at all. */
+  enabled: boolean;
+  slug: string;
+  /** At least one installation is connected to this org. */
+  connected?: boolean;
+  installations: CpGitHubInstallation[];
+};
+
+export type CpSelectableRepo = {
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  installationId?: string;
+};
+
+export type CpRepoList = {
+  repos: CpSelectableRepo[];
+  connected: boolean;
+  /** The page cap stopped the walk — the list is partial and says so. */
+  truncated?: boolean;
+  /** Installations whose repos couldn't be read this time. */
+  unavailable?: string[];
+};
+
+export async function cpGetGitIntegration(orgId: string): Promise<CpGitIntegration> {
+  return cpFetch(`${org(orgId)}/git/integration`, undefined, { orgId });
+}
+
+export async function cpConnectGitIntegration(
+  orgId: string,
+  installationId: string,
+  actor: CpActor
+): Promise<CpGitHubInstallation> {
+  return cpFetch(
+    `${org(orgId)}/git/integration`,
+    { method: "POST", body: JSON.stringify({ installationId }) },
+    { orgId, actor }
+  );
+}
+
+export async function cpDisconnectGitIntegration(
+  orgId: string,
+  installationId: string,
+  actor: CpActor,
+  force = false
+): Promise<void> {
+  await cpFetch(
+    `${org(orgId)}/git/integration/${encodeURIComponent(installationId)}${force ? "?force=true" : ""}`,
+    { method: "DELETE" },
+    { orgId, actor }
+  );
+}
+
+/** Every repo the org's installations can reach — the picker's data source. */
+export async function cpListGitRepos(orgId: string): Promise<CpRepoList> {
+  return cpFetch(`${org(orgId)}/git/repos`, undefined, { orgId });
+}
+
+/** Bind a repo to a project, deriving the git connection when there isn't one.
+ *  Idempotent: selecting the same repo again returns the same connection. */
+export async function cpSelectGitRepo(
+  orgId: string,
+  input: { projectId: string; repoFullName: string; installationId?: string },
+  actor: CpActor
+): Promise<CpGitConnection> {
+  return cpFetch(
+    `${org(orgId)}/git/repos/select`,
+    { method: "POST", body: JSON.stringify(input) },
+    { orgId, actor }
+  );
+}

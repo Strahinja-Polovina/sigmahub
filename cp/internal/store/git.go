@@ -67,6 +67,9 @@ type CreateGitConnectionInput struct {
 	InstallationID string
 	RepoFullName   string // owner/name
 	Token          string // provider token, stored KMS-wrapped (may be empty)
+	// AutoConnected marks a connection derived from the org's GitHub integration
+	// (the repo picker) rather than assembled by hand in the Git panel.
+	AutoConnected bool
 }
 
 // GitWebhookEvent is the provider-agnostic, already-signature-verified shape the
@@ -167,10 +170,10 @@ func (s *Store) CreateGitConnection(ctx context.Context, orgID string, in Create
 		InstallationID: in.InstallationID, RepoFullName: repo, CreatedBy: actor,
 	}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, token_wrapped, created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, token_wrapped, created_by, auto_connected)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		RETURNING created_at`,
-		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy).Scan(&c.CreatedAt)
+		c.ID, c.OrgID, c.ProjectID, c.Provider, c.InstallationID, c.RepoFullName, wrapped, c.CreatedBy, in.AutoConnected).Scan(&c.CreatedAt)
 	if isUniqueViolation(err) {
 		// Uniqueness is org-scoped (SIGMA-174), so this can only be the caller's
 		// own org's connection — the message discloses nothing cross-tenant.

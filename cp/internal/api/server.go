@@ -70,8 +70,11 @@ type Server struct {
 	store               StoreAPI
 	domain              DomainAPI
 	git                 GitAPI
+	gitIntegration      GitIntegrationAPI
 	inspector           RepoInspector
+	repoLister          RepoLister
 	installTokens       InstallationTokenSource
+	installAccounts     InstallationAccountSource
 	githubAppSlug       string
 	dsdStore            DSDStore
 	dsdWaiter           DSDWaiter
@@ -126,6 +129,13 @@ type Options struct {
 	// the https://github.com/apps/<slug>/installations/new install link.
 	InstallationTokens InstallationTokenSource
 	GitHubAppSlug      string
+	// GitIntegration backs the org-level GitHub integration (connect once,
+	// then pick repos). Nil → those endpoints answer "not configured".
+	GitIntegration GitIntegrationAPI
+	// RepoLister lists the repos an installation grants — the picker's source.
+	RepoLister RepoLister
+	// InstallationAccounts names an installation's account for the dashboard.
+	InstallationAccounts InstallationAccountSource
 	// GitHubWebhookSecret verifies inbound deliveries; empty 503s the receiver.
 	GitHubWebhookSecret string
 	// PublicURL is the CP's own public base URL (e.g. https://cp.example.com).
@@ -160,7 +170,10 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		log: log, db: db, store: st, domain: dom,
 		git:                 opts.Git,
 		inspector:           opts.Inspector,
+		repoLister:          opts.RepoLister,
 		installTokens:       opts.InstallationTokens,
+		installAccounts:     opts.InstallationAccounts,
+		gitIntegration:      opts.GitIntegration,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
 		dsdWaiter:           opts.DSDWaiter,
@@ -322,6 +335,14 @@ func (s *Server) routes() {
 	// an installation to a connection mutates it, so Project Admin+.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/app", s.requireService(store.RoleDeveloper, s.handleGitAppInfo))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/connections/{connId}/installation", s.requireService(store.RoleProjectAdmin, s.handleSetInstallation))
+	// Org-level GitHub integration: connect the App once, then SELECT repos per
+	// resource instead of connecting each one by hand. Reading the integration
+	// and the repo list is member-visible; changing it is Project Admin+.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/integration", s.requireService(store.RoleDeveloper, s.handleGetGitIntegration))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/integration", s.requireService(store.RoleProjectAdmin, s.handleConnectGitIntegration))
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/git/integration/{installationId}", s.requireService(store.RoleProjectAdmin, s.handleDisconnectGitIntegration))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/git/repos", s.requireService(store.RoleDeveloper, s.handleListGitRepos))
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/git/repos/select", s.requireService(store.RoleProjectAdmin, s.handleSelectGitRepo))
 	// Previews (P1-12): the per-connection toggle is Project Admin+; the PR
 	// environment list is member-visible.
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/git/connections/{connId}/previews", s.requireService(store.RoleProjectAdmin, s.handleSetPreviews))

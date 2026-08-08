@@ -1,7 +1,12 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { requireMembership, requireProjectRole, assertProjectVisible } from "../active-org";
+import {
+  requireMembership,
+  requireProjectRole,
+  requireOrgAdmin,
+  assertProjectVisible,
+} from "../active-org";
 import { writeAudit } from "../audit";
 import {
   cpEnabled,
@@ -17,11 +22,19 @@ import {
   cpGetGitConnection,
   cpGitAppInfo,
   cpLinkInstallation,
+  cpGetGitIntegration,
+  cpConnectGitIntegration,
+  cpDisconnectGitIntegration,
+  cpListGitRepos,
+  cpSelectGitRepo,
   type CpGitAppInfo,
   type CpDetected,
   type CpGitConnection,
   type CpBranchMap,
   type CpPreviewEnvironment,
+  type CpGitIntegration,
+  type CpGitHubInstallation,
+  type CpRepoList,
 } from "../cp";
 
 /** Git integration is a control-plane feature; the demo path has no webhook
@@ -112,6 +125,8 @@ export async function wireRepoToEnvironment(input: {
   projectId: string;
   repoFullName: string;
   token?: string;
+  /** Installation the repo was picked from (org-level GitHub integration). */
+  installationId?: string;
   branch: string;
   environmentId: string;
 }): Promise<
@@ -124,11 +139,26 @@ export async function wireRepoToEnvironment(input: {
   try {
     let conn: CpGitConnection | undefined;
     try {
-      conn = await cpConnectRepo(
-        input.orgId,
-        { projectId: input.projectId, repoFullName: repo, token: input.token },
-        { name: user.name, role }
-      );
+      // Repo picked from the org integration: selecting is idempotent by
+      // (project, repo), so a second resource on the same repo reuses the
+      // connection instead of relying on an "already connected" error string.
+      if (!input.token) {
+        conn = await cpSelectGitRepo(
+          input.orgId,
+          {
+            projectId: input.projectId,
+            repoFullName: repo,
+            installationId: input.installationId,
+          },
+          { name: user.name, role }
+        );
+      } else {
+        conn = await cpConnectRepo(
+          input.orgId,
+          { projectId: input.projectId, repoFullName: repo, token: input.token },
+          { name: user.name, role }
+        );
+      }
       await writeAudit({ orgId: input.orgId, actor: user.name, action: "Connected Git repo", target: repo });
     } catch (err) {
       // A repo connects once per org — reuse the existing connection so the
@@ -322,4 +352,105 @@ export async function linkInstallation(input: {
     target: input.connectionId,
   });
   revalidatePath(`/dashboard/projects/${input.projectId}`);
+}
+
+// ── GitHub as an org-level integration ──────────────────────────────────────
+
+/** The org's GitHub integration state, for the settings page and the repo
+ *  picker. Read-only, so any member may load it. */
+export async function getGitIntegration(orgId: string): Promise<CpGitIntegration> {
+  ensureCp();
+  await requireMembership(orgId);
+  return cpGetGitIntegration(orgId);
+}
+
+/** Claim a GitHub App installation for the org — the post-install callback.
+ *  Org-level, so it needs an Org Admin rather than a project role. */
+export async function connectGitIntegration(input: {
+  orgId: string;
+  installationId: string;
+}): Promise<CpGitHubInstallation> {
+  ensureCp();
+  const user = await requireOrgAdmin(input.orgId);
+  const inst = await cpConnectGitIntegration(input.orgId, input.installationId, {
+    name: user.name,
+    role: "Org Admin",
+  });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Connected GitHub integration",
+    target: inst.accountLogin || inst.installationId,
+  });
+  revalidatePath("/dashboard/settings");
+  return inst;
+}
+
+/** Disconnect an installation. Refuses while repos still deploy through it
+ *  unless force is set — the caller shows what would break first. */
+export async function disconnectGitIntegration(input: {
+  orgId: string;
+  installationId: string;
+  force?: boolean;
+}): Promise<void> {
+  ensureCp();
+  const user = await requireOrgAdmin(input.orgId);
+  await cpDisconnectGitIntegration(
+    input.orgId,
+    input.installationId,
+    { name: user.name, role: "Org Admin" },
+    input.force ?? false
+  );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Disconnected GitHub integration",
+    target: input.installationId,
+  });
+  revalidatePath("/dashboard/settings");
+}
+
+/** Repos the org's installations can reach — the picker's options.
+ *
+ *  A CP/GitHub failure returns an empty, explicitly-not-connected list rather
+ *  than throwing: Next.js redacts thrown server-action messages in production,
+ *  so a throw would surface as an opaque digest instead of "GitHub isn't
+ *  connected yet". */
+export async function listGitRepos(orgId: string): Promise<CpRepoList> {
+  ensureCp();
+  await requireMembership(orgId);
+  try {
+    return await cpListGitRepos(orgId);
+  } catch {
+    return { repos: [], connected: false };
+  }
+}
+
+/** Bind a repo to a project, deriving the git connection when needed. */
+export async function selectGitRepo(input: {
+  orgId: string;
+  projectId: string;
+  repoFullName: string;
+  installationId?: string;
+}): Promise<CpGitConnection> {
+  ensureCp();
+  await assertProjectVisible(input.orgId, input.projectId);
+  const { user, role } = await requireProjectRole(input.orgId, input.projectId, "Project Admin");
+  const conn = await cpSelectGitRepo(
+    input.orgId,
+    {
+      projectId: input.projectId,
+      repoFullName: input.repoFullName,
+      installationId: input.installationId,
+    },
+    { name: user.name, role }
+  );
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "Selected repository",
+    target: conn.repoFullName,
+  });
+  revalidatePath(`/dashboard/projects/${input.projectId}`);
+  return conn;
 }

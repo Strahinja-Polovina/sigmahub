@@ -13,6 +13,7 @@ import {
   cpDeleteResource,
   cpKind,
   cpMirrorServer,
+  cpSelectGitRepo,
   cpRedeploy,
   cpRequestConfirmToken,
   cpConfirmDestructive,
@@ -34,6 +35,9 @@ export async function createResource(input: {
   kind: string;
   repo?: string;
   domain?: string;
+  /** Installation the repo was picked from (org-level GitHub integration).
+   *  Present when the wizard used the repo picker rather than a pasted token. */
+  installationId?: string;
   /** Repo config from the CP's git inspector, carried through the wizard.
    *  Without it the rendered rollout declares no ports and its health probe
    *  falls back to a port the app does not listen on, so the first deploy is
@@ -107,6 +111,28 @@ export async function createResource(input: {
       { name: user.name, role }
     );
     id = created.id;
+
+    // A repo-backed resource needs a git connection for push-to-deploy: branch
+    // maps, webhook routing and clone credentials all hang off it. With the
+    // org-level GitHub integration the user only PICKED a repo, so derive the
+    // connection here instead of making them build one by hand in the Git panel.
+    // Idempotent per (project, repo), and never fatal — the resource exists
+    // either way and the Git panel can still connect it manually.
+    if (input.repo) {
+      try {
+        await cpSelectGitRepo(
+          project.orgId,
+          {
+            projectId: input.projectId,
+            repoFullName: input.repo,
+            installationId: input.installationId,
+          },
+          { name: user.name, role }
+        );
+      } catch (err) {
+        console.warn("could not link repository to project", err);
+      }
+    }
   }
   const now = new Date();
   // CP mode reports honest state: the resource is provisioning until the

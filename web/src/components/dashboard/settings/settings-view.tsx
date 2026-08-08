@@ -10,6 +10,7 @@ import { TokensTab } from "./tokens-tab";
 import { BetaMetricsTab } from "./beta-metrics-tab";
 import { SecurityTab } from "./security-tab";
 import { AlertsTab } from "./alerts-tab";
+import { IntegrationsTab, type Installation } from "./integrations-tab";
 
 export type SettingsOrg = {
   id: string;
@@ -51,6 +52,7 @@ export function SettingsView({
   cpMode = false,
   orgCreatedAt = null,
   twoFactorEnabled = false,
+  gitIntegration = null,
 }: {
   org: SettingsOrg;
   members: SettingsMember[];
@@ -65,6 +67,12 @@ export function SettingsView({
   cpMode?: boolean;
   orgCreatedAt?: string | Date | null;
   twoFactorEnabled?: boolean;
+  /** Org-level GitHub integration (CP mode); null when unavailable. */
+  gitIntegration?: {
+    enabled: boolean;
+    slug: string;
+    installations: Installation[];
+  } | null;
 }) {
   const isAdmin = currentUserRole === "Org Admin";
 
@@ -79,7 +87,7 @@ export function SettingsView({
     "tokens",
     "security",
     ...(canViewAudit ? ["audit"] : []),
-    ...(cpMode ? ["alerts", "beta"] : []),
+    ...(cpMode ? ["integrations", "alerts", "beta"] : []),
   ];
   const initialTab =
     requestedTab && availableTabs.includes(requestedTab) ? requestedTab : "general";
@@ -98,6 +106,7 @@ export function SettingsView({
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
           <TabsTrigger value="tokens">Tokens</TabsTrigger>
+          {cpMode && <TabsTrigger value="integrations">Integrations</TabsTrigger>}
           <TabsTrigger value="security">Security</TabsTrigger>
           {canViewAudit && <TabsTrigger value="audit">Audit log</TabsTrigger>}
           {cpMode && <TabsTrigger value="alerts">Alerts</TabsTrigger>}
@@ -119,6 +128,17 @@ export function SettingsView({
         <TabsContent value="tokens">
           <TokensTab orgId={org.id} isAdmin={isAdmin} />
         </TabsContent>
+        {cpMode && (
+          <TabsContent value="integrations">
+            <IntegrationsTab
+              orgId={org.id}
+              enabled={gitIntegration?.enabled ?? false}
+              slug={gitIntegration?.slug ?? ""}
+              installations={gitIntegration?.installations ?? []}
+              canManage={isAdmin}
+            />
+          </TabsContent>
+        )}
         <TabsContent value="security">
           <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} />
         </TabsContent>
