@@ -19,6 +19,7 @@ import {
   ArrowRight,
   Search,
   Database,
+  Cpu,
   HardDrive,
 } from "lucide-react";
 
@@ -142,14 +143,22 @@ const STEPS = [
 ] as const;
 
 // Managed services created straight from an engine image — no git repo, no
-// build step. llm stays out until GPU onboarding ships.
+// build step.
 const SERVICE_KINDS: { kind: ResourceKind; icon: React.ElementType; detail: string }[] = [
   { kind: "postgres", icon: Database, detail: "Managed PostgreSQL" },
   { kind: "mysql", icon: Database, detail: "Managed MySQL" },
   { kind: "mongo", icon: Database, detail: "Managed MongoDB" },
   { kind: "redis", icon: Database, detail: "Managed Redis" },
   { kind: "s3", icon: HardDrive, detail: "S3-compatible object storage" },
+  { kind: "llm", icon: Cpu, detail: "Model endpoint on a GPU server" },
 ];
+
+/** Inference runtimes the control plane knows how to render. An unknown one is
+ *  refused at create, so this list is the contract rather than free text. */
+const LLM_ENGINES = [
+  { id: "vllm", label: "vLLM", detail: "High-throughput serving for most open models" },
+  { id: "ollama", label: "Ollama", detail: "Simple single-model serving" },
+] as const;
 
 const DEPLOY_PHASES = [
   "Cloning repository",
@@ -202,6 +211,10 @@ export function DeployWizard({
   const [createState, setCreateState] = React.useState<"idle" | "creating" | "done" | "error">("idle");
   const [createdId, setCreatedId] = React.useState<string | null>(null);
   const createStartedRef = React.useRef(false);
+  // An inference endpoint needs a runtime and a model; the control plane refuses
+  // a create without them rather than guessing.
+  const [llmEngine, setLlmEngine] = React.useState<string>(LLM_ENGINES[0].id);
+  const [llmModel, setLlmModel] = React.useState("");
   const [projectId, setProjectId] = React.useState<string>("");
   const [environmentId, setEnvironmentId] = React.useState<string>("");
   const [serverId, setServerId] = React.useState<string>("");
@@ -384,6 +397,7 @@ export function DeployWizard({
             repo: serviceKind ? undefined : repo?.fullName,
             installationId: serviceKind ? undefined : pickedInstallation,
             detected: serviceKind ? undefined : repo?.detected,
+            llm: serviceKind === "llm" ? { engine: llmEngine, model: llmModel.trim() } : undefined,
           });
           // Wire push-to-deploy for the golden path in ONE resilient call:
           // connect the repo (reusing an existing org connection instead of
@@ -476,6 +490,7 @@ export function DeployWizard({
           name: resourceName || "resource",
           kind: kind ?? "app",
           repo: serviceKind ? undefined : repo?.fullName,
+          llm: serviceKind === "llm" ? { engine: llmEngine, model: llmModel.trim() } : undefined,
         })
           .then(() => {
             setDeploying(false);
@@ -1030,7 +1045,41 @@ export function DeployWizard({
           {/* Step 4 — environment variables */}
           {step === 4 && (
             <div className="flex flex-col gap-3">
-              {serviceKind ? (
+              {serviceKind === "llm" && (
+                <div className="flex flex-col gap-3 rounded-lg border border-border p-3">
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="llm-engine">Runtime</Label>
+                    <Select value={llmEngine} onValueChange={(v) => setLlmEngine(v ?? "")}>
+                      <SelectTrigger id="llm-engine">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {LLM_ENGINES.map((e) => (
+                          <SelectItem key={e.id} value={e.id}>
+                            {e.label} · {e.detail}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="llm-model">Model</Label>
+                    <Input
+                      id="llm-model"
+                      value={llmModel}
+                      onChange={(e) => setLlmModel(e.target.value)}
+                      placeholder="meta-llama/Llama-3.1-8B-Instruct"
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Pulled on first start, so the endpoint takes a few minutes to
+                      become ready. It listens on the private mesh only — never a
+                      public interface.
+                    </p>
+                  </div>
+                </div>
+              )}
+              {serviceKind && serviceKind !== "llm" ? (
                 <div className="flex items-start gap-2.5 rounded-lg border border-border bg-muted/40 p-3">
                   <CircleCheck className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                   <p className="text-xs leading-relaxed text-muted-foreground">
@@ -1040,7 +1089,7 @@ export function DeployWizard({
                     Add variables below only if this service needs something extra.
                   </p>
                 </div>
-              ) : (
+              ) : serviceKind === "llm" ? null : (
                 <p className="text-sm text-muted-foreground">
                   Injected into the container at runtime. Values are encrypted at rest.
                   {repo?.envKeys?.length
@@ -1248,7 +1297,14 @@ export function DeployWizard({
                 Back
               </Button>
               {step === 4 ? (
-                <Button size="sm" onClick={next}>
+                <Button
+                  size="sm"
+                  onClick={next}
+                  // An endpoint with no model has nothing to serve, and the
+                  // control plane refuses the create — better to say so here
+                  // than to fail after the wizard has closed.
+                  disabled={serviceKind === "llm" && llmModel.trim() === ""}
+                >
                   Deploy
                   <ArrowRight className="size-4" />
                 </Button>

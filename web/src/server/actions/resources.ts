@@ -46,6 +46,9 @@ export async function createResource(input: {
     ports?: number[];
     healthCheck?: { type: string; path?: string; port?: number };
   };
+  /** Inference runtime + model, for kind "llm". The control plane refuses an
+   *  unknown runtime, so this is passed through rather than defaulted. */
+  llm?: { engine: string; model: string };
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
@@ -89,6 +92,12 @@ export async function createResource(input: {
   }
   if (input.detected?.healthCheck?.type) {
     spec.healthCheck = input.detected.healthCheck;
+  }
+  // An inference endpoint is defined by what it runs: without these the control
+  // plane has nothing to render and refuses the create.
+  if (input.llm?.engine) {
+    spec.engine = input.llm.engine;
+    spec.model = input.llm.model;
   }
 
   let id = rid("res");
