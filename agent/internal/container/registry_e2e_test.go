@@ -34,12 +34,22 @@ import (
 
 // fakeRegistry is an OCI distribution endpoint that accepts pushes and records
 // what credentials it was given.
+//
+// It is a real content-addressable store, not a stub that says yes: blobs are
+// kept by digest and a HEAD answers from that. Docker's two image stores drive
+// the push differently — the containerd snapshotter uploads and moves on, the
+// classic one verifies each blob is present before it assembles the manifest —
+// and a registry that 404s a blob it just accepted fails the second one with
+// "unknown blob". Behaving correctly is cheaper than guessing which store the
+// host happens to run.
 type fakeRegistry struct {
 	user, pass string
 
-	mu        sync.Mutex
-	uploads   map[string][]byte // upload id -> accumulated blob
-	blobs     int
+	mu      sync.Mutex
+	uploads map[string][]byte // upload id -> bytes received so far
+	blobs   map[string][]byte // digest -> content
+	pushed  int               // finalized blob uploads
+	// manifests is every manifest body accepted, in order.
 	manifests []string
 	// seenAuth is every Authorization header value the registry received.
 	seenAuth []string
@@ -48,7 +58,17 @@ type fakeRegistry struct {
 }
 
 func newFakeRegistry(user, pass string) *fakeRegistry {
-	return &fakeRegistry{user: user, pass: pass, uploads: map[string][]byte{}}
+	return &fakeRegistry{
+		user: user, pass: pass,
+		uploads: map[string][]byte{},
+		blobs:   map[string][]byte{},
+	}
+}
+
+// digestOf is the content address the distribution API keys blobs by.
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // authorized enforces the Basic challenge. Docker only sends credentials after
@@ -87,41 +107,72 @@ func (r *fakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case path == "/v2" || path == "/v2/":
 		w.WriteHeader(http.StatusOK)
 
-	// Start an upload.
+	// Start an upload. A cross-repository mount is declined by simply opening a
+	// normal upload session, which is what a registry that does not support it
+	// does; the client then uploads the bytes.
 	case strings.HasSuffix(path, "/blobs/uploads/") && req.Method == http.MethodPost:
-		id := fmt.Sprintf("u%d", len(r.uploads)+1)
 		r.mu.Lock()
+		id := fmt.Sprintf("u%d", len(r.uploads)+1)
 		r.uploads[id] = nil
 		r.mu.Unlock()
+		// A single-shot POST carries the whole blob and its digest.
+		if d := req.URL.Query().Get("digest"); d != "" {
+			body, _ := io.ReadAll(req.Body)
+			r.storeBlob(d, body)
+			w.Header().Set("Docker-Content-Digest", d)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
 		w.Header().Set("Location", strings.TrimSuffix(path, "/")+"/"+id)
 		w.Header().Set("Range", "0-0")
 		w.Header().Set("Docker-Upload-UUID", id)
 		w.WriteHeader(http.StatusAccepted)
 
-	// Chunked upload, then finalize. Docker uses POST→PATCH→PUT; some clients
-	// go straight to a monolithic PUT, so both accumulate the same way.
+	// Chunked upload, then finalize. Docker uses POST→PATCH→PUT; some clients go
+	// straight to a monolithic PUT, so both accumulate the same way.
 	case strings.Contains(path, "/blobs/uploads/") && (req.Method == http.MethodPatch || req.Method == http.MethodPut):
 		id := path[strings.LastIndexByte(path, '/')+1:]
 		body, _ := io.ReadAll(req.Body)
 		r.mu.Lock()
 		r.uploads[id] = append(r.uploads[id], body...)
-		size := len(r.uploads[id])
-		if req.Method == http.MethodPut {
-			r.blobs++
-		}
+		content := r.uploads[id]
+		size := len(content)
 		r.mu.Unlock()
+
 		if req.Method == http.MethodPatch {
 			w.Header().Set("Location", path)
 			w.Header().Set("Range", fmt.Sprintf("0-%d", size-1))
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		w.Header().Set("Docker-Content-Digest", req.URL.Query().Get("digest"))
+		// Finalize: the client names the digest it expects, and a registry that
+		// stored something else would be silently corrupting the image.
+		want := req.URL.Query().Get("digest")
+		if got := digestOf(content); want != "" && got != want {
+			http.Error(w, `{"errors":[{"code":"DIGEST_INVALID"}]}`, http.StatusBadRequest)
+			return
+		}
+		r.storeBlob(want, content)
+		w.Header().Set("Docker-Content-Digest", want)
 		w.WriteHeader(http.StatusCreated)
 
-	// Blob presence probe: always "absent" so the push actually uploads.
-	case strings.Contains(path, "/blobs/") && req.Method == http.MethodHead:
-		http.Error(w, `{"errors":[{"code":"BLOB_UNKNOWN"}]}`, http.StatusNotFound)
+	// Blob presence. Answering from what was actually stored is the difference
+	// between the two Docker image stores working and only one of them working.
+	case strings.Contains(path, "/blobs/") && (req.Method == http.MethodHead || req.Method == http.MethodGet):
+		d := path[strings.LastIndexByte(path, '/')+1:]
+		r.mu.Lock()
+		content, ok := r.blobs[d]
+		r.mu.Unlock()
+		if !ok {
+			http.Error(w, `{"errors":[{"code":"BLOB_UNKNOWN"}]}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		w.Header().Set("Docker-Content-Digest", d)
+		w.WriteHeader(http.StatusOK)
+		if req.Method == http.MethodGet {
+			_, _ = w.Write(content)
+		}
 
 	case strings.Contains(path, "/manifests/") && req.Method == http.MethodPut:
 		body, _ := io.ReadAll(req.Body)
@@ -142,10 +193,20 @@ func (r *fakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (r *fakeRegistry) storeBlob(digest string, content []byte) {
+	if digest == "" {
+		digest = digestOf(content)
+	}
+	r.mu.Lock()
+	r.blobs[digest] = content
+	r.pushed++
+	r.mu.Unlock()
+}
+
 func (r *fakeRegistry) counts() (manifests, blobs, anonymous int, auths []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.manifests), r.blobs, r.anonymous, append([]string(nil), r.seenAuth...)
+	return len(r.manifests), r.pushed, r.anonymous, append([]string(nil), r.seenAuth...)
 }
 
 // buildScratchImage builds a tiny local image with no base layer, so nothing has
