@@ -662,3 +662,54 @@ func equalSets(a, b []string) bool {
 	}
 	return true
 }
+
+// An engine can satisfy every catalog guard and still start a container nobody
+// can log into.
+//
+// PlainEnv and TunedCommand are per-engine switch statements, which makes their
+// case lists a second spelling of the dbEngines keys that nothing ties to the
+// first. Adversarial review added a fully wired-up engine — a kind, a category,
+// a catalog entry, all three init guards satisfied — and both methods fell
+// through to nil: the reconciler rendered a container with no credentials env
+// and no start command, while the connection panel printed a URL naming a user
+// the engine had never been told to create.
+//
+// A switch cannot be made exhaustive in Go, so this is the substitute: the
+// property each arm exists to provide, asserted for every engine the catalog
+// knows. It fails on the edit that adds an engine, not on the deploy that
+// reveals it.
+func TestEveryEngineIsStartedWithCredentialsAndACommand(t *testing.T) {
+	for _, def := range DBEngineCatalog() {
+		t.Run(def.Engine, func(t *testing.T) {
+			// Both tuning profiles: the production arm is reached only on a
+			// database-type server, so an engine handled in one and not the
+			// other would pass a test that checked a single profile.
+			for _, serverType := range []string{"database", "general"} {
+				if len(def.TunedCommand(serverType)) == 0 {
+					t.Errorf("TunedCommand(%q) is empty: the container starts on the image's own "+
+						"entrypoint, with none of the tuning this catalog exists to apply",
+						serverType)
+				}
+			}
+			// Redis is the one engine with no user or database concept, and it
+			// says so by name in PlainEnv rather than by falling off the end.
+			if def.Engine == "redis" {
+				return
+			}
+			env := def.PlainEnv("sigma_user", "sigma_db")
+			if len(env) == 0 {
+				t.Fatalf("PlainEnv is empty: the engine is started with no credentials, and the " +
+					"connection panel then prints a username nothing created")
+			}
+			var carriesUser bool
+			for _, v := range env {
+				if v == "sigma_user" {
+					carriesUser = true
+				}
+			}
+			if !carriesUser {
+				t.Errorf("PlainEnv = %v, which never names the username it was given", env)
+			}
+		})
+	}
+}

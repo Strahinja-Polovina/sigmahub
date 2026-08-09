@@ -276,6 +276,39 @@ describe("nothing keeps a second copy of the vocabulary", () => {
     return found;
   }
 
+  /** Shape 5: the vocabulary as a chain of EQUALITY comparisons —
+   *  `kind === "postgres" || kind === "mysql" || …`.
+   *
+   *  None of the four shapes above can see it: there is no colon, no array
+   *  literal, no key, and shape 4 explicitly refuses `||` so that `!gpu ||
+   *  !gpu.count` is not read as a run. It is also the most likely way a
+   *  deleted `DB_KINDS.includes(kind)` comes back, because inlining the check
+   *  is the smallest edit that makes a call site compile again after the list
+   *  it used to import is gone.
+   *
+   *  Both operators, because `!==` chains are how the same list gets written
+   *  as an exclusion.
+   *
+   *  A CHAIN, in one expression — the same rule shape 4 draws, and for the same
+   *  reason. Counting scattered comparisons instead flags every file that
+   *  branches on three different kinds in three unrelated places, which is what
+   *  per-kind code legitimately looks like: `kind === "app"` deciding whether to
+   *  send a build method, and `kind === "llm"` deciding whether to send a model,
+   *  are two facts about two kinds and not a statement about the set. A matcher
+   *  that cried wolf on those would be loosened away by the next person, which
+   *  is how the guard this file replaced died. */
+  function comparisonEnumeration(vocabulary: readonly string[], src: string): string[] {
+    const cmp = `[!=]==\\s*["'][A-Za-z0-9][\\w-]*["']`;
+    const runs = src.matchAll(new RegExp(`${cmp}(?:\\s*(?:\\|\\||&&)[^;{}\\n]*?${cmp}){2,}`, "g"));
+    const found: string[] = [];
+    for (const [run] of runs) {
+      const words = [...run.matchAll(/["']([A-Za-z0-9][\w-]*)["']/g)].map((m) => m[1]);
+      const named = [...new Set(words)].filter((w) => vocabulary.includes(w));
+      if (named.length >= 3) found.push(`as an equality chain: ${named.join(", ")}`);
+    }
+    return found;
+  }
+
   function vocabularyCopies(vocabulary: readonly string[], typeName: string) {
     const offenders: string[] = [];
     for (const file of files) {
@@ -291,6 +324,7 @@ describe("nothing keeps a second copy of the vocabulary", () => {
         ...arrayEnumeration(vocabulary, src),
         ...valueEnumeration(vocabulary, src),
         ...proseEnumeration(vocabulary, src),
+        ...comparisonEnumeration(vocabulary, src),
       ];
       for (const hit of found) offenders.push(`${name} (${hit})`);
     }
@@ -311,6 +345,97 @@ describe("nothing keeps a second copy of the vocabulary", () => {
       vocabularyCopies(RESOURCE_KINDS, "ResourceKind"),
       "import RESOURCE_KINDS from @/lib/server-catalog.generated, or key the table on ResourceKind so tsc keeps it exhaustive — a list written out here agrees with the control plane only by luck"
     ).toEqual([]);
+  });
+
+  // The guard's own guard.
+  //
+  // Everything above asserts that no file in src/ trips these matchers, which
+  // is a claim about the tree and says nothing about whether the matchers still
+  // match. Adversarial review made each shape `return []` as its first
+  // statement and the whole suite stayed green; changing one character in WORD
+  // killed two shapes just as quietly. That is precisely the failure this file
+  // was rewritten to remove — its own comment describes the predecessor as "a
+  // regex that matched a SUBSET of a Go map literal, so it passed while
+  // checking almost nothing" — reproduced in the replacement.
+  //
+  // The fixtures use a SYNTHETIC vocabulary. Spelling the real one out here to
+  // demonstrate a copy would be writing the copy this file exists to refuse,
+  // and the guard reads itself.
+  describe("the copy matchers themselves", () => {
+    const VOCAB = ["alpha", "beta", "gamma", "delta"] as const;
+
+    it("sees a table keyed on the vocabulary", () => {
+      expect(keyEnumeration(VOCAB, `const T = { alpha: 1, beta: 2, gamma: 3 };`)).toHaveLength(1);
+      expect(keyEnumeration(VOCAB, `const T = { alpha: 1, beta: 2 };`)).toEqual([]);
+    });
+
+    // The two false positives the key matcher was tightened for, and the reason
+    // it may not be loosened again casually: an image tag and a URL scheme both
+    // carry a colon after a vocabulary word.
+    it("does not mistake an image tag or a URL scheme for a key", () => {
+      const tags = VOCAB.map((v) => `  image: "${v}:16.6",`).join("\n");
+      expect(keyEnumeration(VOCAB, `const compose = {\n${tags}\n};`)).toEqual([]);
+      const urls = VOCAB.map((v) => `const u = "${v}://host:5432/db";`).join("\n");
+      expect(keyEnumeration(VOCAB, urls)).toEqual([]);
+    });
+
+    it("sees the vocabulary written as a flat array", () => {
+      const arr = `const K = [${VOCAB.slice(0, 3).map((v) => `"${v}"`).join(", ")}];`;
+      expect(arrayEnumeration(VOCAB, arr)).toHaveLength(1);
+      const two = `const K = [${VOCAB.slice(0, 2).map((v) => `"${v}"`).join(", ")}];`;
+      expect(arrayEnumeration(VOCAB, two)).toEqual([]);
+    });
+
+    // An array of ROWS is data, not a vocabulary, and every demo fixture is one.
+    it("leaves an array of objects alone", () => {
+      const rows = VOCAB.map((v) => `{ kind: "${v}", name: "x" }`).join(", ");
+      expect(arrayEnumeration(VOCAB, `const rows = [${rows}];`)).toEqual([]);
+    });
+
+    it("sees the vocabulary in value position, and leaves repeated rows alone", () => {
+      const once = VOCAB.slice(0, 3).map((v) => `{ kind: "${v}" }`).join(",\n");
+      expect(valueEnumeration(VOCAB, once)).toHaveLength(1);
+      // Data repeats; an enumeration names each word once and stops.
+      expect(valueEnumeration(VOCAB, `${once},\n{ kind: "${VOCAB[0]}" }`)).toEqual([]);
+    });
+
+    it("sees a pipe-separated run in prose, and is not fooled by a boolean or", () => {
+      expect(proseEnumeration(VOCAB, `// kind: ${VOCAB.slice(0, 3).join(" | ")}`)).toHaveLength(1);
+      const bool = `if (!${VOCAB[0]} || !${VOCAB[1]} || !${VOCAB[2]}) return;`;
+      expect(proseEnumeration(VOCAB, bool)).toEqual([]);
+    });
+
+    it("sees an equality chain, which is how a deleted list comes back inlined", () => {
+      const chain = VOCAB.slice(0, 3).map((v) => `k === "${v}"`).join(" || ");
+      expect(comparisonEnumeration(VOCAB, `const isDb = ${chain};`)).toHaveLength(1);
+      const two = VOCAB.slice(0, 2).map((v) => `k === "${v}"`).join(" || ");
+      expect(comparisonEnumeration(VOCAB, `const isDb = ${two};`)).toEqual([]);
+    });
+
+    // The one that catches a matcher gutted to `return []`, whichever it is:
+    // every shape must answer for the form it owns.
+    it("has a matcher that fires for every shape it claims to cover", () => {
+      const three = VOCAB.slice(0, 3);
+      const fixtures: [string, string[]][] = [
+        [`const T = { ${three.map((v) => `${v}: 1`).join(", ")} };`, ["as keys"]],
+        [`const K = [${three.map((v) => `"${v}"`).join(", ")}];`, ["as an array"]],
+        [three.map((v) => `{ kind: "${v}" }`).join(",\n"), ["in value position"]],
+        [`// ${three.join(" | ")}`, ["as prose"]],
+        [`const x = ${three.map((v) => `k === "${v}"`).join(" || ")};`, ["as an equality"]],
+      ];
+      for (const [src, expected] of fixtures) {
+        const hits = [
+          ...keyEnumeration(VOCAB, src),
+          ...arrayEnumeration(VOCAB, src),
+          ...valueEnumeration(VOCAB, src),
+          ...proseEnumeration(VOCAB, src),
+          ...comparisonEnumeration(VOCAB, src),
+        ].join(" ");
+        for (const want of expected) {
+          expect(hits, `nothing caught ${JSON.stringify(src)}`).toContain(want);
+        }
+      }
+    });
   });
 
   it("has no module left importing the deleted hand-written copies", () => {

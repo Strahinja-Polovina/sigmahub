@@ -157,6 +157,15 @@ func DBEngineKinds() []string {
 
 // PlainEnv is the engine's NON-secret environment (usernames and database
 // names are identifiers, not secrets — the password never appears here).
+//
+// Redis is a named case rather than the default arm, which is the difference
+// between "this engine has no user or database concept" and "we have not
+// thought about this engine". The default arm used to carry a comment saying it
+// belonged to redis, so an engine added to dbEngines silently inherited Redis's
+// semantics — a container started with no credentials env at all, while the
+// connection panel printed a URL naming a user the engine was never told to
+// create. Falling through now returns nil under a name nobody claimed, and
+// TestEveryEngineIsStartedWithCredentialsAndACommand refuses it.
 func (d DBEngineDef) PlainEnv(username, dbname string) map[string]string {
 	switch d.Engine {
 	case "postgres":
@@ -165,7 +174,11 @@ func (d DBEngineDef) PlainEnv(username, dbname string) map[string]string {
 		return map[string]string{"MYSQL_USER": username, "MYSQL_DATABASE": dbname}
 	case "mongodb":
 		return map[string]string{"MONGO_INITDB_ROOT_USERNAME": username}
-	default: // redis has no user/db concept
+	case "redis":
+		// No user or database concept: the password is the whole credential and
+		// it is injected as a secret reference, never here.
+		return nil
+	default:
 		return nil
 	}
 }

@@ -128,7 +128,36 @@ func TestTheInstallerRejectsAHostByNamingTheListItChecked(t *testing.T) {
 					gate.rejection, value, gate.variable, strings.TrimSpace(line))
 			}
 		}
+		// And the CHECK has to read the variable too, not merely the sentence
+		// printed when it fails. Adversarial review inlined a third
+		// architecture into the in_list call while leaving both the variable
+		// and the rejection message untouched: every test here passed, and a
+		// riscv64 host then cleared the gate, installed, and 404'd on an
+		// archive that was never published — after the EXIT trap had already
+		// spent the one-time bootstrap token. A gate that agrees with its own
+		// error message is the only thing that makes either worth reading.
+		check, ok := lineContaining(src, "in_list \"${"+gateVariable(gate.variable)+"}\"")
+		if !ok {
+			t.Errorf("no in_list check reads ${%s}; the vocabulary above it gates nothing",
+				gate.variable)
+			continue
+		}
+		if !strings.Contains(check, "${"+gate.variable+"}") {
+			t.Errorf("install.sh's %s gate does not check against ${%s}, so the list it prints "+
+				"and the list it enforces are two different things:\n  %s",
+				gate.variable, gate.variable, strings.TrimSpace(check))
+		}
 	}
+}
+
+// gateVariable maps a vocabulary variable to the shell variable holding the
+// value being tested against it, so the check line can be found without
+// matching on the list itself.
+func gateVariable(vocabulary string) string {
+	if vocabulary == "SUPPORTED_DISTROS" {
+		return "distro"
+	}
+	return "arch"
 }
 
 // The installer and self-update download the same asset by name, from two

@@ -497,6 +497,28 @@ func init() {
 		}
 		catalogByType[spec.Type] = spec
 	}
+	// A kind nothing can host is the last phantom this catalog let through, and
+	// it is a worse dead end than an empty category because it looks finished.
+	// Adding a kind, giving it a category and stopping — which is exactly where
+	// a half-done edit stops, since tsc names the two Record entries and nothing
+	// else — leaves every check in the repository green while the wizard offers
+	// a tile whose target step can never accept a server. The card reads "No
+	// server is connected. A ClickHouse needs one to run on", with a blank where
+	// the type list should be, above a Connect button that cannot fix it. Worse,
+	// an organization holding any cluster is told the kind IS available, walks
+	// the whole flow, and gets a resource the reconciler has no path for —
+	// provisioning forever.
+	//
+	// Server types have carried this rule in the other direction all along
+	// (HostsNothingReason, checked in the loop above), so this is the missing
+	// half of a pair rather than a new idea. It must come after that loop,
+	// because that loop is what fills kindServerTypes.
+	for _, k := range resourceKinds {
+		if len(kindServerTypes[k.Kind]) == 0 {
+			panic("store: resource kind " + k.Kind + " can be hosted by no server type; " +
+				"add it to the Hosts list of a server type in serverCatalog, or remove the kind")
+		}
+	}
 	// The cluster exclusion list (clusters.go) is keyed by resource kind and is
 	// rendered into the dashboard's catalog from here, so a key that names no
 	// kind is worse than dead: ClusterExcludedKinds walks the catalog to stay
