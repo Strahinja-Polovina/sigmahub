@@ -57,6 +57,9 @@ type DomainAPI interface {
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
 	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
 	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)
+	// BeginDecommission is the graceful disconnect (SIGMA-204); DeleteServer is
+	// the force path it falls back to.
+	BeginDecommission(ctx context.Context, orgID, serverID string, purgeVolumes bool, actor string) (store.DecommissionState, error)
 	DeleteServer(ctx context.Context, orgID, serverID, actor string) error
 	RevokeAgentToken(ctx context.Context, orgID, serverID, actor string) error
 	ListServiceTokens(ctx context.Context, orgID string) ([]store.ServiceTokenInfo, error)

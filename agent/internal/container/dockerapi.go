@@ -196,6 +196,38 @@ func (d *DockerClient) ManagedNetworks(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// NetworkRemove deletes a network. A network that is already gone is success
+// (idempotent) — the decommission teardown may run twice if the op is
+// re-delivered after a crash.
+func (d *DockerClient) NetworkRemove(ctx context.Context, name string) error {
+	err := d.do(ctx, http.MethodDelete, "/networks/"+url.PathEscape(name), nil, nil)
+	if isNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// ManagedVolumes lists the named volumes carrying the managed label. The
+// /volumes response nests them under "Volumes" (unlike /networks), and a daemon
+// with none returns null there — hence the explicit nil-safe walk.
+func (d *DockerClient) ManagedVolumes(ctx context.Context) ([]string, error) {
+	q := url.Values{}
+	q.Set("filters", `{"label":["`+LabelManaged+`=true"]}`)
+	var res struct {
+		Volumes []struct {
+			Name string `json:"Name"`
+		} `json:"Volumes"`
+	}
+	if err := d.do(ctx, http.MethodGet, "/volumes?"+q.Encode(), nil, &res); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(res.Volumes))
+	for _, v := range res.Volumes {
+		out = append(out, v.Name)
+	}
+	return out, nil
+}
+
 // NetworkConnect attaches a container to a network. Connecting an
 // already-connected container is treated as success (idempotent).
 func (d *DockerClient) NetworkConnect(ctx context.Context, network, container string) error {

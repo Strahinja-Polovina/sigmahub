@@ -41,6 +41,7 @@ checksum:
   # where extra_files were previously served unsigned.
   extra_files:
     - glob: ./agent/packaging/install.sh
+    - glob: ./agent/packaging/uninstall.sh
     - glob: ./agent/packaging/sigmad.service
     - glob: ./cp/packaging/sigmahub-cp.service
 
@@ -70,6 +71,10 @@ release:
   # served over HTTPS and cosign-verifies the sigmad binary it downloads.
   extra_files:
     - glob: ./agent/packaging/install.sh
+    # The manual cleanup script the force-disconnect dialog hands out
+    # (SIGMA-205). Shipped from the same file the dialog renders, so the copy
+    # on the page and the copy on disk cannot drift.
+    - glob: ./agent/packaging/uninstall.sh
     - glob: ./agent/packaging/sigmad.service
     # Control-plane self-hosting (bare-binary deployments; the container path
     # builds from cp/Dockerfile + cp/deploy/docker-compose.yml).

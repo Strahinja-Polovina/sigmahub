@@ -61,6 +61,10 @@ type StoreAPI interface {
 	MarkS3OpFailed(ctx context.Context, serverID, opID, detail string) error
 	RecordStorageBytes(ctx context.Context, serverID, opID string, bytes int64, now time.Time) error
 	FailS3OpFromOpStatus(ctx context.Context, serverID, opID, errText string) error
+	// CompleteDecommission finishes a graceful decommission on the agent's ack
+	// (SIGMA-204). Keyed by server id alone: the caller is the agent-token
+	// handler, which already resolved the server from the credential.
+	CompleteDecommission(ctx context.Context, serverID string, ok bool, detail string) error
 }
 
 // ReconcileTrigger nudges the reconciler after a resource mutation.
@@ -264,6 +268,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/hardening", s.requireService(store.RoleProjectAdmin, s.handleSetHardening))
 	// Server + token lifecycle (P1-4). Server delete and agent-token revoke are
 	// Project Admin+; service-token lifecycle is Org Admin only.
+	//
+	// Disconnect is TWO endpoints since SIGMA-204. POST .../decommission is the
+	// ordinary one: it asks the agent to remove the workloads and itself, and
+	// the row is tombstoned when the agent acks (or the sweeper times it out).
+	// DELETE is the force path — tombstone and revoke, host untouched — for a
+	// machine that is already unreachable or a teardown that never finished.
+	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/decommission", s.requireService(store.RoleProjectAdmin, s.handleDecommissionServer))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/servers/{serverId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteServer))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/servers/{serverId}/revoke-token", s.requireService(store.RoleProjectAdmin, s.handleRevokeAgentToken))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/service-tokens", s.requireService(store.RoleOrgAdmin, s.handleListServiceTokens))
@@ -446,6 +457,11 @@ func (s *Server) routes() {
 	// A cluster node's own account of whether k3s came up on it, and the
 	// registry credential a build server needs to push what it built.
 	s.mux.HandleFunc("POST /v1/agent/cluster-status", s.requireAgent(s.handleAgentClusterStatus))
+	// The agent's final word on a graceful decommission (SIGMA-204). Sent from
+	// inside the uninstall handler, BEFORE the teardown reaches the WireGuard
+	// interface and the data dir that holds this very credential — which is why
+	// it cannot be the ordinary DSD op-status report.
+	s.mux.HandleFunc("POST /v1/agent/uninstall-ack", s.requireAgent(s.handleAgentUninstallAck))
 	s.mux.HandleFunc("GET /v1/agent/registry-credential", s.requireAgent(s.handleAgentRegistryCredential))
 	// WAL shipping (P2-5).
 	s.mux.HandleFunc("GET /v1/agent/wal-targets", s.requireAgent(s.handleAgentWALTargets))

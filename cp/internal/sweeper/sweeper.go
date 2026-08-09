@@ -6,12 +6,15 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
 type Store interface {
 	MarkStaleUnreachable(ctx context.Context, threshold time.Duration) (int64, error)
 	PruneMetrics(ctx context.Context, retention time.Duration) (int64, error)
 	TimeoutStaleDeployments(ctx context.Context, timeout time.Duration) (int64, error)
+	TimeoutStaleDecommissions(ctx context.Context, timeout time.Duration) ([]store.DecommissionTimedOut, error)
 }
 
 type Config struct {
@@ -29,6 +32,14 @@ type Config struct {
 	// (SIGMA-182). Backup runs have had this safety net since P1-11; deployments
 	// did not. Keep it comfortably above the agent's own op timeouts.
 	DeployTimeout time.Duration
+	// DecommissionTimeout completes a graceful decommission the agent never
+	// acked (SIGMA-204). A host powered off between the operator pressing
+	// Disconnect and the agent picking the op up would otherwise hold its row
+	// forever: 'decommissioning' is not 'running', so the staleness sweep never
+	// touches it and nothing else ever transitions it. Generous — the teardown
+	// stops containers with a grace period and the agent may be mid-long-poll —
+	// but bounded, because the operator is watching.
+	DecommissionTimeout time.Duration
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run it in a goroutine.
@@ -55,6 +66,19 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 					log.Error("sweeper: timeout stale deployments", "err", err)
 				} else if n > 0 {
 					log.Info("sweeper: deployments timed out", "count", n)
+				}
+			}
+			if cfg.DecommissionTimeout > 0 {
+				if timedOut, err := st.TimeoutStaleDecommissions(ctx, cfg.DecommissionTimeout); err != nil {
+					log.Error("sweeper: timeout stale decommissions", "err", err)
+				} else {
+					for _, d := range timedOut {
+						// Per-server, at warn: the machine still has our binary,
+						// unit, tunnel and containers on it, and only the audit
+						// log and this line say so.
+						log.Warn("sweeper: decommission timed out; server removed without agent confirmation",
+							"server", d.ServerID, "org", d.OrgID, "name", d.Name)
+					}
 				}
 			}
 		}

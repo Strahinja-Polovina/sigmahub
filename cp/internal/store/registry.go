@@ -74,6 +74,16 @@ type Server struct {
 	// dashboard has no null case to invent a meaning for. Populated by
 	// ListServers/GetServer only.
 	IncompatibleReasons []FailedRequirement `json:"incompatibleReasons"`
+	// DecommissioningSince is when a graceful decommission was asked for
+	// (SIGMA-204), null otherwise. The dashboard needs the TIMESTAMP and not
+	// just the status: "Force disconnect" is only offered once the graceful path
+	// has had its chance, and the only way to know that without the CP inventing
+	// a second flag is to compare this against the timeout.
+	DecommissioningSince *time.Time `json:"decommissioningSince"`
+	// PurgeVolumes echoes the operator's opt-in on the in-flight request, so a
+	// reload of the page mid-teardown still says whether application data is
+	// being destroyed.
+	PurgeVolumes bool `json:"purgeVolumes"`
 }
 
 // readinessExpr is the derived Ready predicate: the server is live (running),
@@ -677,7 +687,8 @@ const serverSelect = `
 	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
 	       s.agent_version, s.facts, s.mesh_ip, s.endpoint, s.pubkey, s.last_seen_at, s.created_at,
 	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked,
-	       COALESCE(h.keep_public_ssh, TRUE), s.incompatible_reasons, ` + readinessExpr + ` AS ready
+	       COALESCE(h.keep_public_ssh, TRUE), s.incompatible_reasons,
+	       s.decommission_started_at, s.decommission_purge_volumes, ` + readinessExpr + ` AS ready
 	  FROM servers s
 	  LEFT JOIN server_hardening h ON h.server_id = s.id`
 
@@ -685,7 +696,8 @@ func scanServerRow(row pgx.Row, srv *Server) error {
 	if err := row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Endpoint, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
 		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked,
-		&srv.KeepPublicSSH, &srv.IncompatibleReasons, &srv.Ready); err != nil {
+		&srv.KeepPublicSSH, &srv.IncompatibleReasons,
+		&srv.DecommissioningSince, &srv.PurgeVolumes, &srv.Ready); err != nil {
 		return err
 	}
 	// The column is NOT NULL '[]', so this only normalizes JSON's `[]` → Go's

@@ -18,7 +18,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "9f75015d2c282f80737d3959b9050fdba124d7ed50845dd5cc319a390b01e1a5";
+export const CATALOG_SOURCE_SHA256 = "9f5e4d8eede18b0b1090f74c6839637775e69ff69b11847cdbd26def344b9c01";
 
 export type ServerType =
   | "general"

@@ -148,6 +148,40 @@ func Apply(ctx context.Context, log *slog.Logger, configPath string) {
 	log.Info("mesh: WireGuard interface applied", "config", configPath)
 }
 
+// TearDown brings the WireGuard interface down and deletes the rendered config
+// and the private key — the mesh half of a decommission (SIGMA-204).
+//
+// Callers must have finished talking to the control plane before this runs.
+// `wg-quick down` tears out the routes, and on a fleet whose control plane is
+// itself reachable over the mesh that is the last packet this host can send;
+// removing the key afterwards means even a restarted agent could not re-form
+// the tunnel. Both are fine — that is the point — but only after the ack.
+//
+// Best-effort and idempotent: an interface that is already down, a config that
+// is already gone and a host with no wg-quick all count as torn down, because
+// the state this function promises is "no mesh here", not "a command ran".
+func TearDown(ctx context.Context, log *slog.Logger, dataDir string) error {
+	configPath := filepath.Join(dataDir, ConfigFile)
+	if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("wg-quick"); err == nil && interfaceExists(ctx, ifaceName()) {
+			if out, err := exec.CommandContext(ctx, "wg-quick", "down", configPath).CombinedOutput(); err != nil {
+				// Reported, not fatal: the config and key still go, and the
+				// operator gets the manual cleanup script naming the interface.
+				log.Warn("mesh: wg-quick down failed", "err", err, "output", strings.TrimSpace(string(out)))
+				return fmt.Errorf("wg-quick down: %w", err)
+			}
+			log.Info("mesh: interface torn down", "iface", ifaceName())
+		}
+	}
+	var errs []error
+	for _, p := range []string{configPath, filepath.Join(dataDir, keyFile)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", filepath.Base(p), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // InterfaceUp reports whether the mesh tunnel is actually up. On non-Linux the
 // agent runs config-only (nothing to bring up), so it is "up" by definition;
 // on Linux it checks the real WireGuard device. Callers use this to report an

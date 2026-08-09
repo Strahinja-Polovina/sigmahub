@@ -26,7 +26,12 @@ import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/dashboard/status-indicator";
 import type { ServerType, Status } from "@/lib/mock";
 import type { ServerWithCount } from "@/server/queries";
-import { agentCheckIn, type DemoHostShape } from "@/server/actions/servers";
+import {
+  agentCheckIn,
+  simulateDecommission,
+  type DemoHostShape,
+} from "@/server/actions/servers";
+import { isDecommissioning } from "@/lib/decommission";
 import {
   ClustersPanel,
   type ClusterEnvironment,
@@ -94,6 +99,48 @@ export function CheckInButton({
   );
 }
 
+/** Demo-only: drive an in-flight decommission to one of its real endings.
+ *
+ *  Demo mode is where someone learns what these states mean, so it has to walk
+ *  the whole flow — including the endings where the agent does NOT come back,
+ *  which are the ones that produce the force path and the manual cleanup script
+ *  (SIGMA-215). Absent in CP mode: there a real sigmad answers, or does not. */
+function DecommissionSimButton({
+  serverId,
+  event,
+  label,
+  description,
+}: {
+  serverId: string;
+  event: "ack" | "failed" | "timeout" | "silence";
+  label: string;
+  description: string;
+}) {
+  const [pending, startTransition] = React.useTransition();
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={pending}
+      onClick={() =>
+        startTransition(async () => {
+          try {
+            await simulateDecommission({ serverId, event });
+            toast.success(label, { description });
+          } catch (err) {
+            toast.error("Simulation failed", {
+              description: err instanceof Error ? err.message : "Please try again.",
+            });
+          }
+        })
+      }
+    >
+      {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Radio className="size-3.5" />}
+      {label}
+    </Button>
+  );
+}
+
 function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boolean }) {
   return (
     <TableRow>
@@ -127,6 +174,43 @@ function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boole
               equivalent is checking in as the machine the type expects. */}
           {!cpMode && server.status === "incompatible" && (
             <CheckInButton serverId={server.id} label="…as the right machine" />
+          )}
+          {/* A teardown in flight, and the three ways it ends: the agent
+              confirms, the agent confirms a failure it could not fix, or the
+              agent never answers and the control plane's timeout takes over —
+              which is the state the force path and the cleanup script exist
+              for (SIGMA-204/205). */}
+          {!cpMode && isDecommissioning(server.status) && (
+            <>
+              <DecommissionSimButton
+                serverId={server.id}
+                event="ack"
+                label="Agent confirms"
+                description="The host is clean and the server has been removed."
+              />
+              <DecommissionSimButton
+                serverId={server.id}
+                event="failed"
+                label="…with errors"
+                description="The server is removed and the audit log says what did not tear down."
+              />
+              <DecommissionSimButton
+                serverId={server.id}
+                event="timeout"
+                label="…never answers"
+                description="Open Disconnect again — it now offers Force disconnect and the cleanup script."
+              />
+            </>
+          )}
+          {/* The other route to the force path: a machine that stopped
+              answering cannot be asked to uninstall anything. */}
+          {!cpMode && server.status === "running" && (
+            <DecommissionSimButton
+              serverId={server.id}
+              event="silence"
+              label="Simulate silence"
+              description="The server is now unreachable — Disconnect offers the force path."
+            />
           )}
         </div>
       </TableCell>

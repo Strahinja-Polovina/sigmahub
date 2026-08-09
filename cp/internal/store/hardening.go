@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -34,22 +35,36 @@ type HostHardening struct {
 	// already reads for every render.
 	AgentVersion        string
 	DesiredAgentVersion string
+	// Decommissioning drives the agent.uninstall op (SIGMA-204), and with it the
+	// whole render: a server being torn down gets a document containing that op
+	// and nothing else.
+	//
+	// It is read from decommission_started_at, NOT from status = 'decommissioning'.
+	// The status column is rewritten on every heartbeat by the compatibility gate,
+	// so deriving the render trigger from it would make an in-flight teardown
+	// stop being rendered the moment the host's facts changed underneath it.
+	// PurgeVolumes is the operator's explicit opt-in to destroying named volumes.
+	Decommissioning bool
+	PurgeVolumes    bool
 }
 
 // HostHardeningForServer returns the effective hardening config for a server,
 // defaulting (KEEP public SSH, CIS on, no extra ports) when no row has been set.
 func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (HostHardening, error) {
 	var (
-		meshIP     *string
-		proxyRole  bool
-		keepSSH    bool
-		cisEnabled bool
-		extraRaw   []byte
-		agentVer   string
-		desiredVer string
+		meshIP       *string
+		proxyRole    bool
+		keepSSH      bool
+		cisEnabled   bool
+		extraRaw     []byte
+		agentVer     string
+		desiredVer   string
+		decomStarted *time.Time
+		purgeVolumes bool
 	)
 	err := s.Pool.QueryRow(ctx, `
 		SELECT s.mesh_ip, s.proxy_role, s.agent_version, s.desired_agent_version,
+		       s.decommission_started_at, s.decommission_purge_volumes,
 		       -- Fail SAFE, not closed: with no explicit hardening row we keep
 		       -- public SSH. Closing port 22 is only survivable if the operator
 		       -- has another way in, and the mesh is not one — MeshPeers returns
@@ -63,7 +78,8 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 		  FROM servers s
 		  LEFT JOIN server_hardening h ON h.server_id = s.id
 		 WHERE s.id = $1 AND s.deleted_at IS NULL`, serverID).
-		Scan(&meshIP, &proxyRole, &agentVer, &desiredVer, &keepSSH, &cisEnabled, &extraRaw)
+		Scan(&meshIP, &proxyRole, &agentVer, &desiredVer, &decomStarted, &purgeVolumes,
+			&keepSSH, &cisEnabled, &extraRaw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return HostHardening{}, ErrNotFound
 	}
@@ -77,6 +93,8 @@ func (s *Store) HostHardeningForServer(ctx context.Context, serverID string) (Ho
 		CISEnabled:          cisEnabled,
 		AgentVersion:        agentVer,
 		DesiredAgentVersion: desiredVer,
+		Decommissioning:     decomStarted != nil,
+		PurgeVolumes:        purgeVolumes,
 	}
 	if meshIP != nil {
 		hh.MeshIP = *meshIP

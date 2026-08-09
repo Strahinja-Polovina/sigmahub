@@ -1,6 +1,13 @@
 package mesh
 
 import (
+	"context"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -82,5 +89,37 @@ func TestWriteConfigChangeDetection(t *testing.T) {
 	_, changed, err = WriteConfig(dir, "v2")
 	if err != nil || !changed {
 		t.Fatalf("new content: changed=%v err=%v", changed, err)
+	}
+}
+
+// The decommission's mesh step (SIGMA-204). The interface bring-down is
+// Linux-and-wg-quick-only and cannot be exercised here, but the part that makes
+// the teardown PERMANENT can: both the rendered config and the private key go,
+// so an agent that somehow restarts cannot re-form the tunnel it was just
+// removed from.
+func TestTearDownRemovesConfigAndKey(t *testing.T) {
+	dir := t.TempDir()
+	priv, _, err := LoadOrCreateKey(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := WriteConfig(dir, RenderConfig(priv, "10.8.0.2", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := TearDown(context.Background(), log, dir); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	for _, name := range []string{ConfigFile, "wg.key"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s survived the teardown (stat err = %v)", name, err)
+		}
+	}
+
+	// Idempotent: the op may be re-delivered after a crash, and "no mesh here"
+	// is the state it promises, not "a command ran".
+	if err := TearDown(context.Background(), log, dir); err != nil {
+		t.Fatalf("second teardown: %v", err)
 	}
 }

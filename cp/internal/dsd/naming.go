@@ -19,6 +19,13 @@ const (
 	// changes. Names must match the agent's host package byte-for-byte.
 	// Agent lifecycle (dashboard-driven upgrade).
 	KindAgentUpdate = "agent.update"
+	// Graceful decommission (SIGMA-204): the agent removes the workloads and
+	// then removes ITSELF — containers, networks, the WireGuard interface and
+	// config, the systemd unit, the data dir and the binary — and acks the
+	// control plane before the credential it needs for that ack is revoked.
+	// Same registry as every other kind, so removing a host is a typed op and
+	// not a shell script the control plane pushes (architecture §3 invariant c).
+	KindAgentUninstall = "agent.uninstall"
 
 	KindHostNftables = "host.nftables"
 	KindHostSSHD     = "host.sshd"

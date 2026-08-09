@@ -66,7 +66,6 @@ import { Input } from "@/components/ui/input";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import {
-  disconnectServer,
   renameServer,
   setServerHardening,
   setServerProxyRole,
@@ -76,6 +75,8 @@ import {
 import { ServerMetrics, type MetricsPoint } from "./server-metrics";
 import { CheckInButton } from "./servers-view";
 import { IncompatiblePanel } from "./connect-server-dialog";
+import { DisconnectServerDialog } from "./disconnect-server-dialog";
+import { isDecommissioning } from "@/lib/decommission";
 import {
   SERVER_TYPE_LABELS,
   RESOURCE_KIND_LABELS,
@@ -111,6 +112,10 @@ type ServerRowT = {
   facts?: HostFacts | null;
   /** Why the enrollment gate refused this host, rendered verbatim (SIGMA-203). */
   incompatibleReasons?: FailedRequirement[];
+  /** When a graceful decommission was asked for, null otherwise (SIGMA-204).
+   *  The disconnect dialog compares it against the control plane's timeout to
+   *  tell "the teardown is working" from "the agent never answered". */
+  decommissionStartedAt?: Date | string | null;
 };
 
 type HostedRow = {
@@ -188,12 +193,20 @@ function ServerActions({
   serverName,
   cpMode,
   provisioning,
+  status,
+  decommissioningSince,
+  lastSeenAt,
 }: {
   orgId?: string;
   serverId: string;
   serverName: string;
   cpMode?: boolean;
   provisioning?: boolean;
+  /** The raw CP status — the dialog needs `unreachable` and `decommissioning`
+   *  by name to decide whether the graceful path can land at all. */
+  status: string;
+  decommissioningSince?: Date | string | null;
+  lastSeenAt?: Date | string | null;
 }) {
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
@@ -250,21 +263,11 @@ function ServerActions({
     });
   }
 
-  function disconnect() {
-    startTransition(async () => {
-      try {
-        await disconnectServer({ serverId });
-        toast.success(`Disconnected ${serverName}`, {
-          description: "The agent tears down its WireGuard tunnel.",
-        });
-        router.push("/dashboard/servers");
-      } catch (err) {
-        toast.error("Couldn’t disconnect", {
-          description: err instanceof Error ? err.message : "Please try again.",
-        });
-      }
-    });
-  }
+  // Disconnecting is a dialog, not a menu item that fires (SIGMA-205). It has
+  // to state what leaves the machine, offer the volumes opt-in, and — when the
+  // graceful path cannot land — hand over the manual cleanup script.
+  const [disconnecting, setDisconnecting] = React.useState(false);
+  const decommissioning = isDecommissioning(status);
 
   return (
     <>
@@ -318,16 +321,32 @@ function ServerActions({
             Update agent
           </DropdownMenuItem>
         )}
-        {/* The control plane refuses deletion only while resources are still
-            bound to the host (409 with the offending names) — so a server
-            stuck in provisioning with nothing on it can always be removed. */}
+        {/* Opens the dialog rather than acting: the control plane refuses while
+            resources are still bound (409 with the offending names), and even
+            when it does not, this removes an agent, a tunnel and a set of
+            containers from someone's machine. */}
         <DropdownMenuSeparator />
-        <DropdownMenuItem variant="destructive" className="gap-2" onClick={disconnect}>
+        <DropdownMenuItem
+          variant="destructive"
+          className="gap-2"
+          onClick={() => setDisconnecting(true)}
+        >
           <Unplug className="size-4" />
-          Disconnect
+          {decommissioning ? "Finish disconnecting" : "Disconnect"}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+
+    <DisconnectServerDialog
+      open={disconnecting}
+      onOpenChange={setDisconnecting}
+      serverId={serverId}
+      serverName={serverName}
+      status={status}
+      decommissioningSince={decommissioningSince}
+      lastSeenAt={lastSeenAt}
+      onDisconnected={() => router.push("/dashboard/servers")}
+    />
 
     <Dialog open={Boolean(reissued)} onOpenChange={(next) => { if (!next) setReissued(null); }}>
       <DialogContent className="sm:max-w-lg">
@@ -521,6 +540,7 @@ export function ServerDetailView({
   hardening,
   orgId,
   canManage = false,
+  lastSeenAt,
 }: {
   server: ServerRowT;
   hosted: HostedRow[];
@@ -529,6 +549,10 @@ export function ServerDetailView({
   hardening?: HardeningInfo | null;
   orgId?: string;
   canManage?: boolean;
+  /** Last heartbeat, where the caller has one (CP mode). A host that has gone
+   *  quiet but has not been swept to `unreachable` yet still cannot be asked to
+   *  uninstall itself, so the dialog offers the force path for it too. */
+  lastSeenAt?: string | null;
 }) {
   const router = useRouter();
   const provisioning = server.status === "provisioning";
@@ -594,6 +618,9 @@ export function ServerDetailView({
               serverName={server.name}
               cpMode={cpMode}
               provisioning={provisioning}
+              status={server.status}
+              decommissioningSince={server.decommissionStartedAt}
+              lastSeenAt={lastSeenAt}
             />
           </div>
         </div>

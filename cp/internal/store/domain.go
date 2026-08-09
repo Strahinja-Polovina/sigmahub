@@ -572,6 +572,13 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 				"that server is marked incompatible with its %q type — change its type or disconnect it before scheduling work onto it",
 				serverType)}
 		}
+		// Nor onto a machine that is being torn down. Its document is a single
+		// uninstall op, so a resource created here would never be rendered
+		// anywhere — and worse, it would re-arm the bound-resources 409 and
+		// block the completion of a decommission already in flight (SIGMA-204).
+		if serverStatus == ServerStatusDecommissioning {
+			return Resource{}, ErrInvalid{Msg: "that server is being decommissioned — pick another host"}
+		}
 
 		ok := false
 		for _, t := range allowed {
@@ -792,25 +799,23 @@ func (s *Store) SetServerType(ctx context.Context, orgID, serverID, newType, act
 		return fmt.Errorf("load server: %w", err)
 	}
 
-	// A cluster member is committed in a way `resources` does not record. Its
-	// workloads are bound to the CLUSTER, not to this row's server_id, so the
-	// hosted-resource check below sees nothing and waves the change through —
-	// which let a cluster's control-plane node be re-filed from `k8s` (unit
-	// weight 2) to `general` (weight 1) while it was still running the cluster,
-	// halving the bill for a machine whose job had not changed. Membership is
-	// the cluster's to end, not a type edit's.
-	var clusterName string
-	err = tx.QueryRow(ctx, `
-		SELECT c.name FROM cluster_nodes n
-		  JOIN clusters c ON c.id = n.cluster_id
-		 WHERE n.server_id = $1 AND c.org_id = $2
-		 LIMIT 1`, serverID, orgID).Scan(&clusterName)
-	if err == nil {
-		return fmt.Errorf("%w: this server is a node of the %s cluster — remove it from the cluster before changing its type",
-			ErrConflict, clusterName)
+	// A machine being torn down is not re-filed. The type decides what the
+	// reconciler renders and what the host is billed as, and both questions are
+	// already settled for a server whose only remaining document is the
+	// uninstall op (SIGMA-204). Cancelling a decommission is not a thing the
+	// product offers, so silently letting a type edit sit on the row would leave
+	// the operator with a machine that reads as one type and dies as another.
+	if status == ServerStatusDecommissioning {
+		return fmt.Errorf("%w: %s is being decommissioned — its type can no longer be changed", ErrConflict, name)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("check cluster membership: %w", err)
+
+	// Membership is the cluster's to end, not a type edit's — see
+	// clusterMembershipTx for what waving this through cost.
+	if cluster, err := clusterMembershipTx(ctx, tx, orgID, serverID); err != nil {
+		return err
+	} else if cluster != "" {
+		return fmt.Errorf("%w: this server is a node of the %s cluster — remove it from the cluster before changing its type",
+			ErrConflict, cluster)
 	}
 
 	rows, err := tx.Query(ctx,

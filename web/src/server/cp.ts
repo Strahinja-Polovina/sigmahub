@@ -60,6 +60,12 @@ export type CpServer = {
    *  current control plane; optional here so an older CP that predates the gate
    *  simply reads as "no reasons" rather than crashing the servers page. */
   incompatibleReasons?: FailedRequirement[];
+  /** When a graceful decommission was asked for (SIGMA-204), null otherwise.
+   *  The dashboard compares it against the decommission timeout to decide when
+   *  the graceful path has had its chance and Force disconnect is honest. */
+  decommissioningSince?: string | null;
+  /** Whether that request opted into destroying named volumes. */
+  purgeVolumes?: boolean;
 };
 
 export type CpMetricPoint = {
@@ -175,13 +181,20 @@ async function cpFetch<T>(path: string, init: RequestInit | undefined, opts: CpF
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     let message = `Control plane ${res.status}`;
+    let bound: string[] = [];
     try {
-      const parsed = JSON.parse(body) as { error?: string };
+      const parsed = JSON.parse(body) as { error?: string; boundResources?: string[] };
       if (parsed.error) message = `${message}: ${parsed.error}`;
+      // Some refusals answer with data as well as prose — the disconnect 409
+      // names the resources in the way (SIGMA-205). Carrying it on the error
+      // is what lets a caller render a list instead of a Go error string; the
+      // MESSAGE format is unchanged, so the callers that string-match on
+      // "Control plane 404" keep working.
+      if (Array.isArray(parsed.boundResources)) bound = parsed.boundResources;
     } catch {
       message = `${message}: ${body.slice(0, 200)}`;
     }
-    throw new Error(message);
+    throw new CpRequestError(message, res.status, bound);
   }
   // Some CP endpoints (delete git connection / branch map / alert channel) reply
   // 204 No Content with an empty body. res.json() on an empty body throws
@@ -791,9 +804,54 @@ export async function cpRestoreDatabaseToTimestamp(
   }, { orgId, actor });
 }
 
-// Server + token lifecycle (P1-4). Server delete tombstones the CP record and
-// revokes its agent token; a 409 (with the bound-resource list) surfaces as a
-// thrown "Control plane 409" error the caller can show.
+/** A control-plane refusal that carries structure, not just a sentence.
+ *
+ *  The disconnect 409 names the resources still bound to the host, and the
+ *  dialog has to LIST them — "move or delete web and api, then disconnect" —
+ *  rather than print the API's error string, which is how a Go error ends up on
+ *  a customer's screen (SIGMA-205). cpFetch keeps the same message format, so
+ *  the existing `err.message.startsWith("Control plane 404")` callers are
+ *  unaffected. */
+export class CpRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly boundResources: string[] = []
+  ) {
+    super(message);
+    this.name = "CpRequestError";
+  }
+}
+
+/** The bound-resource names from a failed disconnect, or [] for any other
+ *  error. */
+export function boundResourcesOf(err: unknown): string[] {
+  return err instanceof CpRequestError ? err.boundResources : [];
+}
+
+// Server + token lifecycle (P1-4), and the graceful decommission that replaced
+// the bare delete (SIGMA-204).
+//
+// cpDecommissionServer is the ORDINARY disconnect: the control plane marks the
+// server, renders an agent.uninstall op, and tombstones the row only once the
+// agent confirms it removed itself (or the CP's timeout gives up). The machine
+// is left clean, which the old path never did.
+export async function cpDecommissionServer(
+  orgId: string,
+  serverId: string,
+  purgeVolumes: boolean,
+  actor: CpActor
+): Promise<{ status: string; purgeVolumes: boolean; startedAt: string }> {
+  return cpFetch(`${org(orgId)}/servers/${encodeURIComponent(serverId)}/decommission`, {
+    method: "POST",
+    body: JSON.stringify({ purgeVolumes }),
+  }, { orgId, actor });
+}
+
+// cpDeleteServer is the FORCE path: tombstone + token revoke, host untouched.
+// Only for a machine that cannot be asked to uninstall itself — already
+// unreachable, or a teardown that timed out — and always paired with the manual
+// cleanup script. A 409 carries the bound-resource names (CpRequestError).
 export async function cpDeleteServer(orgId: string, serverId: string, actor: CpActor): Promise<void> {
   await cpFetch(`${org(orgId)}/servers/${encodeURIComponent(serverId)}`, {
     method: "DELETE",
@@ -1596,6 +1654,8 @@ export async function cpMirrorServer(
         // a mirror that never updates them is a stale answer, not an old one.
         facts: row.facts,
         incompatibleReasons: row.incompatibleReasons,
+        decommissionStartedAt: row.decommissionStartedAt,
+        decommissionPurgeVolumes: row.decommissionPurgeVolumes,
       },
     });
   return row;
@@ -1645,6 +1705,11 @@ export function cpServerToRow(cp: CpServer): ServerRow {
     facts: cp.facts ?? {},
     incompatibleReasons: cp.incompatibleReasons ?? [],
     nameAuto: false,
+    // A decommission in flight (SIGMA-204). Carried through so the dialog can
+    // tell "still working" from "the agent never answered" in CP mode exactly
+    // as it does in demo mode.
+    decommissionStartedAt: cp.decommissioningSince ? new Date(cp.decommissioningSince) : null,
+    decommissionPurgeVolumes: cp.purgeVolumes ?? false,
   };
 }
 

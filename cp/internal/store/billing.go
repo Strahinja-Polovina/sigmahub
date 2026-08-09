@@ -33,6 +33,19 @@ const (
 // currently-connected server — the time-integrated billing meter. Idempotent
 // on (server, hour), so running it several times an hour just re-touches the
 // same rows (mirrors SweepUsageHours).
+//
+// "Connected" is status = 'running', which is what decides the two statuses
+// added since: an `incompatible` host is not billed because it cannot do the
+// job it was enrolled for (SIGMA-203), and a `decommissioning` one is not
+// billed because the operator has told us to stop using the machine
+// (SIGMA-204). The decommissioning case is a deliberate choice and not a
+// side effect of the WHERE clause: the alternative — bill until the tombstone —
+// charges for the minutes between pressing Disconnect and an agent finishing a
+// teardown, which is time the customer neither asked for nor controls, and on
+// the timeout path is time we spent waiting for a machine that never answered.
+// The window is bounded by the decommission timeout either way, so the amount
+// at stake is one server-hour; the reason to pick this side is that it is the
+// only one we could explain on an invoice.
 func (s *Store) SweepServerHours(ctx context.Context, now time.Time) (int, error) {
 	tag, err := s.Pool.Exec(ctx, `
 		INSERT INTO server_hours (org_id, server_id, hour)

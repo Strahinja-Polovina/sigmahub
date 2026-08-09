@@ -32,6 +32,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/selfupdate"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/state"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/telemetry"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/uninstall"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=…".
@@ -322,6 +323,40 @@ func run() error {
 		RequestRestart: func() { restartRequested.Store(true) },
 	}
 	updater.Register(registry)
+	// Graceful decommission (agent.uninstall, SIGMA-204). The op removes this
+	// host's workloads, ACKS THE CONTROL PLANE, and only then tears down the
+	// WireGuard tunnel, the systemd unit, the data dir (which holds the very
+	// token the ack used) and the binary. The ordering is the whole feature —
+	// see internal/uninstall — and lives there, not here; this is wiring.
+	uninstaller := &uninstall.Uninstaller{
+		Log:      log,
+		ServerID: st.ServerID,
+		Steps: uninstall.Steps{
+			RemoveK3s:        func(ctx context.Context) error { return uninstall.RemoveK3s(ctx, log) },
+			RemoveContainers: driver.RemoveManagedContainers,
+			RemoveNetworks:   driver.RemoveManagedNetworks,
+			RemoveVolumes:    driver.RemoveManagedVolumes,
+			Ack: func(ctx context.Context, ok bool, detail string) error {
+				return c.PostUninstallAck(ctx, st.AgentToken, ok, detail)
+			},
+			TearDownMesh: func(ctx context.Context, _ string) error {
+				// The interface name is derived from the config basename the
+				// agent wrote (sigma0.conf → sigma0), so the teardown removes
+				// exactly what syncMesh brought up; the spec's meshInterface is
+				// the control plane's matching declaration, carried for the
+				// manual cleanup script and the logs.
+				return mesh.TearDown(ctx, log, *dataDir)
+			},
+			RemoveUnit:    func(ctx context.Context) error { return uninstall.RemoveSystemdUnits(ctx, log) },
+			RemoveDataDir: func(context.Context) error { return uninstall.RemoveDataDir(*dataDir) },
+			RemoveBinary:  func(context.Context) error { return uninstall.RemoveSelfBinary() },
+			// Exit from the handler, not from the DSD loop: the journal that
+			// would carry a flag back out has just been deleted along with the
+			// data dir, and there is no unit left to restart us.
+			Exit: func() { os.Exit(0) },
+		},
+	}
+	uninstaller.Register(registry)
 	// Self-heal the host tool set (wireguard-tools/nftables/restic): hosts
 	// onboarded with a pre-v0.1.1 installer are missing wireguard-tools, which
 	// keeps the mesh down and mesh-bound databases unschedulable. Runs in the
