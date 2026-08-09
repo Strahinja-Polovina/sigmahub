@@ -76,3 +76,28 @@ export const DEPLOY_STATUS_META: Record<
   superseded: { label: "Superseded", text: "text-muted-foreground", dot: "bg-muted-foreground" },
   rolled_back: { label: "Rolled back", text: "text-muted-foreground", dot: "bg-muted-foreground" },
 };
+
+/**
+ * The deploy statuses that mean "work is happening right now".
+ *
+ * One list, because the page has to agree with itself about this: a resource
+ * with an in-flight deployment must poll for fresh data AND suppress the
+ * previous failure's banner. Those used to be two separate judgements, and the
+ * disagreement was visible — the page showed "This resource is failing" with
+ * the last run's error for the entire two-and-a-half minutes a new build was
+ * running, because the banner read the last APPLIED status while the pipeline
+ * had already moved on.
+ *
+ * `running` is here for demo mode, whose simulated pipeline uses it where the
+ * control plane says `deploying`.
+ */
+export const DEPLOY_IN_FLIGHT: ReadonlySet<string> = new Set([
+  "queued",
+  "building",
+  "deploying",
+  "running",
+]);
+
+export function isDeployInFlight(status: string): boolean {
+  return DEPLOY_IN_FLIGHT.has(status);
+}

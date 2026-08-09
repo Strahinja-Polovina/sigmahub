@@ -23,7 +23,17 @@ import (
 const KindProxyTraefik = "proxy.traefik"
 
 const (
-	traefikImage         = "traefik:v3.3"
+	// traefikImage is a FLOOR, not a preference. Traefik's Docker provider built
+	// its API client at a hardcoded 1.24 until the auto-negotiation fix, and
+	// Docker Engine 29 dropped support for versions that old. The pairing is
+	// silently catastrophic: the daemon rejects every provider call, so Traefik
+	// discovers no containers, registers no routers, and answers 404 for every
+	// domain on the host — while the container itself is up, healthy, and
+	// reporting a successful apply. The only evidence is in Traefik's own log
+	// ("client version 1.24 is too old"), which nothing surfaces.
+	//
+	// v3.6.1 is the first release carrying the negotiation fix. Do not lower it.
+	traefikImage         = "traefik:v3.6.1"
 	traefikContainerName = "sigmahub-traefik"
 	traefikACMEVolume    = "sigmahub-traefik-acme"
 	traefikSpecHashLabel = "sigmahub.traefikSpecHash"
@@ -42,6 +52,20 @@ type TraefikSpec struct {
 func (s TraefikSpec) hash() string {
 	b, _ := json.Marshal(s)
 	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
+// proxyDriftHash is what the proxy container is compared against on every apply:
+// the op's spec AND the image this agent pins.
+//
+// The image used to be outside the signal, which made the version pin advisory.
+// opProxyTraefik pulls traefikImage and then compares only spec.hash(), so an
+// agent shipping a NEW Traefik pulled it and left the OLD container running —
+// for as long as nobody edited an unrelated ACME setting. That is the worst
+// shape a version pin can have: upgrading the agent to fix a broken proxy would
+// have fixed nothing, and the fix would have looked deployed.
+func proxyDriftHash(spec TraefikSpec) string {
+	sum := sha256.Sum256([]byte(spec.hash() + "|" + traefikImage))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -95,7 +119,7 @@ func buildTraefikCreateBody(spec TraefikSpec) map[string]any {
 	labels := map[string]string{
 		LabelManaged:         "true",
 		LabelResourceID:      "sigmahub-traefik",
-		traefikSpecHashLabel: spec.hash(),
+		traefikSpecHashLabel: proxyDriftHash(spec),
 		// Never route to the proxy itself.
 		"traefik.enable": "false",
 	}
@@ -150,7 +174,7 @@ func (d *Driver) opProxyTraefik(ctx context.Context, op dsd.Op) error {
 	if err != nil {
 		return err
 	}
-	want := spec.hash()
+	want := proxyDriftHash(spec)
 	if exists && cur.Labels[traefikSpecHashLabel] == want {
 		// Config unchanged: make sure it is running, then (re)attach networks.
 		if !cur.Running {

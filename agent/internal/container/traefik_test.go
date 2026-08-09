@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,69 @@ func TestTraefikSpecHashChangesOnConfig(t *testing.T) {
 	}
 	if a != (TraefikSpec{ChallengeType: "http", ACMEEmail: "a@x.io"}).hash() {
 		t.Error("hash must be deterministic")
+	}
+}
+
+// The drift signal must cover the IMAGE, not just the op spec. It did not, and
+// the consequence was that shipping a new Traefik in the agent changed nothing
+// on a host that already had one: opProxyTraefik pulls traefikImage, compares
+// the spec hash, finds it equal and returns. A proxy pinned to a version that
+// cannot talk to the host's Docker daemon would have stayed pinned there
+// through every upgrade, with the fix sitting unused in the pulled image.
+func TestProxyDriftHashCoversTheImage(t *testing.T) {
+	spec := TraefikSpec{ChallengeType: "http", ACMEEmail: "a@x.io"}
+	if proxyDriftHash(spec) == spec.hash() {
+		t.Error("drift hash must not be the bare spec hash — the image has to be in it")
+	}
+	if proxyDriftHash(spec) != proxyDriftHash(spec) {
+		t.Error("drift hash must be deterministic")
+	}
+	// The label written at create time and the value compared on the next apply
+	// have to be the same function, or every apply sees drift and recreates the
+	// proxy in a loop — dropping ingress each time.
+	body := buildTraefikCreateBody(spec)
+	labels, ok := body["Labels"].(map[string]string)
+	if !ok {
+		t.Fatalf("labels missing from create body: %#v", body["Labels"])
+	}
+	if labels[traefikSpecHashLabel] != proxyDriftHash(spec) {
+		t.Errorf("create-time label %q != drift hash %q",
+			labels[traefikSpecHashLabel], proxyDriftHash(spec))
+	}
+}
+
+// The Docker-provider API floor (Docker Engine 29 rejects the 1.24 client that
+// Traefik hardcoded before v3.6.1). Pinned as a test because the failure it
+// prevents is invisible: the proxy runs, the apply succeeds, and every domain
+// on the host 404s.
+func TestTraefikImageMeetsTheDockerAPIFloor(t *testing.T) {
+	// Compared as numbers, not as strings: "v3.10.0" sorts BELOW "v3.6.1"
+	// lexicographically, so a string compare here would reject the very upgrade
+	// it exists to encourage.
+	parse := func(image string) [3]int {
+		t.Helper()
+		_, ver, ok := strings.Cut(image, ":v")
+		if !ok {
+			t.Fatalf("image %q is not tag-pinned as :v<semver>", image)
+		}
+		var out [3]int
+		for i, part := range strings.SplitN(ver, ".", 3) {
+			n, err := strconv.Atoi(part)
+			if err != nil {
+				t.Fatalf("image %q has a non-numeric version part %q", image, part)
+			}
+			out[i] = n
+		}
+		return out
+	}
+	got, floor := parse(traefikImage), parse("traefik:v3.6.1")
+	for i := range got {
+		if got[i] > floor[i] {
+			return
+		}
+		if got[i] < floor[i] {
+			t.Fatalf("traefikImage %q predates the Docker-29 API negotiation fix (need >= traefik:v3.6.1)", traefikImage)
+		}
 	}
 }
 
