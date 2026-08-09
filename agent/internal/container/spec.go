@@ -34,7 +34,25 @@ const (
 	// two generations at once: the old generation is removed, THEN the new one is
 	// created — a documented, per-service exception to the zero-downtime guarantee.
 	KindDeployRecreate = "deploy.recreate"
+	// KindResourceSync is the control plane's no-op stub for a resource it has
+	// nothing to run right now. The apply handler is registered in sigmad as a
+	// no-op; the container package cares about it only because its spec can carry
+	// a `retain` list that GC must honour (see resourceSyncSpec).
+	KindResourceSync = "resource.sync"
 )
+
+// resourceSyncSpec is the part of the resource.sync stub the container package
+// reads. Retain names the (resource, service) container groups the control plane
+// wants kept even though this document renders no op for them — empty string is
+// the single-container group of a non-Compose app. The control plane emits it
+// whenever it holds a resource's rollout back (a dedicated build server still
+// building, a Compose service gated on a remote dependency), because GC runs
+// before the ops and would otherwise reap the live generation as an orphan and
+// take the app down for the length of the hold (SIGMA-230).
+type resourceSyncSpec struct {
+	ResourceID string   `json:"resourceId"`
+	Retain     []string `json:"retain"`
+}
 
 // HealthProbe is how the agent decides a new container is ready before draining
 // the old (the never-cut invariant). Type "http" GETs Path on Port expecting a

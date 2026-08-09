@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"encoding/json"
+	"sort"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -165,6 +166,59 @@ func reshipsRetainedImage(target store.DeployTarget, requirePin bool) bool {
 		return target.ImagePin != ""
 	}
 	return target.ImagePin != "" || target.ImageDigest != ""
+}
+
+// retainedContainerGroups names the (resource, service) container groups this
+// server is SUPPOSED to be running for a git-deployed app — independent of
+// whether this pass actually rendered their rollout ops. Empty string is the
+// single-container group (a non-Compose app has no service name); the agent
+// keys its GC protection off the same (resourceId, service) pair its containers
+// are labelled with, so a retained group covers every live generation whatever
+// its generation-suffixed name happens to be.
+//
+// SIGMA-230: the agent's GC keep-set is built from the document it is about to
+// apply, and it runs BEFORE the ops. Two shipped paths deliberately render no
+// rollout op for a resource that is very much still running — a dedicated build
+// server holds the target's rollout while the deployment is queued/building, and
+// a cross-server Compose render is held back while a remote dependency is not
+// yet successful. Both fall through to the resource.sync stub, which named no
+// containers at all, so GC saw the live generation as an orphan and reaped it:
+// the app went down for the WHOLE build (or, for a dependency that never
+// succeeds, indefinitely), defeating the never-cut invariant the rollout code
+// goes to such lengths to hold. Naming the groups to retain makes protection
+// independent of the renderer's hold-backs.
+func retainedContainerGroups(rs store.ResourceSpec, target store.DeployTarget, serverID string) []string {
+	if rs.Kind != "app" {
+		return nil
+	}
+	var spec appResourceSpec
+	if err := json.Unmarshal(rs.Spec, &spec); err != nil {
+		return nil
+	}
+	if spec.Compose != nil && len(spec.Compose.Services) > 0 {
+		// Only the services PLACED here — a service hosted on another server has
+		// no container of ours to protect, and a service deleted from the compose
+		// file is not in the list at all, so it stays collectable.
+		var out []string
+		for _, s := range spec.Compose.Services {
+			placed := s.ServerID
+			if placed == "" {
+				placed = target.ServerID
+			}
+			if placed == serverID {
+				out = append(out, s.Name)
+			}
+		}
+		sort.Strings(out) // deterministic: the stub spec feeds the document hash
+		return out
+	}
+	// A dedicated build server renders only clone + build; no container of this
+	// resource lives there, so there is nothing to retain (and pretending
+	// otherwise would pin a stale container on the wrong host forever).
+	if bs := target.BuildServerID; bs != "" && bs != target.ServerID && serverID == bs {
+		return nil
+	}
+	return []string{""}
 }
 
 // renderDeployOps expands a git-deployed app resource into its deploy pipeline:

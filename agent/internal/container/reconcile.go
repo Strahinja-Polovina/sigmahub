@@ -73,8 +73,9 @@ func (d *Driver) RunReconcile(ctx context.Context, interval time.Duration) {
 // a deleted resource is not blocked by the still-running container that held the
 // volume; the desired set is exactly the container.apply ops in that (validly
 // signed) document, independent of apply. The desired-state store is pruned to
-// match. Live rollout/recreate generations are never reaped (see below), so
-// running before apply cannot cut a blue-green swap.
+// match. Live rollout/recreate generations — and any group the document
+// explicitly retains — are never reaped (see protectedGroups), so running
+// before apply cannot cut a blue-green swap or a deploy the CP is holding back.
 func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 	// Held for the whole prune+remove so a concurrent reconcile cannot recreate
 	// a container between the desired-store prune and the container removal.
@@ -95,16 +96,7 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		}
 	}
 
-	// (resource, service) groups managed by a deploy.rollout/recreate op own their
-	// own container lifecycle: the swap creates the new generation and drains the
-	// old ONLY after the new one is healthy, and a health-gate failure deliberately
-	// keeps the old generation serving. GC must not touch any generation of such a
-	// group — a blind reap here (the old generation is never in `want`) would
-	// defeat the never-cut invariant and take a live app down. Scoping to the
-	// (resource, service) PAIR (not the whole resource) means a Compose service
-	// REMOVED from the compose file — whose op disappears from the document — is
-	// still correctly garbage-collected.
-	rolloutGroups := rolloutManagedGroups(doc)
+	protected := protectedGroups(doc)
 
 	managed, err := d.docker.ContainerList(ctx)
 	if err != nil {
@@ -112,27 +104,77 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		return
 	}
 	for _, c := range managed {
-		if want[c.Name] {
+		if !gcReap(c, want, protected, d.serverID) {
 			continue
-		}
-		// Never reap a peer's object. On a real host this is always false —
-		// one agent owns the daemon — but the fleet e2e runs several agents
-		// against ONE daemon, and without this each one deleted its peers'
-		// containers as orphans it had no ops for: the placed service came up,
-		// the other host's next reconcile removed it, and a multi-server deploy
-		// could never converge. An object with no owner label is still reaped:
-		// on a real host it can only be this agent's own, from an older build.
-		if ownedByAnotherServer(c.Labels, d.serverID) {
-			continue
-		}
-		if rid := c.Labels[LabelResourceID]; rid != "" && rolloutGroups[rolloutGroupKey(rid, c.Labels[LabelService])] {
-			continue // a live rollout-owned generation — never GC-reaped
 		}
 		d.log.Info("gc: removing orphaned container", "container", c.Name)
 		if err := d.docker.ContainerRemove(ctx, c.ID, true); err != nil {
 			d.log.Warn("gc: remove", "container", c.Name, "err", err)
 		}
 	}
+}
+
+// gcReap is GC's whole decision for one managed container, split out so the
+// keep rules are testable without a Docker daemon. A container is removed only
+// when the document neither names it nor protects its (resource, service)
+// group, and it is not a peer agent's object.
+func gcReap(c ContainerState, want, protected map[string]bool, serverID string) bool {
+	if want[c.Name] {
+		return false
+	}
+	// Never reap a peer's object. On a real host this is always false — one
+	// agent owns the daemon — but the fleet e2e runs several agents against ONE
+	// daemon, and without this each one deleted its peers' containers as orphans
+	// it had no ops for: the placed service came up, the other host's next
+	// reconcile removed it, and a multi-server deploy could never converge. An
+	// object with no owner label is still reaped: on a real host it can only be
+	// this agent's own, from an older build.
+	if ownedByAnotherServer(c.Labels, serverID) {
+		return false
+	}
+	if rid := c.Labels[LabelResourceID]; rid != "" && protected[rolloutGroupKey(rid, c.Labels[LabelService])] {
+		return false // a live rollout-owned or explicitly retained group
+	}
+	return true
+}
+
+// protectedGroups is the set of (resource, service) groups GC must leave alone
+// entirely, from both of the ways a document can claim one.
+//
+// The first is a deploy.rollout/deploy.recreate op: such a group owns its own
+// container lifecycle — the swap creates the new generation and drains the old
+// ONLY after the new one is healthy, and a health-gate failure deliberately
+// keeps the old generation serving. A blind reap here (the old generation is
+// never in `want`) would defeat the never-cut invariant and take a live app
+// down.
+//
+// The second is an explicit `retain` list on a resource.sync stub. The control
+// plane deliberately renders NO rollout op for a resource whose deploy it is
+// holding back — a dedicated build server still building, a Compose service
+// gated on a remote dependency — and those resources fall through to the stub.
+// Before SIGMA-230 the stub named nothing, so GC (which runs BEFORE the ops)
+// saw the live generation-suffixed container as an orphan and removed it: the
+// app was down for the entire build rather than the swap window, and for a
+// gated dependency that never succeeds, indefinitely.
+//
+// Scoping to the (resource, service) PAIR (not the whole resource) is what
+// keeps a Compose service REMOVED from the compose file — absent from both the
+// ops and the retain list — correctly garbage-collected.
+func protectedGroups(doc dsd.Document) map[string]bool {
+	out := rolloutManagedGroups(doc)
+	for _, op := range doc.Ops {
+		if op.Kind != KindResourceSync {
+			continue
+		}
+		var stub resourceSyncSpec
+		if err := json.Unmarshal(op.Spec, &stub); err != nil || stub.ResourceID == "" {
+			continue
+		}
+		for _, svc := range stub.Retain {
+			out[rolloutGroupKey(stub.ResourceID, svc)] = true
+		}
+	}
+	return out
 }
 
 // ownedByAnotherServer reports whether a managed object belongs to a DIFFERENT
