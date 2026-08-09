@@ -1944,9 +1944,23 @@ export async function cpGetComposeServices(
   orgId: string,
   resourceId: string
 ): Promise<CpComposeServices> {
-  return cpFetch(`${org(orgId)}/resources/${encodeURIComponent(resourceId)}/compose`, undefined, {
-    orgId,
-  });
+  const res = await cpFetch<CpComposeServices>(
+    `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/compose`,
+    undefined,
+    { orgId }
+  );
+  // The type above says `services: CpComposeService[]`, and that has to be true
+  // at RUNTIME, not just to tsc. A Go nil slice marshals to JSON `null`, so the
+  // control plane answering "this app has no compose graph" put a null here and
+  // the resource page — which reads `.length` on it — threw
+  // `Cannot read properties of null (reading 'length')` and rendered nothing at
+  // all. The control plane no longer does that, but a dashboard is expected to
+  // survive an older one on the other side of a rolling deploy, and an app
+  // with no compose graph is the common case rather than an edge.
+  //
+  // Coerced HERE, at the one place the shape is asserted, rather than guarded
+  // at each of the call sites that would otherwise each have to remember.
+  return { ...res, services: res?.services ?? [], homeServerId: res?.homeServerId ?? "" };
 }
 
 export async function cpSetComposePlacements(
