@@ -279,25 +279,51 @@ func (rs ReleaseSource) normalized() ReleaseSource {
 	return rs
 }
 
-// handleInstallScript serves the installer for the version this control plane is
-// pinned to. This is the URL the wizard renders, and the shape install.sh's own
-// header documents: `curl -fsSL https://<host>/install.sh`.
-func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+// installerRelease answers the one question the whole onboarding flow turns on:
+// which release does this control plane install, and if it cannot, why not.
+//
+// It exists because that question used to have TWO answers. The dashboard read
+// its own SIGMAHUB_AGENT_VERSION to build the command's /dl/{version} paths,
+// while GET /install.sh served whatever CP_AGENT_VERSION said — so a deployment
+// that set one and not the other, or set them to different tags, handed an
+// operator a command that fetched the v0.3.0 installer and then asked it to
+// install v0.4.0. Both halves were individually correct; together they were a
+// version nobody chose. That is this project's recurring defect, and the fix is
+// always the same shape: one owner, and everyone else reads it back.
+//
+// So this is the owner. The token-issuing handlers return what it says
+// (registry.go), the wizard renders that, and the /dl route refuses anything
+// else — which makes "the version in the command" and "the version served" the
+// same value by construction rather than by two settings agreeing.
+//
+// refusal is prose an operator can act on, not a status code: it names the
+// setting to change, and it is what the dashboard shows when it cannot render a
+// command, so the sentence is written once here rather than paraphrased there.
+func (s *Server) installerRelease() (version, refusal string) {
 	if s.release.Repo == "" {
-		s.writeInstallerError(w, http.StatusServiceUnavailable,
-			"this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to the owner/name of the repository whose releases publish sigmad.")
-		return
+		return "", "this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to the owner/name of the repository whose releases publish sigmad."
 	}
 	if !releaseTagPattern.MatchString(s.release.Version) {
 		// A source build stamps main.version as "dev", so this is what a
 		// self-hoster who has not pinned an agent version sees. Name both ways
 		// out: the setting, and the URL that carries its own version.
-		s.writeInstallerError(w, http.StatusServiceUnavailable, fmt.Sprintf(
+		return "", fmt.Sprintf(
 			"this control plane is not pinned to a released agent version (it has %q). Set CP_AGENT_VERSION to a released tag such as v0.3.0, or fetch the version-explicit URL /dl/<version>/install.sh.",
-			s.release.Version))
+			s.release.Version)
+	}
+	return s.release.Version, ""
+}
+
+// handleInstallScript serves the installer for the version this control plane is
+// pinned to. This is the URL the wizard renders, and the shape install.sh's own
+// header documents: `curl -fsSL https://<host>/install.sh`.
+func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+	version, refusal := s.installerRelease()
+	if refusal != "" {
+		s.writeInstallerError(w, http.StatusServiceUnavailable, refusal)
 		return
 	}
-	s.proxyReleaseAsset(w, r, s.release.Version, installScriptAsset)
+	s.proxyReleaseAsset(w, r, version, installScriptAsset)
 }
 
 // handleReleaseAsset serves one pinned release asset. install.sh points its

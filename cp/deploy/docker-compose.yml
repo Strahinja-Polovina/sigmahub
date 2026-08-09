@@ -59,11 +59,13 @@ services:
       # both.
       CP_RELEASE_REPO: ${CP_RELEASE_REPO:-}
       CP_RELEASE_TOKEN: ${CP_RELEASE_TOKEN:-}
-      # Which release the CP serves the installer for. Fed from the SAME .env
-      # value the dashboard renders into the install command, deliberately: two
-      # keys for one version is a control plane serving the v0.3.0 installer to
-      # a command that asks it to install v0.4.0. Unset falls back to the
-      # release this control-plane binary was built from.
+      # Which release the CP installs. This is the ONLY place the version is
+      # configured: the dashboard no longer has a setting of its own, it asks the
+      # control plane and renders the answer, so there is nothing here for a
+      # second key to disagree with. Unset falls back to the release this
+      # control-plane binary was built from, which is already correct for a
+      # released image (goreleaser stamps cp and sigmad from one tag) and is
+      # "dev" for a source build — onboarding then refuses, naming this setting.
       CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
@@ -117,9 +119,12 @@ services:
       # agent install command; without it onboarding prints an unusable endpoint
       # (SIGMA-157).
       SIGMAHUB_CP_PUBLIC_URL: ${SIGMAHUB_CP_PUBLIC_URL:?set SIGMAHUB_CP_PUBLIC_URL in .env}
-      # Released agent tag the installer pins (e.g. v0.3.0). Must be a real
-      # release — install.sh 404s on "latest".
-      SIGMAHUB_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:?set SIGMAHUB_AGENT_VERSION in .env}
+      # No agent version here on purpose. The dashboard renders the install
+      # command around the version the control plane hands back with the
+      # bootstrap token, so a setting on this side would be a second opinion
+      # about which release gets installed — and the losing half of that
+      # disagreement is a host that fetches one release's installer and asks it
+      # to install another. See CP_AGENT_VERSION on the cp service.
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}

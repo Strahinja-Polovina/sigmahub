@@ -29,6 +29,10 @@ const CP_URL = "https://cp.example.com";
 let publicUrl = CP_URL;
 const VERSION = "v0.3.0";
 const TOKEN = "sbt_testtoken";
+/** What the control plane says it installs, returned with the bootstrap token.
+ *  Mutable because it is now the ONLY source of the version in the command —
+ *  the tests below steer it to prove the dashboard has no opinion of its own. */
+let release: { agentVersion: string; agentVersionError?: string } = { agentVersion: VERSION };
 
 vi.mock("@/server/db", async () => {
   const { createDemoDb } = await import("@/server/testing/demo-db");
@@ -58,6 +62,7 @@ vi.mock("@/server/cp", () => {
       token: TOKEN,
       bootstrapPubkey: "ssh-ed25519 AAAA sigmahub-bootstrap",
       expiresAt: new Date(Date.now() + 900_000).toISOString(),
+      ...release,
     }),
     cpIssueBootstrapToken: forbidden,
     cpProvisionServer: forbidden,
@@ -98,11 +103,12 @@ const installScriptCode = installScript
   .join("\n");
 
 beforeEach(() => {
-  process.env.SIGMAHUB_AGENT_VERSION = VERSION;
+  release = { agentVersion: VERSION };
 });
 
 afterEach(() => {
-  process.env.SIGMAHUB_AGENT_VERSION = VERSION;
+  release = { agentVersion: VERSION };
+  delete process.env.SIGMAHUB_AGENT_VERSION;
 });
 
 describe("the install command the connect wizard renders", () => {
@@ -163,14 +169,55 @@ describe("the install command the connect wizard renders", () => {
     }
   });
 
-  it("refuses to render a command when no release is pinned", async () => {
-    delete process.env.SIGMAHUB_AGENT_VERSION;
-    await expect(renderedCommand()).rejects.toThrow(/SIGMAHUB_AGENT_VERSION/);
+  it("refuses to render a command when the control plane is pinned to no release", async () => {
+    // An empty version is how the control plane says "I cannot serve an
+    // installer": /install.sh would answer 503 and every /dl path would 404, so
+    // the only honest thing to render is nothing.
+    release = { agentVersion: "", agentVersionError: "CP_AGENT_VERSION is not a released tag" };
+    await expect(renderedCommand()).rejects.toThrow(/CP_AGENT_VERSION/);
   });
 
-  it("refuses \"latest\", which is a tag no release asset is published under", async () => {
-    process.env.SIGMAHUB_AGENT_VERSION = "latest";
-    await expect(renderedCommand()).rejects.toThrow(/released tag/);
+  it("passes the control plane's own refusal through instead of a paraphrase", async () => {
+    // The setting to change lives on the control plane, so the sentence naming
+    // it has to come from there too — a second wording here is a second thing
+    // to keep true.
+    release = {
+      agentVersion: "",
+      agentVersionError: "this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to …",
+    };
+    await expect(renderedCommand()).rejects.toThrow(/CP_RELEASE_REPO/);
+  });
+});
+
+// The version in the command and the version the control plane actually serves
+// were, until SIGMA-217's follow-up, two settings: the dashboard read
+// SIGMAHUB_AGENT_VERSION to build the /dl/{version} paths while the control
+// plane served GET /install.sh from its own CP_AGENT_VERSION. Both halves were
+// individually correct, and a deployment that set one and not the other — or set
+// them to different tags — handed the operator a command that installed a
+// version nobody chose. It is this project's recurring defect: two sides of one
+// question, each answering it honestly.
+//
+// What these two tests pin is that there is only one answer left. The version
+// arrives with the bootstrap token, from the control plane that will serve every
+// URL in the line, and this process has no opinion to contribute.
+describe("the release in the command is the control plane's, and only the control plane's", () => {
+  it("renders whatever version came back with the token", async () => {
+    release = { agentVersion: "v9.9.9-rc.1" };
+    const command = await renderedCommand();
+    expect(command).toContain("SIGMAHUB_VERSION=v9.9.9-rc.1");
+    expect(command).toContain(`SIGMAHUB_DOWNLOAD_BASE=${CP_URL}/dl/v9.9.9-rc.1`);
+    // One version, in both places it appears — the failure this whole change
+    // exists to make impossible is a command whose script and assets disagree.
+    expect(command).not.toContain(VERSION);
+  });
+
+  it("ignores SIGMAHUB_AGENT_VERSION, the second source that used to decide this", async () => {
+    process.env.SIGMAHUB_AGENT_VERSION = "v0.0.1";
+    release = { agentVersion: VERSION };
+    const command = await renderedCommand();
+    expect(command).toContain(`SIGMAHUB_VERSION=${VERSION}`);
+    expect(command).not.toContain("v0.0.1");
   });
 });
 

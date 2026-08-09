@@ -712,3 +712,222 @@ func TestOnlyThePinnedReleaseIsServed(t *testing.T) {
 		t.Fatalf("the pinned release stopped being served: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// The version in the install command and the version this control plane serves
+// used to be two settings.
+//
+// The dashboard read its own SIGMAHUB_AGENT_VERSION to build the command's
+// /dl/{version} paths; GET /install.sh served whatever CP_AGENT_VERSION said.
+// Each was correct on its own terms, and nothing made them agree — so a
+// deployment that set one and not the other, or set them to different tags,
+// handed an operator a line that fetched one release's installer and pointed it
+// at another release's assets. That is a version nobody chose, and the pinning
+// added alongside these tests turns it from a silent wrong install into a 404
+// halfway through onboarding, which is better and still not the fix.
+//
+// The fix is that there is one value. The control plane hands the version back
+// WITH the bootstrap token, the dashboard renders what it was given, and the
+// tests below are what makes "renders what it was given" checkable from this
+// side: whatever comes out of the token route is exactly what the download
+// route will serve, and any other tag is refused.
+func TestTheVersionHandedToTheWizardIsTheVersionTheProxyServes(t *testing.T) {
+	// Two pins, and the second is the one that earns its keep: a handler that
+	// answered with a hard-coded v0.3.0, or with the tag this binary was built
+	// from, would satisfy every assertion below against the fixture's default
+	// and prove nothing about where the answer came from.
+	for _, pinned := range []string{testReleaseVersion, "v7.1.4"} {
+		s, _ := installerServer(t, releaseAtTag(pinned), ReleaseSource{Version: pinned})
+
+		for _, route := range []string{
+			"/v1/orgs/org_1/bootstrap-tokens",
+			"/v1/orgs/org_1/servers/provision",
+			"/v1/orgs/org_1/servers/srv_pre/reissue-token",
+		} {
+			rec := postAsToken(s, testServiceToken, route, `{"type":"general"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST %s = %d, want 201; body %s", route, rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Token             string `json:"token"`
+				AgentVersion      string `json:"agentVersion"`
+				AgentVersionError string `json:"agentVersionError"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("POST %s returned unreadable JSON: %v", route, err)
+			}
+			if body.Token == "" {
+				t.Fatalf("POST %s returned no bootstrap token", route)
+			}
+			if body.AgentVersion != pinned {
+				t.Fatalf("POST %s handed out agentVersion %q (error %q) for a control plane pinned to "+
+					"%s; the wizard renders this into the command's /dl paths, so anything but the pin "+
+					"is a version nobody chose", route, body.AgentVersion, body.AgentVersionError, pinned)
+			}
+			if body.AgentVersionError != "" {
+				t.Errorf("POST %s returned both a version and a refusal (%q); one of them is wrong and "+
+					"the dashboard cannot tell which", route, body.AgentVersionError)
+			}
+			// The whole point: the command built from this response works
+			// against this same control plane. install.sh is fetched
+			// unversioned and every asset from /dl/<that version>/, so both are
+			// checked.
+			if rec := get(t, s, "/install.sh"); rec.Code != http.StatusOK {
+				t.Fatalf("GET /install.sh = %d while the token route handed out %s; the command's first "+
+					"line would fail before any asset was reached", rec.Code, body.AgentVersion)
+			}
+			for _, asset := range []string{"install.sh", "checksums.txt", "sigmad.service", archiveName(pinned, "amd64")} {
+				path := "/dl/" + body.AgentVersion + "/" + asset
+				if rec := get(t, s, path); rec.Code != http.StatusOK {
+					t.Errorf("GET %s = %d, want 200: the version this control plane handed the wizard is "+
+						"one it refuses to serve, which is the disagreement this change removes (body: %s)",
+						path, rec.Code, rec.Body.String())
+				}
+			}
+		}
+	}
+}
+
+// releaseAtTag is releaseWithInstaller for a repository whose published release
+// is some other tag, so a test can tell "the version this control plane serves"
+// apart from "the version the fixtures happen to use".
+func releaseAtTag(tag string) *fakeGitHub {
+	gh := &fakeGitHub{}
+	for _, name := range []string{"install.sh", "checksums.txt", "checksums.txt.sig", "checksums.txt.pem", "sigmad.service"} {
+		gh.add(fakeAsset{tag: tag, name: name, body: []byte("body of " + name)})
+	}
+	for _, arch := range store.SupportedArches() {
+		gh.add(fakeAsset{tag: tag, name: archiveName(tag, arch), body: []byte("archive-" + arch)})
+	}
+	return gh
+}
+
+// The other half of "one value": when the control plane cannot serve an
+// installer it must say so on the token route, not hand out a token the wizard
+// renders into a command that 503s in the operator's terminal.
+func TestAnUnpinnedControlPlaneTellsTheWizardWhyRatherThanAVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*testing.T) *Server
+		wants string
+	}{
+		{
+			// A source build stamps main.version as "dev", which is what a
+			// self-hoster who never set CP_AGENT_VERSION is running.
+			name: "a source build with no pin",
+			build: func(t *testing.T) *Server {
+				s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: "dev"})
+				return s
+			},
+			wants: "CP_AGENT_VERSION",
+		},
+		{
+			// installerServer fills an empty Repo in, so an unconfigured
+			// release source has to be built directly.
+			name: "no release repository",
+			build: func(t *testing.T) *Server {
+				return New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{DevServiceToken: testServiceToken})
+			},
+			wants: "CP_RELEASE_REPO",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.build(t)
+
+			rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/bootstrap-tokens", `{"type":"general"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST bootstrap-tokens = %d, want 201; body %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				AgentVersion      string `json:"agentVersion"`
+				AgentVersionError string `json:"agentVersionError"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("unreadable JSON: %v", err)
+			}
+			if body.AgentVersion != "" {
+				t.Errorf("agentVersion = %q, want empty: this control plane cannot serve an installer, "+
+					"and a version here is a command that fails after the operator has already pasted it",
+					body.AgentVersion)
+			}
+			if !strings.Contains(body.AgentVersionError, tc.wants) {
+				t.Errorf("agentVersionError = %q, want it to name %s — the setting is on this side, so "+
+					"the sentence naming it has to come from this side too", body.AgentVersionError, tc.wants)
+			}
+			// And it is the SAME sentence the installer route answers with, so
+			// an operator reading the dialog and an operator reading a curl get
+			// one explanation rather than two paraphrases.
+			script := get(t, s, "/install.sh")
+			if script.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET /install.sh = %d, want 503", script.Code)
+			}
+			if !strings.Contains(script.Body.String(), body.AgentVersionError) {
+				t.Errorf("the dialog is told %q and the terminal %q; two wordings of one problem is two "+
+					"things to keep true", body.AgentVersionError, script.Body.String())
+			}
+		})
+	}
+}
+
+// The dashboard's agent-upgrade button sends no version, because which release
+// an agent upgrades TO is the same question this file already answers: the agent
+// downloads it through /dl, which serves exactly one.
+func TestAnAgentUpgradeWithNoVersionTakesTheOneTheControlPlaneServes(t *testing.T) {
+	// Deliberately NOT the fixture's default tag: a handler that answered with a
+	// hard-coded v0.3.0 — or with the version it was built from — would pass
+	// against testReleaseVersion and prove nothing about where the answer came
+	// from.
+	const pinned = "v7.1.4"
+	s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: pinned})
+
+	rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent-update with no version = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var body struct{ Version string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unreadable JSON: %v", err)
+	}
+	if body.Version != pinned {
+		t.Errorf("queued version = %q, want %q — the agent fetches its new binary from this control "+
+			"plane's /dl route, so any other answer is an upgrade to something it will refuse to serve",
+			body.Version, pinned)
+	}
+
+	// An unpinned control plane refuses rather than queueing an upgrade to "dev".
+	unpinned, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: "dev"})
+	rec = postAsToken(unpinned, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update", `{}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("agent-update on an unpinned control plane = %d, want 422; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CP_AGENT_VERSION") {
+		t.Errorf("the refusal does not name the setting to fix: %s", rec.Body.String())
+	}
+}
+
+// A tag the caller names explicitly is still accepted — that is how a fleet is
+// pinned or rolled back — and it is checked against the SAME pattern the
+// installer routes use. It used to have its own stricter spelling, which would
+// have refused a prerelease tag the proxy serves happily: a disagreement waiting
+// for the first `-rc` release.
+func TestAnExplicitAgentVersionIsCheckedAgainstTheInstallerRoutesOwnPattern(t *testing.T) {
+	s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{})
+
+	for _, tc := range []struct {
+		version string
+		want    int
+	}{
+		{"v0.4.0", http.StatusOK},
+		{"v0.4.0-rc.1", http.StatusOK},
+		{"latest", http.StatusUnprocessableEntity},
+		{"../../etc/passwd", http.StatusUnprocessableEntity},
+	} {
+		rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update",
+			`{"version":"`+tc.version+`"}`)
+		if rec.Code != tc.want {
+			t.Errorf("agent-update %q = %d, want %d; body %s", tc.version, rec.Code, tc.want, rec.Body.String())
+		}
+		if tc.want == http.StatusOK && !releaseTagPattern.MatchString(tc.version) {
+			t.Errorf("%q is accepted here but is not a tag the /dl route would serve", tc.version)
+		}
+	}
+}

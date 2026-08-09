@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -88,6 +87,29 @@ func unsupportedDistroMessage() string {
 	return "unsupported distro: only " + store.SupportedDistroSentence() + " can be onboarded"
 }
 
+// withInstallerRelease adds the release this control plane installs to a
+// bootstrap-token response.
+//
+// The version travels WITH the token on purpose. The dashboard's only job is to
+// render one line containing both, and it used to source them from two places —
+// the token from here, the version from its own SIGMAHUB_AGENT_VERSION — so the
+// command could name a release this control plane does not serve. Handing both
+// back in one response removes the second source rather than synchronising it:
+// there is no value the dashboard could render that did not come from the
+// control plane that will have to serve it.
+//
+// agentVersionError is present exactly when agentVersion is empty, and carries
+// the control plane's own sentence about which setting is missing, so the dialog
+// shows the operator what to fix instead of a symptom.
+func (s *Server) withInstallerRelease(body map[string]any) map[string]any {
+	version, refusal := s.installerRelease()
+	body["agentVersion"] = version
+	if refusal != "" {
+		body["agentVersionError"] = refusal
+	}
+	return body
+}
+
 func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	var req issueTokenRequest
@@ -110,11 +132,11 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	writeJSON(w, http.StatusCreated, s.withInstallerRelease(map[string]any{
 		"token":     token,
 		"serverId":  serverID,
 		"expiresAt": expiresAt,
-	})
+	}))
 }
 
 // handleProvisionServer is the SSH onboarding entry point: it pre-creates the
@@ -152,12 +174,12 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	writeJSON(w, http.StatusCreated, s.withInstallerRelease(map[string]any{
 		"serverId":        res.ServerID,
 		"token":           res.Token,
 		"expiresAt":       res.ExpiresAt,
 		"bootstrapPubkey": res.BootstrapPubkey,
-	})
+	}))
 }
 
 // handleReissueBootstrapToken regenerates the bootstrap keypair + single-use
@@ -171,19 +193,26 @@ func (s *Server) handleReissueBootstrapToken(w http.ResponseWriter, r *http.Requ
 		s.writeStoreErr(w, err, "reissue bootstrap token")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	writeJSON(w, http.StatusCreated, s.withInstallerRelease(map[string]any{
 		"serverId":        res.ServerID,
 		"token":           res.Token,
 		"expiresAt":       res.ExpiresAt,
 		"bootstrapPubkey": res.BootstrapPubkey,
-	})
+	}))
 }
-
-var releaseVersionRe = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
 // handleAgentUpdate records the desired agent version for a server so the
 // reconciler renders an agent.update op — the dashboard-driven, no-SSH upgrade
 // path. Project Admin+.
+//
+// An ABSENT version means "the release this control plane installs", which is
+// what the dashboard's upgrade button asks for and the only answer that can be
+// right: the agent downloads that release through this control plane's own /dl
+// route, which serves exactly one version. A caller may still name a tag
+// explicitly — that is how a fleet is pinned or rolled back — and it is checked
+// against the same pattern the installer routes use, not a second spelling of
+// "looks like a tag" that would reject a prerelease the proxy would happily
+// serve.
 func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("orgId")
 	serverID := r.PathValue("serverId")
@@ -194,19 +223,28 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	if !releaseVersionRe.MatchString(req.Version) {
+	version := strings.TrimSpace(req.Version)
+	if version == "" {
+		refusal := ""
+		version, refusal = s.installerRelease()
+		if refusal != "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": refusal})
+			return
+		}
+	}
+	if !releaseTagPattern.MatchString(version) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
 			"error": "version must be a released tag like v0.1.2"})
 		return
 	}
-	if err := s.store.SetDesiredAgentVersion(r.Context(), orgID, serverID, req.Version, principalFrom(r).Name); err != nil {
+	if err := s.store.SetDesiredAgentVersion(r.Context(), orgID, serverID, version, principalFrom(r).Name); err != nil {
 		s.writeStoreErr(w, err, "set desired agent version")
 		return
 	}
 	if s.reconcile != nil {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "queued", "version": req.Version})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "queued", "version": version})
 }
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
