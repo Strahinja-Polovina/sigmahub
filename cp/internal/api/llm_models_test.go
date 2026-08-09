@@ -72,13 +72,40 @@ func (f *fakeCatalog) Resolve(_ context.Context, repoID string) (hf.ModelCard, e
 
 func (f *fakeCatalog) TokenConfigured() bool { return f.token }
 
+// fakeWeights stands in for the store's answer to "could a model created in
+// this project fetch its weights". It records the project it was asked about,
+// because the handler forwarding that argument is the difference between an
+// org-wide guess and an answer about the target the operator picked.
+type fakeWeights struct {
+	available bool
+	err       error
+	projects  []string
+}
+
+func (f *fakeWeights) GetLLM(context.Context, string, string) (store.LLMInfo, error) {
+	return store.LLMInfo{}, nil
+}
+
+func (f *fakeWeights) WeightsTokenAvailable(_ context.Context, _, projectID string) (bool, error) {
+	f.projects = append(f.projects, projectID)
+	return f.available, f.err
+}
+
 // newModelServer builds the API with a caller-supplied catalog; a nil one is the
 // unconfigured control plane, which is a state under test rather than a gap.
 func newModelServer(t *testing.T, cat ModelCatalog) *Server {
 	t.Helper()
+	return newModelServerWithWeights(t, cat, nil)
+}
+
+// newModelServerWithWeights adds the weights-token source, which is what the
+// response's tokenConfigured actually reports.
+func newModelServerWithWeights(t *testing.T, cat ModelCatalog, weights LLMAPI) *Server {
+	t.Helper()
 	return New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
 		DevServiceToken: testServiceToken,
 		Models:          cat,
+		LLM:             weights,
 	})
 }
 
@@ -91,19 +118,28 @@ func getAsDev(s *Server, path string) *httptest.ResponseRecorder {
 	return rec
 }
 
-func TestModelSearchAnswersCardsAndWhetherATokenIsConfigured(t *testing.T) {
-	cat := &fakeCatalog{cards: []hf.ModelCard{llama8B}, token: true}
-	rec := getAsDev(newModelServer(t, cat), "/v1/orgs/org_1/llm/models?q=llama+3.1")
+// modelSearch decodes the picker's response, which is two answers to two
+// different questions and used to be one answer to both.
+type modelSearch struct {
+	Models          []hf.ModelCard `json:"models"`
+	TokenConfigured bool           `json:"tokenConfigured"`
+}
+
+func decodeSearch(t *testing.T, rec *httptest.ResponseRecorder) modelSearch {
+	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("search → %d, want 200; body %s", rec.Code, rec.Body)
 	}
-	var out struct {
-		Models          []hf.ModelCard `json:"models"`
-		TokenConfigured bool           `json:"tokenConfigured"`
-	}
+	var out modelSearch
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
+	return out
+}
+
+func TestModelSearchAnswersCardsWithTheirSizing(t *testing.T) {
+	cat := &fakeCatalog{cards: []hf.ModelCard{llama8B}, token: true}
+	out := decodeSearch(t, getAsDev(newModelServer(t, cat), "/v1/orgs/org_1/llm/models?q=llama+3.1"))
 	if len(out.Models) != 1 || out.Models[0].ID != llama8B.ID {
 		t.Fatalf("models = %+v, want the catalog's card passed through", out.Models)
 	}
@@ -113,14 +149,67 @@ func TestModelSearchAnswersCardsAndWhetherATokenIsConfigured(t *testing.T) {
 	if out.Models[0].VRAMBytesRequired != llama8B.VRAMBytesRequired || out.Models[0].VRAMText != "~21 GB" {
 		t.Fatalf("card lost its sizing: %+v", out.Models[0])
 	}
-	// Whether a token is configured changes what the absence of a model MEANS —
-	// without it, a gated repo the operator can see on huggingface.co simply is
-	// not here, and the picker has to say so rather than imply it does not exist.
-	if !out.TokenConfigured {
-		t.Error("tokenConfigured = false with a token-holding catalog")
-	}
 	if len(cat.queries) != 1 || cat.queries[0] != "llama 3.1" {
 		t.Fatalf("catalog saw queries %v, want the decoded q", cat.queries)
+	}
+}
+
+// tokenConfigured decides whether the wizard lets a GATED model through, so it
+// has to describe the DOWNLOAD, not the lookup. Reporting the picker's own
+// credential produced both failures at once: a gated model approved against a
+// token that could read its metadata and not fetch its weights, and a model
+// step hard-blocked for an operator whose org already held the token that
+// would have worked.
+func TestGatedApprovalFollowsTheWeightsTokenAndNotThePickersOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		pickerToken   bool
+		weights       *fakeWeights
+		wantConfigred bool
+	}{
+		{
+			name:        "a picker credential alone does not authenticate a download",
+			pickerToken: true,
+			weights:     &fakeWeights{available: false},
+		},
+		{
+			name:          "a weights credential counts even where the picker has none",
+			pickerToken:   false,
+			weights:       &fakeWeights{available: true},
+			wantConfigred: true,
+		},
+		{
+			// Claiming a credential we could not confirm is the expensive
+			// direction: it suppresses the gated warning and the deploy fails
+			// mid-pull on a host billed at GPU rates.
+			name:        "a lookup that failed reports no token rather than guessing yes",
+			pickerToken: true,
+			weights:     &fakeWeights{available: true, err: errors.New("database is down")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cat := &fakeCatalog{cards: []hf.ModelCard{llama8B}, token: tc.pickerToken}
+			s := newModelServerWithWeights(t, cat, tc.weights)
+			out := decodeSearch(t, getAsDev(s, "/v1/orgs/org_1/llm/models?q=llama&projectId=prj_1"))
+			if out.TokenConfigured != tc.wantConfigred {
+				t.Fatalf("tokenConfigured = %v, want %v", out.TokenConfigured, tc.wantConfigred)
+			}
+			// The project has to reach the store, or the answer is about the
+			// org in general and the operator's target in particular is a guess.
+			if len(tc.weights.projects) != 1 || tc.weights.projects[0] != "prj_1" {
+				t.Fatalf("weights source saw projects %v, want [prj_1]", tc.weights.projects)
+			}
+		})
+	}
+}
+
+// A control plane with a catalog and no model-hosting wiring cannot answer the
+// weights question, and an unanswerable question is not a yes.
+func TestATokenClaimNeedsSomethingBehindIt(t *testing.T) {
+	cat := &fakeCatalog{cards: []hf.ModelCard{llama8B}, token: true}
+	out := decodeSearch(t, getAsDev(newModelServer(t, cat), "/v1/orgs/org_1/llm/models?q=llama"))
+	if out.TokenConfigured {
+		t.Error("tokenConfigured = true with nothing able to confirm a weights credential")
 	}
 }
 
@@ -176,7 +265,7 @@ func TestAControlPlaneWithNoCatalogStillHasAWorkingPicker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.TokenConfigured {
-		t.Error("tokenConfigured = true with no catalog at all")
+		t.Error("tokenConfigured = true with nothing configured at all")
 	}
 
 	// Resolve cannot confirm anything, so it 404s — within the wire contract,

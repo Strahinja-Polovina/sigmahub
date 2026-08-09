@@ -27,9 +27,9 @@
  *   Qwen2.5 7B Instruct      ungated, fits                 → walkable end to end
  *   TinyLlama 1.1B Chat      ungated, tiny                 → fits anything
  *   Llama 2 13B Chat AWQ     4-bit, sized from the NAME    → quantization
- *   phi-2 GGUF               unsizable, served by Ollama   → no fit check, and
- *                                                            a derived runtime
- *                                                            that is not vLLM
+ *   phi-2 GGUF               unsizable, and GGUF           → no fit check, and
+ *                                                            the model step's
+ *                                                            refusal
  */
 
 import type { ModelCard } from "@/lib/wizard/llm";
@@ -144,9 +144,11 @@ export const MOCK_MODELS: ModelCard[] = [
   {
     // The unsizable one, and it is unsizable honestly: a GGUF-only repository
     // publishes no safetensors index, and "phi-2" carries no size token to
-    // parse. It is also the demo's proof that the runtime is DERIVED — vLLM
-    // cannot load GGUF weights, so this card says ollama and the step shows it
-    // without asking.
+    // parse. It is also the demo's GGUF pick, and therefore the one the model
+    // step refuses: the engine is vllm because the control plane no longer
+    // derives ollama from a GGUF repository (hf.EngineForModel), and vLLM cannot
+    // load these weights. Recording "ollama" here would have the demo print
+    // "Served by Ollama" directly above the sentence refusing the pick.
     id: "TheBloke/phi-2-GGUF",
     name: "Phi-2 GGUF",
     gated: false,
@@ -154,7 +156,7 @@ export const MOCK_MODELS: ModelCard[] = [
     likes: 268,
     pipelineTag: "text-generation",
     library: "transformers",
-    engine: "ollama",
+    engine: "vllm",
     parameters: 0,
     parametersKnown: false,
     quantization: "gguf",
@@ -166,15 +168,15 @@ export const MOCK_MODELS: ModelCard[] = [
 ];
 
 /**
- * Whether demo mode claims a Hub token.
+ * Whether demo mode claims a token to DOWNLOAD weights with.
  *
- * FALSE, so the gated models above are refused at the model step exactly as
- * they would be on a control plane nobody has configured — which is the state
- * every self-hoster starts in, and the one where the refusal has to be
- * comprehensible. Pretending a token exists would make the demo's most-clicked
- * model deploy offline and fail for real users, which is the opposite of what
- * demo mode is for. Four ungated models remain, so the flow still walks to the
- * end.
+ * FALSE, so the gated models above carry the warning they would carry on a
+ * control plane nobody has configured — the state every self-hoster starts in,
+ * and the one where the sentence has to be comprehensible. Pretending a token
+ * exists would let the demo's most-clicked model look ready to deploy while a
+ * real pull 401s, which is the opposite of what demo mode is for. The warning is
+ * not a wall: a gated pick still continues, here as everywhere, because nothing
+ * in this process can see whether the operator has been granted access.
  */
 export const MOCK_TOKEN_CONFIGURED = false;
 

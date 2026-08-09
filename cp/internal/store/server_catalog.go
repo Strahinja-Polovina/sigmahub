@@ -26,9 +26,13 @@ package store
 // endpoint.
 //
 // The resource-KIND vocabulary is not single-sourced to the same standard yet:
-// adding a kind here compiles and passes everything while the wizard's picker,
-// the two DB_KINDS tables, config.go's engine list and clusters.go's exclusions
-// all stay ignorant of it (SIGMA-216).
+// adding a kind here compiles and passes everything while the two DB_KINDS
+// tables, config.go's engine list and clusters.go's exclusions all stay
+// ignorant of it (SIGMA-216). The wizard's PICKER is no longer on that list —
+// its grouping, its labels and the order it offers them in are rendered from
+// resourceCategories below — but the icon it draws beside each kind still lives
+// in the dashboard, because a lucide component is not a thing this file can
+// name.
 
 //go:generate go run ../../cmd/gen-server-catalog
 
@@ -154,21 +158,55 @@ type ServerTypeSpec struct {
 	Requires ServerRequirements `json:"requires"`
 }
 
-// Resource kinds, in the order the dashboard offers them. Separate from the
-// matrix on purpose: a kind that no server type can host is still a KNOWN kind
-// (CreateResource must say "no server can host this" rather than "unknown
-// kind"), and deriving the kind list from the matrix would lose that.
+// Resource kinds, in the order the dashboard offers them, each naming the
+// category it belongs to. Separate from the matrix on purpose: a kind that no
+// server type can host is still a KNOWN kind (CreateResource must say "no
+// server can host this" rather than "unknown kind"), and deriving the kind list
+// from the matrix would lose that.
+//
+// The category is stated HERE, on the kind, and never as a list of members on
+// the category: one kind cannot then land in two buckets or in none, which is
+// the failure a hand-kept membership list has.
 var resourceKinds = []struct {
-	Kind  string
-	Label string
+	Kind     string
+	Label    string
+	Category string
 }{
-	{"app", "App"},
-	{"postgres", "PostgreSQL"},
-	{"mysql", "MySQL"},
-	{"mongodb", "MongoDB"},
-	{"redis", "Redis"},
-	{"s3", "Object storage"},
-	{"llm", "LLM"},
+	{"app", "App", "application"},
+	{"postgres", "PostgreSQL", "database"},
+	{"mysql", "MySQL", "database"},
+	{"mongodb", "MongoDB", "database"},
+	{"redis", "Redis", "database"},
+	{"s3", "Object storage", "storage"},
+	{"llm", "LLM", "model"},
+}
+
+// The categories the New Resource wizard offers first, in the order it offers
+// them — slice order IS display order, as it is for the kinds above and the
+// server types below, so an ordering field cannot come to disagree with the
+// list it orders.
+//
+// Categories exist because postgres, mysql, mongodb and redis are not peers of
+// "Application": they are one decision made four times, and step 1 laid all
+// seven kinds out flat as if they were equals. That grid also gets taller with
+// every kind we add, which is the part that does not survive the next few.
+//
+// What a category must NOT become is a second click bought with the first. A
+// category holding exactly one kind is a question with a single possible
+// answer, and the dashboard resolves it without asking (see
+// web/src/lib/wizard/steps.ts). That is why Kinds is not a field an editor
+// fills in and why nothing here says "Application has one kind": the structure
+// is the same for all four, and the day Application gains a second kind it
+// starts showing a list without another line being written.
+var resourceCategories = []struct {
+	ID    string
+	Label string
+	Hint  string
+}{
+	{"application", "Application", "Build and deploy a repository."},
+	{"database", "Database", "A managed engine with generated credentials."},
+	{"model", "Model endpoint", "Serve a model from the Hub on GPU hardware."},
+	{"storage", "Object storage", "S3-compatible buckets on a storage host."},
 }
 
 // The distros the hardened onboarding path accepts (SIGMA-A-5). Labelled here
@@ -317,29 +355,66 @@ var serverCatalog = []ServerTypeSpec{
 	},
 }
 
+// ResourceCategorySpec is one bucket of the wizard's first screen: what it is
+// called, the line under its card, and the kinds it holds in catalog order.
+//
+// Kinds is DERIVED from resourceKinds rather than typed out here — see the
+// comment on resourceCategories for why membership is stated on the kind.
+type ResourceCategorySpec struct {
+	ID    string   `json:"id"`
+	Label string   `json:"label"`
+	Hint  string   `json:"hint"`
+	Kinds []string `json:"kinds"`
+}
+
 // Derived indexes. Built once at init so every lookup is a map hit and, more
 // importantly, so the consistency checks below run on package load: a catalog
 // entry that names a kind nothing recognises is a programming error we want at
 // startup, not at the first CreateResource of the week.
 var (
-	catalogByType   map[string]ServerTypeSpec
-	catalogKinds    map[string]string   // kind → label
-	kindServerTypes map[string][]string // kind → server types (the transpose)
-	catalogDistros  map[string]bool
+	catalogByType     map[string]ServerTypeSpec
+	catalogKinds      map[string]string   // kind → label
+	kindServerTypes   map[string][]string // kind → server types (the transpose)
+	catalogCategories map[string]bool     // category id → known
+	categoryKinds     map[string][]string // category → kinds (the transpose)
+	catalogDistros    map[string]bool
 )
 
 func init() {
 	catalogByType = make(map[string]ServerTypeSpec, len(serverCatalog))
 	catalogKinds = make(map[string]string, len(resourceKinds))
 	kindServerTypes = make(map[string][]string, len(resourceKinds))
+	catalogCategories = make(map[string]bool, len(resourceCategories))
+	categoryKinds = make(map[string][]string, len(resourceCategories))
 	catalogDistros = make(map[string]bool, len(supportedDistroLabels))
 
+	for _, c := range resourceCategories {
+		if catalogCategories[c.ID] {
+			panic("store: duplicate resource category in catalog: " + c.ID)
+		}
+		if c.Label == "" || c.Hint == "" {
+			panic("store: resource category has no label or hint: " + c.ID)
+		}
+		catalogCategories[c.ID] = true
+		categoryKinds[c.ID] = []string{}
+	}
 	for _, k := range resourceKinds {
 		catalogKinds[k.Kind] = k.Label
+		if !catalogCategories[k.Category] {
+			panic("store: resource kind " + k.Kind + " names unknown category " + k.Category)
+		}
+		categoryKinds[k.Category] = append(categoryKinds[k.Category], k.Kind)
 		// Non-nil even when nothing hosts the kind: AllowedServerTypes uses nil
 		// to mean "unknown kind", so a known-but-unhostable kind must not
 		// masquerade as a typo.
 		kindServerTypes[k.Kind] = []string{}
+	}
+	for _, c := range resourceCategories {
+		// An empty category is a card that opens an empty list — the dead end
+		// the wizard rework exists to delete, shipped by a one-line edit.
+		if len(categoryKinds[c.ID]) == 0 {
+			panic("store: resource category holds no kinds: " + c.ID)
+		}
 	}
 	for _, d := range supportedDistroLabels {
 		catalogDistros[d.ID] = true
@@ -418,6 +493,29 @@ func ResourceKinds() []string {
 	out := make([]string, 0, len(resourceKinds))
 	for _, k := range resourceKinds {
 		out = append(out, k.Kind)
+	}
+	return out
+}
+
+// ResourceCategories lists the category ids in the order the wizard offers
+// them.
+func ResourceCategories() []string {
+	out := make([]string, 0, len(resourceCategories))
+	for _, c := range resourceCategories {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+// ResourceCategoryCatalog returns the categories in presentation order, each
+// carrying the kinds inside it. This is what the TypeScript generator renders
+// the step-1 picker from.
+func ResourceCategoryCatalog() []ResourceCategorySpec {
+	out := make([]ResourceCategorySpec, 0, len(resourceCategories))
+	for _, c := range resourceCategories {
+		kinds := make([]string, len(categoryKinds[c.ID]))
+		copy(kinds, categoryKinds[c.ID])
+		out = append(out, ResourceCategorySpec{ID: c.ID, Label: c.Label, Hint: c.Hint, Kinds: kinds})
 	}
 	return out
 }

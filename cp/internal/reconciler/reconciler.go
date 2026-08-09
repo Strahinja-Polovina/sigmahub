@@ -156,7 +156,7 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 			}
 		}
 		if target, isLLM := llmTargets[rs.ResourceID]; isLLM {
-			if llmOps, netID, ok := renderLLMOps(rs, hardening.MeshIP, target.Port, secretRefs[rs.ResourceID]); ok {
+			if llmOps, netID, ok := renderLLMOps(rs, target, hardening.MeshIP, secretRefs[rs.ResourceID]); ok {
 				resourceOps = append(resourceOps, llmOps...)
 				networks[netID] = dsd.NetworkName(rs.ProjectID)
 				continue

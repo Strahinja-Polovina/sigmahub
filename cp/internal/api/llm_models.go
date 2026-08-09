@@ -41,10 +41,10 @@ import (
 type ModelCatalog interface {
 	Search(ctx context.Context, query string, limit int) ([]hf.ModelCard, error)
 	Resolve(ctx context.Context, repoID string) (hf.ModelCard, error)
-	// TokenConfigured reports whether this control plane holds a Hub token. It
-	// is published with every search because it changes what the picker MEANS:
-	// without one the results are public repos only, and a gated model the
-	// operator can see on the website will not appear here.
+	// TokenConfigured reports whether this control plane holds a Hub token for
+	// its own metadata calls. It shapes what a SEARCH can return — without one
+	// the results are public repos only — and it is deliberately NOT what the
+	// response's tokenConfigured field carries: see handleSearchModels.
 	TokenConfigured() bool
 }
 
@@ -74,17 +74,30 @@ func modelLimit(raw string) int {
 
 // handleSearchModels answers the picker's typeahead.
 //
-// With no catalog wired the answer is an EMPTY list and tokenConfigured=false,
-// not a 503. That is a deliberate product choice and the difference between a
-// degraded step and a dead one: the dashboard renders "no catalog — type a
-// model id" and the operator finishes the wizard, whereas a 503 leaves them on
-// a step with nothing to click. The same shape already covers "the Hub returned
-// nothing for `qwn3`", so the dashboard needs no second branch for it.
+// With no catalog wired the answer is an EMPTY list, not a 503. That is a
+// deliberate product choice and the difference between a degraded step and a
+// dead one: the dashboard renders "no catalog — type a model id" and the
+// operator finishes the wizard, whereas a 503 leaves them on a step with
+// nothing to click. The same shape already covers "the Hub returned nothing for
+// `qwn3`", so the dashboard needs no second branch for it.
+//
+// `tokenConfigured` travels with the results and is NOT the catalog's own
+// token. The wizard uses it for one decision — may this operator deploy a GATED
+// model — and that decision is about the DOWNLOAD the agent performs on a GPU
+// host, not about the metadata lookup this process just made. Reporting the
+// picker's token there produced both wrong answers at once: with
+// CP_HUGGING_FACE_TOKEN set the wizard approved a gated model whose weights
+// nothing was authenticated to fetch, and with only the org's
+// HUGGING_FACE_HUB_TOKEN secret set it blocked the model step and told the
+// operator to go configure a variable that would not have helped. The wire name
+// is kept because it is what the dashboard already reads; only its meaning is
+// now the true one — see store.WeightsTokenAvailable.
 func (s *Server) handleSearchModels(w http.ResponseWriter, r *http.Request) {
 	limit := modelLimit(r.URL.Query().Get("limit"))
+	tokenConfigured := s.weightsTokenAvailable(r)
 	if s.models == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"models": []hf.ModelCard{}, "tokenConfigured": false,
+			"models": []hf.ModelCard{}, "tokenConfigured": tokenConfigured,
 		})
 		return
 	}
@@ -100,8 +113,34 @@ func (s *Server) handleSearchModels(w http.ResponseWriter, r *http.Request) {
 		cards = []hf.ModelCard{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"models": cards, "tokenConfigured": s.models.TokenConfigured(),
+		"models": cards, "tokenConfigured": tokenConfigured,
 	})
+}
+
+// weightsTokenAvailable answers "will a model created here be able to fetch its
+// weights", from the optional `projectId` the picker sends.
+//
+// projectId is optional, and its absence is not an error: without it the answer
+// is the control-plane half alone (a token here is seeded into every endpoint
+// the org creates), which is right for every project that has not set its own.
+//
+// Unknown answers FALSE, and that direction is chosen, not defaulted. False
+// makes the wizard warn about gated models — noise for someone who has a token
+// we failed to confirm. True suppresses the warning, and the failure on the
+// other side of that is a gated model accepted, scheduled, and 401'd tens of
+// gigabytes into a pull on a host billed at GPU rates. The dashboard's own
+// catalogue call already fails this way for the same reason.
+func (s *Server) weightsTokenAvailable(r *http.Request) bool {
+	if s.llm == nil {
+		return false
+	}
+	ok, err := s.llm.WeightsTokenAvailable(r.Context(),
+		r.PathValue("orgId"), strings.TrimSpace(r.URL.Query().Get("projectId")))
+	if err != nil {
+		s.log.Error("weights token lookup", "err", err)
+		return false
+	}
+	return ok
 }
 
 // handleResolveModel answers for one repo id — the call the wizard makes when a

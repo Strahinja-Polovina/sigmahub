@@ -10,13 +10,14 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import {
   downloadsText,
-  gatedBlocked,
+  gatedWarning,
   looksLikeRepoId,
   parameterText,
+  unservableReason,
   vramNeedText,
   type ModelCard,
 } from "@/lib/wizard/llm";
-import { LLM_ENGINES } from "@/lib/wizard/managed";
+import { llmEngineLabel } from "@/lib/wizard/managed";
 import { resolveModel, searchModels } from "@/server/actions/llm";
 import { ResourceNameField } from "./resource-name-field";
 
@@ -41,8 +42,6 @@ import { ResourceNameField } from "./resource-name-field";
 /** Long enough that an ordinary typing burst is one request, short enough that
  *  the list feels attached to the keyboard. */
 const SEARCH_DEBOUNCE_MS = 300;
-
-const ENGINE_LABELS = new Map(LLM_ENGINES.map((e) => [e.id as string, e.label as string]));
 
 /** The results, tagged with the search they answer.
  *
@@ -78,6 +77,9 @@ export function ModelStep({
    *  see the unresolved notice below. */
   card: ModelCard | null;
   onModelChange: (id: string, card: ModelCard | null) => void;
+  /** Whether a HUGGING_FACE_HUB_TOKEN exists to pull weights with — the search
+   *  publishes it. It changes what this step SAYS about a gated model and never
+   *  whether the step can be left: see gatedWarning. */
   tokenConfigured: boolean;
   onTokenConfiguredChange: (value: boolean) => void;
 }) {
@@ -153,8 +155,24 @@ export function ModelStep({
     }
   }
 
-  const gateReason = gatedBlocked(card, tokenConfigured);
-  const engineLabel = card ? (ENGINE_LABELS.get(card.engine) ?? card.engine) : null;
+  const refusal = unservableReason(card);
+  const gateWarning = gatedWarning(card, tokenConfigured);
+  // What the picked model IS, in one line. The runtime is DERIVED and shown
+  // rather than asked: it is the one the control plane will render, and every
+  // other answer the old dropdown accepted was a container that would not start.
+  // A REFUSED model gets no runtime line at all — "Served by vLLM" printed above
+  // a sentence explaining that vLLM cannot load these weights is the same
+  // self-contradiction the token notice used to print two elements higher.
+  const summary = card
+    ? [
+        refusal ? null : `Served by ${llmEngineLabel(card.engine)}`,
+        card.parametersKnown
+          ? `needs about ${vramNeedText(card)} of VRAM`
+          : "no size published, so no fit check",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -279,10 +297,18 @@ export function ModelStep({
         </Button>
       )}
 
+      {/* Gated repositories ARE in the list above, with a lock on them, because
+          the Hub publishes their METADATA to anyone and gates only the weights —
+          demo mode ships three of them and this notice used to claim, directly
+          above their rows, that they were not listed. The token that matters is
+          the one the GPU host pulls with, so that is the one named here. */}
       {!tokenConfigured && (
         <p className="text-xs text-muted-foreground">
-          This control plane holds no Hugging Face token, so gated repositories are
-          not listed here and their weights cannot be downloaded.
+          Gated repositories are listed here — Hugging Face describes them to
+          anyone and gates only the download. Their weights need an account that
+          has accepted the model&rsquo;s licence, and a token from it in
+          HUGGING_FACE_HUB_TOKEN on this control plane; none is configured, so a
+          gated model may fail on its first pull.
         </p>
       )}
 
@@ -290,15 +316,7 @@ export function ModelStep({
         <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/40 p-3">
           <p className="font-mono text-sm text-foreground">{modelId}</p>
           {card ? (
-            <p className="text-xs text-muted-foreground">
-              {/* The runtime is DERIVED, and shown rather than asked: it is the
-                  one the control plane will render for this model, and every
-                  other answer was a container that would not start. */}
-              Served by {engineLabel}
-              {card.parametersKnown
-                ? ` · needs about ${vramNeedText(card)} of VRAM`
-                : " · no size published, so no fit check"}
-            </p>
+            <p className="text-xs text-muted-foreground">{summary}</p>
           ) : (
             <p className="text-xs text-muted-foreground">
               {unresolved ?? "Served by the runtime this control plane picks for it."}
@@ -311,10 +329,22 @@ export function ModelStep({
         </div>
       )}
 
-      {gateReason && (
+      {/* A refusal, in destructive red: this model cannot be served by anything
+          the control plane deploys, and Continue is blocked on it. */}
+      {refusal && (
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
           <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-          <p className="min-w-0 text-xs text-destructive/90">{gateReason}</p>
+          <p className="min-w-0 text-xs text-destructive/90">{refusal}</p>
+        </div>
+      )}
+
+      {/* A WARNING, in amber, and Continue stays live behind it. We cannot see
+          whether this operator holds access to a gated repository, and a wall
+          built on that guess is a dead end for everyone who does. */}
+      {gateWarning && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <Lock className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <p className="min-w-0 text-xs text-muted-foreground">{gateWarning}</p>
         </div>
       )}
     </div>

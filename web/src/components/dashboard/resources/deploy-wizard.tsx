@@ -12,12 +12,7 @@ import {
   CircleCheck,
   CircleAlert,
   ArrowRight,
-  Database,
-  Cpu,
-  HardDrive,
-  GitBranch,
   Lock,
-  ExternalLink,
 } from "lucide-react";
 
 import {
@@ -28,7 +23,6 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -39,20 +33,25 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import Link from "next/link";
 import {
+  RESOURCE_CATEGORY_CATALOG,
   RESOURCE_KIND_LABELS,
-  RESOURCE_KINDS,
+  categoryForKind,
+  type ResourceCategoryId,
   type ResourceKind,
 } from "@/lib/server-catalog.generated";
 import {
   buildInventory,
+  clusterFitsModel,
   kindAvailability,
+  targetChoices,
   type WizardCluster,
   type WizardProject,
 } from "@/lib/wizard/availability";
 import {
+  kindPickerPhase,
   nextStepId,
+  pickCategory,
   prevStepId,
   resolveStep,
   stepsForKind,
@@ -110,6 +109,7 @@ import { detectRepo, getGitAppInfo, wireRepoToEnvironment } from "@/server/actio
 import { revealDatabaseConnection } from "@/server/actions/databases";
 import { revealS3Connection } from "@/server/actions/s3";
 import type { DeployTarget } from "./resource-meta";
+import { KindStep } from "./wizard/kind-step";
 import { SourceStep } from "./wizard/source-step";
 import { ModelStep } from "./wizard/model-step";
 import { ResourceNameField } from "./wizard/resource-name-field";
@@ -118,22 +118,6 @@ import { NetworkStep } from "./wizard/network-step";
 import { TargetStep } from "./wizard/target-step";
 import { EnvStep } from "./wizard/env-step";
 import { ReviewStep } from "./wizard/review-step";
-
-/** The step-1 card grid. Ordered as the product talks about itself: the app
- *  first, then the data it needs, then the specialist. */
-const KIND_CARDS: {
-  kind: ResourceKind;
-  icon: React.ElementType;
-  detail: string;
-}[] = [
-  { kind: "app", icon: GitBranch, detail: "Build and deploy a repository" },
-  { kind: "postgres", icon: Database, detail: "Managed PostgreSQL" },
-  { kind: "mysql", icon: Database, detail: "Managed MySQL" },
-  { kind: "mongodb", icon: Database, detail: "Managed MongoDB" },
-  { kind: "redis", icon: Database, detail: "Managed Redis" },
-  { kind: "s3", icon: HardDrive, detail: "S3-compatible object storage" },
-  { kind: "llm", icon: Cpu, detail: "Model endpoint on a GPU server" },
-];
 
 type PickedRepo = {
   fullName: string;
@@ -172,6 +156,10 @@ export function DeployWizard({
   const router = useRouter();
 
   const [kind, setKind] = React.useState<ResourceKind | null>(null);
+  /** Step 1's first face. A substate of the "kind" step, not a step — see
+   *  wizard/steps.ts for why that is the only shape that keeps a single-kind
+   *  category free of a second click. */
+  const [category, setCategory] = React.useState<ResourceCategoryId | null>(null);
   const [step, setStep] = React.useState<WizardStepId>("kind");
   const [name, setName] = React.useState("");
 
@@ -249,6 +237,25 @@ export function DeployWizard({
   const server = environments.flatMap((e) => e.servers).find((s) => s.id === serverId);
   const cluster = clusters.find((c) => c.id === clusterId);
   const project = projects.find((p) => p.id === projectId);
+
+  // Built here rather than inside the step because the Continue gate reads the
+  // same verdict the step renders: when every target in the environment is
+  // refused, the button's reason has to be the refusal's own sentence and not
+  // "Pick a server or a cluster", which is advice for a screen where something
+  // is pickable.
+  const choices = React.useMemo(
+    () =>
+      targetChoices({
+        projects,
+        clusters,
+        inventory,
+        kind,
+        model: modelCard,
+        projectId,
+        environmentId,
+      }),
+    [projects, clusters, inventory, kind, modelCard, projectId, environmentId]
+  );
 
   // Memoized because the step guard below depends on it: a fresh object on
   // every render would recompute (and re-render) on every keystroke.
@@ -343,6 +350,11 @@ export function DeployWizard({
         }
       }
       setKind(draft?.kind ?? null);
+      // The draft carries the KIND, because that is what the rest of the wizard
+      // is decided by; the category it sits in is derived rather than stored, so
+      // a draft written before categories existed still reopens on the right
+      // screen instead of on a picker showing nothing selected.
+      setCategory(draft ? categoryForKind(draft.kind) : null);
       // A restored draft lands on Source, which is where the user was when they
       // left for github.com — dropping them back on step 1 would technically
       // preserve their state and still feel like starting over.
@@ -472,7 +484,13 @@ export function DeployWizard({
   const stepBlocked = React.useMemo((): string | null => {
     switch (step) {
       case "kind":
-        if (!kind) return "Pick what you're deploying.";
+        if (!kind) {
+          // Named, because "pick what you're deploying" reads as unanswered on
+          // a screen where the category already was.
+          return category
+            ? `Pick which ${RESOURCE_CATEGORY_CATALOG[category].label.toLowerCase()} to deploy.`
+            : "Pick what you're deploying.";
+        }
         if (!kindAvailability(kind, inventory).available) {
           return "Nothing in this organization can host that yet.";
         }
@@ -495,11 +513,11 @@ export function DeployWizard({
         return resourceNameError(name);
       case "model":
         if (resourceNameError(name)) return resourceNameError(name);
-        return modelStepError(modelCard, llmModel, tokenConfigured);
+        return modelStepError(modelCard, llmModel);
       case "target":
         if (!projectId) return "Pick a project.";
         if (!environmentId) return "Pick an environment.";
-        if (!serverId && !clusterId) return "Pick a server or a cluster.";
+        if (!serverId && !clusterId) return choices.deadEnd ?? "Pick a server or a cluster.";
         return null;
       case "env":
         return envVarsValid(envVars) ? null : "Fix the variable names first.";
@@ -511,6 +529,7 @@ export function DeployWizard({
   }, [
     step,
     kind,
+    category,
     name,
     inventory,
     repo,
@@ -521,11 +540,11 @@ export function DeployWizard({
     domain,
     llmModel,
     modelCard,
-    tokenConfigured,
     projectId,
     environmentId,
     serverId,
     clusterId,
+    choices,
     envVars,
     reviewInput,
   ]);
@@ -537,20 +556,36 @@ export function DeployWizard({
    *  picker will refuse it with the reason, but a serverId already in state
    *  would sail past the Target step's own gate and be refused by the create
    *  call instead, which is the late failure this whole flow exists to remove.
-   *  So the selection is dropped here, where the fact that made it invalid is. */
+   *  So the selection is dropped here, where the fact that made it invalid is.
+   *
+   *  A CLUSTER is dropped on the same terms and for the same reason: it carries
+   *  its largest node's card and the control plane's create check compares
+   *  against exactly that (SIGMA-214), so leaving one selected would recreate
+   *  the 422 for the other kind of target. */
   const handleModelChange = React.useCallback(
     (id: string, next: ModelCard | null) => {
       setLlmModel(id);
       setModelCard(next);
-      if (!serverId) return;
-      const chosen = projects
-        .flatMap((p) => p.environments)
-        .flatMap((e) => e.servers)
-        .find((s) => s.id === serverId);
-      if (chosen && !serverFitsModel(next, chosen).fits) setServerId("");
+      if (serverId) {
+        const chosen = projects
+          .flatMap((p) => p.environments)
+          .flatMap((e) => e.servers)
+          .find((s) => s.id === serverId);
+        if (chosen && !serverFitsModel(next, chosen).fits) setServerId("");
+      }
+      if (clusterId) {
+        const chosen = clusters.find((c) => c.id === clusterId);
+        if (chosen && !clusterFitsModel(next, chosen).fits) setClusterId("");
+      }
     },
-    [projects, serverId]
+    [projects, clusters, serverId, clusterId]
   );
+
+  // Step 1 has an inside, so Back does too: from a category's kind list it
+  // returns to the categories rather than being the dead button it is on the
+  // first screen. Everywhere else it is still simply the previous step.
+  const backToCategories = step === "kind" && kindPickerPhase(category) === "kinds";
+  const backStep = backToCategories ? null : prevStepId(kind, step);
 
   function goNext() {
     if (stepBlocked) return;
@@ -558,8 +593,34 @@ export function DeployWizard({
     if (next) setStep(next);
   }
   function goBack() {
-    const prev = prevStepId(kind, step);
-    if (prev) setStep(prev);
+    if (backToCategories) {
+      chooseCategory(null);
+      return;
+    }
+    if (backStep) setStep(backStep);
+  }
+
+  /** Step 1's first answer.
+   *
+   *  A category holding exactly one kind IS that kind (pickCategory), so this
+   *  and pickKind must leave identical state — otherwise the flow would depend
+   *  on which of step 1's two faces the user happened to answer on. Hence the
+   *  delegation rather than a second copy of the same resets.
+   *
+   *  Passing null is backing out of a kind list, which un-picks the kind with
+   *  the category: the screen stops showing what was chosen, and Continue must
+   *  not advance on a selection nobody can see. */
+  function chooseCategory(next: ResourceCategoryId | null) {
+    const picked = pickCategory(next);
+    setCategory(picked.category);
+    if (picked.kind) {
+      pickKind(picked.kind);
+      return;
+    }
+    setKind(null);
+    setStep((s) => resolveStep(null, s));
+    setServerId("");
+    setClusterId("");
   }
 
   function pickKind(next: ResourceKind) {
@@ -776,8 +837,10 @@ export function DeployWizard({
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
           {step === "kind" && (
             <KindStep
+              category={category}
               kind={kind}
-              onPick={pickKind}
+              onPickCategory={chooseCategory}
+              onPickKind={pickKind}
               inventory={inventory}
               name={name}
               onNameChange={setName}
@@ -855,11 +918,8 @@ export function DeployWizard({
 
           {step === "target" && kind && (
             <TargetStep
-              kind={kind}
               projects={projects}
-              clusters={clusters}
-              inventory={inventory}
-              model={modelCard}
+              choices={choices}
               projectId={projectId}
               environmentId={environmentId}
               serverId={serverId}
@@ -920,7 +980,7 @@ export function DeployWizard({
                 variant="ghost"
                 size="sm"
                 onClick={goBack}
-                disabled={!prevStepId(kind, step)}
+                disabled={!backToCategories && !backStep}
               >
                 <ChevronLeft className="size-4" />
                 Back
@@ -957,119 +1017,6 @@ export function DeployWizard({
         </div>
       </DialogContent>
     </Dialog>
-  );
-}
-
-/** Step 1: the type grid, with availability decided here rather than at step 4. */
-function KindStep({
-  kind,
-  onPick,
-  inventory,
-  name,
-  onNameChange,
-}: {
-  kind: ResourceKind | null;
-  onPick: (k: ResourceKind) => void;
-  inventory: ReturnType<typeof buildInventory>;
-  name: string;
-  onNameChange: (v: string) => void;
-}) {
-  const nameProblem = kind ? resourceNameError(name) : null;
-  const availability = kind ? kindAvailability(kind, inventory) : null;
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1.5">
-        <Label className="text-xs text-muted-foreground">What are you deploying?</Label>
-        <div className="grid gap-1.5 sm:grid-cols-2">
-          {KIND_CARDS.filter((c) => (RESOURCE_KINDS as string[]).includes(c.kind)).map(
-            ({ kind: k, icon: Icon, detail }) => {
-              const avail = kindAvailability(k, inventory);
-              const selected = kind === k;
-              return (
-                <button
-                  key={k}
-                  type="button"
-                  disabled={!avail.available}
-                  aria-pressed={selected}
-                  onClick={() => avail.available && onPick(k)}
-                  className={cn(
-                    "flex items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                    !avail.available && "cursor-not-allowed border-border bg-muted/40",
-                    avail.available &&
-                      (selected
-                        ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                        : "border-border bg-card hover:bg-muted/50")
-                  )}
-                >
-                  <Icon
-                    className={cn(
-                      "mt-0.5 size-4 shrink-0",
-                      avail.available ? "text-muted-foreground" : "text-muted-foreground/50"
-                    )}
-                  />
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className={cn(
-                        "block text-sm font-medium",
-                        avail.available ? "text-foreground" : "text-muted-foreground"
-                      )}
-                    >
-                      {RESOURCE_KIND_LABELS[k]}
-                    </span>
-                    <span className="block text-xs leading-snug text-muted-foreground">
-                      {avail.available ? detail : avail.reason}
-                    </span>
-                    {!avail.available && avail.action && (
-                      <Link
-                        href={avail.action.href}
-                        className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-2 hover:underline"
-                      >
-                        {avail.action.label}
-                        <ExternalLink className="size-3" />
-                      </Link>
-                    )}
-                  </span>
-                  {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
-                </button>
-              );
-            }
-          )}
-        </div>
-      </div>
-
-      {/* An application names itself from its repository, so its name field
-          lives on the Source step. Everything else needs one now. */}
-      {kind === "app" && (
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="wizard-name">Name</Label>
-          <Input
-            id="wizard-name"
-            value={name}
-            onChange={(e) => onNameChange(e.target.value)}
-            placeholder="storefront"
-            className="font-mono"
-            spellCheck={false}
-            aria-invalid={nameProblem ? true : undefined}
-          />
-          <p
-            className={cn(
-              "text-xs",
-              nameProblem ? "text-destructive" : "text-muted-foreground"
-            )}
-          >
-            {nameProblem ?? "Used for the container, its private DNS name and its volumes."}
-          </p>
-        </div>
-      )}
-
-      {availability && !availability.available && (
-        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600" />
-          <p className="min-w-0 text-xs text-muted-foreground">{availability.reason}</p>
-        </div>
-      )}
-    </div>
   );
 }
 

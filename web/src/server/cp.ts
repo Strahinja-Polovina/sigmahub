@@ -1962,6 +1962,13 @@ export type CpCluster = {
   createdBy: string;
   createdAt: string;
   nodes: CpClusterNode[];
+  /** The largest per-card GPU memory across its nodes, 0 when no node ever
+   *  reported an inventory (store.Cluster.MaxVRAMBytesPerGPU). The wizard
+   *  compares a chosen model against it exactly as it compares against a
+   *  server's own card — the create call already refuses what does not fit, and
+   *  before this figure crossed the boundary the dashboard could only find that
+   *  out from the 422 (SIGMA-214). */
+  maxVramBytesPerGpu?: number;
 };
 
 export async function cpListClusters(

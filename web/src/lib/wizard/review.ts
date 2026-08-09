@@ -15,6 +15,7 @@
 
 import { RESOURCE_KIND_LABELS, type ResourceKind } from "@/lib/server-catalog.generated";
 import { BUILD_METHOD_LABELS, type BuildMethod } from "./build";
+import { llmEngineLabel } from "./managed";
 import { reachability, type PortMapping } from "./networking";
 
 export type ReviewInput = {
@@ -121,7 +122,9 @@ export function reviewSummary(input: ReviewInput): ReviewRow[] {
   if (input.llmEngine) {
     rows.push({
       label: "Runtime",
-      value: input.llmEngine,
+      // The same label the model step showed. Printing the id here read as a
+      // different answer to the same question one screen later.
+      value: llmEngineLabel(input.llmEngine),
       hint: input.llmModel || undefined,
       step: "model",
     });

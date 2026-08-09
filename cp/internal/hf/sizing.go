@@ -14,7 +14,11 @@ package hf
 //	required = weights × KVActivationFactor ÷ UtilizationCap
 //
 // Both constants exist because the weights are not the whole story and the card
-// is not entirely ours to use; each is documented at its declaration.
+// is not entirely ours to use; each is documented at its declaration. A third,
+// SizedContextTokens, does not appear in the expression and is the reason the
+// expression is true at all: the KV term budgets ONE context length, and the
+// runtime has to be started at that same length or this arithmetic describes a
+// deployment nobody made.
 //
 // The estimate is deliberately a little pessimistic, and it errs in the safe
 // direction ONLY when the parameter count is real. When it is a guess there is
@@ -30,13 +34,41 @@ import (
 
 const (
 	// KVActivationFactor covers everything resident on the card that is not a
-	// weight: the KV cache for an ordinary context window, activations for a
-	// modest batch, and allocator fragmentation. 20% is the smallest headroom
-	// that holds for the shapes people actually deploy; a long-context or
-	// high-concurrency configuration needs more, and the runtime will say so at
-	// start-up rather than us refusing an ordinary deploy to protect an
-	// extraordinary one.
+	// weight: the KV cache, activations for a modest batch, and allocator
+	// fragmentation. 20% is a measured number, not a feeling. Llama-3.1-8B — a
+	// grouped-query checkpoint, which is what open weights have shipped as since
+	// Llama-3 — spends 128 KiB of KV per token, so SizedContextTokens costs
+	// 1.07 GB of the 3.21 GB this factor adds to its 16.06 GB of weights: the
+	// pinned window two or three times over for a batch, and the rest for
+	// activations and fragmentation.
+	//
+	// The number this factor buys is therefore a context length, not the model's
+	// maximum, and a runtime started at any other length is running a
+	// configuration nothing checked. That is what SizedContextTokens is for.
 	KVActivationFactor = 1.20
+
+	// SizedContextTokens is the context window the formula above is arithmetic
+	// FOR, and so the window the runtime must be pinned to — vLLM's
+	// --max-model-len, rendered by the store from this constant.
+	//
+	// It is the half of SIGMA-214 the first cut left out. With no --max-model-len
+	// vLLM takes the model's max_position_embeddings, and for Llama-3.1 that is
+	// 131072 tokens — sixteen times what KVActivationFactor budgets. On a 24 GiB
+	// card the fit check compared 21.41 GB required against 25.77 GB available,
+	// approved the deploy and drew a green checkmark; vLLM then asked for 131072
+	// tokens of KV cache, found room for about 54k, and exited with "The model's
+	// max seq len is larger than the maximum number of tokens that can be stored
+	// in KV cache". A fit check that passes in front of the exact failure it
+	// exists to prevent is worse than no fit check, because it also tells the
+	// operator the problem is somewhere else.
+	//
+	// 8192 is long enough for the chat and retrieval shapes people deploy and
+	// short enough that the 20% headroom is real at 8B on a 24 GB card, which is
+	// the machine this feature was designed against. It is EXPORTED because the
+	// store renders it into the start command: a literal there and a factor here
+	// drift apart on the first change to either, and the drift is invisible
+	// until a container exits.
+	SizedContextTokens = 8192
 
 	// UtilizationCap is vLLM's default --gpu-memory-utilization. The runtime
 	// will not allocate the last 10% of the card, so sizing against 100% of the
@@ -45,6 +77,18 @@ const (
 	// check at all.
 	UtilizationCap = 0.90
 )
+
+// maxPlausibleParameters is where a parameter count stops being a parameter
+// count. Ten trillion is an order of magnitude past the largest model anyone has
+// published, so a value above it is a version string we misread or a Hub field
+// that is wrong — and either one has to be REJECTED rather than sized, because
+// both reach the same place: a count that large overflows the byte arithmetic
+// and renders as "~9223372037 GB", which is a fit check gating a deploy on a
+// number that means nothing.
+//
+// It applies to BOTH sources of a count. The name path has always had it; the
+// safetensors path is a third party's integer and had none.
+const maxPlausibleParameters = 1e13
 
 // paramPattern finds a size token in a repository name: "7B", "1.5B", "405B",
 // "135M", and the mixture-of-experts spelling "8x7B". The surrounding boundary
@@ -105,7 +149,7 @@ func ParseParameterCount(repoID string) (uint64, bool) {
 		}
 		// Reject the absurd rather than gate a deploy on it: a name that claims
 		// ten trillion parameters is a version string we misread.
-		if value <= 0 || value > 1e13 {
+		if value <= 0 || value > maxPlausibleParameters {
 			continue
 		}
 		if n := uint64(math.Round(value)); n > best {
@@ -168,11 +212,21 @@ func RequiredVRAMBytes(parameters uint64, bytesPerParam float64) uint64 {
 }
 
 // FormatVRAM renders a byte count as the one string both sides show, e.g.
-// "~21 GB".
+// "~21.4 GB".
 //
 // Decimal GB, not GiB, because the number the user is comparing it against is
 // the one printed on the card ("a 24 GB 4090"), and a fit check that reports
 // 22 GiB against a 24 GB card invites arithmetic nobody should have to do.
+//
+// The tenth of a gigabyte below 100 GB is load-bearing, not decoration. The
+// capacity this figure is set against is rendered by store.humanBytes and the
+// web's formatReportedBytes, and both TRUNCATE — so a 17.33 GB requirement on a
+// 17.18 GB card produced "needs ~17 GB but this server has 17 GB", a refusal
+// that reads as a bug in the refusal and leaves the operator with nothing to
+// act on. At or above 100 GB a tenth is noise, so the estimate rounds UP there
+// instead; that keeps the same guarantee by a different route, because a figure
+// that is larger and never rounds down cannot land on a figure that is smaller
+// and always truncates.
 //
 // Zero renders as the empty string rather than "~0 GB": an unsized model has no
 // size to show, and a UI can test for empty. "~0 GB" is a number, and it lies.
@@ -180,30 +234,51 @@ func FormatVRAM(bytes uint64) string {
 	if bytes == 0 {
 		return ""
 	}
-	if bytes < 1e9 {
-		return fmt.Sprintf("~%.0f MB", math.Max(1, math.Round(float64(bytes)/1e6)))
+	// The unit is chosen from the ROUNDED figure rather than the raw byte count:
+	// 999999999 bytes is under a gigabyte and rounds to 1000 MB, and "~1000 MB"
+	// is a gigabyte spelled the long way.
+	if mb := math.Round(float64(bytes) / 1e6); mb < 1000 {
+		return fmt.Sprintf("~%.0f MB", math.Max(1, mb))
 	}
-	return fmt.Sprintf("~%.0f GB", math.Round(float64(bytes)/1e9))
+	gb := float64(bytes) / 1e9
+	if gb < 100 {
+		return fmt.Sprintf("~%.1f GB", gb)
+	}
+	return fmt.Sprintf("~%.0f GB", math.Ceil(gb))
 }
 
-// EngineForModel picks the runtime from the model's own metadata: GGUF weights
-// are an ollama format and everything else is served by vLLM.
+// EngineForModel is the runtime the control plane will render for a picked
+// model. Every model picked here gets vLLM.
 //
-// This is a question the wizard used to ASK, on a screen before it knew anything
-// about the model — and it was a question with exactly one correct answer that
-// the user had to look up. A picked GGUF repository cannot be loaded by vLLM and
-// a picked safetensors repository is not what ollama wants, so every answer but
-// this one led to a container that would not start. The step is gone; the
-// metadata answers it.
+// The question was one the wizard used to ASK, on a screen before it knew
+// anything about the model, and it is not being given back. What changed is the
+// number of answers: it used to have two, and the second one did not work.
 //
-// The returned names are keys of the store package's engine catalog. They are
-// literals here so this package stays free of the database layer; the API layer
+// A GGUF repository derived "ollama", whose spec carries the model in
+// OLLAMA_MODEL and no start command — but ollama cannot resolve
+// "TheBloke/phi-2-GGUF". It wants hf.co/<id> or a library tag, so it pulled
+// nothing, the container came up HEALTHY, and every completion 404'd. A runtime
+// that starts and serves nothing is worse than one that refuses to start,
+// because nothing in the product is watching for it and the operator is billed
+// at GPU rates while they find out. So a GGUF repository is refused at the model
+// step instead of being routed to a runtime that cannot serve it; the card keeps
+// its Quantization of "gguf", which is how the picker recognises the pick and
+// says so.
+//
+// ollama remains a supported ENGINE in the store's catalog and that path still
+// works: a hand-entered library tag ("llama3.1:8b") is a reference ollama CAN
+// resolve. It is only no longer DERIVED, because deriving it produced an
+// endpoint that served nothing.
+//
+// The arguments stay because they are the record of what used to decide this,
+// and because this is still the one place the question is answered — the next
+// person who wants an engine derived from a model's format has to come here to
+// do it, which is where the paragraph above is.
+//
+// The returned name is a key of the store package's engine catalog. It is a
+// literal here so this package stays free of the database layer; the API layer
 // that renders the resource spec is where the two meet.
 func EngineForModel(library, quantization string) string {
-	if strings.EqualFold(strings.TrimSpace(quantization), "gguf") ||
-		strings.EqualFold(strings.TrimSpace(library), "gguf") {
-		return "ollama"
-	}
 	return "vllm"
 }
 
@@ -215,7 +290,12 @@ func applySizing(card *ModelCard, tags []string, dtype string, safetensorsTotal 
 	card.BytesPerParam = BytesPerParam(dtype, card.Quantization)
 
 	switch {
-	case safetensorsTotal > 0 && !packsParameters(card.Quantization):
+	// The upper bound is the one the name path applies, for the same reason:
+	// safetensors.total is a third party's integer, and a wrong one is not a
+	// slightly wrong size, it is "~9223372037 GB" in front of a deploy. Over the
+	// bound the name takes over, which is where a repository with no readable
+	// index lands anyway.
+	case safetensorsTotal > 0 && safetensorsTotal <= maxPlausibleParameters && !packsParameters(card.Quantization):
 		card.Parameters, card.ParametersKnown, card.SizingBasis = safetensorsTotal, true, "safetensors"
 	default:
 		// The documented priority order puts safetensors.total first because it

@@ -120,6 +120,92 @@ func TestAllowedServerTypesSeparatesUnknownFromUnhostable(t *testing.T) {
 	}
 }
 
+// Categories are what the wizard offers before it offers a kind. Membership is
+// stated once, on the kind, so what is worth restating here is that the derived
+// transpose really is a PARTITION: a kind in two buckets is rendered twice, and
+// a kind in none is a kind nobody can reach through the wizard at all.
+func TestEveryKindSitsInExactlyOneCategory(t *testing.T) {
+	seen := make(map[string]int, len(ResourceKinds()))
+	for _, c := range ResourceCategoryCatalog() {
+		if c.Label == "" || c.Hint == "" {
+			t.Errorf("category %q has no label or hint; its card would render blank", c.ID)
+		}
+		if len(c.Kinds) == 0 {
+			t.Errorf("category %q holds no kinds; its card would open an empty list", c.ID)
+		}
+		for _, kind := range c.Kinds {
+			if ResourceKindLabel(kind) == kind {
+				t.Errorf("category %q holds %q, which is not a labelled kind", c.ID, kind)
+			}
+			seen[kind]++
+		}
+	}
+	for _, kind := range ResourceKinds() {
+		if seen[kind] != 1 {
+			t.Errorf("kind %q is in %d categories; it must be in exactly one", kind, seen[kind])
+		}
+	}
+}
+
+// Both orders the picker renders in are the catalog's own: the categories in
+// the order they are written down, and the kinds within one in the order the
+// kind list is written down. Nothing sorts either at the point of display, so
+// this file is where "what comes first" is decided.
+func TestCategoryOrderFollowsTheCatalog(t *testing.T) {
+	ids := ResourceCategories()
+	catalog := ResourceCategoryCatalog()
+	if len(ids) != len(catalog) {
+		t.Fatalf("ResourceCategories lists %d, ResourceCategoryCatalog lists %d", len(ids), len(catalog))
+	}
+	for i, c := range catalog {
+		if c.ID != ids[i] {
+			t.Errorf("position %d: ResourceCategories says %q, the catalog says %q", i, ids[i], c.ID)
+		}
+	}
+	kinds := ResourceKinds()
+	for _, c := range catalog {
+		last := -1
+		for _, kind := range c.Kinds {
+			at := indexOf(kinds, kind)
+			if at <= last {
+				t.Errorf("category %q lists %q out of catalog order", c.ID, kind)
+			}
+			last = at
+		}
+	}
+}
+
+// The categories reach the dashboard the same way everything else does. A
+// category that never rendered would leave the picker with a card holding no
+// kinds — which the web cannot distinguish from a category we deliberately
+// emptied, because we never can: the catalog refuses to hold one.
+func TestGeneratedTypeScriptCarriesTheCategories(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := string(RenderTypeScript(sha))
+
+	for _, c := range ResourceCategoryCatalog() {
+		for _, fragment := range []string{
+			`  | "` + c.ID + `"`, // the ResourceCategoryId union
+			// …and the three fields of its RESOURCE_CATEGORY_CATALOG entry.
+			`    label: ` + tsString(c.Label) + `,`,
+			`    hint: ` + tsString(c.Hint) + `,`,
+			`    kinds: ` + tsStringArray(c.Kinds) + `,`,
+		} {
+			if !strings.Contains(ts, fragment) {
+				t.Errorf("category %q: generated TS is missing %q", c.ID, fragment)
+			}
+		}
+	}
+	for _, k := range resourceKinds {
+		if fragment := `  ` + k.Kind + `: "` + k.Category + `",`; !strings.Contains(ts, fragment) {
+			t.Errorf("kind %q: KIND_CATEGORY is missing %q", k.Kind, fragment)
+		}
+	}
+}
+
 // Domain rules worth restating as tests: each was a deliberate product
 // decision, and each would be silently reversible by a one-word catalog edit.
 func TestCatalogDomainRules(t *testing.T) {
@@ -307,12 +393,16 @@ func hostsOf(t *testing.T, typ string) []string {
 }
 
 func contains(items []string, want string) bool {
-	for _, item := range items {
+	return indexOf(items, want) >= 0
+}
+
+func indexOf(items []string, want string) int {
+	for i, item := range items {
 		if item == want {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 func equalSets(a, b []string) bool {

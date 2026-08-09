@@ -153,6 +153,15 @@ func (s *Store) ResolveSecretsForResource(ctx context.Context, orgID, serverID, 
 		return nil, err
 	}
 	out = append(out, s3Secrets...)
+	// SIGMA-213: an inference endpoint's Hugging Face token rides it too, but
+	// under the OPPOSITE precedence — `seen` goes in so a tenant secret of the
+	// same name suppresses ours rather than losing to it. resolveLLMSecretsTx
+	// says why.
+	llmSecrets, err := s.resolveLLMSecretsTx(ctx, tx, orgID, serverID, resourceID, seen)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, llmSecrets...)
 
 	if len(out) > 0 {
 		if err := auditTx(ctx, tx, orgID, actor, "Secrets fetched (agent)", resourceID); err != nil {

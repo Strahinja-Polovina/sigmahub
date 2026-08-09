@@ -68,6 +68,12 @@ const (
 	maxSearchLimit = 50
 )
 
+// TextGenerationTask is the Hub's name for the task the picker offers, and the
+// one the configured runtime is known to serve. It is both what Search asks the
+// Hub for and what a ModelCard's PipelineTag carries back, so the query and the
+// wizard's refusal compare one string rather than two spellings of one idea.
+const TextGenerationTask = "text-generation"
+
 // ErrNotFound is returned (wrapped, with the id and the fix) when the Hub has no
 // such repository. The API layer tests for it with errors.Is so a typo in the
 // picker answers 404 — a truthful "no such model" — instead of 502, which would
@@ -85,11 +91,23 @@ var defaultHTTPClient = &http.Client{Timeout: 15 * time.Second}
 // else. The JSON tags are the wire contract with the dashboard — changing one is
 // changing an API.
 type ModelCard struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Gated       bool   `json:"gated"`
-	Downloads   int    `json:"downloads"`
-	Likes       int    `json:"likes"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Gated     bool   `json:"gated"`
+	Downloads int    `json:"downloads"`
+	Likes     int    `json:"likes"`
+	// PipelineTag is the Hub's task for the repository, and it travels on every
+	// card so the wizard can refuse a model no runtime can serve AT the model
+	// step, with the model still on screen. Search only ever returns
+	// TextGenerationTask (it asks the Hub for that task); Resolve returns
+	// whatever the repository declares, because an id typed by hand is not
+	// filtered and the refusal has to be able to name what was picked.
+	//
+	// Empty means the HUB did not say — a gated repository read without a token
+	// has no metadata at all (see gatedCard). Empty is UNKNOWN and must never be
+	// read as "not a text model": refusing on it would refuse every gated model
+	// on a control plane with no Hub token, which is the one case where the
+	// operator can do least about it.
 	PipelineTag string `json:"pipelineTag"`
 	Library     string `json:"library"`
 	// Engine is the runtime the control plane would render for this model. The
@@ -107,7 +125,13 @@ type ModelCard struct {
 	// picker and the sentence in the refusal cannot say different things.
 	VRAMBytesRequired uint64 `json:"vramBytesRequired"`
 	VRAMText          string `json:"vramText"`
-	SizingBasis       string `json:"sizingBasis"`
+	// SizingBasis names where the parameter count came from — "safetensors",
+	// "name" or "unknown" — and it is DIAGNOSTIC only. Nothing reads it to
+	// decide anything, and that is the design: a name-derived count is used or
+	// it is not, and a third confidence tier ("probably fits") is a decision
+	// nobody asked for and nobody could act on. It exists so a support question
+	// about a surprising number can be answered without re-running the sizer.
+	SizingBasis string `json:"sizingBasis"`
 }
 
 // Client reads the Hub through a bounded, TTL'd cache. It carries a mutex, so it
@@ -170,6 +194,20 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]ModelCa
 	// only EXACT parameter count the Hub gives us. Without it every card in the
 	// list would be sized off its name.
 	q.Set("full", "true")
+	// The task filter is the picker's own purpose applied to its own list. The
+	// Hub ranks /api/models by downloads across EVERY task, so unfiltered the
+	// empty query is BERT, embedding, ASR and diffusion repositories, and typing
+	// "whisper" returns whisper: openai/whisper-large-v3 sizes cleanly at ~3.9
+	// GB, fits every card the fit check knows about, and crash-loops vLLM. That
+	// is the late failure this whole feature exists to delete, offered with a
+	// green checkmark in front of it.
+	//
+	// It costs a handful of repositories vLLM can in fact serve —
+	// text2text-generation and image-text-to-text are separate tasks on the Hub
+	// — and that trade is deliberate, because Resolve is NOT filtered: an
+	// operator who names a repository by hand has already decided, and the id
+	// still resolves (see Resolve).
+	q.Set("pipeline_tag", TextGenerationTask)
 
 	body, status, err := c.do(ctx, "/api/models?"+q.Encode(), "model search")
 	if err != nil {
@@ -265,8 +303,13 @@ func (c *Client) Resolve(ctx context.Context, repoID string) (ModelCard, error) 
 
 // gatedCard is everything that can be honestly said about a repository the Hub
 // will not describe to us: it exists, it is gated, and its NAME still sizes it
-// (see ParseParameterCount). Sizing basis "name" is exactly the signal the
-// dashboard needs to soften the fit check for it.
+// (see ParseParameterCount). The card's SizingBasis says "name" so a support
+// question can be answered later; nothing softens the fit check on the strength
+// of it, and nothing should — see the field's comment for why a third
+// confidence tier is a decision nobody asked for.
+//
+// PipelineTag is empty here and cannot be otherwise: a 401 carries no metadata.
+// Empty is unknown, and unknown is not a refusal.
 func gatedCard(id string) ModelCard {
 	card := ModelCard{ID: id, Name: displayName(id), Gated: true}
 	applySizing(&card, nil, "", 0)

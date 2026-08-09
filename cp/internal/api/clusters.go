@@ -188,6 +188,12 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 // LLMAPI is the model-hosting slice of the store.
 type LLMAPI interface {
 	GetLLM(ctx context.Context, orgID, resourceID string) (store.LLMInfo, error)
+	// WeightsTokenAvailable answers whether a model created in this project
+	// would have a Hugging Face credential to DOWNLOAD with. It lives here and
+	// not on ModelCatalog because it is a question about the org's secrets, not
+	// about huggingface.co — and conflating the two is exactly the defect the
+	// picker's own TokenConfigured caused.
+	WeightsTokenAvailable(ctx context.Context, orgID, projectID string) (bool, error)
 }
 
 // DNSAPI derives and verifies a custom domain's DNS records.

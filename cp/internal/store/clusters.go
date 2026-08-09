@@ -31,6 +31,18 @@ type Cluster struct {
 	CreatedBy     string        `json:"createdBy"`
 	CreatedAt     time.Time     `json:"createdAt"`
 	Nodes         []ClusterNode `json:"nodes"`
+	// MaxVRAMBytesPerGPU is the largest per-card GPU memory any node reports,
+	// and 0 means nobody has reported any — the same "absent is UNKNOWN, not
+	// zero" rule the rest of the fleet runs on.
+	//
+	// It is published because CreateResource already refuses a model that
+	// cannot fit it (SIGMA-214), and the wizard had no way to know the number:
+	// it offered every cluster as an eligible target and the API refused the
+	// create after Review, which is precisely the dead end the type-first
+	// wizard exists to remove. maxVRAMPerGPU computes it, here and at create,
+	// so the two walls quote one figure — and it is the LARGEST node's card
+	// because the scheduler only has to place the workload somewhere.
+	MaxVRAMBytesPerGPU uint64 `json:"maxVramBytesPerGpu"`
 }
 
 // ClusterNode is one server's membership in a cluster.
@@ -327,9 +339,12 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 	for _, c := range out {
 		ids = append(ids, c.ID)
 	}
+	// s.facts rides along for MaxVRAMBytesPerGPU: the node rows are being read
+	// anyway, so the GPU figure the wizard needs costs a column rather than a
+	// second query that could observe different membership.
 	nodeRows, err := s.Pool.Query(ctx, `
 		SELECT n.cluster_id, n.server_id, s.name, s.type, s.status, COALESCE(s.mesh_ip,''), n.role, n.joined_at,
-		       n.node_status, n.node_message, n.reported_at
+		       n.node_status, n.node_message, n.reported_at, s.facts
 		  FROM cluster_nodes n JOIN servers s ON s.id = n.server_id
 		 WHERE n.cluster_id = ANY($1)
 		 ORDER BY n.role, s.name`, ids)
@@ -337,19 +352,28 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 		return nil, err
 	}
 	defer nodeRows.Close()
+	facts := map[string][]json.RawMessage{}
 	for nodeRows.Next() {
 		var clusterID string
+		var nodeFacts json.RawMessage
 		var n ClusterNode
 		if err := nodeRows.Scan(&clusterID, &n.ServerID, &n.ServerName, &n.ServerType,
 			&n.Status, &n.MeshIP, &n.Role, &n.JoinedAt,
-			&n.NodeStatus, &n.NodeMessage, &n.ReportedAt); err != nil {
+			&n.NodeStatus, &n.NodeMessage, &n.ReportedAt, &nodeFacts); err != nil {
 			return nil, err
 		}
 		if i, ok := index[clusterID]; ok {
 			out[i].Nodes = append(out[i].Nodes, n)
+			facts[clusterID] = append(facts[clusterID], nodeFacts)
 		}
 	}
-	return out, nodeRows.Err()
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+	for id, nodeFacts := range facts {
+		out[index[id]].MaxVRAMBytesPerGPU = maxVRAMPerGPU(nodeFacts)
+	}
+	return out, nil
 }
 
 // DeleteCluster removes a cluster. Resources deployed into it lose their

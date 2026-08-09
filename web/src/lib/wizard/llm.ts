@@ -1,6 +1,9 @@
 /**
- * The model step's verdicts: does this model fit that GPU, and can this control
- * plane even download it (SIGMA-213, SIGMA-214).
+ * The model step's verdicts: can anything here serve this model, does it fit
+ * that GPU, and is its download going to be authorised (SIGMA-213, SIGMA-214).
+ *
+ * Only the first two are refusals. The third is a warning, because it is the one
+ * of the three we cannot check — see gatedWarning.
  *
  * The LLM path used to ask for two things it had no way to check. "Runtime" was
  * a dropdown with exactly one right answer that the operator had to look up —
@@ -67,11 +70,17 @@ export type ModelCard = {
   sizingBasis: string;
 };
 
-/** What a search answered, plus the one fact that changes what an EMPTY result
- *  means: without a Hub token the results are public repositories only, so a
- *  gated model the operator can see on huggingface.co is simply not here. */
+/** What a search answered, plus the one fact the picker cannot see for itself:
+ *  whether a model created here would have a credential to DOWNLOAD its weights
+ *  with. */
 export type ModelSearchResult = {
   models: ModelCard[];
+  /** Whether the control plane holds a usable HUGGING_FACE_HUB_TOKEN for this
+   *  target — the token the agent injects so the runtime can pull the weights,
+   *  NOT the CP_HUGGING_FACE_TOKEN its own metadata calls use. The wire name is
+   *  unchanged and its meaning is not: it used to report the picker's token,
+   *  which answered a question nobody was asking (see gatedWarning). False also
+   *  covers "we could not confirm one", so it warns rather than blocks. */
   tokenConfigured: boolean;
   /** Set when the lookup itself failed — a timeout, an unreachable control
    *  plane. Distinct from "no matches", which is `models: []` and no error,
@@ -114,7 +123,14 @@ export type GpuHostFacts = { gpu?: HostFacts["gpu"] };
  */
 export function serverFitsModel(
   card: ModelCard | null | undefined,
-  facts: GpuHostFacts | null | undefined
+  facts: GpuHostFacts | null | undefined,
+  /** How the refusal names the hardware it just measured. Prose only — it
+   *  changes no arithmetic and no verdict. A cluster row says "this cluster's
+   *  largest GPU node" because "this server's GPU" under a row badged Cluster
+   *  reads as a bug in the picker rather than a fact about the fleet, and the
+   *  alternative — a second fit function for clusters — is how the two targets
+   *  would come to answer the same question differently. */
+  hardware = "this server's GPU"
 ): ModelFit {
   if (!card || !card.parametersKnown || card.vramBytesRequired <= 0) return { fits: true };
   const perGpu = facts?.gpu?.vramBytesPerGpu ?? 0;
@@ -122,7 +138,7 @@ export function serverFitsModel(
   if (card.vramBytesRequired <= perGpu) return { fits: true };
   return {
     fits: false,
-    reason: `This model needs about ${vramNeedText(card)} of VRAM; this server's GPU has ${formatReportedBytes(
+    reason: `This model needs about ${vramNeedText(card)} of VRAM; ${hardware} has ${formatReportedBytes(
       perGpu
     )}.`,
   };
@@ -147,50 +163,97 @@ export function vramNeedText(card: ModelCard): string {
 }
 
 /**
- * Why a gated model cannot be deployed by this control plane, or null.
+ * What is worth SAYING about a gated model with no weights token, or null.
  *
- * A gated repository serves its weights only to an account that has been granted
- * access. With no Hub token the pull fails with a 401 — after the resource
- * exists, on a host already billed at GPU rates — so this is refused at the
- * MODEL step, which is the last screen where the answer is still a different
- * model rather than a support ticket. The fix is an operator action on the
- * control plane, so the sentence names the environment variable: nobody guesses
- * "CP_HUGGING_FACE_TOKEN" from "access denied".
+ * A warning, not a refusal, and the difference is the whole point. A gated
+ * repository serves its weights only to an account that has been granted
+ * access, and `tokenConfigured` tells us whether this control plane holds a
+ * HUGGING_FACE_HUB_TOKEN to pull them with — which is not the same as whether
+ * the operator HAS access. They may have accepted the licence months ago and
+ * hold a token in a secret this process cannot read, and blocking Continue on
+ * our guess would leave them on a step with no way forward and nothing to fix.
+ * Warning costs a paragraph; blocking costs them the feature.
+ *
+ * It names HUGGING_FACE_HUB_TOKEN because that is the variable the runtime reads
+ * on the GPU host (store.HubTokenSecretName). CP_HUGGING_FACE_TOKEN — which this
+ * sentence used to name — authenticates the picker's metadata calls and would
+ * not have helped a single failing pull.
  */
-export function gatedBlocked(
+export function gatedWarning(
   card: ModelCard | null | undefined,
   tokenConfigured: boolean
 ): string | null {
   if (!card?.gated || tokenConfigured) return null;
-  return `${card.id} is a gated repository — Hugging Face serves its weights only to an account that has been granted access, and this control plane holds no Hub token. Set CP_HUGGING_FACE_TOKEN on the control plane to a token from an account with access to this model, or pick an ungated one.`;
+  return `${card.id} is gated — Hugging Face serves its weights only to an account that has been granted access, and no HUGGING_FACE_HUB_TOKEN is configured here. Accept the model's licence on huggingface.co and set HUGGING_FACE_HUB_TOKEN on the control plane to a token from that account, or the first pull fails with a 401. Continue if you have already done both — this check cannot see your account.`;
+}
+
+/** The Hub's task for the models an endpoint can serve, spelled exactly as the
+ *  control plane spells it (hf.TextGenerationTask): the search asks the Hub for
+ *  this task and the refusal below compares against it, so one string decides
+ *  both. */
+const TEXT_GENERATION_TASK = "text-generation";
+
+/**
+ * Why this repository cannot be served AT ALL, or null.
+ *
+ * Both branches describe a deploy that succeeds and then does nothing, which is
+ * the worst failure this product has: the container starts, the health check
+ * passes, the resource reads green, and every request 404s or the runtime
+ * crash-loops on a host billed at GPU rates. Nothing downstream catches it —
+ * there is no probe for "serving the wrong thing" — so the model step, where the
+ * pick is still on screen, is the only place it can be caught.
+ *
+ *   - GGUF is an ollama format and vLLM cannot load it. The control plane no
+ *     longer derives ollama from it (hf.EngineForModel says why: the derived
+ *     runtime could not resolve a Hub repo id either), so a GGUF card would
+ *     deploy as vLLM and serve nothing.
+ *   - A pipeline tag that is not text generation is whisper, an embedding model
+ *     or a diffusion model. openai/whisper-large-v3 sizes cleanly at ~4 GB, fits
+ *     every card in the fleet, and crash-loops vLLM.
+ *
+ * An EMPTY pipeline tag is unknown and never refused: the Hub returns no
+ * metadata at all for a gated repository read without a token, and refusing on
+ * silence would refuse every gated model on a control plane that has no picker
+ * token — the one case where the operator can do least about it.
+ */
+export function unservableReason(card: ModelCard | null | undefined): string | null {
+  if (!card) return null;
+  if (card.quantization.trim().toLowerCase() === "gguf") {
+    return `${card.id} is a GGUF build, and the runtime this control plane deploys cannot load GGUF weights — pick the original safetensors repository for this model instead.`;
+  }
+  const tag = card.pipelineTag.trim();
+  if (tag && tag !== TEXT_GENERATION_TASK) {
+    return `${card.id} is a ${tag} model, and a model endpoint serves text generation only — this one would start, report healthy and fail every request. Pick a text-generation repository.`;
+  }
+  return null;
 }
 
 /**
  * Whether the model step may be left — the whole canContinue gate for it.
  *
- * It blocks on exactly two things, and both are certainties rather than
- * suspicions: nothing has been named, or the named model is one whose weights
- * this control plane provably cannot download.
+ * It blocks on certainties only: nothing has been named, or the named model is
+ * one no runtime this control plane deploys could serve. A gated model is NOT
+ * one of them — see gatedWarning for why we cannot prove the operator lacks
+ * access, and why a warning they can read beats a wall they cannot pass.
  *
- * It deliberately does NOT block a model that failed to resolve. A repo id the
- * Hub could not confirm may still be perfectly deployable — the Hub was slow,
- * the control plane has no catalogue configured at all (a supported, minimal
- * deployment), or the reference is an Ollama library tag, which names nothing on
- * the Hub by design. The control plane's resolve route answers 404 for all of
- * those and its create path uses the id exactly as typed; a wizard that refused
- * to continue would be the only component in the stack treating "unconfirmed" as
- * "wrong", and it would make the picker's dependency on huggingface.co a
- * dependency of deploying at all.
+ * It also deliberately does NOT block a model that failed to resolve. A repo id
+ * the Hub could not confirm may still be perfectly deployable — the Hub was
+ * slow, the control plane has no catalogue configured at all (a supported,
+ * minimal deployment), or the reference is an Ollama library tag, which names
+ * nothing on the Hub by design. The control plane's resolve route answers 404
+ * for all of those and its create path uses the id exactly as typed; a wizard
+ * that refused to continue would be the only component in the stack treating
+ * "unconfirmed" as "wrong", and it would make the picker's dependency on
+ * huggingface.co a dependency of deploying at all.
  */
 export function modelStepError(
   card: ModelCard | null | undefined,
-  query: string,
-  tokenConfigured: boolean
+  modelId: string
 ): string | null {
-  if (!query.trim()) {
+  if (!modelId.trim()) {
     return "Pick a model, or type its Hugging Face repo id (owner/name).";
   }
-  return gatedBlocked(card, tokenConfigured);
+  return unservableReason(card);
 }
 
 /**

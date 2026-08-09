@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   downloadsText,
-  gatedBlocked,
+  gatedWarning,
   looksLikeRepoId,
   modelStepError,
   parameterText,
   serverFitsModel,
+  unservableReason,
   vramNeedText,
   type ModelCard,
 } from "./llm";
@@ -105,25 +106,74 @@ describe("an unknown never blocks a deploy", () => {
   });
 });
 
-describe("a gated model with no Hub token is refused at the model step", () => {
-  it("names the environment variable that fixes it", () => {
-    const reason = gatedBlocked(card({ gated: true }), false);
-    expect(reason).toContain("CP_HUGGING_FACE_TOKEN");
-    expect(reason).toContain("meta-llama/Llama-3.1-8B-Instruct");
+describe("a gated model with no weights token is warned about, not blocked", () => {
+  // The token that has to exist is the one the RUNTIME reads on the GPU host.
+  // Naming the picker's own credential sent operators to configure a variable
+  // that would not have made a single pull succeed.
+  it("names the variable the download actually reads", () => {
+    const warning = gatedWarning(card({ gated: true }), false);
+    expect(warning).toContain("HUGGING_FACE_HUB_TOKEN");
+    expect(warning).not.toContain("CP_HUGGING_FACE_TOKEN");
+    expect(warning).toContain("meta-llama/Llama-3.1-8B-Instruct");
   });
 
-  it("allows a gated model once the control plane holds a token", () => {
-    expect(gatedBlocked(card({ gated: true }), true)).toBeNull();
+  // We cannot see the operator's Hugging Face account. They may hold access we
+  // have no way to confirm, and a step they cannot leave is a worse answer than
+  // a paragraph they can read.
+  it("still lets the step be left", () => {
+    expect(modelStepError(card({ gated: true }), "meta-llama/Llama-3.1-8B-Instruct")).toBeNull();
   });
 
-  it("allows an ungated model with no token", () => {
-    expect(gatedBlocked(card({ gated: false }), false)).toBeNull();
+  it("says nothing once a weights token is configured", () => {
+    expect(gatedWarning(card({ gated: true }), true)).toBeNull();
+  });
+
+  it("says nothing about an ungated model", () => {
+    expect(gatedWarning(card({ gated: false }), false)).toBeNull();
+  });
+});
+
+describe("a model no runtime here can serve is refused while it is still on screen", () => {
+  // vLLM cannot load GGUF weights, and the control plane no longer routes a
+  // GGUF pick to ollama — that container came up healthy and 404'd every
+  // request, which is the failure nothing downstream watches for.
+  it("refuses a GGUF build and names the repository to pick instead", () => {
+    const reason = unservableReason(card({ id: "TheBloke/phi-2-GGUF", quantization: "gguf" }));
+    expect(reason).toContain("GGUF");
+    expect(reason).toContain("safetensors");
+  });
+
+  // openai/whisper-large-v3 sizes at ~4 GB, fits every card in the fleet and
+  // crash-loops the runtime. Nothing in the fit check can catch it.
+  it("refuses a model whose task is not text generation", () => {
+    const reason = unservableReason(
+      card({ id: "openai/whisper-large-v3", pipelineTag: "automatic-speech-recognition" })
+    );
+    expect(reason).toContain("automatic-speech-recognition");
+    expect(reason).toContain("text generation");
+  });
+
+  // The Hub returns no metadata at all for a gated repository read without a
+  // token, so an empty tag is unknown. Refusing on it would refuse every gated
+  // model on a control plane with no picker token.
+  it("refuses nothing when the Hub published no task", () => {
+    expect(unservableReason(card({ pipelineTag: "" }))).toBeNull();
+  });
+
+  it("accepts an ordinary text-generation repository", () => {
+    expect(unservableReason(card())).toBeNull();
+  });
+
+  it("blocks the step on the refusal", () => {
+    expect(modelStepError(card({ quantization: "gguf" }), "TheBloke/phi-2-GGUF")).toContain(
+      "GGUF"
+    );
   });
 });
 
 describe("the model step's continue gate", () => {
   it("asks for a model before anything is typed", () => {
-    expect(modelStepError(null, "   ", true)).toContain("repo id");
+    expect(modelStepError(null, "   ")).toContain("repo id");
   });
 
   // The control plane answers 404 for a Hub it could not reach, for a control
@@ -132,17 +182,12 @@ describe("the model step's continue gate", () => {
   // refused here would make the picker's dependency on huggingface.co a
   // dependency of deploying at all.
   it("lets an unresolved repo id through", () => {
-    expect(modelStepError(null, "meta-llama/Llama-3.1-8B-Instruct", false)).toBeNull();
-    expect(modelStepError(null, "llama3.2:3b", false)).toBeNull();
+    expect(modelStepError(null, "meta-llama/Llama-3.1-8B-Instruct")).toBeNull();
+    expect(modelStepError(null, "llama3.2:3b")).toBeNull();
   });
 
-  it("blocks a gated model this control plane cannot download", () => {
-    const blocked = modelStepError(card({ gated: true }), "meta-llama/Llama-3.1-8B-Instruct", false);
-    expect(blocked).toContain("CP_HUGGING_FACE_TOKEN");
-  });
-
-  it("lets a resolved, ungated model continue", () => {
-    expect(modelStepError(card(), "meta-llama/Llama-3.1-8B-Instruct", false)).toBeNull();
+  it("lets a resolved, servable model continue", () => {
+    expect(modelStepError(card(), "meta-llama/Llama-3.1-8B-Instruct")).toBeNull();
   });
 });
 

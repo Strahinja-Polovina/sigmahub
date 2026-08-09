@@ -8,12 +8,23 @@
  * Redis took five screens to make two decisions.
  */
 
-import { RESOURCE_KIND_LABELS, type ResourceKind } from "@/lib/server-catalog.generated";
+import {
+  RESOURCE_KIND_LABELS,
+  categoryForKind,
+  type ResourceKind,
+} from "@/lib/server-catalog.generated";
 
-export const DATABASE_KINDS: ResourceKind[] = ["postgres", "mysql", "mongodb", "redis"];
-
+/**
+ * Asked of the control plane's catalog rather than of a list kept here.
+ *
+ * The list used to be `["postgres", "mysql", "mongodb", "redis"]`, typed out
+ * beside a control plane that already knew the same fact — so adding an engine
+ * meant remembering a table in the dashboard, and forgetting it meant a new
+ * database whose credentials were never revealed after create. The category IS
+ * that fact now (SIGMA-216).
+ */
 export function isDatabaseKind(kind: ResourceKind | null | undefined): boolean {
-  return !!kind && DATABASE_KINDS.includes(kind);
+  return !!kind && categoryForKind(kind) === "database";
 }
 
 /** Kinds that need no repository, no build and no variables. */
@@ -52,6 +63,20 @@ export const LLM_ENGINES = [
 ] as const;
 
 export const DEFAULT_LLM_ENGINE = LLM_ENGINES[0].id;
+
+/**
+ * A runtime's display name, for every screen that shows one.
+ *
+ * One source, because there were two: the model step looked the label up and the
+ * review screen printed the raw id, so the same deploy read "Served by vLLM" on
+ * one screen and "Runtime: vllm" on the next — which reads like two different
+ * things were configured. An id the catalog does not know is printed as itself:
+ * the control plane's engine list can outrun this one, and an unrecognised
+ * runtime is still worth showing.
+ */
+export function llmEngineLabel(engine: string): string {
+  return LLM_ENGINES.find((e) => e.id === engine)?.label ?? engine;
+}
 
 /**
  * What the operator gets, said before they commit rather than discovered after.

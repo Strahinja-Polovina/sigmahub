@@ -1,6 +1,10 @@
 package hf
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 // The number the whole feature turns on. Llama 3.1 8B in BF16 is the model the
 // sizing was designed against, and if this drifts, every fit check in the
@@ -19,8 +23,40 @@ func TestALlamaEightBillionInBF16SizesToTwentyOneGigabytes(t *testing.T) {
 	if required < 21_000_000_000 || required > 21_500_000_000 {
 		t.Fatalf("required = %d bytes, want ~21.4e9", required)
 	}
-	if got := FormatVRAM(required); got != "~21 GB" {
-		t.Fatalf("FormatVRAM = %q, want ~21 GB", got)
+	if got := FormatVRAM(required); got != "~21.4 GB" {
+		t.Fatalf("FormatVRAM = %q, want ~21.4 GB", got)
+	}
+}
+
+// The fit check's headroom and the context length the runtime is started at are
+// one decision written in two places, and this is the arithmetic that ties them
+// together. The first cut of SIGMA-214 budgeted for an unnamed "ordinary context
+// window" and pinned the runtime to nothing, so vLLM took the model's 131072 and
+// exited on a deploy the fit check had approved. Raising SizedContextTokens
+// without raising KVActivationFactor now fails here instead of in a container
+// log an hour later.
+func TestTheBudgetedHeadroomCoversTheContextTheRuntimeIsPinnedTo(t *testing.T) {
+	// Llama-3.1-8B, the shape the sizing was designed against: 32 layers × 8 KV
+	// heads × 128 head dimensions, a key and a value each, two bytes apiece —
+	// 128 KiB of KV cache per token.
+	const kvBytesPerToken = 2 * 32 * 8 * 128 * 2
+	const parameters = 8_030_261_248
+
+	weights := float64(parameters) * BytesPerParam("BF16", "none")
+	headroom := weights*KVActivationFactor - weights
+	kv := float64(SizedContextTokens) * kvBytesPerToken
+
+	if kv > headroom {
+		t.Fatalf("%d tokens of KV cache is %.2f GB but the factor budgets %.2f GB of headroom — "+
+			"the fit check would approve a deploy the runtime cannot start",
+			SizedContextTokens, kv/1e9, headroom/1e9)
+	}
+	// The other half of the same statement: the headroom is not KV cache alone.
+	// Activations and allocator fragmentation live in what is left, so a context
+	// length that eats the whole budget is as wrong as one that overruns it.
+	if kv > headroom/2 {
+		t.Fatalf("%d tokens of KV cache takes %.2f GB of %.2f GB, leaving nothing for activations "+
+			"or fragmentation", SizedContextTokens, kv/1e9, headroom/1e9)
 	}
 }
 
@@ -85,26 +121,42 @@ func TestBytesPerParamFollowsTheStorageFormat(t *testing.T) {
 	}
 }
 
-// The wizard used to ask which runtime to use. It cannot ask any more, so this
-// has to be right for every model anyone picks.
-func TestTheModelsOwnMetadataChoosesTheRuntime(t *testing.T) {
+// The wizard cannot ask which runtime to use, so this has to be right for every
+// model anyone picks — and for GGUF "right" is vLLM, because the alternative was
+// an ollama container that pulled nothing, reported healthy and 404'd every
+// completion. A GGUF repository is refused at the model step; it is never routed
+// to a runtime that cannot serve it.
+func TestEveryPickedModelIsServedByTheRuntimeThatCanActuallyStart(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		library      string
 		quantization string
-		want         string
 	}{
-		{"safetensors transformers repo", "transformers", "none", "vllm"},
-		{"quantized transformers repo", "transformers", "awq", "vllm"},
-		{"gguf by library", "gguf", "none", "ollama"},
-		{"gguf by quantization", "", "gguf", "ollama"},
-		{"nothing known at all", "", "", "vllm"},
+		{"safetensors transformers repo", "transformers", "none"},
+		{"quantized transformers repo", "transformers", "awq"},
+		{"gguf by library", "gguf", "none"},
+		{"gguf by quantization", "", "gguf"},
+		{"nothing known at all", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := EngineForModel(tc.library, tc.quantization); got != tc.want {
-				t.Fatalf("EngineForModel(%q, %q) = %q, want %q", tc.library, tc.quantization, got, tc.want)
+			if got := EngineForModel(tc.library, tc.quantization); got != "vllm" {
+				t.Fatalf("EngineForModel(%q, %q) = %q, want vllm", tc.library, tc.quantization, got)
 			}
 		})
+	}
+}
+
+// The GGUF card still has to SAY it is GGUF. The engine no longer distinguishes
+// it, so the format on the card is the only thing the wizard can refuse it by.
+func TestAGGUFRepositoryKeepsTheFormatThatGetsItRefused(t *testing.T) {
+	card := ModelCard{ID: "TheBloke/phi-2-GGUF", Library: "gguf"}
+	applySizing(&card, []string{"gguf", "text-generation"}, "", 0)
+
+	if card.Quantization != "gguf" {
+		t.Fatalf("quantization = %q, want gguf — the wizard has nothing else to recognise the pick by", card.Quantization)
+	}
+	if card.Engine != "vllm" {
+		t.Errorf("engine = %q, want vllm — ollama is no longer derived, it served nothing", card.Engine)
 	}
 }
 
@@ -114,11 +166,18 @@ func TestFormatVRAMIsTheOnlyPlaceTheSizeStringIsWritten(t *testing.T) {
 		bytes uint64
 		want  string
 	}{
-		{"llama 8b", 21_414_029_995, "~21 GB"},
-		{"rounds to the nearest gigabyte", 5_600_000_000, "~6 GB"},
-		{"just over a gigabyte", 1_200_000_000, "~1 GB"},
+		{"llama 8b", 21_414_029_995, "~21.4 GB"},
+		{"a tenth of a gigabyte is the resolution", 5_600_000_000, "~5.6 GB"},
+		{"just over a gigabyte", 1_200_000_000, "~1.2 GB"},
 		{"below a gigabyte falls back to megabytes", 512_000_000, "~512 MB"},
 		{"a tiny model still has a size", 900_000, "~1 MB"},
+		// A gigabyte spelled the long way. The unit has to be chosen from the
+		// rounded figure, not from the byte count that produced it.
+		{"a hair under a gigabyte is a gigabyte", 999_999_999, "~1.0 GB"},
+		// Past 100 GB a tenth is noise, and rounding UP is what keeps the figure
+		// from landing on a truncated capacity.
+		{"past a hundred gigabytes it rounds up to whole ones", 187_733_333_333, "~188 GB"},
+		{"an exact hundred and one", 101_000_000_000, "~101 GB"},
 		// Not "~0 GB": an unsized model has no size to show, and a UI can test
 		// for empty where it cannot test for a number that lies.
 		{"unsized renders as nothing", 0, ""},
@@ -126,6 +185,42 @@ func TestFormatVRAMIsTheOnlyPlaceTheSizeStringIsWritten(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := FormatVRAM(tc.bytes); got != tc.want {
 				t.Fatalf("FormatVRAM(%d) = %q, want %q", tc.bytes, got, tc.want)
+			}
+		})
+	}
+}
+
+// A refusal states both numbers in one sentence, and the two are rendered by
+// different code: the requirement by FormatVRAM here, the card's capacity by
+// store.humanBytes (and the web's formatReportedBytes, which is the same four
+// lines in TypeScript). Those truncate. Rounding to whole gigabytes here meant a
+// 17.33 GB model on a 17.18 GB card refused with "needs ~17 GB but this server
+// has 17 GB" — a sentence with no information in it and no way for the operator
+// to tell it from a bug.
+func TestARefusalCannotQuoteTheSameNumberTwice(t *testing.T) {
+	// The capacity renderer, transcribed rather than imported: this package must
+	// not depend on the store (see the package comment), and the assertion is
+	// about the pair of strings a human reads, not about either function.
+	truncatedGB := func(bytes uint64) string {
+		return fmt.Sprintf("%d GB", bytes/1_000_000_000)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		required uint64
+		capacity uint64
+	}{
+		{"the pair from the review", 17_330_000_000, 17_180_000_000},
+		{"a whole gigabyte apart", 25_000_000_000, 24_000_000_000},
+		{"barely over", 24_000_000_001, 24_000_000_000},
+		// Above the decimal cut-off the requirement rounds up instead, which
+		// buys the same guarantee on a card nobody had when this was written.
+		{"two big cards", 141_400_000_000, 141_000_000_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			need, have := FormatVRAM(tc.required), truncatedGB(tc.capacity)
+			if strings.TrimPrefix(need, "~") == have {
+				t.Fatalf("a refusal would read %q needed against %q available — the operator learns nothing", need, have)
 			}
 		})
 	}
@@ -148,11 +243,37 @@ func TestAQuantizedRepositoryIsSizedFromItsNameNotItsPackedTensorCount(t *testin
 		t.Errorf("sizing = %s/%d, want name/7e9 — the packed element count is not a parameter count", card.SizingBasis, card.Parameters)
 	}
 	// 7e9 × 0.5 = 3.5 GB of weights, × 1.2 ÷ 0.9 ≈ 4.7 GB.
-	if card.VRAMText != "~5 GB" {
-		t.Errorf("vramText = %q, want ~5 GB", card.VRAMText)
+	if card.VRAMText != "~4.7 GB" {
+		t.Errorf("vramText = %q, want ~4.7 GB", card.VRAMText)
 	}
 	if card.Engine != "vllm" {
 		t.Errorf("engine = %q, want vllm — AWQ is a vLLM format", card.Engine)
+	}
+}
+
+// safetensors.total is a third party's integer and it is not always a parameter
+// count. An absurd one used to be multiplied out into a byte figure that
+// overflowed and printed as "~9223372037 GB" — a fit check gating a real deploy
+// on a number with no meaning. The name is the fallback, exactly as it is for a
+// repository with no index at all.
+func TestACorruptSafetensorsTotalIsRefusedRatherThanSized(t *testing.T) {
+	card := ModelCard{ID: "some-lab/Mistral-7B-Instruct", Library: "transformers"}
+	applySizing(&card, []string{"transformers"}, "BF16", 1<<63)
+
+	if card.SizingBasis != "name" || card.Parameters != 7_000_000_000 {
+		t.Fatalf("sizing = %s/%d, want name/7e9 — an impossible index must fall through to the name",
+			card.SizingBasis, card.Parameters)
+	}
+	if card.VRAMText != "~18.7 GB" {
+		t.Errorf("vramText = %q, want the name-derived size", card.VRAMText)
+	}
+
+	// A repository with an impossible index AND no size in its name is simply
+	// unsized, which is the same answer as any other model nobody can size.
+	nameless := ModelCard{ID: "some-lab/experimental", Library: "transformers"}
+	applySizing(&nameless, nil, "BF16", 1<<63)
+	if nameless.ParametersKnown || nameless.VRAMBytesRequired != 0 {
+		t.Errorf("card = %+v, want no size at all rather than an invented one", nameless)
 	}
 }
 

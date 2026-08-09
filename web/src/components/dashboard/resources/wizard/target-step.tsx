@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { Boxes, Server as ServerIcon, Check, Network, CircleAlert } from "lucide-react";
 
 import { Label } from "@/components/ui/label";
@@ -13,15 +12,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { SERVER_TYPE_LABELS, type ResourceKind, type ServerType } from "@/lib/server-catalog.generated";
-import {
-  clusterOptions,
-  serverOptions,
-  type TargetInventory,
-  type WizardCluster,
-  type WizardProject,
-} from "@/lib/wizard/availability";
-import type { ModelCard } from "@/lib/wizard/llm";
+import { SERVER_TYPE_LABELS, type ServerType } from "@/lib/server-catalog.generated";
+import type { TargetChoices, WizardProject } from "@/lib/wizard/availability";
 
 /**
  * Project → Environment → Server OR Cluster (SIGMA-210).
@@ -32,13 +24,17 @@ import type { ModelCard } from "@/lib/wizard/llm";
  * flow. The picker is filtered to the chosen environment because a cluster
  * belongs to exactly one, and offering the others would offer a target the
  * control plane refuses.
+ *
+ * WHICH targets are offered is not decided here. This component renders a
+ * TargetChoices and nothing else, because the defect it shipped with was an
+ * argument that never got passed — the chosen model reached the server filter
+ * and not the cluster one — and an argument list inside JSX is the one thing
+ * this repository's suites cannot reach (they run in node, with no DOM). The
+ * decision lives in availability.targetChoices, where a test can hold it.
  */
 export function TargetStep({
-  kind,
   projects,
-  clusters,
-  inventory,
-  model,
+  choices,
   projectId,
   environmentId,
   serverId,
@@ -48,13 +44,10 @@ export function TargetStep({
   onServerChange,
   onClusterChange,
 }: {
-  kind: ResourceKind;
   projects: WizardProject[];
-  clusters: WizardCluster[];
-  inventory: TargetInventory;
-  /** The model an `llm` resource will serve (SIGMA-214). Every other kind
-   *  passes nothing and is filtered exactly as before. */
-  model?: ModelCard | null;
+  /** Every offer for the chosen project + environment, already filtered against
+   *  the kind and the model. */
+  choices: TargetChoices;
   projectId: string;
   environmentId: string;
   serverId: string;
@@ -64,19 +57,7 @@ export function TargetStep({
   onServerChange: (id: string) => void;
   onClusterChange: (id: string) => void;
 }) {
-  const environments = React.useMemo(
-    () => projects.find((p) => p.id === projectId)?.environments ?? [],
-    [projects, projectId]
-  );
-  const env = environments.find((e) => e.id === environmentId);
-  const servers = React.useMemo(() => serverOptions(env, kind, model), [env, kind, model]);
-  const clusterChoices = React.useMemo(
-    () => clusterOptions(clusters, environmentId, kind, inventory),
-    [clusters, environmentId, kind, inventory]
-  );
-
-  const noEligibleServer =
-    Boolean(environmentId) && servers.length > 0 && servers.every((s) => !s.eligible);
+  const { environments, servers, clusters: clusterChoices, deadEnd } = choices;
 
   return (
     <div className="flex flex-col gap-4">
@@ -247,13 +228,14 @@ export function TargetStep({
           </div>
         )}
 
-        {noEligibleServer && clusterChoices.every((c) => !c.eligible) && (
+        {/* Every row above carries its own reason, and a column of reasons still
+            leaves "so what do I do" unanswered — most sharply when the cause is
+            the model, whose fix is a different model rather than a different
+            server. */}
+        {deadEnd && (
           <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-            <p className="min-w-0 text-xs text-destructive/90">
-              Nothing in this environment can host this resource. Attach a compatible
-              server to it, or pick a different environment.
-            </p>
+            <p className="min-w-0 text-xs text-destructive/90">{deadEnd}</p>
           </div>
         )}
       </div>

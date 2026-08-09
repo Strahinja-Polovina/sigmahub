@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MOCK_MODELS, MOCK_TOKEN_CONFIGURED, findMockModel, searchMockModels } from "./models";
-import { gatedBlocked, serverFitsModel } from "@/lib/wizard/llm";
+import { gatedWarning, modelStepError, serverFitsModel, unservableReason } from "@/lib/wizard/llm";
 
 /** The GPU the demo fleet ships with (mock/data.ts, gpu-a100-01): one 40 GiB
  *  A100, which is what makes the fit check mean something offline. */
@@ -21,16 +21,20 @@ describe("the demo catalogue walks every branch of the model step", () => {
     expect(serverFitsModel(big, DEMO_GPU).reason).toContain("42 GB");
   });
 
-  it("offers a gated model, which demo mode refuses for the real reason", () => {
+  // Listed WITH the lock badge, warned about, and still pickable — the token
+  // the warning names is the one the GPU host would pull with, and nothing here
+  // can see whether the operator holds access to the repository.
+  it("offers gated models, warned about for the real reason and not blocked", () => {
     const gated = MOCK_MODELS.filter((m) => m.gated);
     expect(gated.length).toBeGreaterThan(0);
-    expect(gatedBlocked(gated[0], MOCK_TOKEN_CONFIGURED)).toContain("CP_HUGGING_FACE_TOKEN");
+    expect(gatedWarning(gated[0], MOCK_TOKEN_CONFIGURED)).toContain("HUGGING_FACE_HUB_TOKEN");
+    expect(modelStepError(gated[0], gated[0].id)).toBeNull();
   });
 
   // A demo where every model is blocked is a demo of a wall.
-  it("leaves ungated models that deploy end to end offline", () => {
+  it("leaves models that deploy end to end offline", () => {
     const walkable = MOCK_MODELS.filter(
-      (m) => !gatedBlocked(m, MOCK_TOKEN_CONFIGURED) && serverFitsModel(m, DEMO_GPU).fits
+      (m) => !modelStepError(m, m.id) && serverFitsModel(m, DEMO_GPU).fits
     );
     expect(walkable.length).toBeGreaterThan(0);
   });
@@ -43,10 +47,19 @@ describe("the demo catalogue walks every branch of the model step", () => {
     );
   });
 
-  // The runtime is derived from the model, so the demo needs a model that
-  // derives something other than the default.
-  it("offers a model served by each runtime", () => {
-    expect(new Set(MOCK_MODELS.map((m) => m.engine))).toEqual(new Set(["vllm", "ollama"]));
+  // A GGUF repository deploys as a container that starts, reports healthy and
+  // serves nothing, so the model step refuses it — and a demo that never shows
+  // that sentence hides the check from everyone evaluating the product.
+  it("offers a GGUF repository, which the model step refuses", () => {
+    const gguf = MOCK_MODELS.filter((m) => m.quantization === "gguf");
+    expect(gguf.length).toBeGreaterThan(0);
+    expect(unservableReason(gguf[0])).toContain("safetensors");
+  });
+
+  // The runtime is read from the card rather than asked for, and the control
+  // plane renders exactly one for a picked model.
+  it("records the runtime the control plane would render", () => {
+    expect(new Set(MOCK_MODELS.map((m) => m.engine))).toEqual(new Set(["vllm"]));
   });
 
   it("covers both sizing bases plus the absence of one", () => {

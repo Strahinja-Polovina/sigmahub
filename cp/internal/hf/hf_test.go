@@ -2,10 +2,12 @@ package hf
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +41,22 @@ const (
 		"library_name": "gguf",
 		"tags": ["gguf","llama","text-generation"]
 	}`
+
+	// The model the unfiltered picker offered and no runtime here can load. It
+	// out-downloads almost everything on the Hub, it sizes cleanly at ~3.9 GB,
+	// and it fits every card the fit check knows about — which is why it reached
+	// a deploy and only failed once vLLM tried to load it.
+	whisperLargeV3 = `{
+		"id": "openai/whisper-large-v3",
+		"modelId": "openai/whisper-large-v3",
+		"likes": 4000,
+		"downloads": 9000000,
+		"gated": false,
+		"pipeline_tag": "automatic-speech-recognition",
+		"library_name": "transformers",
+		"tags": ["transformers","safetensors","whisper","automatic-speech-recognition"],
+		"safetensors": {"parameters": {"F32": 1543304960}, "total": 1543304960}
+	}`
 )
 
 // stubHub serves the two Hub endpoints this package calls, counts requests (so a
@@ -51,9 +69,10 @@ type stubHub struct {
 	// wantToken, when set, makes every unauthenticated request 401.
 	wantToken string
 
-	mu    sync.Mutex
-	calls int
-	auths []string
+	mu      sync.Mutex
+	calls   int
+	auths   []string
+	queries []url.Values
 }
 
 func (h *stubHub) start(t *testing.T) *httptest.Server {
@@ -63,6 +82,7 @@ func (h *stubHub) start(t *testing.T) *httptest.Server {
 		h.mu.Lock()
 		h.calls++
 		h.auths = append(h.auths, auth)
+		h.queries = append(h.queries, r.URL.Query())
 		h.mu.Unlock()
 
 		if h.wantToken != "" && auth != "Bearer "+h.wantToken {
@@ -74,11 +94,19 @@ func (h *stubHub) start(t *testing.T) *httptest.Server {
 
 		if rest == "" || rest == "/" {
 			query := strings.ToLower(r.URL.Query().Get("search"))
+			// The Hub applies pipeline_tag server-side, and so does this: a stub
+			// that ignored it could not tell a filter that is sent from one that
+			// is merely written down.
+			task := r.URL.Query().Get("pipeline_tag")
 			var matched []string
 			for id, raw := range h.models {
-				if query == "" || strings.Contains(strings.ToLower(id), query) {
-					matched = append(matched, raw)
+				if query != "" && !strings.Contains(strings.ToLower(id), query) {
+					continue
 				}
+				if task != "" && taskOf(raw) != task {
+					continue
+				}
+				matched = append(matched, raw)
 			}
 			// Deterministic order: the client must not depend on it, but a test
 			// that indexes the result must.
@@ -114,6 +142,21 @@ func (h *stubHub) authHeaders() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.auths...)
+}
+
+func (h *stubHub) sentQueries() []url.Values {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]url.Values(nil), h.queries...)
+}
+
+// taskOf reads a fixture's pipeline_tag the way the Hub reads a repository's.
+func taskOf(raw string) string {
+	var m apiModel
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return ""
+	}
+	return m.PipelineTag
 }
 
 func sortRawByID(raw []string) {
@@ -170,16 +213,20 @@ func TestSearchTurnsHubRecordsIntoRunnableModelCards(t *testing.T) {
 	if safetensors.BytesPerParam != 2 {
 		t.Errorf("bytesPerParam = %v, want 2 for BF16", safetensors.BytesPerParam)
 	}
-	if safetensors.VRAMText != "~21 GB" {
-		t.Errorf("vramText = %q, want ~21 GB", safetensors.VRAMText)
+	if safetensors.VRAMText != "~21.4 GB" {
+		t.Errorf("vramText = %q, want ~21.4 GB", safetensors.VRAMText)
+	}
+	if safetensors.PipelineTag != "text-generation" {
+		t.Errorf("pipelineTag = %q — the wizard cannot refuse what it was not told", safetensors.PipelineTag)
 	}
 
-	// The GGUF repository is the decision-removal in one row: no safetensors, so
-	// it is sized off its name, and its format — not a question to the user —
-	// selects the runtime.
+	// The GGUF repository is sized off its name for want of a safetensors index,
+	// and it carries the format that gets it refused at the step. It does NOT
+	// carry a second engine: ollama could not resolve "owner/name" and served
+	// nothing, so no repository derives it any more.
 	gguf := byID["TheBloke/Llama-2-7B-Chat-GGUF"]
-	if gguf.Engine != "ollama" {
-		t.Errorf("engine = %q, want ollama for GGUF weights", gguf.Engine)
+	if gguf.Engine != "vllm" {
+		t.Errorf("engine = %q, want vllm — a derived ollama endpoint pulled nothing and 404'd", gguf.Engine)
 	}
 	if gguf.Quantization != "gguf" || gguf.BytesPerParam != 0.6 {
 		t.Errorf("quantization/bytesPerParam = %s/%v, want gguf/0.6", gguf.Quantization, gguf.BytesPerParam)
@@ -189,6 +236,75 @@ func TestSearchTurnsHubRecordsIntoRunnableModelCards(t *testing.T) {
 	}
 	if gguf.Gated {
 		t.Error("gated = true, but the Hub reported gated:false")
+	}
+}
+
+// The Hub ranks /api/models by downloads across every task, so an unfiltered
+// picker offers embedding, ASR and diffusion repositories — models it can size,
+// fit and deploy, and no configured runtime can load. The filter has to be part
+// of the QUERY rather than a pass over the results: the Hub decides which 20
+// rows come back, and dropping half of them here would leave the operator
+// scrolling for a model they are allowed to have.
+func TestSearchAsksTheHubOnlyForModelsARuntimeCanServe(t *testing.T) {
+	hub := &stubHub{models: map[string]string{
+		"meta-llama/Llama-3.1-8B-Instruct": llama8B,
+		"openai/whisper-large-v3":          whisperLargeV3,
+	}}
+	c := newClient(t, hub, "")
+
+	cards, err := c.Search(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hub.sentQueries()[0].Get("pipeline_tag"); got != "text-generation" {
+		t.Fatalf("pipeline_tag sent = %q, want text-generation — the Hub, not this process, decides which rows come back", got)
+	}
+	if len(cards) != 1 || cards[0].ID != "meta-llama/Llama-3.1-8B-Instruct" {
+		t.Fatalf("cards = %+v, want the text-generation model alone", cards)
+	}
+
+	// And searching for the wrong kind of model by name finds nothing, rather
+	// than finding it and failing an hour later inside a GPU container.
+	asr, err := c.Search(context.Background(), "whisper", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(asr) != 0 {
+		t.Fatalf("searching for whisper returned %+v — the picker exists to remove this deploy", asr)
+	}
+}
+
+// Resolve is deliberately NOT filtered. An operator who types a repository id
+// has decided already, and a lookup that refuses to LOOK cannot explain what is
+// wrong with the answer. The task rides back on the card so the wizard can
+// refuse the pick at the step it was made, with the model still on screen.
+func TestResolveAnswersForAnyTaskAndSaysWhichOneItIs(t *testing.T) {
+	hub := &stubHub{models: map[string]string{
+		"meta-llama/Llama-3.1-8B-Instruct": llama8B,
+		"openai/whisper-large-v3":          whisperLargeV3,
+	}}
+	c := newClient(t, hub, "")
+	ctx := context.Background()
+
+	asr, err := c.Resolve(ctx, "openai/whisper-large-v3")
+	if err != nil {
+		t.Fatalf("an id typed by hand must still resolve: %v", err)
+	}
+	if asr.PipelineTag != "automatic-speech-recognition" {
+		t.Errorf("pipelineTag = %q, want the task the repository declares", asr.PipelineTag)
+	}
+	for _, q := range hub.sentQueries() {
+		if q.Get("pipeline_tag") != "" {
+			t.Errorf("resolve sent pipeline_tag=%q — a named repository is not filtered", q.Get("pipeline_tag"))
+		}
+	}
+
+	text, err := c.Resolve(ctx, "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text.PipelineTag != "text-generation" {
+		t.Errorf("pipelineTag = %q, want text-generation on the resolve path too", text.PipelineTag)
 	}
 }
 
@@ -294,6 +410,13 @@ func TestAGatedModelWithoutATokenStillProducesACard(t *testing.T) {
 	}
 	if card.Engine != "vllm" || card.VRAMText == "" {
 		t.Errorf("card = %+v, want a runnable, sized card", card)
+	}
+	// The one field a 401 cannot produce. Empty is UNKNOWN, and the wizard must
+	// read it that way: refusing on an absent task would refuse every gated
+	// model on a control plane with no Hub token — which is precisely the
+	// control plane whose operator can do least about it.
+	if card.PipelineTag != "" {
+		t.Errorf("pipelineTag = %q, want empty — a 401 carries no metadata to fill it with", card.PipelineTag)
 	}
 
 	// With a token the same repository resolves fully, and the exact

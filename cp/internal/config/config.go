@@ -73,15 +73,25 @@ type Config struct {
 	PaddleWebhookSecret string
 	PaddleEnv           string
 	PaddlePriceID       string
-	// HuggingFaceToken authenticates the model picker's Hub calls
-	// (CP_HUGGING_FACE_TOKEN). OPTIONAL, and deliberately not defaulted or
-	// required: the Hub's model API serves public repos unauthenticated, so a
-	// self-hoster who sets nothing still gets a working picker over the models
-	// most people deploy. A token adds the org's private repos and the gated
-	// ones (Llama & co) it has been granted, and the search response says which
-	// of the two worlds the operator is looking at — see the API's
-	// tokenConfigured field, which exists so nobody has to guess why a model
-	// they can see on huggingface.co is missing from the picker.
+	// HuggingFaceToken (CP_HUGGING_FACE_TOKEN) is the Hugging Face account this
+	// control plane acts as. It does BOTH jobs, and that is the whole point of
+	// there being one setting: it authenticates the model picker's Hub calls in
+	// this process, and it is seeded into each inference endpoint's
+	// HUGGING_FACE_HUB_TOKEN secret so the agent DOWNLOADS the weights as the
+	// same account (store.SetHuggingFaceToken). Those used to be two unrelated
+	// things — the picker had a token, the download referenced a secret nothing
+	// ever created — so the wizard could approve a gated model whose weights
+	// then 401'd tens of gigabytes into a pull on a GPU-billed host.
+	//
+	// OPTIONAL, and deliberately not defaulted or required: the Hub's model API
+	// serves public repos unauthenticated and public weights download without
+	// credentials, so a self-hoster who sets nothing gets a working picker and
+	// working deploys over the models most people run. A token adds the org's
+	// private repos and the gated ones (Llama & co) it has been granted, and the
+	// search response says whether the operator's target can actually fetch them
+	// — see the API's tokenConfigured field, which reports the WEIGHTS
+	// credential rather than this one, because that is the question the wizard
+	// is really asking.
 	HuggingFaceToken string
 	// RequireActor (CP_REQUIRE_ACTOR=true) makes a valid X-Sigmahub-Actor header
 	// mandatory on org-scoped service tokens (SIGMA-82). Off by default: the

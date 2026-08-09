@@ -70,6 +70,17 @@ export function resourceKindLabel(kind: string): string {
   return RESOURCE_KIND_LABELS[kind as ResourceKind] ?? kind;
 }
 
+/** The kinds inside a category, in catalog order. Never empty. */
+export function kindsInCategory(id: ResourceCategoryId): ResourceKind[] {
+  return RESOURCE_CATEGORY_CATALOG[id].kinds;
+}
+
+/** The category a kind sits in, or null for a string that is not a kind —
+ *  restored drafts and CP rows carry plain strings. */
+export function categoryForKind(kind: string): ResourceCategoryId | null {
+  return KIND_CATEGORY[kind as ResourceKind] ?? null;
+}
+
 /** Billing weight of a server type. An unknown type bills as an ordinary
  *  server, never as free: a typo must not silently zero out a bill. */
 export function serverUnitWeight(type: string): number {
@@ -98,6 +109,7 @@ func RenderTypeScript(srcSHA string) []byte {
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "export type ServerType =\n%s;\n\n", tsUnion(types))
 	fmt.Fprintf(&b, "export type ResourceKind =\n%s;\n\n", tsUnion(kinds))
+	fmt.Fprintf(&b, "export type ResourceCategoryId =\n%s;\n\n", tsUnion(ResourceCategories()))
 	fmt.Fprintf(&b, "export type RequirementId =\n%s;\n\n", tsUnion(requirementIDs()))
 
 	b.WriteString(`/** One precondition a host must meet to enroll as a type. The fact field names
@@ -133,6 +145,19 @@ export type ServerTypeSpec = {
   connectable: boolean;
   unitWeight: number;
   requires: ServerRequirements;
+};
+
+/** One bucket of the New Resource wizard's first screen. */
+export type ResourceCategorySpec = {
+  id: ResourceCategoryId;
+  label: string;
+  hint: string;
+  /** The kinds inside it, in catalog order. Exactly one means the category is a
+   *  question with a single possible answer, and the picker answers it rather
+   *  than asking — see web/src/lib/wizard/steps.ts. Never empty: a card that
+   *  opens an empty list is a dead end, and the control plane refuses to load
+   *  a catalog containing one. */
+  kinds: ResourceKind[];
 };
 
 `)
@@ -182,6 +207,30 @@ export type ServerTypeSpec = {
 	b.WriteString("export const RESOURCE_KIND_LABELS: Record<ResourceKind, string> = {\n")
 	for _, k := range resourceKinds {
 		fmt.Fprintf(&b, "  %s: %s,\n", k.Kind, tsString(k.Label))
+	}
+	b.WriteString("};\n\n")
+
+	b.WriteString("/** Step 1 of the wizard: the categories, and the kinds each one holds. */\n")
+	b.WriteString("export const RESOURCE_CATEGORY_CATALOG: Record<ResourceCategoryId, ResourceCategorySpec> = {\n")
+	for _, c := range ResourceCategoryCatalog() {
+		b.WriteString("  " + c.ID + ": {\n")
+		fmt.Fprintf(&b, "    id: %s,\n", tsString(c.ID))
+		fmt.Fprintf(&b, "    label: %s,\n", tsString(c.Label))
+		fmt.Fprintf(&b, "    hint: %s,\n", tsString(c.Hint))
+		fmt.Fprintf(&b, "    kinds: %s,\n", tsStringArray(c.Kinds))
+		b.WriteString("  },\n")
+	}
+	b.WriteString("};\n\n")
+
+	b.WriteString("/** Every category, in the order step 1 offers them. */\n")
+	fmt.Fprintf(&b, "export const RESOURCE_CATEGORIES: ResourceCategoryId[] = %s;\n\n",
+		tsStringArray(ResourceCategories()))
+
+	b.WriteString("/** The same membership, kind-first — what a resumed draft needs to reopen\n" +
+		" *  the picker on the screen the user left it on. */\n")
+	b.WriteString("export const KIND_CATEGORY: Record<ResourceKind, ResourceCategoryId> = {\n")
+	for _, k := range resourceKinds {
+		fmt.Fprintf(&b, "  %s: %s,\n", k.Kind, tsString(k.Category))
 	}
 	b.WriteString("};\n\n")
 
