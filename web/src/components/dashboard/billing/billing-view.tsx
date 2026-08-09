@@ -3,6 +3,7 @@
 import * as React from "react";
 import { toast } from "sonner";
 import {
+  AlertTriangle,
   CreditCard,
   Server as ServerIcon,
   Check,
@@ -16,6 +17,7 @@ import {
   History,
 } from "lucide-react";
 
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   Card,
   CardContent,
@@ -206,13 +208,49 @@ export function BillingView({
   billing,
   servers,
   subscription,
+  cpBillingError,
 }: {
   orgName: string;
-  billing: Billing;
+  /** Null when the control plane could not be asked — see cpBillingError. */
+  billing: Billing | null;
   servers: ServerItem[];
   /** CP-mode Paddle state; omitted in demo mode. */
   subscription?: Subscription;
+  /** Why the control plane's billing figures are missing, when they are. */
+  cpBillingError?: string | null;
 }) {
+  // The control plane did not answer (SIGMA-242). Everything below this point is
+  // a monetary claim, and the only numbers we could put behind those claims come
+  // from the local mirror, which describes a fleet and has never seen an
+  // invoice or a subscription status. So: no figures at all, and say why.
+  if (cpBillingError || !billing) {
+    return (
+      <div className="flex flex-col gap-6 p-4 md:p-6">
+        <div className="flex flex-col gap-1">
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">Billing</h1>
+        </div>
+        <Alert variant="destructive">
+          <AlertTriangle />
+          <AlertTitle>Couldn’t reach the control plane</AlertTitle>
+          <AlertDescription className="flex flex-col gap-2">
+            <span>
+              We can’t show {orgName}’s usage or subscription right now, so nothing on
+              this page would be your bill. Your servers keep running — this is a
+              reporting outage, not a billing change.
+            </span>
+            <span>
+              If you were expecting a payment warning here, check your email or ask an
+              operator: a past-due subscription would still be past due.
+            </span>
+            {cpBillingError && (
+              <span className="font-mono text-xs opacity-80">{cpBillingError}</span>
+            )}
+          </AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
+
   const { unitPrice, freeTier, currency } = billing;
   const fc = (a: number, cents = false) => money(a, currency, cents);
   const { pending: portalPending, go } = useBillingPortal();
