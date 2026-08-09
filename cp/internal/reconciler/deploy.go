@@ -65,6 +65,16 @@ type gitCloneOpSpec struct {
 	CredentialRef string `json:"credentialRef,omitempty"`
 }
 
+// imagePullOpSpec mirrors the agent's container.ImageSpec. RegistryHost is set
+// only when the image lives in the ORG's registry — an image this fleet built
+// and pushed — so the pulling agent authenticates instead of going out
+// anonymous (SIGMA-243). A public image leaves it empty and the agent never
+// asks the control plane for a credential it has no use for.
+type imagePullOpSpec struct {
+	Image        string `json:"image"`
+	RegistryHost string `json:"registryHost,omitempty"`
+}
+
 type buildImageOpSpec struct {
 	ResourceID string `json:"resourceId"`
 	SHA        string `json:"sha"`
@@ -329,9 +339,14 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		if target.Status == "queued" || target.Status == "building" {
 			return nil, "", false
 		}
-		// Pull the image the build server pushed, then roll out.
+		// Pull the image the build server pushed, then roll out. The pull carries
+		// the registry to authenticate against: this image is in the org's own
+		// registry, which is private by default (a pushed GHCR package is), so an
+		// anonymous pull is a 401 and the deployment dies at 'deploying' with a
+		// Docker-level "denied" (SIGMA-243). The push that produced it
+		// authenticated against exactly this host.
 		pullID := "pull:" + rs.ResourceID
-		pull, _ := json.Marshal(map[string]string{"image": imageTag})
+		pull, _ := json.Marshal(imagePullOpSpec{Image: imageTag, RegistryHost: registry.host})
 		ops = append(ops,
 			dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull},
 			dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: append(rolloutDeps, pullID), Spec: rolloutBytes},

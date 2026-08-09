@@ -295,9 +295,23 @@ func (d *DockerClient) VolumeRemove(ctx context.Context, name string, force bool
 
 // --- Images ---
 
-// ImagePull pulls an image reference. It drains the progress stream and fails
-// if the stream reports an error. Public images need no auth.
+// ImagePull pulls a PUBLIC image reference anonymously. It drains the progress
+// stream and fails if the stream reports an error.
 func (d *DockerClient) ImagePull(ctx context.Context, image string) error {
+	return d.ImagePullAuth(ctx, image, build.RegistryAuth{})
+}
+
+// ImagePullAuth pulls an image, presenting a registry credential when one is
+// given. A zero auth pulls anonymously.
+//
+// The pull half of the build-and-ship pipeline used to hard-code an empty
+// X-Registry-Auth, so it was always anonymous (SIGMA-243). The push half has
+// authenticated since it was written — and the two halves talk to the SAME
+// registry. An org whose registry is private (ghcr.io packages are private by
+// default) therefore had its build server push an image successfully and its
+// deploy target answered 401 on the pull, killing the deployment at 'deploying'
+// with a bare Docker "denied" that named nothing an operator could act on.
+func (d *DockerClient) ImagePullAuth(ctx context.Context, image string, auth build.RegistryAuth) error {
 	fromImage, tag := splitImageRef(image)
 	q := url.Values{}
 	q.Set("fromImage", fromImage)
@@ -308,7 +322,17 @@ func (d *DockerClient) ImagePull(ctx context.Context, image string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Registry-Auth", "")
+	// Docker wants the header present either way; an empty value means "no
+	// credentials", which is right for a public image and fatal for a private one.
+	header := ""
+	if auth.Username != "" || auth.Password != "" {
+		blob, merr := json.Marshal(auth)
+		if merr != nil {
+			return merr
+		}
+		header = base64.URLEncoding.EncodeToString(blob)
+	}
+	req.Header.Set("X-Registry-Auth", header)
 	resp, err := d.http.Do(req)
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/build"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
 
@@ -31,6 +32,11 @@ type Driver struct {
 	// leaves the behaviour as it was: the container is removed and its account
 	// of why it never started goes with it.
 	startup startupSink
+	// registry resolves the org's registry credential for a pull of an image
+	// this fleet built and pushed (SIGMA-243). Nil on a host that only ever
+	// pulls public images — and, before this existed, on every host, which is
+	// why the dedicated build server could not be used with a private registry.
+	registry RegistryFetcher
 	// serverID stamps every object this agent creates with its owner, so GC can
 	// leave a peer's containers alone. Empty until registration completes.
 	serverID string
@@ -64,6 +70,18 @@ func NewDriver(docker *DockerClient, store *Store, log *slog.Logger, fetcher Sec
 func (d *Driver) SetStartupLogSink(sink func(ctx context.Context, deploymentID string, lines []string)) {
 	d.startup = sink
 }
+
+// RegistryFetcher resolves the org's registry credential from the control
+// plane. It is the same shape the build path's push already uses — the two
+// halves of one pipeline authenticate against the same registry with the same
+// credential, and only the push half ever did (SIGMA-243).
+type RegistryFetcher func(ctx context.Context) (build.RegistryAuth, error)
+
+// SetRegistryFetcher installs the credential source for pulls of images this
+// fleet built. Separate from NewDriver for the same reason as the startup sink:
+// the control-plane client is built after the driver, and a host with no fetcher
+// still deploys — it just cannot pull from a private registry.
+func (d *Driver) SetRegistryFetcher(f RegistryFetcher) { d.registry = f }
 
 // Register wires every container op kind into the apply registry. This is the
 // single place these capabilities come into existence — an op kind not
@@ -145,7 +163,26 @@ func (d *Driver) opImagePull(ctx context.Context, op dsd.Op) error {
 	if err := d.allowlist.Check(spec.Image); err != nil {
 		return err
 	}
-	return d.docker.ImagePull(ctx, spec.Image)
+	// An image that lives in the org's own registry needs the org's credential:
+	// this is an image OUR build server pushed, and a private registry — the
+	// default for GHCR packages — refuses an anonymous pull (SIGMA-243). Fail
+	// here, naming the registry, rather than pulling anonymously and letting the
+	// deploy die on an opaque "denied" from the daemon.
+	var auth build.RegistryAuth
+	if spec.RegistryHost != "" {
+		if d.registry == nil {
+			return fmt.Errorf("pull from %s needs a registry credential and this agent has no way to fetch one", spec.RegistryHost)
+		}
+		got, err := d.registry(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve registry credential for %s: %w", spec.RegistryHost, err)
+		}
+		auth = got
+		if auth.Host == "" {
+			auth.Host = spec.RegistryHost
+		}
+	}
+	return d.docker.ImagePullAuth(ctx, spec.Image, auth)
 }
 
 // opContainerApply converges one container to its desired spec. It is

@@ -173,6 +173,17 @@ func run() error {
 			log.Warn("startup log post failed", "err", err, "deployment", deploymentID)
 		}
 	})
+	// Pulling an image ANOTHER host in this fleet built means pulling from the
+	// org's registry, which is private by default — the same credential the push
+	// half of the pipeline already uses (SIGMA-243). A public image carries no
+	// registry host in its op spec and never reaches this.
+	driver.SetRegistryFetcher(func(ctx context.Context) (build.RegistryAuth, error) {
+		res, err := c.FetchRegistryCredential(ctx, st.AgentToken)
+		if err != nil {
+			return build.RegistryAuth{}, err
+		}
+		return build.RegistryAuth{Host: res.Host, Username: res.Username, Password: res.Password}, nil
+	})
 	driver.Register(registry)
 	// Kubernetes (k3s): membership + workload ops behind the same typed
 	// registry. A host that never joins a cluster simply never sees these ops.

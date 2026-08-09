@@ -19,8 +19,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -303,5 +305,134 @@ func TestDockerE2EAnonymousPushIsRejected(t *testing.T) {
 	}
 	if manifests, _, _, _ := reg.counts(); manifests != 0 {
 		t.Fatal("a rejected push must not have delivered a manifest")
+	}
+}
+
+// --- image.pull authentication (SIGMA-243) ---
+//
+// The push half of this pipeline authenticates; the pull half did not. Every
+// container-path pull went out with `X-Registry-Auth: ""`, so a deploy target
+// pulling an image the build server had just pushed to a PRIVATE registry — the
+// default for GHCR packages — got a 401 and the deployment died at 'deploying'.
+//
+// This needs no real Docker: the defect is entirely in what the agent puts on
+// the wire to the daemon, so a fake daemon that refuses an unauthenticated
+// /images/create is a faithful and always-runnable stand-in for a registry that
+// 401s anonymously.
+type fakePullDaemon struct {
+	mu    sync.Mutex
+	auths []string // every X-Registry-Auth value received, in order
+}
+
+func (f *fakePullDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !strings.Contains(r.URL.Path, "/images/create") {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	auth := r.Header.Get("X-Registry-Auth")
+	f.mu.Lock()
+	f.auths = append(f.auths, auth)
+	f.mu.Unlock()
+
+	// Docker relays a registry denial inside the progress stream under a 200 —
+	// which is exactly why an unauthenticated pull is easy to miss.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if !credentialed(auth) {
+		_, _ = io.WriteString(w, `{"error":"denied: requested access to the resource is denied"}`+"\n")
+		return
+	}
+	_, _ = io.WriteString(w, `{"status":"Download complete"}`+"\n")
+}
+
+func (f *fakePullDaemon) seen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.auths...)
+}
+
+// credentialed decodes the header the way the daemon does and reports whether it
+// actually carries a username/password. Both base64 alphabets are accepted:
+// Docker takes either, and the push path uses the URL-safe one.
+func credentialed(header string) bool {
+	if header == "" {
+		return false
+	}
+	raw, err := base64.URLEncoding.DecodeString(header)
+	if err != nil {
+		raw, err = base64.StdEncoding.DecodeString(header)
+		if err != nil {
+			return false
+		}
+	}
+	var got build.RegistryAuth
+	if err := json.Unmarshal(raw, &got); err != nil {
+		return false
+	}
+	return got.Username != "" || got.Password != ""
+}
+
+func pullDriver(t *testing.T) (*Driver, *fakePullDaemon) {
+	t.Helper()
+	daemon := &fakePullDaemon{}
+	srv := httptest.NewServer(daemon)
+	t.Cleanup(srv.Close)
+	docker := NewDockerClient("", "tcp://"+strings.TrimPrefix(srv.URL, "http://"))
+	return NewDriver(docker, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil), daemon
+}
+
+// A cross-host pull of an image WE pushed has to present the same credential the
+// push used. Without it the dedicated build server is unusable with any private
+// registry, which is the default configuration.
+func TestImagePullAuthenticatesAgainstThePrivateRegistry(t *testing.T) {
+	d, daemon := pullDriver(t)
+	d.SetRegistryFetcher(func(context.Context) (build.RegistryAuth, error) {
+		return build.RegistryAuth{Host: "ghcr.io", Username: "bot", Password: "s3cret"}, nil
+	})
+	op := opFor(t, KindImagePull, "pull:res_x", nil, ImageSpec{
+		Image: "ghcr.io/acme/sigmahub/res_x:abc1234-pin1", RegistryHost: "ghcr.io",
+	})
+	if err := d.opImagePull(context.Background(), op); err != nil {
+		t.Fatalf("authenticated pull failed: %v", err)
+	}
+	seen := daemon.seen()
+	if len(seen) != 1 || !credentialed(seen[0]) {
+		t.Fatalf("the pull went out unauthenticated; X-Registry-Auth headers seen: %q", seen)
+	}
+}
+
+// A public image carries no registry host, so nothing is fetched and the pull
+// stays anonymous — a host that never pulls a private image must not be made to
+// ask the control plane for a credential it has no use for.
+func TestImagePullStaysAnonymousWithoutARegistryHost(t *testing.T) {
+	d, daemon := pullDriver(t)
+	called := 0
+	d.SetRegistryFetcher(func(context.Context) (build.RegistryAuth, error) {
+		called++
+		return build.RegistryAuth{Username: "bot", Password: "s3cret"}, nil
+	})
+	// The fake daemon denies anonymous pulls, so this must fail — the point is
+	// that it failed WITHOUT consulting the credential fetcher.
+	err := d.opImagePull(context.Background(), opFor(t, KindImagePull, "pull:res_pub", nil,
+		ImageSpec{Image: "nginx:1.27"}))
+	if err == nil {
+		t.Fatal("a registry that denies anonymous pulls must fail the op")
+	}
+	if called != 0 {
+		t.Fatalf("a public pull fetched a registry credential %d times", called)
+	}
+	if seen := daemon.seen(); len(seen) != 1 || credentialed(seen[0]) {
+		t.Fatalf("a public pull presented credentials: %q", seen)
+	}
+}
+
+// A missing credential must fail the op where the cause is legible, rather than
+// going out anonymous and surfacing as an opaque registry denial.
+func TestImagePullWithoutAFetcherFailsLoudly(t *testing.T) {
+	d, _ := pullDriver(t)
+	err := d.opImagePull(context.Background(), opFor(t, KindImagePull, "pull:res_x", nil,
+		ImageSpec{Image: "ghcr.io/acme/sigmahub/res_x:abc-pin1", RegistryHost: "ghcr.io"}))
+	if err == nil || !strings.Contains(err.Error(), "ghcr.io") {
+		t.Fatalf("err = %v, want a failure naming the registry it could not authenticate against", err)
 	}
 }

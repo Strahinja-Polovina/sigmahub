@@ -106,6 +106,12 @@ type VolumeSpec struct {
 // ImageSpec is the payload of an image.pull op.
 type ImageSpec struct {
 	Image string `json:"image"`
+	// RegistryHost names the registry this pull must authenticate against, and
+	// is set only when the image lives in the ORG's registry — an image this
+	// fleet built and pushed, which another host now has to pull (SIGMA-243).
+	// Empty means a public image: the pull stays anonymous and the agent never
+	// asks the control plane for a credential it has no use for.
+	RegistryHost string `json:"registryHost,omitempty"`
 }
 
 // PortMapping publishes a container port on the host. Host 0 means "do not
