@@ -65,6 +65,43 @@ function hash(input: string): number {
   return h;
 }
 
+/**
+ * The database name the control plane would create, reproduced rather than
+ * approximated.
+ *
+ * The demo used to do `name.replace(/-/g, "_")`, which agrees with
+ * store.dbSafeName on almost every name and disagrees on the one case that
+ * matters: a resource whose name starts with a digit. Postgres will not take an
+ * unquoted identifier beginning with a number, so the control plane prefixes
+ * `db_` — and the wizard's own name rule permits a leading digit. A demo user
+ * naming a database `2fa-store` was shown `2fa_store` on the panel and would
+ * have been given `db_2fa_store`, on the one field of that screen people paste
+ * straight into a client.
+ *
+ * Kept in step with cp/internal/store/databases.go dbSafeName, including the
+ * 48-character truncation and the "app" fallback for a name with nothing usable
+ * in it. Both are unreachable through the wizard today — RESOURCE_NAME_RE caps
+ * at 40 and requires an alphanumeric — and both are written out anyway, because
+ * the reason this function exists is that "almost the same rule" is what broke.
+ */
+function dbSafeName(name: string): string {
+  let out = "";
+  let lastUnderscore = false;
+  for (const ch of name.toLowerCase()) {
+    if (/[a-z0-9]/.test(ch)) {
+      out += ch;
+      lastUnderscore = false;
+    } else if (!lastUnderscore && out.length > 0) {
+      out += "_";
+      lastUnderscore = true;
+    }
+  }
+  out = out.replace(/^_+|_+$/g, "");
+  if (out === "") return "app";
+  if (out[0] >= "0" && out[0] <= "9") out = `db_${out}`;
+  return out.length > 48 ? out.slice(0, 48) : out;
+}
+
 /** A stable token derived from a string. */
 function token(input: string, length: number): string {
   let out = "";
@@ -144,7 +181,7 @@ export function demoDatabaseInfo(input: {
     image: spec.image,
     host: (input.meshIp ?? "").trim() || `${input.resourceName}.sigma.internal`,
     port: meshPort(input.resourceId),
-    database: input.resourceName.replace(/-/g, "_"),
+    database: dbSafeName(input.resourceName),
     username: `sigma_${token(`${input.resourceId}:user`, 6)}`,
     // Always. It is the product's rule, not a per-resource setting, and the
     // panel renders a lock badge off it.

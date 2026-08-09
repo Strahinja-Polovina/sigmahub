@@ -9,9 +9,12 @@
  */
 
 import {
+  DEFAULT_S3_ENGINE,
   RESOURCE_KIND_LABELS,
+  S3_ENGINE_NAMES,
   categoryForKind,
   type ResourceKind,
+  type S3Engine,
 } from "@/lib/server-catalog.generated";
 
 /**
@@ -33,28 +36,42 @@ export function isManagedKind(kind: ResourceKind | null | undefined): boolean {
 }
 
 /**
- * Object-storage engines the control plane can provision.
+ * How each object-storage engine is described in the picker.
  *
- * An unknown engine is refused at create (store.CreateResource), so this list is
- * the contract rather than free text — the same reason the LLM runtimes below
- * are enumerated instead of typed. The VERSIONS are deliberately absent: the CP
- * pins one image per engine, so offering a version picker would be offering a
- * choice it ignores.
+ * Only the COPY lives here. Which engines exist, and which one is the default,
+ * come from the generated catalog — the control plane refuses an engine it does
+ * not know, so a list assembled here could only ever agree with it by
+ * coincidence, and it did not: a third engine added to the Go catalog was
+ * provisioned by the control plane, described by the demo, and never offered by
+ * this picker, while renaming one left the wizard sending a value the create
+ * call rejects with a 422 after the dialog has closed — the exact failure the
+ * comment on this list used to claim enumeration prevents.
+ *
+ * Typed as a total Record so that adding an engine to the Go catalog does not
+ * silently drop it from the picker: it stops compiling until someone writes the
+ * sentence a customer reads before choosing it.
+ *
+ * The VERSIONS are deliberately absent: the CP pins one image per engine, so
+ * offering a version picker would be offering a choice it ignores.
  */
-export const S3_ENGINES = [
-  {
-    id: "minio",
+const S3_ENGINE_COPY: Record<S3Engine, { label: string; detail: string }> = {
+  minio: {
     label: "MinIO",
     detail: "The default. Widely deployed, strict S3 API compatibility.",
   },
-  {
-    id: "seaweedfs",
+  seaweedfs: {
     label: "SeaweedFS",
     detail: "Lighter on memory for very large object counts.",
   },
-] as const;
+};
 
-export const DEFAULT_S3_ENGINE = S3_ENGINES[0].id;
+/** The picker's options, in the catalog's own order. */
+export const S3_ENGINES = S3_ENGINE_NAMES.map((id) => ({ id, ...S3_ENGINE_COPY[id] }));
+
+// Re-exported rather than derived from S3_ENGINES[0]: the default is the
+// control plane's choice, and "whichever the catalog happens to list first" is
+// a different statement that was true only by luck.
+export { DEFAULT_S3_ENGINE };
 
 /** Inference runtimes the control plane knows how to render. */
 export const LLM_ENGINES = [

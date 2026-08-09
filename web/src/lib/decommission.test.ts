@@ -12,6 +12,7 @@ import {
   isDecommissioning,
   msUntilNextTeardownStep,
   removalPlan,
+  mayAckDemoTeardown,
 } from "./decommission";
 import { MANUAL_UNINSTALL_SCRIPT } from "./uninstall-script";
 import { SERVER_STATUS, nextServerStatus, statusAfterTypeChange } from "./server-compat";
@@ -321,5 +322,56 @@ describe("the demo teardown", () => {
   it("asks to be looked at again exactly when the next step lands", () => {
     expect(msUntilNextTeardownStep(at(1_000))).toBe(DEMO_TEARDOWN_STEP_MS - 1_000);
     expect(msUntilNextTeardownStep(at(demoTeardownSpanMs(false)))).toBeNull();
+  });
+});
+
+// The ack DELETES a server, so this predicate is the thing standing between a
+// page load and a machine leaving the fleet. It was a pair of booleans inside a
+// render body until adversarial review mutated it five ways — dropping either
+// half of the condition, or the guard reading it — and all 543 tests stayed
+// green while a fresh demo went back to tombstoning a host nobody had touched.
+// Every case below fails if one of those mutations comes back.
+describe("who may write a demo teardown's ack", () => {
+  const START = 1_700_000_000_000;
+  const watching = {
+    status: SERVER_STATUS.decommissioning,
+    startedAt: new Date(START),
+    watchedFromStart: true,
+  };
+
+  it("lets a page that watched the teardown start finish it", () => {
+    expect(mayAckDemoTeardown({ ...watching, now: START + demoTeardownSpanMs(false) })).toBe(true);
+  });
+
+  it("refuses a page that arrived after the fact, however finished the clock says it is", () => {
+    // The seeded fixture, and any tab opened a moment late. Writing the ack
+    // here claims an agent reported in to a page that never saw one.
+    expect(
+      mayAckDemoTeardown({ ...watching, watchedFromStart: false, now: START + 60_000 })
+    ).toBe(false);
+  });
+
+  it("refuses once the control plane's window has closed, even to the page that watched", () => {
+    // What is true about that row is that nothing answered. Force disconnect
+    // and the cleanup script are the next honest move, not a tombstone written
+    // on the agent's behalf — and this is what makes "the agent never answers"
+    // reach the state it advertises instead of deleting the server whose force
+    // path it exists to demonstrate.
+    expect(mayAckDemoTeardown({ ...watching, now: START + DECOMMISSION_TIMEOUT_MS })).toBe(false);
+  });
+
+  it("refuses a server that is not being decommissioned at all", () => {
+    expect(mayAckDemoTeardown({ ...watching, status: SERVER_STATUS.running })).toBe(false);
+  });
+
+  it("needs both conditions, not either one", () => {
+    // Pinned as a pair because each mutation that dropped one of them left the
+    // other looking sufficient.
+    expect(
+      mayAckDemoTeardown({ ...watching, watchedFromStart: false, now: START + 1_000 })
+    ).toBe(false);
+    expect(
+      mayAckDemoTeardown({ ...watching, now: START + DECOMMISSION_TIMEOUT_MS + 1 })
+    ).toBe(false);
   });
 });

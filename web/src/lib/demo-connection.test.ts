@@ -200,3 +200,30 @@ describe("a demo object store's connection details", () => {
     expect(info.endpoint).toBe(`http://assets.sigma.internal:${info.port}`);
   });
 });
+
+// The one field on this panel people paste straight into a client, and the one
+// case where "almost the control plane's rule" was not it. RESOURCE_NAME_RE
+// permits a leading digit; Postgres does not permit an unquoted identifier that
+// starts with one, so store.dbSafeName prefixes db_ and the demo did not.
+describe("the database name the demo reports", () => {
+  const info = (name: string) =>
+    demoDatabaseInfo({
+      resourceId: "res_x",
+      resourceName: name,
+      kind: "postgres",
+      meshIp: "10.8.0.1",
+    })!.database;
+
+  it("prefixes a name that starts with a digit, as the control plane does", () => {
+    expect(info("2fa-store")).toBe("db_2fa_store");
+  });
+
+  it("collapses separators to single underscores and trims them", () => {
+    expect(info("shop-api")).toBe("shop_api");
+    expect(info("shop--api")).toBe("shop_api");
+  });
+
+  it("leaves an ordinary name alone", () => {
+    expect(info("orders")).toBe("orders");
+  });
+});

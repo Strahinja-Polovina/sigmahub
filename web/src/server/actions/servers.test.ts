@@ -1,0 +1,183 @@
+// The demo teardown's endings, and the one thing that must not be one of them.
+//
+// simulateDecommission is where a demo server actually stops existing: two of
+// its four events delete the row. Nothing covered it, and a reviewer proved the
+// cost by mutating the guard — the suite stayed green while a fresh demo went
+// back to deleting a host on first paint, and while the button whose whole job
+// is to reach the force path deleted the server instead of ageing it.
+//
+// The page-side half of that decision lives in mayAckDemoTeardown and is tested
+// in lib/decommission.test.ts. This file is the second line: whatever a caller
+// asks for, the action itself refuses to report on a teardown nobody started.
+//
+// Runs against a real migrated PGlite database (see @/server/testing/demo-db),
+// because what broke was never a helper — it was the wiring.
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+
+import { DECOMMISSION_TIMEOUT_MS } from "@/lib/decommission";
+import { SERVER_STATUS } from "@/lib/server-compat";
+import * as s from "@/server/db/schema";
+import { FIXTURE, seedDemoFixture, type DemoDb } from "@/server/testing/demo-db";
+
+vi.mock("@/server/db", async () => {
+  const { createDemoDb } = await import("@/server/testing/demo-db");
+  return { db: await createDemoDb() };
+});
+vi.mock("next/cache", () => ({ revalidatePath: () => {} }));
+vi.mock("@/server/audit", () => ({ writeAudit: async () => {} }));
+vi.mock("@/server/active-org", () => {
+  const actor = { user: { id: "usr_you", name: "you" }, role: "Org Admin" };
+  return {
+    requireMembership: async () => actor,
+    requireProjectAdmin: async () => actor,
+    getActiveOrgId: async () => FIXTURE.orgId,
+  };
+});
+// cpEnabled() false is the branch under test. Every other export throws: in
+// demo mode none of them may be reached, and a test that let one through
+// silently would be covering the control plane's path by accident.
+vi.mock("@/server/cp", () => {
+  const forbidden = async () => {
+    throw new Error("the CP client must not be called in demo mode");
+  };
+  return {
+    cpEnabled: () => false,
+    cpIssueBootstrapToken: forbidden,
+    cpProvisionServer: forbidden,
+    cpSetHardening: forbidden,
+    cpSetProxyRole: forbidden,
+    cpPublicUrl: () => "",
+    cpDecommissionServer: forbidden,
+    cpDeleteServer: forbidden,
+    cpGetServer: forbidden,
+    boundResourcesOf: () => [],
+    cpReissueBootstrapToken: forbidden,
+    cpRenameServer: forbidden,
+    cpSetServerType: forbidden,
+    cpUpdateServerAgent: forbidden,
+  };
+});
+
+import { simulateDecommission } from "./servers";
+import { db } from "@/server/db";
+
+const database = db as unknown as DemoDb;
+
+/** Put a fixture host into the state a Disconnect leaves behind. */
+async function beginTeardown(serverId: string, msAgo: number): Promise<void> {
+  await database
+    .update(s.servers)
+    .set({
+      status: SERVER_STATUS.decommissioning,
+      decommissionStartedAt: new Date(Date.now() - msAgo),
+      decommissionPurgeVolumes: false,
+    })
+    .where(eq(s.servers.id, serverId));
+}
+
+async function serverRow(serverId: string) {
+  const [row] = await database.select().from(s.servers).where(eq(s.servers.id, serverId));
+  return row;
+}
+
+beforeEach(async () => {
+  await database.delete(s.clusterNodes);
+  await database.delete(s.clusters);
+  await database.delete(s.resources);
+  await database.delete(s.envServers);
+  await database.delete(s.environments);
+  await database.delete(s.projects);
+  await database.delete(s.servers);
+  await database.delete(s.orgs);
+  await seedDemoFixture(database);
+});
+
+describe("reporting on a demo teardown", () => {
+  it("removes the server when the agent acks a teardown that was actually requested", () => {
+    return (async () => {
+      await beginTeardown(FIXTURE.dbHostId, 1_000);
+      await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "ack" });
+      expect(await serverRow(FIXTURE.dbHostId)).toBeUndefined();
+    })();
+  });
+
+  // The defect, stated as a test. A page that arrives after a teardown's clock
+  // has run out used to fire this at a row it had merely loaded, and the fleet
+  // shrank by one for a visitor who touched nothing.
+  it("refuses to report on a server nobody is decommissioning, and says how to start one", async () => {
+    await expect(
+      simulateDecommission({ serverId: FIXTURE.dbHostId, event: "ack" })
+    ).rejects.toThrow(/not being decommissioned/i);
+    expect(await serverRow(FIXTURE.dbHostId)).toBeDefined();
+  });
+
+  it("refuses a failure report on a running server too, not just an ack", async () => {
+    // "failed" deletes the row as well — it is the same hazard wearing the
+    // other label, and a guard that only covered the happy ending would have
+    // left half the door open.
+    await expect(
+      simulateDecommission({ serverId: FIXTURE.storageHostId, event: "failed" })
+    ).rejects.toThrow(/not being decommissioned/i);
+    expect(await serverRow(FIXTURE.storageHostId)).toBeDefined();
+  });
+
+  it("ages a teardown past the control plane's window instead of ending it", async () => {
+    // The route SIGMA-205 exists for: timeout -> Force disconnect -> the manual
+    // cleanup script. This button used to delete the very server whose force
+    // path it demonstrates, so what is pinned here is that the row SURVIVES and
+    // stays decommissioning, with a clock old enough for the dialog to offer
+    // Force.
+    await beginTeardown(FIXTURE.dbHostId, 1_000);
+    await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "timeout" });
+
+    const row = await serverRow(FIXTURE.dbHostId);
+    expect(row, "the timeout simulation must not tombstone the server").toBeDefined();
+    expect(row.status).toBe(SERVER_STATUS.decommissioning);
+    const age = Date.now() - new Date(row.decommissionStartedAt!).getTime();
+    expect(age).toBeGreaterThanOrEqual(DECOMMISSION_TIMEOUT_MS);
+  });
+
+  // The half the status check cannot see. A page arriving late finds a row that
+  // IS decommissioning, so status alone waves it through — and adversarial
+  // review drove exactly that shape and watched the server get deleted.
+  it("refuses to confirm a teardown nothing answered inside the window, and points at Force disconnect", async () => {
+    await beginTeardown(FIXTURE.dbHostId, DECOMMISSION_TIMEOUT_MS + 60_000);
+    await expect(
+      simulateDecommission({ serverId: FIXTURE.dbHostId, event: "ack" })
+    ).rejects.toThrow(/Force disconnect/i);
+    expect(await serverRow(FIXTURE.dbHostId)).toBeDefined();
+  });
+
+  it("still lets the timeout simulation run on a row that is already past the window", async () => {
+    // Ageing a row past the window is that button's whole job, so the guard
+    // above must not catch it — a guard that made its own demonstration
+    // unreachable would be the previous bug wearing a badge.
+    await beginTeardown(FIXTURE.dbHostId, DECOMMISSION_TIMEOUT_MS + 60_000);
+    await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "timeout" });
+    expect(await serverRow(FIXTURE.dbHostId)).toBeDefined();
+  });
+
+  it("lets the silence simulation touch a server that is not being decommissioned", async () => {
+    // "silence" is not a report ABOUT a teardown — it is the agent going quiet,
+    // which happens to any host at any time. Sharing the guard with the other
+    // three would have made an ordinary state unreachable.
+    await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "silence" });
+    const row = await serverRow(FIXTURE.dbHostId);
+    expect(row).toBeDefined();
+    expect(row.status).toBe(SERVER_STATUS.unreachable);
+  });
+
+  it("does nothing at all when a control plane is in charge", async () => {
+    // Every CP export in this file throws, so reaching one would fail loudly.
+    // What is pinned is the early return: in CP mode a real sigmad answers, or
+    // does not, and this action has no business writing anything.
+    const mod = await import("@/server/cp");
+    vi.spyOn(mod, "cpEnabled").mockReturnValue(true);
+    await beginTeardown(FIXTURE.dbHostId, 1_000);
+    await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "ack" });
+    expect(await serverRow(FIXTURE.dbHostId)).toBeDefined();
+    vi.restoreAllMocks();
+  });
+});

@@ -253,6 +253,50 @@ export function msUntilNextTeardownStep(input: {
   return DEMO_TEARDOWN_STEP_MS - (elapsed % DEMO_TEARDOWN_STEP_MS);
 }
 
+/**
+ * Whether the demo page is entitled to write the ack that ends a teardown —
+ * and, since the ack DELETES the server row, whether it is entitled to remove a
+ * machine from the fleet.
+ *
+ * This lives here rather than inline in the component because of what it costs
+ * to get wrong, and because a decision inside a render body is a decision
+ * nothing can assert. Adversarial review mutated the inline version five ways —
+ * dropping either half of the condition, or the guard around it — and all 543
+ * tests stayed green while a fresh demo went back to deleting a server nobody
+ * had touched. Both halves were individually correct; nothing observed them.
+ *
+ * The two conditions answer two different questions and neither implies the
+ * other:
+ *
+ *   watchedFromStart — did this page see the teardown while it was still
+ *     running? An ack is a claim that the agent reported in. A component that
+ *     arrives after the fact and acks is asserting something it never observed:
+ *     the seeded fixture is minutes old, the step clock is seconds long, so
+ *     without this every visitor's first paint would tombstone a host and drop
+ *     the fleet from fourteen to thirteen under an unrequested success toast.
+ *
+ *   timedOut — has the control plane's window closed? Past it, whatever the
+ *     step clock says, the true thing about that row is that nothing answered.
+ *     Force disconnect and the cleanup script are the next honest move, not a
+ *     tombstone written on the agent's behalf. This is what makes "Simulate: the
+ *     agent never answers" reach the state it advertises instead of deleting the
+ *     server whose force path it exists to demonstrate.
+ */
+export function mayAckDemoTeardown(input: {
+  status: string;
+  startedAt: Date | string | null | undefined;
+  watchedFromStart: boolean;
+  now?: number;
+}): boolean {
+  if (!input.watchedFromStart) return false;
+  if (input.status !== SERVER_STATUS.decommissioning) return false;
+  return forceReason({
+    status: input.status,
+    decommissioningSince: input.startedAt,
+    now: input.now,
+  }) === null;
+}
+
 /** How the 409 from either disconnect endpoint is turned into something the
  *  dialog can render. The control plane answers with the blocking resource
  *  NAMES as data; printing its error string instead was the previous behaviour

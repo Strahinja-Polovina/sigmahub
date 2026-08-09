@@ -34,7 +34,7 @@ import {
 } from "@/server/actions/servers";
 import {
   demoTeardownPhase,
-  forceReason,
+  mayAckDemoTeardown,
   isDecommissioning,
   msUntilNextTeardownStep,
 } from "@/lib/decommission";
@@ -204,12 +204,10 @@ function TeardownProgress({
   const [watched, setWatched] = React.useState(() => ({ key, fromStart: !phase.done }));
   if (watched.key !== key) setWatched({ key, fromStart: !phase.done });
   const fromStart = watched.key === key ? watched.fromStart : !phase.done;
-  // And past the control plane's window, the graceful path has had its chance:
-  // whatever the step clock says, what is true about that row is that nothing
-  // answered. Force disconnect and the cleanup script are the next honest move,
-  // not a tombstone written on the agent's behalf.
-  const timedOut = forceReason({ status, decommissioningSince: startedAt }) !== null;
-  const watching = fromStart && !timedOut;
+  // Whether this page may write the ack — which deletes the row — lives in
+  // decommission.ts so it can be asserted. Both of its conditions were mutated
+  // away without a single test noticing.
+  const watching = mayAckDemoTeardown({ status, startedAt, watchedFromStart: fromStart });
   const ackedRef = React.useRef(false);
 
   React.useEffect(() => {

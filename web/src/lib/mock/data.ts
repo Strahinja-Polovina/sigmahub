@@ -84,18 +84,31 @@ const DEBIAN_12 = {
 // reached the way the product reaches it: press Disconnect and watch the
 // teardown you asked for.
 //
-// Inside DECOMMISSION_TIMEOUT_MS, because what this fixture is for is the state
-// a freshly-clicked Disconnect leaves behind — the control plane still waiting,
-// Force disconnect deliberately withheld — so that "Simulate: the agent never
-// answers" has somewhere to move the row TO.
+// PAST DECOMMISSION_TIMEOUT_MS too, and that is the second half of the same
+// argument rather than a separate choice.
 //
-// The midpoint is not a compromise between the two: it is the value furthest
-// from both mistakes, and it stays on the correct side of each for as long as a
-// teardown is quicker than the patience it is given, however either constant is
-// edited.
-const SEEDED_TEARDOWN_AGE_MS = Math.round(
-  (demoTeardownSpanMs(true) + DECOMMISSION_TIMEOUT_MS) / 2
-);
+// The obvious value sits between the two clocks — inside the control plane's
+// window, so the fixture shows a Disconnect still waiting with Force
+// deliberately withheld. It does not survive contact with how a demo is
+// deployed. The PGlite directory is written once by `npm run db:seed`, at build
+// time, and is not re-seeded per visit; the window is ten minutes. So every
+// visitor after the first ten minutes of the deployment's life opens on the
+// force path anyway, and the fixture's stated purpose is a state almost nobody
+// can reach — while the comment claiming otherwise goes on being read as true.
+//
+// A seeded row cannot demonstrate a state defined by elapsed time. What it CAN
+// demonstrate deterministically is the state at the far end: asked for, never
+// answered, past the point where waiting is the right move. That is the state
+// with somewhere to go — Force disconnect and the manual cleanup script, which
+// is the whole payoff of SIGMA-205 and the one thing no timer produces. The
+// two states in the middle are reached the way the product reaches them: press
+// Disconnect on any running server for the ticking counter, and read the
+// dialog's withheld Force before the window closes.
+//
+// Being deterministic is the point. A fixture whose demonstrated state depends
+// on how long ago someone ran the build is a demo that looks different every
+// morning, and the seed is otherwise deliberately reproducible.
+const SEEDED_TEARDOWN_AGE_MS = DECOMMISSION_TIMEOUT_MS + demoTeardownSpanMs(true);
 
 // Disk and VRAM figures are ENUMERATED sizes — what the kernel and nvidia-smi
 // actually report — never the number on the invoice. A "2 TB" NVMe is

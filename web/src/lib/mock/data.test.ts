@@ -126,20 +126,25 @@ describe("a decommission in flight", () => {
     expect(resources.filter((r) => r.serverId === teardowns[0].id)).toEqual([]);
   });
 
-  it("opens on a teardown the control plane is still waiting on, and ages into the force path rather than starting there", () => {
+  // The state a seeded row can actually hold, asserted as the state it claims.
+  //
+  // The value in between the two clocks reads better and is not reachable: the
+  // PGlite directory is seeded once at build time and the control plane's
+  // window is ten minutes, so every visitor after the first ten minutes of a
+  // deployment's life opens past it regardless. Pinning the reachable state is
+  // what keeps the fixture's comment true a week after it was written.
+  it("opens on a teardown nothing ever answered, which is the state with somewhere to go", () => {
     const input = {
       status: SERVER_STATUS.decommissioning,
       decommissioningSince: seeded().startedAt,
     };
-    // Freshly seeded: the graceful path has time left, so Force disconnect is
-    // deliberately not offered — it is one click, it "works", and every press
-    // leaves an agent and a tunnel behind on a machine we stop showing.
-    expect(forceReason(input)).toBeNull();
-    // Past the control plane's window — reached in the demo by pressing
-    // "…never answers", and reached on its own by a database left for a week.
-    expect(forceReason({ ...input, now: Date.now() + DECOMMISSION_TIMEOUT_MS })?.kind).toBe(
-      "timedOut"
-    );
+    // Force disconnect and the manual cleanup script — the payoff no timer
+    // produces, and the reason this row is in the fixture at all.
+    expect(forceReason(input)?.kind).toBe("timedOut");
+    // And it is past the window by construction rather than by luck: the age is
+    // derived from DECOMMISSION_TIMEOUT_MS, so editing that constant moves the
+    // fixture with it instead of stranding it on the wrong side.
+    expect(forceReason({ ...input, now: Date.now() - DECOMMISSION_TIMEOUT_MS })).toBeNull();
   });
 
   // The clock the old test never asked, and the answer it has to give. A seeded
@@ -155,14 +160,19 @@ describe("a decommission in flight", () => {
     expect(demoTeardownPhase(seeded()).done).toBe(true);
   });
 
-  it("sits between the two clocks by construction, not by a number that fits today", () => {
+  it("clears both clocks by construction, not by a number that fits today", () => {
     const { startedMsAgo } = teardowns[0].decommission!;
     // The longest sequence, so the bound holds whichever volume choice a
     // fixture makes.
     expect(startedMsAgo, "a visitor could arrive mid-teardown and ack a server nobody touched")
       .toBeGreaterThan(demoTeardownSpanMs(true));
-    expect(startedMsAgo, "a fresh demo would open on Force disconnect, skipping the graceful path")
-      .toBeLessThan(DECOMMISSION_TIMEOUT_MS);
+    // And past the control plane's window as well. The value in between reads
+    // better and cannot be held: the demo database is seeded once at build time
+    // and the window is ten minutes, so a visitor an hour into a deployment's
+    // life sees the force path whatever the fixture intended. Pinning the
+    // reachable state is what stops the comment beside it from going stale.
+    expect(startedMsAgo, "the seeded state would depend on how long ago the build ran")
+      .toBeGreaterThan(DECOMMISSION_TIMEOUT_MS);
   });
 
   // The route SIGMA-205 exists for: timeout → Force disconnect → cleanup

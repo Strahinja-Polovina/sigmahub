@@ -142,7 +142,21 @@ export function SettingsView({
           />
         </TabsContent>
         <TabsContent value="tokens">
-          <TokensTab orgId={org.id} isAdmin={isAdmin} />
+          {/* Gated like Integrations, Alerts and Beta metrics below. It was the
+              one tab that was not, so opening it in demo mode fired a listing
+              at a control plane that is not there and greeted the visitor with
+              a red "Couldn't load tokens" — an error after the action, three
+              lines from three siblings that say what the feature is before
+              offering it. */}
+          {cpMode ? (
+            <TokensTab orgId={org.id} isAdmin={isAdmin} />
+          ) : (
+            <ControlPlaneNote title="Service tokens are minted by the control plane">
+              A service token lets CI and your own scripts call this organization&rsquo;s API —
+              trigger a deploy, read a status, rotate a secret. Issuing and revoking one is the
+              control plane&rsquo;s job, so there is nothing to mint until you connect it.
+            </ControlPlaneNote>
+          )}
         </TabsContent>
         <TabsContent value="integrations">
           {cpMode ? (

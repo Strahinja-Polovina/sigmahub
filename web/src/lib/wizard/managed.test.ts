@@ -10,6 +10,10 @@ import {
   managedSummary,
   resourceNameError,
 } from "./managed";
+import {
+  DEFAULT_S3_ENGINE as CATALOG_DEFAULT_S3_ENGINE,
+  S3_ENGINE_NAMES,
+} from "@/lib/server-catalog.generated";
 
 describe("which kinds skip the application flow", () => {
   it("classes every engine as managed and the app as not", () => {
@@ -29,14 +33,34 @@ describe("engine catalogs are enumerations, not free text", () => {
   // The control plane refuses an unknown engine at create, so an input box
   // here would be a field whose only outcomes are "a value from this list" and
   // "a 422 after the wizard closed".
-  it("defaults to the first entry of each", () => {
-    expect(DEFAULT_S3_ENGINE).toBe(S3_ENGINES[0].id);
-    expect(DEFAULT_LLM_ENGINE).toBe(LLM_ENGINES[0].id);
+  // Asserted against the GENERATED catalog, not against a literal typed here.
+  // The previous version of this test compared the list to a copy of itself and
+  // to `S3_ENGINES[0].id`, so it stayed green through every disagreement that
+  // mattered: a third engine added to the Go catalog was provisioned by the
+  // control plane and never offered by the wizard, and renaming one left the
+  // picker sending a value create rejects with a 422 after the dialog closed.
+  it("offers exactly the object-storage engines the control plane provisions", () => {
+    expect(S3_ENGINES.map((e) => e.id)).toEqual(S3_ENGINE_NAMES);
   });
 
-  it("names the engines the control plane provisions", () => {
-    expect(S3_ENGINES.map((e) => e.id)).toEqual(["minio", "seaweedfs"]);
+  it("defaults to the control plane's default, not to whichever is listed first", () => {
+    expect(DEFAULT_S3_ENGINE).toBe(CATALOG_DEFAULT_S3_ENGINE);
+  });
+
+  it("gives every offered engine a sentence to choose it by", () => {
+    for (const engine of S3_ENGINES) {
+      expect(engine.label, `${engine.id} has no label`).toBeTruthy();
+      expect(engine.detail, `${engine.id} has no detail`).toBeTruthy();
+    }
+  });
+
+  // The inference runtimes are still a hand-kept list. They are not generated
+  // because nothing about them reaches the web today except two names — but
+  // they are the same shape as the S3 list above was, and the same failure is
+  // available to them the moment the control plane gains a third runtime.
+  it("names the inference runtimes the control plane knows how to render", () => {
     expect(LLM_ENGINES.map((e) => e.id)).toEqual(["vllm", "ollama"]);
+    expect(DEFAULT_LLM_ENGINE).toBe(LLM_ENGINES[0].id);
   });
 });
 
