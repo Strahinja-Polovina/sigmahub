@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
 func TestFromEnv(t *testing.T) {
@@ -86,6 +88,86 @@ func TestRequireActorFromEnv(t *testing.T) {
 	}
 }
 
+// TestDBEnginesFromEnv covers the P1-10 CP_DB_ENGINES allowlist: unset enables
+// every engine the store catalog defines, a subset narrows it (the pre-agreed
+// Postgres-only fallback build), and a typo fails boot rather than silently
+// disabling an engine the operator believes is on.
+//
+// The default is compared against store.DBEngineKinds() rather than against a
+// spelled-out list, because a spelled-out list here is the third copy SIGMA-216
+// deleted from config.go coming back in the test that was meant to defend it.
+func TestDBEnginesFromEnv(t *testing.T) {
+	const db = "postgres://x"
+	for _, tc := range []struct {
+		name    string
+		val     string // "" ⇒ leave unset (fall through to the default)
+		wantErr bool
+		want    string // comma-joined expected engines
+	}{
+		{"unset enables every engine the catalog defines", "", false,
+			strings.Join(store.DBEngineKinds(), ",")},
+		{"postgres only is the fallback build", "postgres", false, "postgres"},
+		{"whitespace tolerated", " postgres , redis ", false, "postgres,redis"},
+		{"unknown engine rejected", "postgres,clickhouse", true, ""},
+		{"blank list rejected", ",", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CP_DATABASE_URL", db)
+			t.Setenv("CP_S3_ENGINES", "")
+			t.Setenv("CP_DB_ENGINES", tc.val)
+			cfg, err := FromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %+v", cfg.DBEngines)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := strings.Join(cfg.DBEngines, ","); got != tc.want {
+				t.Fatalf("DBEngines = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The rejection message has to be RENDERED from the catalog, not restated beside
+// it. config.go used to spell the four database engines out inside the error
+// text, next to a map that spelled them out again, next to a default value that
+// spelled them out a third time — so an engine added to the control plane
+// changed none of them, and the operator who mistyped one was handed the list of
+// engines this product supported on whatever day that sentence was last edited.
+// Nothing read the sentence, so nothing could notice it had gone stale.
+//
+// What is asserted is the property (the message names every engine the catalog
+// knows), never the wording.
+func TestTheUnknownEngineMessageNamesEveryEngineTheCatalogKnows(t *testing.T) {
+	for _, tc := range []struct {
+		key   string
+		known []string
+	}{
+		{"CP_DB_ENGINES", store.DBEngineKinds()},
+		{"CP_S3_ENGINES", store.S3EngineNames()},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Setenv("CP_DATABASE_URL", "postgres://x")
+			t.Setenv("CP_DB_ENGINES", "")
+			t.Setenv("CP_S3_ENGINES", "")
+			t.Setenv(tc.key, "clickhouse")
+			cfg, err := FromEnv()
+			if err == nil {
+				t.Fatalf("%s accepted an engine the catalog does not define: %+v", tc.key, cfg)
+			}
+			for _, engine := range tc.known {
+				if !strings.Contains(err.Error(), engine) {
+					t.Errorf("%q is in the catalog but %s does not name it: %v", engine, tc.key, err)
+				}
+			}
+		})
+	}
+}
+
 // TestS3EnginesFromEnv covers the P2-2 CP_S3_ENGINES allowlist: default enables
 // both engines, a subset narrows, and a typo fails boot rather than silently
 // disabling an engine (mirrors CP_DB_ENGINES).
@@ -106,6 +188,7 @@ func TestS3EnginesFromEnv(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CP_DATABASE_URL", db)
+			t.Setenv("CP_DB_ENGINES", "")
 			t.Setenv("CP_S3_ENGINES", tc.val)
 			cfg, err := FromEnv()
 			if tc.wantErr {

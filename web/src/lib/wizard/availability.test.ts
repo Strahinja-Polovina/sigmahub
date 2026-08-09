@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { RESOURCE_CATEGORIES, RESOURCE_CATEGORY_CATALOG } from "@/lib/server-catalog.generated";
+import {
+  CLUSTER_EXCLUDED_KINDS,
+  CONNECTABLE_SERVER_TYPES,
+  RESOURCE_CATEGORIES,
+  RESOURCE_CATEGORY_CATALOG,
+} from "@/lib/server-catalog.generated";
 import {
   buildInventory,
   categoryAvailability,
@@ -77,7 +82,11 @@ describe("a kind with zero compatible targets says so on step one", () => {
   // The LLM path was the worst of these: it asked for a runtime and a model
   // reference before mentioning that nothing here has a GPU.
   it("explains the GPU requirement in hardware terms, not matrix terms", () => {
-    const inv = buildInventory(projectWith(["general", "database", "storage"]));
+    // Every host type an operator can connect EXCEPT a GPU one, rather than the
+    // three that were typed here: the sentence has to be about hardware however
+    // much other hardware is already in the fleet, and a type added to the
+    // catalog is precisely the one that would have been left out of a hand list.
+    const inv = buildInventory(projectWith(CONNECTABLE_SERVER_TYPES.filter((t) => t !== "gpu")));
     const verdict = kindAvailability("llm", inv);
     expect(verdict.available).toBe(false);
     expect(verdict.reason).toContain("GPU");
@@ -89,7 +98,7 @@ describe("a kind with zero compatible targets says so on step one", () => {
     const inv = buildInventory(
       projectWith(["build"]),
       [{ id: "cl", name: "prod", environmentId: "env" }],
-      ["postgres", "mysql", "redis", "mongodb", "s3"]
+      CLUSTER_EXCLUDED_KINDS
     );
     expect(kindAvailability("app", inv).available).toBe(true);
     expect(kindAvailability("postgres", inv).available).toBe(false);
@@ -166,7 +175,7 @@ describe("a category answers for the kinds inside it", () => {
     const inv = buildInventory(
       projectWith(["build"]),
       [{ id: "cl", name: "prod", environmentId: "env" }],
-      ["postgres", "mysql", "redis", "mongodb", "s3"]
+      CLUSTER_EXCLUDED_KINDS
     );
     expect(categoryAvailability("database", inv).reason).toContain("cluster");
     // The cluster hosts an app, so Application is simply available.
@@ -346,7 +355,7 @@ describe("cluster options are scoped to the environment", () => {
 // publishing a GPU figure at all.
 describe("a model endpoint is refused for the cluster itself, at any size", () => {
   const clusters = [{ id: "cl", name: "prod", environmentId: "env" }];
-  const inv = buildInventory([], clusters, ["postgres", "mysql", "redis", "mongodb", "s3", "llm"]);
+  const inv = buildInventory([], clusters, CLUSTER_EXCLUDED_KINDS);
 
   it("refuses the cluster and names where a model endpoint does run", () => {
     const [opt] = clusterOptions(clusters, "env", "llm", inv);

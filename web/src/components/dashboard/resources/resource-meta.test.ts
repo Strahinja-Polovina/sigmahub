@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RESOURCE_KINDS } from "@/lib/server-catalog.generated";
 import { formatDuration, KIND_LABELS, DEPLOY_STATUS_META } from "./resource-meta";
 
 describe("formatDuration", () => {
@@ -15,8 +16,12 @@ describe("formatDuration", () => {
 
 describe("resource kind labels", () => {
   it("covers every kind the availability matrix knows", () => {
-    for (const kind of ["app", "postgres", "mysql", "mongodb", "redis", "s3", "llm"]) {
-      expect(KIND_LABELS[kind as keyof typeof KIND_LABELS]).toBeTruthy();
+    // Read from the catalog rather than typed out: this list WAS the seven
+    // kinds of the day, so the test claimed to cover every kind while covering
+    // whichever ones someone last remembered — the eighth would have been
+    // labelled "undefined" on the resource header with this assertion green.
+    for (const kind of RESOURCE_KINDS) {
+      expect(KIND_LABELS[kind], kind).toBeTruthy();
     }
   });
 });

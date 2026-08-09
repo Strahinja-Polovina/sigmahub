@@ -44,19 +44,53 @@ remove_bootstrap_key() {
 # cleanup is added to the trap once $work exists.
 trap remove_bootstrap_key EXIT
 
+# --- The two vocabularies this script shares with the Go code ----------------
+#
+# SUPPORTED_DISTROS is the shell copy of the onboarding distro catalog in
+# cp/internal/store/server_catalog.go (supportedDistroLabels) — the same list
+# the registration compatibility gate enrolls hosts against. SUPPORTED_ARCHES is
+# the shell copy of selfupdate.SupportedArches, the architectures .goreleaser
+# actually builds sigmad for.
+#
+# They are copies because a shell script cannot import Go, and because the two
+# Go copies live in modules (cp/ and agent/) that cannot import each other. The
+# copy is fine; the DRIFT is the defect, and two tests read this file off disk to
+# make drift a build failure: agent/packaging/install_script_test.go pins
+# SUPPORTED_ARCHES to the agent's list and to the release that publishes it, and
+# cp/internal/store/installer_vocabulary_test.go pins SUPPORTED_DISTROS to the
+# catalog. Each fails on the edit that causes the bug rather than on the
+# onboarding that reveals it — an architecture missing here is a host the release
+# builds for and this script turns away, and a distro missing there is a host
+# this script happily installs onto and the control plane then parks as
+# `incompatible` with the agent already running.
+#
+# Each list is written ONCE and both the gate and its rejection message are
+# rendered from it, so the message cannot go stale on its own the way the
+# hand-typed "Ubuntu 22.04/24.04 and Debian 12" sentence it replaced could.
+SUPPORTED_DISTROS="ubuntu-22.04 ubuntu-24.04 debian-12"
+SUPPORTED_ARCHES="amd64 arm64"
+
+# Membership in a space-separated list, without arrays or grep: this gate runs
+# before ensure_tool has installed anything.
+in_list() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
 # --- Distro gate: only the hardened-onboarding targets are supported ----------
 . /etc/os-release 2>/dev/null || die "cannot read /etc/os-release"
 distro="${ID:-}-${VERSION_ID:-}"
-case "$distro" in
-  ubuntu-22.04|ubuntu-24.04|debian-12) : ;;
-  *) die "unsupported distro '${distro}'. Onboarding supports Ubuntu 22.04/24.04 and Debian 12 only." ;;
-esac
+in_list "${distro}" "${SUPPORTED_DISTROS}" \
+  || die "unsupported distro '${distro}'. Onboarding supports: ${SUPPORTED_DISTROS}. Reinstall this host on one of those, or connect a different machine."
 
-arch="$(uname -m)"; case "$arch" in
-  x86_64|amd64) arch=amd64 ;;
-  aarch64|arm64) arch=arm64 ;;
-  *) die "unsupported CPU architecture '${arch}'" ;;
+# uname -m reports the KERNEL's name for the machine, which is not the release's
+# name for it: x86_64 is amd64 and aarch64 is arm64. Normalize first, then check
+# membership, so SUPPORTED_ARCHES stays exactly the release's vocabulary and this
+# mapping stays what it is — a fact about Linux, not a second architecture list.
+arch="$(uname -m)"
+case "$arch" in
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
 esac
+in_list "${arch}" "${SUPPORTED_ARCHES}" \
+  || die "unsupported CPU architecture '$(uname -m)'. sigmad is published for: ${SUPPORTED_ARCHES}."
 ver_noV="${SIGMAHUB_VERSION#v}"
 
 need() { command -v "$1" >/dev/null 2>&1; }

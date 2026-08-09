@@ -20,6 +20,7 @@ import {
   type CpBackupTarget,
   type CpBackupRun,
 } from "@/server/cp";
+import { isDatabaseEngine } from "@/lib/server-catalog.generated";
 import { getDatabaseInfo } from "@/server/actions/databases";
 import { getS3Info } from "@/server/actions/s3";
 import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
@@ -110,21 +111,27 @@ async function loadDeployments(
   }
 }
 
-const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongodb"]);
-
 /** Load a database resource's connection metadata (P1-10). A CP failure
  *  degrades to null rather than breaking the page.
  *
  *  Both modes since SIGMA-215: the action derives a demo engine's details from
  *  the resource id, so the panel — the screen that says a managed database is
- *  mesh-only and hands out an audited credential — is reachable offline. */
+ *  mesh-only and hands out an audited credential — is reachable offline.
+ *
+ *  Which kinds have connection details is the control plane's engine table, so
+ *  it is asked rather than restated. This module kept its own Set of the four
+ *  engine kinds, a second copy of the one in resource-detail.tsx and in a file
+ *  that never sees it; a fifth engine added to the Go catalog would have been
+ *  provisioned by the control plane and then opened to a page with no Database
+ *  panel at all, because the loader in front of it had never heard of it
+ *  (SIGMA-216). */
 async function loadDatabase(
   failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
 ): Promise<CpDatabaseInfo | null> {
-  if (!DB_KINDS.has(kind)) return null;
+  if (!isDatabaseEngine(kind)) return null;
   return attempt(
     failures,
     "connection details",

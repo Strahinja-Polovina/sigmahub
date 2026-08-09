@@ -7,6 +7,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -144,6 +145,43 @@ func TestEveryKindSitsInExactlyOneCategory(t *testing.T) {
 	for _, kind := range ResourceKinds() {
 		if seen[kind] != 1 {
 			t.Errorf("kind %q is in %d categories; it must be in exactly one", kind, seen[kind])
+		}
+	}
+}
+
+// "This kind is a database" and "this kind has a managed engine" are meant to be
+// one fact, and server_catalog.go's init panics if they ever stop being. A panic
+// at package load cannot be asserted from inside the package it would refuse to
+// load, so this states the property those panics defend — and states it through
+// the PUBLISHED accessors, which is what every consumer actually reads.
+//
+// The ticket's phantom-kind proof was adding {"clickhouse", "ClickHouse",
+// "database"} to resourceKinds: it compiled, regenerated and left every suite on
+// both sides of the product green while nothing could provision it — the wizard
+// offered a card the reconciler had no image, no port and no connection-URL
+// shape for. This is the assertion it now fails.
+func TestEveryDatabaseKindHasAnEngineAndEveryEngineIsADatabaseKind(t *testing.T) {
+	var inCategory []string
+	for _, c := range ResourceCategoryCatalog() {
+		if c.ID == CategoryDatabase {
+			inCategory = c.Kinds
+		}
+	}
+	if len(inCategory) == 0 {
+		t.Fatalf("the catalog holds no %q category, so CP_DB_ENGINES validates against nothing",
+			CategoryDatabase)
+	}
+	if engines := DBEngineKinds(); !slices.Equal(engines, inCategory) {
+		t.Fatalf("db_engines.go defines %v, the %q category holds %v — a kind in one and not the "+
+			"other is either a managed database with no image or an engine no UI ever offers",
+			engines, CategoryDatabase, inCategory)
+	}
+	// …and the per-kind predicate the create path branches on has to answer the
+	// same question, so IsDBKind cannot claim a kind the wizard files elsewhere.
+	for _, kind := range ResourceKinds() {
+		if want := slices.Contains(inCategory, kind); IsDBKind(kind) != want {
+			t.Errorf("IsDBKind(%q) = %v but the %q category holding it is %v; they are one question",
+				kind, IsDBKind(kind), CategoryDatabase, want)
 		}
 	}
 }

@@ -153,30 +153,146 @@ describe("nothing keeps a second copy of the vocabulary", () => {
   // tsc, so adding a type to the CP catalog breaks the build at the omission,
   // while `Record<string, …>` silently keeps a stale list. That distinction is
   // exactly what these two tests enforce.
-  function untypedEnumerations(vocabulary: readonly string[], typeName: string) {
+  //
+  // It used to enforce it for ONE shape — the vocabulary written as object KEYS
+  // — which meant it could not see the copies that were actually out there. A
+  // four-name DB_KINDS list lived in two modules that never see each other, one
+  // an array and one a Set, and a probe file carrying full array copies of BOTH
+  // vocabularies (in the banned "mongo" spelling, no less) plus a
+  // re-implemented canHost passed this suite 13/13. A guard with a blind spot
+  // that wide reads as protection and is not (SIGMA-216). Four shapes now, one
+  // per way this project has actually written a vocabulary down.
+  //
+  // Every shape is built from the same definition of a WORD, and that is the
+  // whole reason the two false positives this guard has already paid for stay
+  // out. `image: "postgres:16"` — a docker image tag in a demo compose fixture,
+  // three of which once failed a guard about something else entirely — and
+  // `mysql://…` — a connection string, three of which failed it again the day
+  // the demo's URLs started being asserted in full — both carry a character no
+  // member of either vocabulary contains. Neither is ever a word here, so no
+  // widening below can bring either back.
+  //
+  // This file is inside src/, so the guard reads ITSELF. That is deliberate —
+  // the test that forbids a copy is no more entitled to one than anything else
+  // — and it is why the shapes below are described rather than illustrated:
+  // spelling out an example list here would be writing the copy this test
+  // exists to refuse.
+  const WORD = /^(["'])([a-z0-9][a-z0-9-]*)\1$/;
+
+  /** Shape 1: the vocabulary as object KEYS — `postgres: {…}`.
+   *
+   *  Bare or fully quoted, and never preceded by a quote: the looser
+   *  `["']?name["']?\s*:` counted the colon INSIDE a string literal, which is
+   *  how an image tag read as a table keyed by resource kind. The `//`
+   *  lookahead is the same refusal for a URL scheme — nothing that is really a
+   *  key is followed by two slashes. */
+  function keyEnumeration(vocabulary: readonly string[], src: string): string[] {
+    const named = vocabulary.filter((v) =>
+      new RegExp(`(^|[^\\w\\-"'\`])(${v}|"${v}"|'${v}')\\s*:(?!//)`, "m").test(src)
+    );
+    return named.length >= 3 ? [`as keys: ${named.join(", ")}`] : [];
+  }
+
+  /** Shape 2: the vocabulary as an ARRAY of quoted words.
+   *
+   *  The shape both DB_KINDS copies were written in, and the one the key
+   *  matcher was structurally unable to see. Only FLAT literals whose every
+   *  element is a quoted word count, which is what keeps demo fixtures out: an
+   *  array of resource ROWS is an array of objects, so it never gets here.
+   *
+   *  A word the vocabulary does NOT contain does not disqualify the literal —
+   *  only a punctuation-carrying one does. Otherwise a copy that misspells
+   *  "mongodb" as "mongo" would be the single copy this test waves through, and
+   *  that spelling is the exact bug the dashboard already shipped once.
+   *
+   *  Three words is the line, the same one shape 1 draws, and it applies to a
+   *  fixture as much as to a table: a test that wants a project holding three
+   *  kinds of host says so from the catalog rather than by typing three names,
+   *  which is both shorter to read and true after the eighth type lands. */
+  function arrayEnumeration(vocabulary: readonly string[], src: string): string[] {
+    const found: string[] = [];
+    for (const [literal] of src.matchAll(/\[[^[\]{}]*\]/g)) {
+      const parts = literal
+        .slice(1, -1)
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => p !== "");
+      if (parts.length === 0) continue;
+      const words = parts.map((p) => WORD.exec(p)?.[2]);
+      if (words.some((w) => w === undefined)) continue;
+      const named = [...new Set(words as string[])].filter((w) => vocabulary.includes(w));
+      if (named.length >= 3) found.push(`as an array: ${named.join(", ")}`);
+    }
+    return found;
+  }
+
+  /** Shape 3: the vocabulary in VALUE position — `{ kind: "postgres" }`.
+   *
+   *  How a table gets written when the word is the entry's identity rather than
+   *  its key, and invisible to shape 1 for exactly that reason.
+   *
+   *  Demo FIXTURES put kinds in value position too — every mock resource row
+   *  carries one — so repetition is what separates the two: an enumeration
+   *  names each word once and stops, while data says "app" on four rows and
+   *  "postgres" on two. A file where any word repeats there is describing
+   *  resources, not the set of kinds, and is left alone. */
+  function valueEnumeration(vocabulary: readonly string[], src: string): string[] {
+    const counts = new Map<string, number>();
+    for (const word of vocabulary) {
+      const key = `(?:[A-Za-z_$][\\w$]*|"[^"\\n]*"|'[^'\\n]*')`;
+      const re = new RegExp(`(?:^|[{,])\\s*${key}\\s*:\\s*(["'])${word}\\1`, "gm");
+      const hits = [...src.matchAll(re)].length;
+      if (hits > 0) counts.set(word, hits);
+    }
+    if (counts.size < 3) return [];
+    if ([...counts.values()].some((n) => n > 1)) return [];
+    return [`in value position: ${[...counts.keys()].join(", ")}`];
+  }
+
+  /** Shape 4: the vocabulary as PROSE — a `|`-separated run, as a column
+   *  comment or a TypeScript union writes one.
+   *
+   *  The copy that survived longest and the smallest one there is, because a
+   *  comment is the only form of this that no generator can write and no
+   *  reviewer diffs. Both columns in the schema documented their vocabulary
+   *  this way, and the servers.type one had been four names long since before
+   *  the product grew a VPS, a cluster node and a build server: the file that
+   *  defines the column described a fleet three types smaller than the one it
+   *  stores, and nothing anywhere could notice.
+   *
+   *  Runs of three or more words joined by a SINGLE `|`, so `!gpu || !gpu.count`
+   *  is not a run, and a run naming no member of this vocabulary — the
+   *  neighbouring `queued | building | running | success | failed` — is not a
+   *  copy of it. */
+  function proseEnumeration(vocabulary: readonly string[], src: string): string[] {
+    const token = `["']?[A-Za-z0-9][\\w-]*["']?`;
+    const runs = src.matchAll(new RegExp(`(?<![|\\w])${token}(?:\\s*\\|(?!\\|)\\s*${token}){2,}`, "g"));
+    const found: string[] = [];
+    for (const [run] of runs) {
+      const words = run.split("|").map((w) => w.trim().replace(/^["']|["']$/g, ""));
+      const named = [...new Set(words)].filter((w) => vocabulary.includes(w));
+      if (named.length >= 3) found.push(`as prose: ${named.join(", ")}`);
+    }
+    return found;
+  }
+
+  function vocabularyCopies(vocabulary: readonly string[], typeName: string) {
     const offenders: string[] = [];
     for (const file of files) {
       const src = readFileSync(file, "utf8");
-      // Match a vocabulary word used as an OBJECT KEY: bare, or fully quoted,
-      // and never preceded by a quote. The looser `["']?name["']?\s*:` counted
-      // the colon INSIDE a string literal, so `image: "postgres:16"` in a demo
-      // compose fixture read as a table keyed by resource kind — and three
-      // docker image tags in one file failed a guard about something else
-      // entirely. A key is what this is looking for; an image reference is not
-      // a key, and no real offender writes one without balanced quotes.
-      //
-      // A URL SCHEME is not a key either, for the same reason and with the same
-      // consequence: three connection strings in one test — `mysql://…`,
-      // `mongodb://…`, `redis://…` — read as a table keyed by resource kind the
-      // day the demo's connection URLs started being asserted in full. Hence the
-      // backtick among the excluded prefixes and the `//` lookahead; nothing
-      // that is really a key is followed by two slashes.
-      const named = vocabulary.filter((v) =>
-        new RegExp(`(^|[^\\w\\-"'\`])(${v}|"${v}"|'${v}')\\s*:(?!//)`, "m").test(src)
-      );
-      if (named.length < 3) continue;
-      if (new RegExp(`Record<\\s*${typeName}\\s*,`).test(src)) continue;
-      offenders.push(`${relative(process.cwd(), file)} (${named.join(", ")})`);
+      const name = relative(process.cwd(), file);
+      // The Record escape belongs to shape 1 alone: a table keyed on the type
+      // IS the sanctioned way to hold one, and tsc keeps it exhaustive. It
+      // excuses nothing about an array, a value list or a comment, none of
+      // which tsc checks at all.
+      const keyed = new RegExp(`Record<\\s*${typeName}\\s*,`).test(src);
+      const found = [
+        ...(keyed ? [] : keyEnumeration(vocabulary, src)),
+        ...arrayEnumeration(vocabulary, src),
+        ...valueEnumeration(vocabulary, src),
+        ...proseEnumeration(vocabulary, src),
+      ];
+      for (const hit of found) offenders.push(`${name} (${hit})`);
     }
     return offenders;
   }
@@ -185,15 +301,15 @@ describe("nothing keeps a second copy of the vocabulary", () => {
     // Five modules used to hold this list, and the one that mattered most — the
     // CP's own HTTP boundary — was the one nobody remembered to update.
     expect(
-      untypedEnumerations(SERVER_TYPES, "ServerType"),
-      "import from @/lib/server-catalog.generated, or key the table on ServerType so tsc keeps it exhaustive"
+      vocabularyCopies(SERVER_TYPES, "ServerType"),
+      "import SERVER_TYPES from @/lib/server-catalog.generated, or key the table on ServerType so tsc keeps it exhaustive — a list written out here agrees with the control plane only by luck"
     ).toEqual([]);
   });
 
   it("finds no untyped copy of the resource-kind list", () => {
     expect(
-      untypedEnumerations(RESOURCE_KINDS, "ResourceKind"),
-      "import from @/lib/server-catalog.generated, or key the table on ResourceKind so tsc keeps it exhaustive"
+      vocabularyCopies(RESOURCE_KINDS, "ResourceKind"),
+      "import RESOURCE_KINDS from @/lib/server-catalog.generated, or key the table on ResourceKind so tsc keeps it exhaustive — a list written out here agrees with the control plane only by luck"
     ).toEqual([]);
   });
 
@@ -210,7 +326,10 @@ describe("nothing keeps a second copy of the vocabulary", () => {
 // is one word away from being reversed by accident.
 describe("availability matrix", () => {
   it("never lets a database land on a storage or gpu server", () => {
-    for (const kind of ["postgres", "mysql", "mongodb", "redis"] as ResourceKind[]) {
+    // Every engine the control plane provisions, not the four that existed when
+    // this rule was written: a fifth added to the Go catalog is exactly the one
+    // nobody would think to add here.
+    for (const kind of DB_ENGINE_KINDS) {
       expect(canHost("storage", kind)).toBe(false);
       expect(canHost("gpu", kind)).toBe(false);
     }
@@ -272,7 +391,12 @@ describe("the kinds a cluster refuses", () => {
     // Each has its own reason and both are product decisions: an engine
     // rescheduled onto a node without its volume is data loss, and nothing
     // renders a cluster-targeted model endpoint at all.
-    for (const kind of ["postgres", "mysql", "mongodb", "redis", "s3", "llm"] as ResourceKind[]) {
+    // Stated as "every engine, plus storage, plus models" rather than as
+    // CLUSTER_EXCLUDED_KINDS, which would assert the list against itself and
+    // pass whatever it said. Naming the two non-engine kinds is the product
+    // decision; the engines come from the catalog so a new one is refused by
+    // the cluster from the day it exists.
+    for (const kind of [...DB_ENGINE_KINDS, "s3", "llm"] as ResourceKind[]) {
       expect(clusterCanHost(kind)).toBe(false);
     }
     expect(clusterCanHost("app")).toBe(true);

@@ -38,6 +38,60 @@ const DefaultRepo = "Strahinja-Polovina/sigmahub"
 
 var versionRe = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
+// The architectures sigmad is published for, and the one place that list is
+// written in Go.
+//
+// It is a named vocabulary rather than a pair of string comparisons because
+// three other files restate the same fact and none of them can import this one.
+// agent/packaging/install.sh spells it in shell, .goreleaser.yaml spells it as
+// the set of assets a release actually builds, and cp/internal/store's server
+// catalog spells it as the architectures a host may enroll with — cp and agent
+// are separate Go modules and cp cannot import agent, so the citation in that
+// catalog's comment could only ever BE a citation.
+//
+// Drift between any two of the four is an outage in one of two directions. An
+// architecture added here and forgotten in the installer is a host sigmad is
+// built for and the installer refuses at the distro/arch gate. An architecture
+// the installer accepts but the release never built is a download of an asset
+// that does not exist — and that failure lands after the one-time bootstrap key
+// has already been spent, so the operator's retry needs a whole new token.
+//
+// agent/packaging/install_script_test.go and
+// cp/internal/store/installer_vocabulary_test.go hold the four copies together.
+// They read the shell and YAML off disk, which is the only thing two Go modules
+// and a shell script can share, and they fail on the edit that introduces the
+// drift rather than on the onboarding that reveals it.
+var supportedArches = []string{"amd64", "arm64"}
+
+// SupportedArches lists the architectures sigmad is published for, in the order
+// the release builds them.
+func SupportedArches() []string {
+	out := make([]string, len(supportedArches))
+	copy(out, supportedArches)
+	return out
+}
+
+// ArchSupported reports whether a GOARCH value names an architecture sigmad is
+// published for.
+func ArchSupported(arch string) bool {
+	for _, a := range supportedArches {
+		if a == arch {
+			return true
+		}
+	}
+	return false
+}
+
+// ArchiveName renders the release archive for a version and architecture: the
+// exact name goreleaser's sigmad archive template produces, and therefore the
+// exact name install.sh has to download. Rendered from one function so that
+// renaming the artifact is a single Go edit whose shell half the packaging
+// drift test names, instead of a rename that self-update and onboarding
+// discover separately at runtime.
+func ArchiveName(version, arch string) string {
+	return fmt.Sprintf("sigmad_%s_linux_%s.tar.gz", strings.TrimPrefix(version, "v"), arch)
+}
+
 // Updater executes agent.update ops.
 type Updater struct {
 	Log            *slog.Logger
@@ -86,15 +140,20 @@ func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 	}
 
 	arch := runtime.GOARCH
-	if arch != "amd64" && arch != "arm64" {
-		return fmt.Errorf("agent.update: unsupported architecture %q", arch)
+	if !ArchSupported(arch) {
+		// The set is named, not just the refusal. This message is what the
+		// dashboard shows against a failed update op, and "unsupported
+		// architecture" alone leaves the operator unable to tell a machine we
+		// will never publish for from one a release simply has not built yet.
+		return fmt.Errorf("agent.update: no sigmad release is published for %q; published architectures are %s",
+			arch, strings.Join(supportedArches, ", "))
 	}
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("agent.update: self-update is linux-only")
 	}
 
 	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, spec.Version)
-	archive := fmt.Sprintf("sigmad_%s_linux_%s.tar.gz", strings.TrimPrefix(spec.Version, "v"), arch)
+	archive := ArchiveName(spec.Version, arch)
 
 	work, err := os.MkdirTemp("", "sigmad-update-*")
 	if err != nil {

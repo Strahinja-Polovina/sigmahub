@@ -25,14 +25,21 @@ package store
 // at runtime could not do that, which is why this is codegen and not an
 // endpoint.
 //
-// The resource-KIND vocabulary is not single-sourced to the same standard yet:
-// adding a kind here compiles and passes everything while the two DB_KINDS
-// tables, config.go's engine list and clusters.go's exclusions all stay
-// ignorant of it (SIGMA-216). The wizard's PICKER is no longer on that list —
-// its grouping, its labels and the order it offers them in are rendered from
-// resourceCategories below — but the icon it draws beside each kind still lives
-// in the dashboard, because a lucide component is not a thing this file can
-// name.
+// The resource-KIND vocabulary was the axis this file did NOT hold to that
+// standard, and SIGMA-216 is the ticket that closed the gap. Adding a kind here
+// used to compile, regenerate and leave every suite green while the consumers
+// that decide what a kind MEANS carried lists of their own; the kind list is now
+// what those consumers are derived from or checked against. On this side of the
+// product that is: the cluster exclusion list (clusters.go), whose keys must
+// name kinds this file knows; the database engine catalog (db_engines.go), tied
+// to the database category in both directions by init() below; and the
+// CP_DB_ENGINES allowlist, which config.go validates against that engine catalog
+// instead of restating it.
+//
+// The wizard's PICKER is derived too — its grouping, its labels and the order it
+// offers them in are rendered from resourceCategories below — but the icon it
+// draws beside each kind still lives in the dashboard, because a lucide
+// component is not a thing this file can name.
 
 //go:generate go run ../../cmd/gen-server-catalog
 
@@ -209,10 +216,36 @@ var resourceCategories = []struct {
 	{"storage", "Object storage", "S3-compatible buckets on a storage host."},
 }
 
+// CategoryDatabase is the one category id Go code asks for by name, and it is a
+// const for the same reason DefaultS3Engine is: "which kinds are databases" is a
+// question this package has to ask in more than one place, and a bare "database"
+// typed at each asking site is a string that can be misspelled into a silently
+// empty answer. init() asserts it names a category the catalog actually holds,
+// so the misspelling fails at boot instead.
+//
+// It is deliberately the CATEGORY and not a new IsDatabase flag on the kind. The
+// flag would be a second statement of a fact the catalog already makes — a kind
+// could then carry Category "database" and IsDatabase false, and the wizard
+// would group it with the engines while every subset derived from the flag left
+// it out. That is the two-lists defect this ticket exists to delete, reproduced
+// at field scale inside the very table that fixed it. Category is already
+// total (every kind has exactly one, init panics otherwise) and already the
+// thing the picker groups by, which is everything a flag would have been.
+const CategoryDatabase = "database"
+
 // The distros the hardened onboarding path accepts (SIGMA-A-5). Labelled here
 // so the operator-facing sentence is generated instead of hand-written — it
 // used to be typed out twice in api/registry.go, which meant adding a distro
 // was a prose edit in two places that no test covered.
+//
+// The host enforces the same list a second time, in shell, before this package
+// ever hears from the machine (agent/packaging/install.sh). That copy is
+// unavoidable — the installer runs before there is a control plane to ask — and
+// installer_vocabulary_test.go pins it to this one, because the two halves fail
+// in opposite and equally unhelpful directions: a distro only listed here is
+// refused by the installer with a bootstrap token already spent, and a distro
+// only listed there installs cleanly and then sits in the dashboard as
+// `incompatible`, fully provisioned and unschedulable.
 var supportedDistroLabels = []struct {
 	ID    string
 	Label string
@@ -233,8 +266,25 @@ func allDistros() []string {
 	return out
 }
 
-// Architectures. The agent itself ships amd64 and arm64 binaries
-// (agent/internal/selfupdate), so those are the only two a host can run at all.
+// Architectures. sigmad is published for amd64 and arm64 — that list is stated
+// in agent/internal/selfupdate (SupportedArches), built by .goreleaser.yaml and
+// enforced on the host by agent/packaging/install.sh — so those are the only two
+// a host can run the agent on at all, and bothArches is a COPY of that fact
+// rather than a decision made here.
+//
+// It can only be a copy: cp and agent are separate Go modules and cp cannot
+// import agent. Until SIGMA-216 the sentence above was the entire link, which is
+// to say there was none — a citation in a comment is undisturbed by an edit on
+// either side, and an architecture added to the agent and forgotten here is a
+// machine the release builds for that this catalog will not enroll.
+// installer_vocabulary_test.go closes it the way web/src/lib/decommission.test.ts
+// already closes web ↔ agent/packaging/uninstall.sh: both sides are checked
+// against install.sh, the one file both modules can read off disk, so the four
+// copies fail each other's builds instead of agreeing by memory.
+//
+// amd64Only is a NARROWING of that list, not a second vocabulary — see the gpu
+// entry for the reason it exists, and the test above for the rule that a type
+// may narrow this list and may never widen it.
 var (
 	bothArches = []string{"amd64", "arm64"}
 	amd64Only  = []string{"amd64"}
@@ -461,6 +511,53 @@ func init() {
 	for kind := range clusterExcludedKinds {
 		if _, ok := catalogKinds[kind]; !ok {
 			panic("store: cluster exclusion names unknown resource kind: " + kind)
+		}
+	}
+	// The database engine catalog (db_engines.go) is keyed by resource kind and
+	// until SIGMA-216 nothing said so: its keys and the database category were two
+	// lists that merely happened to agree. Both directions are checked because
+	// each catches one half of the phantom-kind proof in that ticket.
+	//
+	// KIND → ENGINE is the proof itself. Adding {"clickhouse", "ClickHouse",
+	// "database"} to resourceKinds compiled, regenerated and left every suite on
+	// both sides green — while DBEngine("clickhouse") answered false, so
+	// CreateResource accepted the kind, wrote the row, and handed the reconciler a
+	// managed database it has no image, no port and no connection-URL shape for.
+	// The wizard offered it (it renders the category), and the failure surfaced as
+	// a resource stuck provisioning.
+	//
+	// ENGINE → KIND catches what a half-finished fix for the above looks like: an
+	// engine definition added under a name resourceKinds never gained.
+	// DBEngineCatalog walks ResourceKinds() to stay deterministic for the
+	// generator, so such an engine renders into neither the API nor the dashboard
+	// — the product simply never mentions it, and nothing anywhere fails. The
+	// category half of the same direction catches the subtler version: an engine
+	// whose kind IS in the catalog but sits under "application" or "storage",
+	// which would be a managed engine the picker files under the wrong card and
+	// every database-only path (backups, credential reveal, the engine allowlist)
+	// disagrees about.
+	//
+	// Here rather than in db_engines.go's own init because package init functions
+	// run in file-name order: db_engines.go sorts first, and categoryKinds does
+	// not exist yet when its init would run.
+	if !catalogCategories[CategoryDatabase] {
+		panic("store: CategoryDatabase names no category in the catalog: " + CategoryDatabase)
+	}
+	databaseKinds := make(map[string]bool, len(categoryKinds[CategoryDatabase]))
+	for _, kind := range categoryKinds[CategoryDatabase] {
+		databaseKinds[kind] = true
+		if _, ok := dbEngines[kind]; !ok {
+			panic("store: resource kind " + kind + " is in the " + CategoryDatabase +
+				" category but db_engines.go defines no engine for it")
+		}
+	}
+	for kind := range dbEngines {
+		if _, ok := catalogKinds[kind]; !ok {
+			panic("store: db engine " + kind + " is not a resource kind, so nothing renders it")
+		}
+		if !databaseKinds[kind] {
+			panic("store: db engine " + kind + " is not in the " + CategoryDatabase +
+				" category, so the wizard files it under the wrong card")
 		}
 	}
 }
