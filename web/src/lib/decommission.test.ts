@@ -4,9 +4,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   DECOMMISSION_TIMEOUT_MS,
+  DEMO_TEARDOWN_STEP_MS,
   boundResourcesMessage,
+  demoTeardownPhase,
   forceReason,
   isDecommissioning,
+  msUntilNextTeardownStep,
   removalPlan,
 } from "./decommission";
 import { MANUAL_UNINSTALL_SCRIPT } from "./uninstall-script";
@@ -228,5 +231,65 @@ describe("the decommission timeout matches the control plane", () => {
       DECOMMISSION_TIMEOUT_MS,
       "the dialog and the sweeper disagree about how long a teardown gets"
     ).toBe(ms);
+  });
+});
+
+// The demo teardown (SIGMA-215). Its job is to end: with no control plane there
+// is no agent to ack, so pressing Disconnect used to leave the row in
+// `decommissioning` for good unless the operator noticed a simulate button.
+describe("the demo teardown", () => {
+  const START = Date.UTC(2027, 4, 1, 12, 0, 0);
+  const at = (elapsed: number) => ({
+    startedAt: new Date(START),
+    purgeVolumes: false,
+    now: START + elapsed,
+  });
+
+  it("starts on the step the agent starts on — the containers", () => {
+    const phase = demoTeardownPhase(at(0));
+    expect(phase.step).toBe(0);
+    expect(phase.label.toLowerCase()).toContain("container");
+    expect(phase.done).toBe(false);
+  });
+
+  it("walks one step per interval, in the agent's own order", () => {
+    const labels = [0, 1, 2].map((i) => demoTeardownPhase(at(i * DEMO_TEARDOWN_STEP_MS)).label);
+    expect(labels[0].toLowerCase()).toContain("container");
+    expect(labels[1].toLowerCase()).toContain("wireguard");
+    expect(labels[2].toLowerCase()).toContain("agent");
+  });
+
+  // The one destructive step is only walked when the operator opted in, and it
+  // is named while it happens rather than only in the confirmation dialog.
+  it("says it is deleting volumes only when that was asked for", () => {
+    const kept = demoTeardownPhase(at(DEMO_TEARDOWN_STEP_MS));
+    expect(kept.label.toLowerCase()).not.toContain("volume");
+    const purged = demoTeardownPhase({
+      startedAt: new Date(START),
+      purgeVolumes: true,
+      now: START + DEMO_TEARDOWN_STEP_MS,
+    });
+    expect(purged.label.toLowerCase()).toContain("volume");
+    expect(purged.total).toBe(kept.total + 1);
+  });
+
+  it("finishes, which is the whole reason it exists", () => {
+    expect(demoTeardownPhase(at(4 * DEMO_TEARDOWN_STEP_MS)).done).toBe(true);
+  });
+
+  // Ten seconds, not ten minutes. The timeout is what the "never answers"
+  // simulation reaches, and nobody watching a demo can sit through it.
+  it("completes far inside the control plane's patience", () => {
+    expect(4 * DEMO_TEARDOWN_STEP_MS).toBeLessThan(DECOMMISSION_TIMEOUT_MS / 10);
+  });
+
+  it("treats a row with no start time as already finished, never as stuck", () => {
+    const phase = demoTeardownPhase({ startedAt: null, purgeVolumes: false, now: START });
+    expect(phase.done).toBe(true);
+  });
+
+  it("asks to be looked at again exactly when the next step lands", () => {
+    expect(msUntilNextTeardownStep(at(1_000))).toBe(DEMO_TEARDOWN_STEP_MS - 1_000);
+    expect(msUntilNextTeardownStep(at(4 * DEMO_TEARDOWN_STEP_MS))).toBeNull();
   });
 });

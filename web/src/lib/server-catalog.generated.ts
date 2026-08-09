@@ -3,7 +3,8 @@
 // The dashboard's server-type vocabulary — the type list, the resource-kind ×
 // server-type availability matrix, the billing weights and the per-type
 // enrollment requirements — is RENDERED from the control plane's canonical
-// catalog at cp/internal/store/server_catalog.go.
+// catalog at cp/internal/store/server_catalog.go, together with the kinds a
+// cluster refuses, which come from cp/internal/store/clusters.go.
 //
 // Editing this file by hand re-creates the defect SIGMA-198 removed: a
 // dashboard offering server types the API rejects. Change the Go catalog and
@@ -18,7 +19,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "b43f1cb5658245e74ad00fed226e3d491e82cbd266d9ab7db2e23ae4dfbad202";
+export const CATALOG_SOURCE_SHA256 = "9cc7a938194c617b46b02ef1b41e10811b7c07cb30ddc72bcc1d6ac30a772cfc";
 
 export type ServerType =
   | "general"
@@ -347,6 +348,16 @@ export const ALLOWED_SERVER_TYPES: Record<ResourceKind, ServerType[]> = {
   llm: ["gpu"],
 };
 
+/** Kinds a Kubernetes cluster refuses to host, in catalog order.
+ *
+ *  The other half of "where can this run": the matrix above answers it for
+ *  servers, this answers it for clusters. It is rendered from the control
+ *  plane's own list (store.ClusterExcludedKinds) rather than restated, because
+ *  the runtime answer travels with the cluster listing and demo mode has no
+ *  control plane to ask — an empty list there would offer a cluster as a target
+ *  for a database the API refuses. */
+export const CLUSTER_EXCLUDED_KINDS: ResourceKind[] = ["postgres", "mysql", "mongodb", "redis", "s3", "llm"];
+
 /** Billing weight per server type — what a server costs to MANAGE, never
  *  what the hardware costs; customers always bring their own infrastructure. */
 export const SERVER_UNIT_WEIGHTS: Record<ServerType, number> = {
@@ -399,6 +410,15 @@ export function kindsInCategory(id: ResourceCategoryId): ResourceKind[] {
  *  restored drafts and CP rows carry plain strings. */
 export function categoryForKind(kind: string): ResourceCategoryId | null {
   return KIND_CATEGORY[kind as ResourceKind] ?? null;
+}
+
+/** Whether a kind may be deployed INSIDE a cluster. Takes a plain string, and
+ *  answers true for one that is not a kind at all, because that is what the
+ *  control plane answers: ClusterKindAllowed reads a DENY list, so anything not
+ *  on it is allowed and the create call is the thing that rejects a nonsense
+ *  kind. A stricter answer here would refuse targets the API would have taken. */
+export function clusterCanHost(kind: string): boolean {
+  return !CLUSTER_EXCLUDED_KINDS.includes(kind as ResourceKind);
 }
 
 /** Billing weight of a server type. An unknown type bills as an ordinary

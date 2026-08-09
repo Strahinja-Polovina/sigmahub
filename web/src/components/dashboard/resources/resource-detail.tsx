@@ -79,6 +79,7 @@ import { DatabasePanel } from "./database-panel";
 import { S3Panel } from "./s3-panel";
 import { ComposeServicesPanel, type PlacementServer } from "./compose-services-panel";
 import { DatabaseBackupsPanel } from "./database-backups-panel";
+import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type {
   CpDatabaseInfo,
   CpS3Info,
@@ -121,6 +122,10 @@ type Detail = {
   projectName: string;
   envName: string;
   server: { id: string; name: string; type: string } | null;
+  /** The other kind of deploy target. Exactly one of server and cluster is set;
+   *  a workload in a cluster has no server because the scheduler picks its
+   *  node, and rendering "—" for it said the resource ran nowhere. */
+  cluster: { id: string; name: string } | null;
   deployments: Deployment[];
   secrets: { id: string; name: string; envVar: boolean; scope: "project" | "environment" }[];
   canManage: boolean;
@@ -361,7 +366,8 @@ export function ResourceDetail({
    *  not-configured state. null = demo mode (labeled synthetic data). */
   cpTelemetry?: CpTelemetry | null;
 }) {
-  const { resource, projectName, envName, server, deployments, secrets, canManage } = detail;
+  const { resource, projectName, envName, server, cluster, deployments, secrets, canManage } =
+    detail;
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
 
@@ -445,6 +451,12 @@ export function ResourceDetail({
                 <span className="inline-flex items-center gap-1.5">
                   <ServerIcon className="size-3.5" />
                   {server.name}
+                </span>
+              )}
+              {cluster && (
+                <span className="inline-flex items-center gap-1.5">
+                  <Boxes className="size-3.5" />
+                  {cluster.name}
                 </span>
               )}
             </div>
@@ -537,8 +549,21 @@ export function ResourceDetail({
                 <FactRow icon={Globe} label="Domain">
                   {resource.domain ?? <span className="text-muted-foreground">—</span>}
                 </FactRow>
-                <FactRow icon={ServerIcon} label="Server">
-                  {server ? (
+                {/* One row for whichever target this resource has. Naming it
+                    "Server" and printing "—" for a cluster workload was the
+                    page saying it ran nowhere. */}
+                <FactRow
+                  icon={cluster ? Boxes : ServerIcon}
+                  label={cluster ? "Cluster" : "Server"}
+                >
+                  {cluster ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      {cluster.name}
+                      <Badge variant="outline" className="text-[10px]">
+                        Kubernetes
+                      </Badge>
+                    </span>
+                  ) : server ? (
                     <span className="inline-flex items-center gap-1.5">
                       {server.name}
                       <Badge variant="outline" className="text-[10px]">
@@ -572,6 +597,7 @@ export function ResourceDetail({
                   resourceId={resource.id}
                   info={database}
                   canManage={canManage}
+                  simulated={!isCp}
                 />
               )}
               {s3 && orgId && (
@@ -580,9 +606,23 @@ export function ResourceDetail({
                   resourceId={resource.id}
                   info={s3}
                   canManage={canManage}
+                  simulated={!isCp}
                 />
               )}
-              {database && orgId && (
+              {/* Backups are the control plane running restic against a real S3
+                  target on a schedule. There is nothing offline to schedule,
+                  verify or restore, so the panel is replaced by what it would
+                  have done rather than by nothing at all (SIGMA-215). */}
+              {database && orgId && !isCp && (
+                <ControlPlaneNote title="Backups run on the control plane">
+                  With a control plane, this database is backed up on a schedule to an
+                  S3-compatible target you own, every backup is verified by restoring it,
+                  and PostgreSQL additionally streams WAL so you can recover to a
+                  point in time. None of that can happen here: there is no engine to dump
+                  and nowhere to write to.
+                </ControlPlaneNote>
+              )}
+              {database && orgId && isCp && (
                 <DatabaseBackupsPanel
                   orgId={orgId}
                   resourceId={resource.id}
@@ -757,6 +797,20 @@ export function ResourceDetail({
                     ))}
                   </TableBody>
                 </Table>
+                {/* The demo timeline is real enough to walk — a redeploy queues
+                    here and advances — but three things on this tab are the
+                    control plane's pipeline and cannot be, so they are named
+                    rather than silently missing (SIGMA-215). */}
+                <div className="px-4 pt-4">
+                  <ControlPlaneNote title="Build logs and rollback come from the pipeline">
+                    With a control plane, each release here carries the clone, build and
+                    rollout it came from, streams that build&apos;s logs while it runs, and
+                    can be rolled back to any earlier successful release without rebuilding
+                    — the image is already in your registry. That pipeline is the control
+                    plane cloning your repository onto a build server, so there is nothing
+                    offline to stream or roll back to.
+                  </ControlPlaneNote>
+                </div>
               </CardContent>
             </Card>
           )}
@@ -789,6 +843,21 @@ export function ResourceDetail({
                 domains={domains}
                 canManage={canManage}
               />
+            )}
+            {/* Not hidden any more. A custom domain is a certificate issued by
+                ACME and a route programmed into Traefik on an edge server —
+                nothing a demo can do — but hiding the panel meant an evaluator
+                concluded the product has no custom domains, rather than that
+                they cannot watch one be issued here (SIGMA-215). */}
+            {!showDomains && resource.kind === "app" && (
+              <ControlPlaneNote title="Custom domains are issued by the control plane">
+                With a control plane, you point a hostname at a server carrying the edge
+                role and SigmaHub programmes the route, requests a Let&apos;s Encrypt
+                certificate over HTTP-01 or DNS-01, renews it, and shows you the exact DNS
+                records to create and whether they have propagated. Issuing a real
+                certificate needs a real hostname and a reachable host, so there is
+                nothing here to issue.
+              </ControlPlaneNote>
             )}
 
             <Card className="ring-destructive/20">

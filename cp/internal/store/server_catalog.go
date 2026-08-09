@@ -447,6 +447,22 @@ func init() {
 		}
 		catalogByType[spec.Type] = spec
 	}
+	// The cluster exclusion list (clusters.go) is keyed by resource kind and is
+	// rendered into the dashboard's catalog from here, so a key that names no
+	// kind is worse than dead: ClusterExcludedKinds walks the catalog to stay
+	// deterministic, so the typo drops out of the published list entirely while
+	// ClusterKindAllowed goes on answering "yes" for the kind somebody meant to
+	// exclude — a cluster target offered for a database, which is the exact
+	// disagreement the generated list exists to remove.
+	//
+	// It is checked here rather than in clusters.go's own init because package
+	// init functions run in file-name order: clusters.go sorts first, and
+	// catalogKinds does not exist yet when its init would run.
+	for kind := range clusterExcludedKinds {
+		if _, ok := catalogKinds[kind]; !ok {
+			panic("store: cluster exclusion names unknown resource kind: " + kind)
+		}
+	}
 }
 
 // ServerCatalog returns the canonical specs in presentation order. This is what

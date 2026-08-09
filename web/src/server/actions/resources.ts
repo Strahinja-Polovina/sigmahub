@@ -8,6 +8,7 @@ import { requireProjectAdminForResource, requireProjectRole } from "../active-or
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import { isIncompatible } from "@/lib/server-compat";
+import { clusterCanHost, resourceKindLabel } from "@/lib/server-catalog.generated";
 import { attachDomain } from "./domains";
 import {
   buildResourceSpec,
@@ -117,6 +118,31 @@ export async function createResource(input: {
       );
     }
   }
+  // The cluster half of the same check. In CP mode the control plane owns the
+  // cluster and refuses a foreign id under the org token; demo clusters are
+  // local rows with no such boundary unless it is drawn here (SIGMA-215).
+  if (target.clusterId && !cpEnabled()) {
+    const [cluster] = await db
+      .select({ id: s.clusters.id, name: s.clusters.name, environmentId: s.clusters.environmentId })
+      .from(s.clusters)
+      .where(and(eq(s.clusters.id, target.clusterId), eq(s.clusters.orgId, project.orgId)));
+    if (!cluster) throw new Error("Cluster does not belong to this organization.");
+    // A cluster belongs to exactly one environment, and deploying into one from
+    // a different environment would put the workload somewhere the environment
+    // panel never shows it.
+    if (cluster.environmentId !== input.environmentId) {
+      throw new Error(`${cluster.name} belongs to a different environment.`);
+    }
+    // store.ClusterKindAllowed, from the catalog the control plane generates
+    // its own copy of. The wizard already refuses these kinds on the target
+    // step; this is the refusal that has to hold when the request did not come
+    // from the wizard.
+    if (!clusterCanHost(input.kind)) {
+      throw new Error(
+        `${resourceKindLabel(input.kind)} runs on its own server, not inside a cluster.`
+      );
+    }
+  }
 
   // The spec is built by a pure helper so it is testable — see
   // buildResourceSpec, and the regression that motivated extracting it.
@@ -179,6 +205,16 @@ export async function createResource(input: {
     projectId: input.projectId,
     environmentId: input.environmentId,
     serverId: target.serverId ?? null,
+    // Only in demo mode. The column references the LOCAL clusters table, which
+    // exists to hold demo clusters; a CP-mode cluster id names a row in the
+    // control plane's database and writing it here would break the FK. In CP
+    // mode the control plane holds the target and the mirror is a read model,
+    // which is already true of the compose placements and the domains.
+    //
+    // Demo mode had nowhere to put it at all, so a resource the user aimed at a
+    // cluster was stored with neither a server nor a cluster and rendered as
+    // unassigned — the wizard's choice reached the create call and evaporated.
+    clusterId: cp ? null : target.clusterId ?? null,
     name,
     kind: input.kind,
     status: cp ? "provisioning" : "running",

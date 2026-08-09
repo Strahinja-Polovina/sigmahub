@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   ALLOWED_SERVER_TYPES,
   CATALOG_SOURCE_SHA256,
+  CLUSTER_EXCLUDED_KINDS,
   CONNECTABLE_SERVER_TYPES,
   HOSTS_NOTHING_REASON,
   RESOURCE_KINDS,
@@ -15,6 +16,7 @@ import {
   SERVER_TYPE_LABELS,
   SERVER_UNIT_WEIGHTS,
   canHost,
+  clusterCanHost,
 } from "./server-catalog.generated";
 import type { ResourceKind, ServerType } from "./server-catalog.generated";
 
@@ -40,11 +42,19 @@ const STORE_GO = join(REPO, "cp", "internal", "store");
 const GENERATED = join("src", "lib", "server-catalog.generated.ts");
 
 // Every input the generated module is rendered from, in the order the Go side
-// hashes them (store.CatalogSourceFiles). All three, because the output embeds
+// hashes them (store.CatalogSourceFiles). All four, because the output embeds
 // more than the catalog: hashing only server_catalog.go let a currency change
 // in billing.go ship a dashboard that still said EUR, with the whole web suite
-// green.
-const CATALOG_SOURCES = ["server_catalog.go", "server_catalog_ts.go", "billing.go"];
+// green. clusters.go joined the list when CLUSTER_EXCLUDED_KINDS started being
+// rendered from it — an exclusion the web cannot see change is the same failure
+// wearing a different hat, and demo mode reads that list with no control plane
+// to correct it.
+const CATALOG_SOURCES = [
+  "server_catalog.go",
+  "server_catalog_ts.go",
+  "billing.go",
+  "clusters.go",
+];
 
 describe("the generated catalog tracks the control plane", () => {
   it("was rendered from the Go catalog currently on disk", () => {
@@ -206,6 +216,40 @@ describe("availability matrix", () => {
     // But it stays a known type: the API accepts every canonical type, and a
     // narrower list at the edge is the bug SIGMA-198 removed.
     expect(SERVER_TYPES).toContain("k8s");
+  });
+});
+
+// The other half of "where can this run". It arrives here compiled in rather
+// than over the wire because demo mode has no control plane to ask, and the
+// empty list it used to hard-code made clusterEligible() answer true for every
+// kind — a demo cluster offered as a target for a Postgres the real product
+// refuses.
+describe("the kinds a cluster refuses", () => {
+  it("names only kinds this dashboard knows about", () => {
+    // A typo here would be a kind excluded in the control plane and offered
+    // here, which is the disagreement the generated list exists to end.
+    for (const kind of CLUSTER_EXCLUDED_KINDS) {
+      expect(RESOURCE_KINDS).toContain(kind);
+    }
+  });
+
+  it("answers clusterCanHost for every kind, and for a string that is not one", () => {
+    for (const kind of RESOURCE_KINDS) {
+      expect(clusterCanHost(kind)).toBe(!CLUSTER_EXCLUDED_KINDS.includes(kind));
+    }
+    // A deny list, exactly as the control plane reads it: anything unlisted is
+    // allowed, and the create call is what rejects a kind nobody defined.
+    expect(clusterCanHost("not-a-kind")).toBe(true);
+  });
+
+  it("keeps stateful engines and model endpoints out of the cluster", () => {
+    // Each has its own reason and both are product decisions: an engine
+    // rescheduled onto a node without its volume is data loss, and nothing
+    // renders a cluster-targeted model endpoint at all.
+    for (const kind of ["postgres", "mysql", "mongodb", "redis", "s3", "llm"] as ResourceKind[]) {
+      expect(clusterCanHost(kind)).toBe(false);
+    }
+    expect(clusterCanHost("app")).toBe(true);
   });
 });
 

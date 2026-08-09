@@ -3,8 +3,12 @@
 // S3 storage (P2-1): the info/reveal split mirrors databases — metadata for
 // every member, the audited credential reveal for Project Admin+.
 
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import * as schema from "../db/schema";
 import { requireProjectAdminForResource, requireResourceVisible } from "../active-org";
 import { writeAudit } from "../audit";
+import { demoS3Connection, demoS3Info } from "@/lib/demo-connection";
 import {
   cpEnabled,
   cpGetS3,
@@ -20,31 +24,67 @@ import {
 } from "../cp";
 import { revalidatePath } from "next/cache";
 
+/** Bucket, key and quota CRUD is the agent's s3.configure op talking to a real
+ *  MinIO. There is no engine behind a demo resource for it to configure, and a
+ *  bucket list that only ever agreed with itself would teach nothing — so this
+ *  half stays control-plane-only, and the panel says so rather than offering
+ *  buttons that throw (see S3Panel's `simulated` branch). */
 function ensureCp() {
   if (!cpEnabled()) {
-    throw new Error("S3 storage requires the control plane (set SIGMAHUB_CP_URL).");
+    throw new Error("Managing buckets requires the control plane (set SIGMAHUB_CP_URL).");
   }
 }
 
+/** The local row a demo endpoint is derived from. */
+async function demoResource(resourceId: string) {
+  const [row] = await db
+    .select({
+      id: schema.resources.id,
+      name: schema.resources.name,
+      kind: schema.resources.kind,
+      meshIp: schema.servers.meshIp,
+    })
+    .from(schema.resources)
+    .leftJoin(schema.servers, eq(schema.resources.serverId, schema.servers.id))
+    .where(eq(schema.resources.id, resourceId));
+  return row;
+}
+
+/** Endpoint metadata, member-visible. Demo mode derives it from the resource id
+ *  rather than throwing, for the same reason the database panel does: the
+ *  wizard's last screen and the resource's Storage panel are where an operator
+ *  learns that provisioning object storage hands them an endpoint and a key
+ *  pair, and neither could render at all offline (SIGMA-215). */
 export async function getS3Info(input: {
   orgId: string;
   resourceId: string;
 }): Promise<CpS3Info | null> {
-  ensureCp();
   await requireResourceVisible(input.orgId, input.resourceId);
-  return cpGetS3(input.orgId, input.resourceId);
+  if (cpEnabled()) return cpGetS3(input.orgId, input.resourceId);
+  const row = await demoResource(input.resourceId);
+  if (!row || row.kind !== "s3") return null;
+  return demoS3Info({ resourceId: row.id, resourceName: row.name, meshIp: row.meshIp });
 }
 
 export async function revealS3Connection(input: {
   orgId: string;
   resourceId: string;
 }): Promise<CpS3Connection> {
-  ensureCp();
   const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
-  const conn = await cpRevealS3Connection(input.orgId, input.resourceId, {
-    name: user.name,
-    role,
-  });
+  let conn: CpS3Connection;
+  if (cpEnabled()) {
+    conn = await cpRevealS3Connection(input.orgId, input.resourceId, {
+      name: user.name,
+      role,
+    });
+  } else {
+    const row = await demoResource(input.resourceId);
+    if (!row || row.kind !== "s3") throw new Error("This resource is not object storage.");
+    conn = demoS3Connection({ resourceId: row.id, resourceName: row.name, meshIp: row.meshIp });
+  }
+  // Audited in both modes: the reveal is a privileged read, and a demo that
+  // did not write the row would leave the audit log looking like nobody had
+  // ever looked at a secret.
   await writeAudit({
     orgId: input.orgId,
     actor: user.name,

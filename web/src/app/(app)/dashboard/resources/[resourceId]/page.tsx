@@ -9,8 +9,6 @@ import {
   cpListDeployments,
   cpListResources,
   cpRollbackTargets,
-  cpGetDatabase,
-  cpGetS3,
   cpGetComposeServices,
   cpListServers,
   cpListBackupTargets,
@@ -22,6 +20,8 @@ import {
   type CpBackupTarget,
   type CpBackupRun,
 } from "@/server/cp";
+import { getDatabaseInfo } from "@/server/actions/databases";
+import { getS3Info } from "@/server/actions/s3";
 import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
@@ -112,27 +112,36 @@ async function loadDeployments(
 
 const DB_KINDS = new Set(["postgres", "mysql", "redis", "mongodb"]);
 
-/** Load a database resource's connection metadata (P1-10, CP mode only). A CP
- *  failure degrades to null rather than breaking the page. */
+/** Load a database resource's connection metadata (P1-10). A CP failure
+ *  degrades to null rather than breaking the page.
+ *
+ *  Both modes since SIGMA-215: the action derives a demo engine's details from
+ *  the resource id, so the panel — the screen that says a managed database is
+ *  mesh-only and hands out an audited credential — is reachable offline. */
 async function loadDatabase(
   failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
 ): Promise<CpDatabaseInfo | null> {
-  if (!cpEnabled() || !DB_KINDS.has(kind)) return null;
-  return attempt(failures, "connection details", () => cpGetDatabase(orgId, resourceId), null);
+  if (!DB_KINDS.has(kind)) return null;
+  return attempt(
+    failures,
+    "connection details",
+    () => getDatabaseInfo({ orgId, resourceId }),
+    null
+  );
 }
 
-/** Load an S3 resource's endpoint metadata (P2-1, CP mode only). */
+/** Load an S3 resource's endpoint metadata (P2-1), likewise in both modes. */
 async function loadS3(
   failures: LoadFailures,
   orgId: string,
   resourceId: string,
   kind: string
 ): Promise<CpS3Info | null> {
-  if (!cpEnabled() || kind !== "s3") return null;
-  return attempt(failures, "endpoint details", () => cpGetS3(orgId, resourceId), null);
+  if (kind !== "s3") return null;
+  return attempt(failures, "endpoint details", () => getS3Info({ orgId, resourceId }), null);
 }
 
 /** The live per-resource failure the agent reported (mesh bind, image pull,
@@ -182,7 +191,12 @@ async function loadBackups(
   isDatabase: boolean,
   failures: LoadFailures
 ): Promise<{ targets: CpBackupTarget[]; runs: CpBackupRun[] }> {
-  if (!isDatabase) return { targets: [], runs: [] };
+  // Still CP-only, and now explicitly rather than by accident: the database
+  // panel renders in demo mode, so this had to stop being "whatever cpGetDatabase
+  // returned". Backups are executed by the control plane against a real S3
+  // target — there is nothing offline to schedule, verify or restore — so the
+  // panel states that instead of offering buttons that throw (SIGMA-215).
+  if (!cpEnabled() || !isDatabase) return { targets: [], runs: [] };
   return attempt(failures, "backups", async () => {
     const [targets, runs] = await Promise.all([
       cpListBackupTargets(orgId),

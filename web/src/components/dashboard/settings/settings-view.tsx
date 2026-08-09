@@ -8,6 +8,7 @@ import { MembersTab } from "./members-tab";
 import { AuditTab } from "./audit-tab";
 import { TokensTab } from "./tokens-tab";
 import { BetaMetricsTab } from "./beta-metrics-tab";
+import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import { SecurityTab } from "./security-tab";
 import { AlertsTab } from "./alerts-tab";
 import { IntegrationsTab, type Installation } from "./integrations-tab";
@@ -95,7 +96,14 @@ export function SettingsView({
     "tokens",
     "security",
     ...(canViewAudit ? ["audit"] : []),
-    ...(cpMode ? ["integrations", "alerts", "beta"] : []),
+    // Present in both modes. Hiding these three with no control plane meant
+    // someone evaluating SigmaHub offline concluded it has no GitHub App, no
+    // registry, no alerting and no beta feed — rather than that they cannot
+    // configure those from here. Each one now explains itself instead
+    // (SIGMA-215).
+    "integrations",
+    "alerts",
+    "beta",
   ];
   const initialTab =
     requestedTab && availableTabs.includes(requestedTab) ? requestedTab : "general";
@@ -114,11 +122,11 @@ export function SettingsView({
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
           <TabsTrigger value="tokens">Tokens</TabsTrigger>
-          {cpMode && <TabsTrigger value="integrations">Integrations</TabsTrigger>}
+          <TabsTrigger value="integrations">Integrations</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
           {canViewAudit && <TabsTrigger value="audit">Audit log</TabsTrigger>}
-          {cpMode && <TabsTrigger value="alerts">Alerts</TabsTrigger>}
-          {cpMode && <TabsTrigger value="beta">Beta metrics</TabsTrigger>}
+          <TabsTrigger value="alerts">Alerts</TabsTrigger>
+          <TabsTrigger value="beta">Beta metrics</TabsTrigger>
         </TabsList>
 
         <TabsContent value="general">
@@ -136,8 +144,8 @@ export function SettingsView({
         <TabsContent value="tokens">
           <TokensTab orgId={org.id} isAdmin={isAdmin} />
         </TabsContent>
-        {cpMode && (
-          <TabsContent value="integrations">
+        <TabsContent value="integrations">
+          {cpMode ? (
             <IntegrationsTab
               orgId={org.id}
               enabled={gitIntegration?.enabled ?? false}
@@ -146,8 +154,17 @@ export function SettingsView({
               canManage={isAdmin}
               registry={registry}
             />
-          </TabsContent>
-        )}
+          ) : (
+            <ControlPlaneNote title="The GitHub App and the image registry live on the control plane">
+              Two org-wide integrations are configured here. The GitHub App is installed
+              once and gives every project a repository picker and push-to-deploy; the
+              container registry is what makes an image built on one of your machines
+              runnable on all of them. Both hold credentials the control plane owns — an
+              installation token and a registry password — so neither can be set up
+              without one.
+            </ControlPlaneNote>
+          )}
+        </TabsContent>
         <TabsContent value="security">
           <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} />
         </TabsContent>
@@ -156,16 +173,33 @@ export function SettingsView({
             <AuditTab entries={audit} />
           </TabsContent>
         )}
-        {cpMode && (
-          <TabsContent value="alerts">
+        <TabsContent value="alerts">
+          {cpMode ? (
             <AlertsTab orgId={org.id} isAdmin={isAdmin} />
-          </TabsContent>
-        )}
-        {cpMode && (
-          <TabsContent value="beta">
+          ) : (
+            <ControlPlaneNote title="Alerts are delivered by the control plane">
+              With a control plane, you add Slack, email or webhook channels, choose which
+              operational events each one receives — a server going unreachable, a deploy
+              failing, a backup that did not verify — and fire a real test notification to
+              prove delivery works before you rely on it. Delivery is the control plane
+              making an outbound call when something happens to your fleet, and there is
+              no fleet being watched here.
+            </ControlPlaneNote>
+          )}
+        </TabsContent>
+        <TabsContent value="beta">
+          {cpMode ? (
             <BetaMetricsTab orgId={org.id} orgCreatedAt={orgCreatedAt} />
-          </TabsContent>
-        )}
+          ) : (
+            <ControlPlaneNote title="Beta metrics are measured on the control plane">
+              This tab reports how this organization is doing against the beta&apos;s exit
+              criteria — time from connecting a server to a first successful deploy,
+              deploy success rate, agent version spread. Every figure is measured from
+              real events the control plane recorded, so with none recorded there is
+              nothing to report rather than a chart of nothing.
+            </ControlPlaneNote>
+          )}
+        </TabsContent>
       </Tabs>
     </div>
   );

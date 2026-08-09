@@ -21,6 +21,7 @@ import {
   deleteBucket,
   createBucketKey,
 } from "@/server/actions/s3";
+import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type { CpS3Info, CpS3Connection, CpBucket } from "@/server/cp";
 
 function errMsg(err: unknown): string {
@@ -254,11 +255,16 @@ export function S3Panel({
   resourceId,
   info,
   canManage,
+  simulated = false,
 }: {
   orgId: string;
   resourceId: string;
   info: CpS3Info;
   canManage: boolean;
+  /** Demo mode: the endpoint and key pair are derived from the resource rather
+   *  than reported by a running MinIO, and bucket management — which is the
+   *  agent reconfiguring that MinIO over the mesh — has nothing to talk to. */
+  simulated?: boolean;
 }) {
   const [conn, setConn] = React.useState<CpS3Connection | null>(null);
   const [revealed, setRevealed] = React.useState(false);
@@ -363,8 +369,28 @@ export function S3Panel({
           </div>
         </div>
 
-        {/* P2-1b bucket management over the mesh. */}
-        <BucketManager orgId={orgId} resourceId={resourceId} canManage={canManage} />
+        {simulated ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              No object store is running behind this: the endpoint and access key are
+              generated from the resource so the flow is walkable, and the secret starts
+              with <code className="font-mono">demo_</code> so it cannot be mistaken for
+              one.
+            </p>
+            {/* Buckets are the agent's s3.configure op talking to a real engine.
+                A list that only ever agreed with itself would teach nothing, so
+                the panel says what the capability is instead (SIGMA-215). */}
+            <ControlPlaneNote title="Buckets are created on the engine itself">
+              With a control plane, this panel creates and deletes buckets, sets
+              per-bucket quotas and mints scoped access keys — the agent applies each
+              change to the running engine over the mesh and the panel reflects it as it
+              converges. There is no engine here to apply them to.
+            </ControlPlaneNote>
+          </>
+        ) : (
+          /* P2-1b bucket management over the mesh. */
+          <BucketManager orgId={orgId} resourceId={resourceId} canManage={canManage} />
+        )}
 
         {info.endpoint && (
           <div className="rounded-md border border-border bg-muted/40 p-3">

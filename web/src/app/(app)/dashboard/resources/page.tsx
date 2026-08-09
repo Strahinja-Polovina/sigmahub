@@ -26,7 +26,12 @@ export default async function ResourcesPage({
     // Clusters are a deploy TARGET, and the wizard could not offer them because
     // nothing loaded them here — clusterId has threaded end to end since
     // SIGMA-200 with no control able to set it.
-    cpEnabled() ? listClusters(orgId) : Promise.resolve({ clusters: [], excludedKinds: [] }),
+    //
+    // Unconditional now. The mode branch used to live here, and both halves of
+    // its fallback were wrong: no clusters at all with no control plane, and an
+    // empty exclusion list, which the control plane reads as "a cluster hosts
+    // every kind" — the opposite of what it means (SIGMA-215).
+    listClusters(orgId),
     searchParams,
   ]);
   const orgName = myOrgs.find((o) => o.id === orgId)?.name ?? "your organization";

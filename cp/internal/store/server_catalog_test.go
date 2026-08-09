@@ -206,6 +206,74 @@ func TestGeneratedTypeScriptCarriesTheCategories(t *testing.T) {
 	}
 }
 
+// The kinds a cluster refuses are published TWICE — by the API at runtime
+// (GET /clusters returns excludedKinds) and by the generated catalog, which the
+// dashboard compiles in for demo mode, where there is no control plane to ask.
+// Two publishers of one rule is the drift this test exists to forbid: while the
+// demo hard-coded an empty list, clusterEligible() answered true for every kind,
+// so a demo cluster would have been offered as a target for a Postgres that the
+// real product refuses — the two sides of one question disagreeing, which is the
+// defect single-sourcing the catalog was meant to end. Rendering FROM
+// ClusterExcludedKinds is what makes them one statement; this asserts it, so the
+// day someone hand-writes the TS array the CP suite says so.
+func TestBothPublishedClusterExclusionListsAreOneStatement(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := string(RenderTypeScript(sha))
+
+	published := ClusterExcludedKinds()
+	fragment := "export const CLUSTER_EXCLUDED_KINDS: ResourceKind[] = " + tsStringArray(published) + ";"
+	if !strings.Contains(ts, fragment) {
+		t.Fatalf("the generated catalog does not carry the API's own list %v;\nexpected: %s",
+			published, fragment)
+	}
+
+	// …and the published list must be the rule the create call actually
+	// enforces. A kind listed but allowed sends the wizard to a target that
+	// works; a kind excluded but unlisted sends it to one that 422s after Review.
+	for _, kind := range published {
+		if ClusterKindAllowed(kind) {
+			t.Errorf("%q is published as excluded but ClusterKindAllowed accepts it", kind)
+		}
+	}
+	for _, kind := range ResourceKinds() {
+		if !ClusterKindAllowed(kind) && !contains(published, kind) {
+			t.Errorf("%q is refused inside a cluster but is not published, so the wizard offers it", kind)
+		}
+	}
+	// The rule itself, so a one-word edit to the map cannot reverse it quietly.
+	if !ClusterKindAllowed("app") {
+		t.Error("app must be deployable into a cluster; it is what clusters are for")
+	}
+	for _, kind := range []string{"postgres", "mysql", "mongodb", "redis", "s3", "llm"} {
+		if ClusterKindAllowed(kind) {
+			t.Errorf("%q must not run inside a cluster", kind)
+		}
+	}
+}
+
+// The exclusion list is rendered into a CHECKED-IN file, so its order has to be
+// a property of the catalog rather than of a map range: Go randomizes map
+// iteration, and a list that reshuffles per run makes `go generate` produce a
+// different file most times it runs — the staleness test would then fail on
+// commits that changed nothing.
+func TestClusterExclusionsAreListedInCatalogOrder(t *testing.T) {
+	kinds := ResourceKinds()
+	last := -1
+	for _, kind := range ClusterExcludedKinds() {
+		at := indexOf(kinds, kind)
+		if at < 0 {
+			t.Fatalf("%q is published as excluded but is not a known resource kind", kind)
+		}
+		if at <= last {
+			t.Errorf("%q is out of catalog order; the rendered TypeScript is not reproducible", kind)
+		}
+		last = at
+	}
+}
+
 // Domain rules worth restating as tests: each was a deliberate product
 // decision, and each would be silently reversible by a one-word catalog edit.
 func TestCatalogDomainRules(t *testing.T) {

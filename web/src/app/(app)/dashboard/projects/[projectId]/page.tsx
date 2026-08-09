@@ -152,8 +152,11 @@ export default async function ProjectDetailPage({
     loadGitConnections(orgId, projectId),
     loadGitApp(orgId),
     // A cluster is a deploy TARGET, and the wizard could not offer one because
-    // nothing loaded them here (SIGMA-210).
-    cpEnabled() ? listClusters(orgId) : Promise.resolve({ clusters: [], excludedKinds: [] }),
+    // nothing loaded them here (SIGMA-210). Asked in both modes since
+    // SIGMA-215 — listClusters answers for the demo tables too, and the
+    // exclusion list it returns is the catalog's rather than an empty array,
+    // which the control plane reads as "a cluster hosts every kind".
+    listClusters(orgId),
   ]);
   // What recent pushes to this project's repositories actually produced. The
   // org-wide list is filtered to this project's connections; a CP failure just

@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Server as ServerIcon, ShieldCheck, Boxes, Loader2, Radio } from "lucide-react";
 import { toast } from "sonner";
 
@@ -31,7 +32,11 @@ import {
   simulateDecommission,
   type DemoHostShape,
 } from "@/server/actions/servers";
-import { isDecommissioning } from "@/lib/decommission";
+import {
+  demoTeardownPhase,
+  isDecommissioning,
+  msUntilNextTeardownStep,
+} from "@/lib/decommission";
 import {
   ClustersPanel,
   type ClusterEnvironment,
@@ -141,6 +146,74 @@ function DecommissionSimButton({
   );
 }
 
+/** Demo-only: the graceful teardown actually happening.
+ *
+ *  Pressing Disconnect used to leave the row in `decommissioning` forever,
+ *  because the thing that ends it is an agent ack and demo mode has no agent.
+ *  The only way out was a simulate button the user had to notice — a demo of a
+ *  transient state that never transitioned.
+ *
+ *  So the default outcome runs on a clock, and the clock walks the agent's real
+ *  uninstall sequence step by step (see demoTeardownPhase). This component is
+ *  what asks for the render that shows each step, and it is what writes the ack
+ *  at the end: nothing runs between requests, so if the page is not watching,
+ *  nothing finishes it. The other endings stay as buttons next to it — a
+ *  teardown that fails, or an agent that never answers, are not things a timer
+ *  can produce, and they are the two that lead to the force path. */
+function TeardownProgress({
+  serverId,
+  startedAt,
+  purgeVolumes,
+}: {
+  serverId: string;
+  startedAt: Date | string | null;
+  purgeVolumes: boolean;
+}) {
+  const router = useRouter();
+  // The clock is the source of truth and the state is only a reason to look at
+  // it again, so the phase is DERIVED on render rather than stored: a copy in
+  // state would need an effect to keep it correct, and the two would disagree
+  // for one frame every time a step landed.
+  const [, retick] = React.useState(0);
+  const phase = demoTeardownPhase({ startedAt, purgeVolumes });
+  const ackedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    if (phase.done) {
+      // Once, even if this effect re-runs: the ack DELETES the server row, and
+      // a second call would fail with "Server not found" against a row the
+      // first one legitimately removed.
+      if (ackedRef.current) return;
+      ackedRef.current = true;
+      void simulateDecommission({ serverId, event: "ack" })
+        .then(() => {
+          toast.success("Decommissioned", {
+            description: "The agent removed everything it installed and then itself.",
+          });
+          router.refresh();
+        })
+        .catch(() => {
+          // Another tab, or the "…with errors" button, got there first. The row
+          // is gone either way, which is the outcome this was driving toward.
+        });
+      return;
+    }
+    const wait = msUntilNextTeardownStep({ startedAt, purgeVolumes });
+    if (wait === null) return;
+    const timer = setTimeout(() => retick((n) => n + 1), wait + 100);
+    return () => clearTimeout(timer);
+  }, [serverId, startedAt, purgeVolumes, phase.done, phase.step, router]);
+
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+      <Loader2 className="size-3.5 animate-spin" />
+      <span>
+        {phase.label} ({Math.min(phase.step + 1, phase.total)}/{phase.total})
+      </span>
+    </span>
+  );
+}
+
 function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boolean }) {
   return (
     <TableRow>
@@ -182,11 +255,12 @@ function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boole
               for (SIGMA-204/205). */}
           {!cpMode && isDecommissioning(server.status) && (
             <>
-              <DecommissionSimButton
+              {/* The default ending, happening. It finishes by itself; the
+                  buttons beside it are the two that a clock cannot produce. */}
+              <TeardownProgress
                 serverId={server.id}
-                event="ack"
-                label="Agent confirms"
-                description="The host is clean and the server has been removed."
+                startedAt={server.decommissionStartedAt}
+                purgeVolumes={server.decommissionPurgeVolumes}
               />
               <DecommissionSimButton
                 serverId={server.id}
@@ -352,21 +426,24 @@ export function ServersView({
         </CardContent>
       </Card>
 
-      {cpMode && (
-        <ClustersPanel
-          orgId={orgId}
-          clusters={clusters}
-          excludedKinds={clusterExcludedKinds}
-          servers={servers.map((sv) => ({
-            id: sv.id,
-            name: sv.name,
-            type: sv.type,
-            status: sv.status,
-          }))}
-          environments={clusterEnvironments}
-          canManage
-        />
-      )}
+      {/* Both modes. It was gated on cpMode, so with no control plane the
+          product's whole cluster story — build one from your own servers, then
+          deploy to it like a server — was invisible to exactly the audience
+          demo mode exists for (SIGMA-215). */}
+      <ClustersPanel
+        orgId={orgId}
+        clusters={clusters}
+        excludedKinds={clusterExcludedKinds}
+        servers={servers.map((sv) => ({
+          id: sv.id,
+          name: sv.name,
+          type: sv.type,
+          status: sv.status,
+        }))}
+        environments={clusterEnvironments}
+        canManage
+        simulated={!cpMode}
+      />
     </div>
   );
 }
