@@ -5,6 +5,11 @@ import { Copy, Eye, EyeOff, FolderPlus, HardDrive, KeyRound, Loader2, Lock, Tras
 import { toast } from "sonner";
 
 import {
+  S3_ENGINE_NAMES,
+  type S3Engine,
+} from "@/lib/server-catalog.generated";
+
+import {
   Card,
   CardContent,
   CardDescription,
@@ -21,6 +26,7 @@ import {
   deleteBucket,
   createBucketKey,
 } from "@/server/actions/s3";
+import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type { CpS3Info, CpS3Connection, CpBucket } from "@/server/cp";
 
 function errMsg(err: unknown): string {
@@ -29,7 +35,11 @@ function errMsg(err: unknown): string {
 
 // Human labels for the object-storage engines (P2-2). SeaweedFS is the
 // Apache-2.0 hedge against MinIO's AGPL license; both speak the S3 API.
-const ENGINE_LABELS: Record<string, string> = {
+//
+// Keyed on S3Engine rather than on string, so an engine added to the control
+// plane's catalog stops this file compiling instead of rendering its raw id at
+// a customer. The engines themselves are the catalog's; only the words are ours.
+const ENGINE_LABELS: Record<S3Engine, string> = {
   minio: "MinIO",
   seaweedfs: "SeaweedFS",
 };
@@ -37,14 +47,18 @@ const ENGINE_LABELS: Record<string, string> = {
 // The honest support matrix: what maps 1:1 across engines and what does not,
 // so an operator picking SeaweedFS knows exactly what stays the same. Mirrors
 // the database-engine matrix — no silent feature gaps.
-const SUPPORT_MATRIX: { capability: string; minio: string; seaweedfs: string }[] = [
-  { capability: "S3 API over the mesh", minio: "yes", seaweedfs: "yes" },
-  { capability: "Root credentials (env)", minio: "yes", seaweedfs: "yes" },
-  { capability: "Buckets via any S3 client", minio: "yes", seaweedfs: "yes" },
-  { capability: "In-dashboard bucket CRUD", minio: "yes", seaweedfs: "yes" },
-  { capability: "Per-bucket keys + quotas", minio: "yes*", seaweedfs: "yes" },
-  { capability: "Built-in web console", minio: "off (disabled)", seaweedfs: "n/a" },
-  { capability: "License", minio: "AGPL-3.0", seaweedfs: "Apache-2.0" },
+//
+// A row is a total Record over the engines for the same reason as above: a
+// third engine used to get no column here at all, which reads as "this table
+// covers everything" while quietly covering less.
+const SUPPORT_MATRIX: { capability: string; support: Record<S3Engine, string> }[] = [
+  { capability: "S3 API over the mesh", support: { minio: "yes", seaweedfs: "yes" } },
+  { capability: "Root credentials (env)", support: { minio: "yes", seaweedfs: "yes" } },
+  { capability: "Buckets via any S3 client", support: { minio: "yes", seaweedfs: "yes" } },
+  { capability: "In-dashboard bucket CRUD", support: { minio: "yes", seaweedfs: "yes" } },
+  { capability: "Per-bucket keys + quotas", support: { minio: "yes*", seaweedfs: "yes" } },
+  { capability: "Built-in web console", support: { minio: "off (disabled)", seaweedfs: "n/a" } },
+  { capability: "License", support: { minio: "AGPL-3.0", seaweedfs: "Apache-2.0" } },
 ];
 
 function copy(value: string, label: string) {
@@ -254,11 +268,16 @@ export function S3Panel({
   resourceId,
   info,
   canManage,
+  simulated = false,
 }: {
   orgId: string;
   resourceId: string;
   info: CpS3Info;
   canManage: boolean;
+  /** Demo mode: the endpoint and key pair are derived from the resource rather
+   *  than reported by a running MinIO, and bucket management — which is the
+   *  agent reconfiguring that MinIO over the mesh — has nothing to talk to. */
+  simulated?: boolean;
 }) {
   const [conn, setConn] = React.useState<CpS3Connection | null>(null);
   const [revealed, setRevealed] = React.useState(false);
@@ -309,7 +328,7 @@ export function S3Panel({
             <span className="text-sm text-muted-foreground">Engine</span>
             <span className="inline-flex min-w-0 items-center gap-2">
               <Badge variant="secondary" className="shrink-0">
-                {ENGINE_LABELS[info.engine] ?? info.engine}
+                {ENGINE_LABELS[info.engine as S3Engine] ?? info.engine}
               </Badge>
               <span className="truncate font-mono text-xs text-muted-foreground">
                 {info.image}
@@ -363,8 +382,28 @@ export function S3Panel({
           </div>
         </div>
 
-        {/* P2-1b bucket management over the mesh. */}
-        <BucketManager orgId={orgId} resourceId={resourceId} canManage={canManage} />
+        {simulated ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              No object store is running behind this: the endpoint and access key are
+              generated from the resource so the flow is walkable, and the secret starts
+              with <code className="font-mono">demo_</code> so it cannot be mistaken for
+              one.
+            </p>
+            {/* Buckets are the agent's s3.configure op talking to a real engine.
+                A list that only ever agreed with itself would teach nothing, so
+                the panel says what the capability is instead (SIGMA-215). */}
+            <ControlPlaneNote title="Buckets are created on the engine itself">
+              With a control plane, this panel creates and deletes buckets, sets
+              per-bucket quotas and mints scoped access keys — the agent applies each
+              change to the running engine over the mesh and the panel reflects it as it
+              converges. There is no engine here to apply them to.
+            </ControlPlaneNote>
+          </>
+        ) : (
+          /* P2-1b bucket management over the mesh. */
+          <BucketManager orgId={orgId} resourceId={resourceId} canManage={canManage} />
+        )}
 
         {info.endpoint && (
           <div className="rounded-md border border-border bg-muted/40 p-3">
@@ -381,34 +420,34 @@ export function S3Panel({
         <div className="overflow-x-auto rounded-md border border-border">
           <table className="w-full text-xs">
             <thead>
+              {/* Columns come from the catalog, so a new engine gets one
+                  rather than being left out of a table that claims to compare
+                  them all. */}
               <tr className="border-b border-border bg-muted/40 text-left text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Capability</th>
-                <th className="px-3 py-2 font-medium">MinIO</th>
-                <th className="px-3 py-2 font-medium">SeaweedFS</th>
+                {S3_ENGINE_NAMES.map((engine) => (
+                  <th key={engine} className="px-3 py-2 font-medium">
+                    {ENGINE_LABELS[engine]}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {SUPPORT_MATRIX.map((row) => (
                 <tr key={row.capability} className="border-b border-border last:border-0">
                   <td className="px-3 py-2 text-foreground">{row.capability}</td>
-                  <td
-                    className={
-                      row.minio === "yes"
-                        ? "px-3 py-2 font-medium text-emerald-600"
-                        : "px-3 py-2 text-muted-foreground"
-                    }
-                  >
-                    {row.minio}
-                  </td>
-                  <td
-                    className={
-                      row.seaweedfs === "yes"
-                        ? "px-3 py-2 font-medium text-emerald-600"
-                        : "px-3 py-2 text-muted-foreground"
-                    }
-                  >
-                    {row.seaweedfs}
-                  </td>
+                  {S3_ENGINE_NAMES.map((engine) => (
+                    <td
+                      key={engine}
+                      className={
+                        row.support[engine] === "yes"
+                          ? "px-3 py-2 font-medium text-emerald-600"
+                          : "px-3 py-2 text-muted-foreground"
+                      }
+                    >
+                      {row.support[engine]}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>

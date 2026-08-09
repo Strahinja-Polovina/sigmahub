@@ -77,6 +77,7 @@ import {
   type PushActivity,
 } from "./project-git-panel";
 import { ProjectMembersPanel, type ProjectMemberRow } from "./project-members-panel";
+import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 
 type ProjectRow = { id: string; name: string; slug: string; description: string };
 export type OrgServer = {
@@ -666,6 +667,25 @@ export function ProjectDetailView({
           gitApp={gitApp}
           pendingInstallationId={pendingInstallationId}
         />
+      )}
+
+      {/* Push-to-deploy is a GitHub App installation, a webhook receiver and a
+          clone credential — three things that only exist beside a control
+          plane. The panel used to be hidden entirely, which read as "this
+          product does not connect to GitHub" rather than "you cannot connect
+          one from here" (SIGMA-215). The wizard's own repository step still
+          works offline against the sample repositories, so the flow it feeds is
+          walkable; this is the half that is not. */}
+      {!showGit && (
+        <ControlPlaneNote title="Connecting a repository needs a control plane">
+          With a control plane, you install the SigmaHub GitHub App once for the
+          organization, pick a repository per project, and every push to a mapped branch
+          clones, builds and rolls out to the environment you mapped it to — with pull
+          requests optionally getting their own preview environment, torn down when they
+          close. It needs somewhere for GitHub to deliver webhooks and somewhere to hold
+          the installation token, so it cannot run here. The New Resource wizard still
+          walks its Source and Build steps against sample repositories.
+        </ControlPlaneNote>
       )}
 
       {projectMembers && orgId && (

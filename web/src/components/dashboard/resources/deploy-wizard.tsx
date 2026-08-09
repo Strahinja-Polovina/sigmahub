@@ -741,7 +741,12 @@ export function DeployWizard({
         // Generated credentials, shown once (SIGMA-212). The reveal is audited
         // on both sides; showing them here is the difference between "your
         // database exists" and "your database is usable".
-        if (cpMode && isManagedKind(kind)) {
+        // Both modes since SIGMA-215. The demo branches of these two actions
+        // derive the engine's details from the resource, so the last screen of
+        // the managed-data flow stops being blank for five of the seven kinds —
+        // and "your database is usable" is the half of SIGMA-212 that a demo
+        // user could not see at all.
+        if (isManagedKind(kind)) {
           try {
             const creds = isDatabaseKind(kind)
               ? await revealDatabaseConnection({ orgId, resourceId: id }).then((c) => [

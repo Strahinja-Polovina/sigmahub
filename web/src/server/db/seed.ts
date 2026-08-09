@@ -13,10 +13,12 @@ import * as s from "./schema";
 import { user, session, account, verification, twoFactor } from "./auth-schema";
 import { auth } from "../../lib/auth";
 import { checkServerCompatibility, SERVER_STATUS } from "../../lib/server-compat";
+import { assertResourceTargetsAreLegal, deriveSeededClusters } from "./seed-rows";
 import {
   orgs as mockOrgs,
   projects as mockProjects,
   environments as mockEnvs,
+  clusters as mockClusters,
   servers as mockServers,
   resources as mockResources,
   members as mockMembers,
@@ -39,9 +41,16 @@ async function main() {
   await repairMigrationLedger((stmt) => db.execute(sql.raw(stmt)));
   await migrate(db, { migrationsFolder: "drizzle" });
 
+  // Before a single row is written, so a bad fixture fails at the top with a
+  // sentence naming the file to fix rather than as a foreign-key error two
+  // hundred inserts later.
+  assertResourceTargetsAreLegal(mockResources);
+
   // Idempotent: clear (child → parent) then identity tables.
   await db.delete(s.deployments);
   await db.delete(s.resources);
+  await db.delete(s.clusterNodes);
+  await db.delete(s.clusters);
   await db.delete(s.envServers);
   await db.delete(s.servers);
   await db.delete(s.environments);
@@ -103,36 +112,64 @@ async function main() {
     mockEnvs.map((e) => ({ id: e.id, projectId: e.projectId, name: e.name }))
   );
 
-  await db.insert(s.servers).values(
-    mockServers.map((sv) => {
-      // A seeded server's compatibility is DERIVED, never written down: the
-      // gate runs over whatever facts the fixture reports, exactly as it does
-      // at registration. A demo host filed under a type its facts contradict
-      // therefore lands in `incompatible` with the control plane's own
-      // sentences, and a fixture edit that fixes the hardware clears it —
-      // neither is a status somebody remembered to update (SIGMA-203).
-      const facts = sv.facts ?? {};
-      const incompatibleReasons = checkServerCompatibility(sv.type, facts);
-      return {
-        id: sv.id,
-        orgId: sv.orgId,
-        name: sv.name,
-        type: sv.type,
-        source: "byo",
-        provider: sv.provider,
-        region: sv.region,
-        status: incompatibleReasons.length > 0 ? SERVER_STATUS.incompatible : sv.status,
-        agentVersion: sv.agentVersion,
-        ip: sv.ip,
-        cpu: sv.cpu,
-        memGb: sv.memGb,
-        byoVpn: sv.byoVpn,
-        connectedAt: new Date(sv.connectedAt),
-        facts,
-        incompatibleReasons,
-      };
-    })
-  );
+  // Every clock the demo hands to a live comparison is measured from ONE
+  // instant, so a seed run cannot produce a fleet whose in-flight states were
+  // each captured a few milliseconds apart.
+  const seededAt = Date.now();
+
+  const DAY = 86_400_000;
+
+  // Kept as a value rather than inlined into the insert: the cluster rows below
+  // are derived from the status each of these hosts LANDED in, which is not the
+  // status its fixture states — and reading it back out of the database would be
+  // a round trip to learn something we just decided.
+  const serverRows = mockServers.map((sv) => {
+    // A seeded server's compatibility is DERIVED, never written down: the gate
+    // runs over whatever facts the fixture reports, exactly as it does at
+    // registration. A demo host filed under a type its facts contradict
+    // therefore lands in `incompatible` with the control plane's own sentences,
+    // and a fixture edit that fixes the hardware clears it — neither is a status
+    // somebody remembered to update (SIGMA-203).
+    const facts = sv.facts ?? {};
+    const incompatibleReasons = checkServerCompatibility(sv.type, facts);
+    // The teardown clock, likewise derived — the fixture states an OFFSET in
+    // milliseconds and this is where it becomes a date, so "where in each of the
+    // two teardown clocks is this demo" is answered from when the database was
+    // seeded rather than from a calendar date somebody typed (SIGMA-204).
+    const decommissionStartedAt = sv.decommission
+      ? new Date(seededAt - sv.decommission.startedMsAgo)
+      : null;
+    return {
+      id: sv.id,
+      orgId: sv.orgId,
+      name: sv.name,
+      type: sv.type,
+      source: "byo",
+      provider: sv.provider,
+      region: sv.region,
+      // `decommissioning` outranks the gate, which is the same terminal rule
+      // nextServerStatus holds and load-bearing for the same reason: one of the
+      // two documented exits from `incompatible` IS disconnecting, so the host
+      // most likely to be torn down is one whose facts fail its type.
+      status: decommissionStartedAt
+        ? SERVER_STATUS.decommissioning
+        : incompatibleReasons.length > 0
+          ? SERVER_STATUS.incompatible
+          : sv.status,
+      agentVersion: sv.agentVersion,
+      ip: sv.ip,
+      meshIp: sv.meshIp,
+      cpu: sv.cpu,
+      memGb: sv.memGb,
+      byoVpn: sv.byoVpn,
+      connectedAt: new Date(sv.connectedAt),
+      facts,
+      incompatibleReasons,
+      decommissionStartedAt,
+      decommissionPurgeVolumes: sv.decommission?.purgeVolumes ?? false,
+    };
+  });
+  await db.insert(s.servers).values(serverRows);
 
   await db.insert(s.envServers).values(
     mockEnvs.flatMap((e) =>
@@ -140,19 +177,32 @@ async function main() {
     )
   );
 
+  // A cluster's rows are DERIVED from its nodes' hosts — from the status each
+  // one LANDED in above, which is not the status its fixture states — by the
+  // demo's own functions rather than by a second copy of the rule. See
+  // deriveSeededClusters for why the columns are written at all when every read
+  // re-derives them.
+  const seededClusters = deriveSeededClusters({
+    clusters: mockClusters,
+    hosts: serverRows,
+    seededAt,
+  });
+  await db.insert(s.clusters).values(seededClusters.clusters);
+  await db.insert(s.clusterNodes).values(seededClusters.nodes);
+
   // Deploy dates are relative to "now" (recent past) so that live deploys
   // created in-app sort as the newest — the mock's fixed 2027 dates would
   // otherwise always outrank them.
-  const DAY = 86_400_000;
   const resourceDeployAt = (idx: number) =>
-    new Date(Date.now() - ((idx % 12) + 1) * DAY - idx * 3_600_000);
+    new Date(seededAt - ((idx % 12) + 1) * DAY - idx * 3_600_000);
 
   await db.insert(s.resources).values(
     mockResources.map((r, idx) => ({
       id: r.id,
       projectId: r.projectId,
       environmentId: r.environmentId,
-      serverId: r.serverId ?? null,
+      serverId: r.serverId,
+      clusterId: r.clusterId ?? null,
       name: r.name,
       kind: r.kind,
       status: r.status,
@@ -178,14 +228,15 @@ async function main() {
     })
   );
 
-  const [orgN, projN, srvN, resN] = await Promise.all([
+  const [orgN, projN, srvN, clsN, resN] = await Promise.all([
     db.$count(s.orgs),
     db.$count(s.projects),
     db.$count(s.servers),
+    db.$count(s.clusters),
     db.$count(s.resources),
   ]);
   console.log(
-    `seed done — orgs:${orgN} projects:${projN} servers:${srvN} resources:${resN} · ` +
+    `seed done — orgs:${orgN} projects:${projN} servers:${srvN} clusters:${clsN} resources:${resN} · ` +
       `login ${DEMO_EMAIL} / ${DEMO_PASSWORD}`
   );
   await client.close();

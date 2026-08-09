@@ -4,7 +4,7 @@ import { getServersWithCounts, type ServerWithCount } from "@/server/queries";
 import { cpEnabled, cpListServers, cpListResources, cpServerToRow } from "@/server/cp";
 import { ServersView } from "@/components/dashboard/servers/servers-view";
 import { listClusters } from "@/server/actions/clusters";
-import { getCommandIndex } from "@/server/queries";
+import { getClusterEnvironments } from "@/server/queries";
 import { getSessionUser, visibleProjects } from "@/server/active-org";
 
 async function cpServersWithCounts(orgId: string): Promise<ServerWithCount[]> {
@@ -28,22 +28,20 @@ export default async function ServersPage() {
   const [servers, myOrgs, clusterData, sessionUser] = await Promise.all([
     cp ? cpServersWithCounts(orgId) : getServersWithCounts(orgId),
     getMyOrgs(),
-    cp ? listClusters(orgId) : Promise.resolve({ clusters: [], excludedKinds: [] }),
+    // Both modes: the clusters panel is where a cluster is built, and hiding it
+    // with no control plane made "promote your own servers into a cluster" a
+    // capability nobody without hardware could see (SIGMA-215).
+    listClusters(orgId),
     getSessionUser(),
   ]);
   const org = myOrgs.find((o) => o.id === orgId);
 
   // A cluster is created inside an environment, so only offer environments the
-  // user can actually see (P2-7 project scoping).
+  // user can actually see (P2-7 project scoping). Also asked in both modes now:
+  // an empty list hides the "New cluster" button, which is how the demo panel
+  // would have rendered as a permanent empty state (SIGMA-215).
   const visible = await visibleProjects(sessionUser.id, orgId, org?.role ?? "Developer");
-  const index = cp
-    ? await getCommandIndex(orgId, visible)
-    : { environments: [] as { id: string; name: string; projectName: string }[] };
-  const environments = index.environments.map((e) => ({
-    id: e.id,
-    name: e.name,
-    projectName: e.projectName,
-  }));
+  const environments = await getClusterEnvironments(orgId, visible);
 
   return (
     <ServersView

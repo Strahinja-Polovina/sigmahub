@@ -34,14 +34,24 @@
  * that size. Re-record these from a live control plane and they must land on
  * exactly these strings.
  *
- * The set covers every branch the picker and the fit check can take:
+ * The set covers every branch the picker and the fit check can take, and it is
+ * sized against the three cards the demo fleet reports (mock/data.ts): an A10G
+ * at 23.8 GB, an A100 at 42.9 GB and an H100 at 85.5 GB. Two entries exist only
+ * to make that ladder visible — a catalogue where every model either fits every
+ * host or none of them demonstrates a check that never has to choose.
  *
- *   Llama 3.1 8B Instruct    gated, fits a 40 GB card      → the ordinary path
+ *   Llama 3.1 8B Instruct    gated, fits all three cards   → the ordinary path
  *   Llama 3.1 70B Instruct   gated, fits nothing in demo   → the VRAM refusal
  *   Mistral 7B Instruct      gated                         → the token gate
  *   Qwen2.5 7B Instruct      ungated, fits                 → walkable end to end
+ *   Qwen2.5 14B Instruct     too big for the A10G ONLY     → the refusal that
+ *                                                            names one host and
+ *                                                            not its neighbour
  *   TinyLlama 1.1B Chat      ungated, tiny                 → fits anything
  *   Llama 2 13B Chat AWQ     4-bit, sized from the NAME    → quantization
+ *   Llama 3.1 70B AWQ INT4   only the H100 takes it        → the quantized build
+ *                                                            the too-big refusal
+ *                                                            tells you to go find
  *   phi-2 GGUF               unsizable, and GGUF           → no fit check, and
  *                                                            the model step's
  *                                                            refusal
@@ -123,6 +133,29 @@ export const MOCK_MODELS: ModelCard[] = [
     sizingBasis: "safetensors",
   },
   {
+    // The rung between the demo's cards: 39.4 GB is more than the A10G's 23.8
+    // and less than the A100's 42.9, so one target step shows an eligible host
+    // and a refused one side by side with the two numbers that decided it. Every
+    // other sized model in this catalogue clears all three cards or none of
+    // them, and a fit check that never has to choose between two hosts is a fit
+    // check nobody can see working.
+    id: "Qwen/Qwen2.5-14B-Instruct",
+    name: "Qwen2.5 14B Instruct",
+    gated: false,
+    downloads: 341_882,
+    likes: 618,
+    pipelineTag: "text-generation",
+    library: "transformers",
+    engine: "vllm",
+    parameters: 14_770_033_664,
+    parametersKnown: true,
+    quantization: "none",
+    bytesPerParam: 2,
+    vramBytesRequired: 39_386_756_438,
+    vramText: "~39.4 GB",
+    sizingBasis: "safetensors",
+  },
+  {
     id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     name: "TinyLlama 1.1B Chat v1.0",
     gated: false,
@@ -158,6 +191,33 @@ export const MOCK_MODELS: ModelCard[] = [
     bytesPerParam: 0.5,
     vramBytesRequired: 8_666_666_667,
     vramText: "~8.7 GB",
+    sizingBasis: "name",
+  },
+  {
+    // The answer the too-big refusal gives, made reachable. Turned away from
+    // every card for Llama 3.1 70B, the operator is told to find "an AWQ or GPTQ
+    // repository of the same model" — and a demo catalogue that offered no such
+    // repository would send them looking for something it does not have. This is
+    // it: the same 70 billion parameters at half a byte each, 46.7 GB, which the
+    // H100 takes and the A100 beside it does not.
+    //
+    // 70_000_000_000 exactly, because an AWQ checkpoint is sized from the repo
+    // NAME — the same reason as the 13B entry above, and the reason the figure
+    // is not the fp16 repository's 70_553_706_496.
+    id: "hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4",
+    name: "Llama 3.1 70B Instruct AWQ INT4",
+    gated: false,
+    downloads: 196_418,
+    likes: 274,
+    pipelineTag: "text-generation",
+    library: "transformers",
+    engine: "vllm",
+    parameters: 70_000_000_000,
+    parametersKnown: true,
+    quantization: "awq",
+    bytesPerParam: 0.5,
+    vramBytesRequired: 46_666_666_667,
+    vramText: "~46.7 GB",
     sizingBasis: "name",
   },
   {

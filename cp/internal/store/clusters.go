@@ -60,6 +60,17 @@ const (
 
 // clusterExcludedKinds are resource kinds that must NOT run inside a cluster.
 //
+// This map is the whole statement of the rule, and it now reaches both halves of
+// the product from here: the API publishes it at runtime (ClusterExcludedKinds,
+// returned by GET /clusters) and the dashboard compiles it in at BUILD time,
+// because server_catalog_ts.go renders CLUSTER_EXCLUDED_KINDS from it. The
+// second path exists for demo mode, which runs with no control plane to ask and
+// so used to hard-code an empty exclusion list — inert only until demo mode grew
+// a cluster, at which point the demo would have offered a cluster as a target for
+// a Postgres that the real product refuses. Editing this map is therefore an edit
+// that needs `cd cp && go generate ./...`; this file is in CatalogSourceFiles, so
+// both suites say so instead of shipping a dashboard that disagrees.
+//
 // The stateful engines are excluded because each one's data lives in a volume on
 // one host. In a scheduler that means node affinity, PV lifecycle and eviction
 // semantics we do not model — and a database silently rescheduled onto a node
@@ -94,12 +105,25 @@ var clusterExcludedKinds = map[string]bool{
 // cluster.
 func ClusterKindAllowed(kind string) bool { return !clusterExcludedKinds[kind] }
 
-// ClusterExcludedKinds lists the kinds a cluster refuses, for the API to
-// publish so the dashboard explains the rule instead of hardcoding its own copy.
+// ClusterExcludedKinds lists the kinds a cluster refuses, in catalog order, for
+// the API to publish so the dashboard explains the rule instead of hardcoding
+// its own copy.
+//
+// The order is derived by walking ResourceKinds() rather than by ranging the map
+// directly, and that is load-bearing rather than tidiness: Go randomizes map
+// iteration, and this list is now rendered into a CHECKED-IN TypeScript file, so
+// a map range would make `go generate` emit a different byte sequence on most
+// runs and the staleness test fail at random. Catalog order is also the order the
+// dashboard lists kinds in everywhere else.
+//
+// A key naming no known kind would silently vanish here; server_catalog.go's init
+// panics on one rather than letting the list quietly shrink.
 func ClusterExcludedKinds() []string {
 	out := make([]string, 0, len(clusterExcludedKinds))
-	for k := range clusterExcludedKinds {
-		out = append(out, k)
+	for _, kind := range ResourceKinds() {
+		if clusterExcludedKinds[kind] {
+			out = append(out, kind)
+		}
 	}
 	return out
 }

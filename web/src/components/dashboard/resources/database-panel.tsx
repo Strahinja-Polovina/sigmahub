@@ -64,11 +64,16 @@ export function DatabasePanel({
   resourceId,
   info,
   canManage,
+  simulated = false,
 }: {
   orgId: string;
   resourceId: string;
   info: CpDatabaseInfo;
   canManage: boolean;
+  /** Demo mode: no engine was provisioned, so these values are derived from the
+   *  resource id rather than reported by one. It has to be SAID — a credential
+   *  that looks real is the one thing on this card someone might act on. */
+  simulated?: boolean;
 }) {
   const [conn, setConn] = React.useState<CpDatabaseConnection | null>(null);
   const [revealed, setRevealed] = React.useState(false);
@@ -181,6 +186,16 @@ export function DatabasePanel({
             </div>
           )}
         </div>
+
+        {simulated && (
+          <p className="text-xs text-muted-foreground">
+            No engine is running behind this: these values are generated from the
+            resource so the flow is walkable, and every secret starts with{" "}
+            <code className="font-mono">demo_</code> so it cannot be mistaken for one.
+            With a control plane the engine generates them itself and this reveal is
+            audited on both sides.
+          </p>
+        )}
 
         <p className="text-xs text-muted-foreground">
           Public exposure (per-engine TLS + IP allowlist) is not available in v1 —

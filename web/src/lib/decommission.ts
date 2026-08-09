@@ -143,6 +143,160 @@ export function isDecommissioning(status: string): boolean {
   return status === SERVER_STATUS.decommissioning;
 }
 
+// ── The demo teardown (SIGMA-215) ───────────────────────────────────────────
+//
+// With no control plane there is no agent to ask and nothing to ack, so the
+// graceful path — the one an operator actually takes — had no way to finish.
+// Pressing Disconnect left the row in `decommissioning` for good, and the only
+// way out was a simulate button the user had to notice. A demo of a state that
+// never ends is the infinite spinner this programme exists to delete.
+//
+// So the demo's default outcome runs on a clock, and the clock walks the
+// agent's REAL uninstall sequence (agent/internal/uninstall), the same order
+// removalPlan() lists. What an operator learns from watching it is what their
+// own machine will do.
+
+/** How long each teardown step takes in demo mode.
+ *
+ *  2.5 seconds: the whole sequence is then seven and a half to ten seconds
+ *  (demoTeardownSpanMs), long enough to read each line as it happens and short
+ *  enough that nobody concludes it has hung. It is deliberately unrelated to
+ *  DECOMMISSION_TIMEOUT_MS — that is the control plane's ten-MINUTE patience,
+ *  and the whole point of the "never answers" simulation is that nobody can sit
+ *  through it.
+ *
+ *  Two clocks three orders of magnitude apart, in one feature, is how the demo
+ *  came to delete a server nobody had touched: a fixture stated its age in
+ *  minutes and justified it against the ten-minute one, and the servers page
+ *  measured the same row against this one, found it long finished, and wrote
+ *  the agent's ack. Nothing that has to fall on one side of either boundary may
+ *  be written as a number that happens to fit — derive it from
+ *  demoTeardownSpanMs for this clock, from DECOMMISSION_TIMEOUT_MS for the
+ *  other, and it cannot be made wrong by editing the other file. */
+export const DEMO_TEARDOWN_STEP_MS = 2_500;
+
+export type TeardownPhase = {
+  /** Steps completed so far, 0-based, capped at `total`. */
+  step: number;
+  total: number;
+  /** What the agent is doing right now, or what it finished doing. */
+  label: string;
+  /** True once the agent would have reported back — the caller's cue to write
+   *  the ack and tombstone the row. */
+  done: boolean;
+};
+
+/** The steps, in the order the agent performs them. `purgeVolumes` inserts the
+ *  one destructive step the operator had to opt into, so a demo that deletes
+ *  data says the words while it happens. */
+function teardownSteps(purgeVolumes: boolean): string[] {
+  return [
+    "Stopping containers and removing networks",
+    ...(purgeVolumes ? ["Deleting named volumes — application data"] : []),
+    "Bringing down the WireGuard tunnel",
+    "Removing the agent, its unit and its config",
+  ];
+}
+
+/** The whole demo teardown, from the request to the ack, for the sequence the
+ *  operator's volume choice produces.
+ *
+ *  It is ABSOLUTE wall time and there is nothing to pause it: no agent reports,
+ *  no job runs between requests, and a page that was not open while these
+ *  seconds passed missed the entire teardown. So a row older than this span
+ *  says only that the span is over — never that anything happened — and code
+ *  that reads "finished" as "the agent confirmed" is inventing a report. That
+ *  is the boundary a watcher has to be present for, and the number anything
+ *  sitting deliberately outside it must be derived from. */
+export function demoTeardownSpanMs(purgeVolumes: boolean): number {
+  return teardownSteps(purgeVolumes).length * DEMO_TEARDOWN_STEP_MS;
+}
+
+/** Where a demo teardown has got to, from the timestamp the decommission was
+ *  requested at. Derived rather than stored for the same reason the demo
+ *  cluster's node status is: nothing runs between requests here, so a
+ *  simulation that needed something to keep writing would stop the moment the
+ *  tab did. */
+export function demoTeardownPhase(input: {
+  startedAt: Date | string | null | undefined;
+  purgeVolumes: boolean;
+  now?: number;
+}): TeardownPhase {
+  const steps = teardownSteps(input.purgeVolumes);
+  const started = ms(input.startedAt);
+  // No timestamp at all means the row predates the request or was written by
+  // hand; treating that as finished is the safe answer, because the alternative
+  // is a teardown stuck at step zero with nothing that could ever move it.
+  if (started === null) {
+    return { step: steps.length, total: steps.length, label: steps[steps.length - 1], done: true };
+  }
+  const elapsed = (input.now ?? Date.now()) - started;
+  const completed = Math.max(0, Math.floor(elapsed / DEMO_TEARDOWN_STEP_MS));
+  if (completed >= steps.length) {
+    return { step: steps.length, total: steps.length, label: steps[steps.length - 1], done: true };
+  }
+  return { step: completed, total: steps.length, label: steps[completed], done: false };
+}
+
+/** How long until the next teardown step, so a watching client can schedule one
+ *  render instead of polling. Null once there is nothing left to wait for. */
+export function msUntilNextTeardownStep(input: {
+  startedAt: Date | string | null | undefined;
+  purgeVolumes: boolean;
+  now?: number;
+}): number | null {
+  const phase = demoTeardownPhase(input);
+  if (phase.done) return null;
+  const started = ms(input.startedAt);
+  if (started === null) return null;
+  const elapsed = (input.now ?? Date.now()) - started;
+  return DEMO_TEARDOWN_STEP_MS - (elapsed % DEMO_TEARDOWN_STEP_MS);
+}
+
+/**
+ * Whether the demo page is entitled to write the ack that ends a teardown —
+ * and, since the ack DELETES the server row, whether it is entitled to remove a
+ * machine from the fleet.
+ *
+ * This lives here rather than inline in the component because of what it costs
+ * to get wrong, and because a decision inside a render body is a decision
+ * nothing can assert. Adversarial review mutated the inline version five ways —
+ * dropping either half of the condition, or the guard around it — and all 543
+ * tests stayed green while a fresh demo went back to deleting a server nobody
+ * had touched. Both halves were individually correct; nothing observed them.
+ *
+ * The two conditions answer two different questions and neither implies the
+ * other:
+ *
+ *   watchedFromStart — did this page see the teardown while it was still
+ *     running? An ack is a claim that the agent reported in. A component that
+ *     arrives after the fact and acks is asserting something it never observed:
+ *     the seeded fixture is minutes old, the step clock is seconds long, so
+ *     without this every visitor's first paint would tombstone a host and drop
+ *     the fleet from fourteen to thirteen under an unrequested success toast.
+ *
+ *   timedOut — has the control plane's window closed? Past it, whatever the
+ *     step clock says, the true thing about that row is that nothing answered.
+ *     Force disconnect and the cleanup script are the next honest move, not a
+ *     tombstone written on the agent's behalf. This is what makes "Simulate: the
+ *     agent never answers" reach the state it advertises instead of deleting the
+ *     server whose force path it exists to demonstrate.
+ */
+export function mayAckDemoTeardown(input: {
+  status: string;
+  startedAt: Date | string | null | undefined;
+  watchedFromStart: boolean;
+  now?: number;
+}): boolean {
+  if (!input.watchedFromStart) return false;
+  if (input.status !== SERVER_STATUS.decommissioning) return false;
+  return forceReason({
+    status: input.status,
+    decommissioningSince: input.startedAt,
+    now: input.now,
+  }) === null;
+}
+
 /** How the 409 from either disconnect endpoint is turned into something the
  *  dialog can render. The control plane answers with the blocking resource
  *  NAMES as data; printing its error string instead was the previous behaviour

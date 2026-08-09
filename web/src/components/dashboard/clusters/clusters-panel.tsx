@@ -45,6 +45,7 @@ import {
 import { StatusDot } from "@/components/dashboard/status-indicator";
 import type { Status } from "@/lib/mock";
 import { resourceKindLabel } from "@/lib/server-catalog.generated";
+import { msUntilNodeReady } from "@/lib/demo-cluster";
 import {
   createCluster,
   addClusterNode,
@@ -87,6 +88,7 @@ export function ClustersPanel({
   servers,
   environments,
   canManage,
+  simulated = false,
 }: {
   orgId: string;
   clusters: CpCluster[];
@@ -94,8 +96,39 @@ export function ClustersPanel({
   servers: ClusterServer[];
   environments: ClusterEnvironment[];
   canManage: boolean;
+  /** Demo mode: a node's Kubernetes install is a clock over its join time
+   *  rather than an agent reporting in, so this panel is the only thing that
+   *  will ever ask for the render that shows it finishing. */
+  simulated?: boolean;
 }) {
+  const router = useRouter();
   const [createOpen, setCreateOpen] = React.useState(false);
+
+  // Watch a demo cluster come up. Without this the card says "provisioning"
+  // until the user thinks to reload — a spinner that never resolves, which is
+  // exactly what a demo of a provisioning state must not be. One timeout for
+  // the soonest node, then the next render schedules the next one; nothing
+  // polls, and CP mode never enters here because a real k3s install finishes
+  // when the agent says so, not when a timer expires.
+  const joinTimes = clusters
+    .flatMap((c) => c.nodes)
+    .map((n) => `${n.serverId}:${n.joinedAt}:${n.status}`)
+    .join("|");
+  React.useEffect(() => {
+    if (!simulated) return;
+    const waits = clusters
+      .flatMap((c) => c.nodes)
+      .map((n) => msUntilNodeReady({ joinedAt: n.joinedAt, serverStatus: n.status }))
+      .filter((w): w is number => w !== null);
+    if (waits.length === 0) return;
+    // A small margin past the deadline: the server re-derives from Date.now()
+    // and a refresh that lands on the same millisecond re-renders "pending".
+    const timer = setTimeout(() => router.refresh(), Math.min(...waits) + 250);
+    return () => clearTimeout(timer);
+    // clusters is a new array every render; the node join times are what
+    // actually decides when to look again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simulated, joinTimes, router]);
 
   // A server already in a cluster can't join another one.
   const claimed = new Set(clusters.flatMap((c) => c.nodes.map((n) => n.serverId)));

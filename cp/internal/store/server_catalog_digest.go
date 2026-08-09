@@ -24,16 +24,40 @@ import (
 // go:generate, cwd = this package) and the package's own tests resolve them
 // from there.
 //
-// All THREE, not just the catalog: the generated module also embeds the billing
-// constants from billing.go and every literal the renderer itself writes. With
-// only the catalog hashed, changing BillingCurrency from "EUR" to "USD" left the
-// checked-in TypeScript saying EUR and the whole web suite green — the web-side
-// guard is the one that has to notice a control-plane-only edit, so it has to
-// cover everything that reaches the output.
+// All SIX, not just the catalog: the generated module also embeds the billing
+// constants from billing.go, the cluster exclusion list from clusters.go, the
+// engine catalogs from db_engines.go and s3_engines.go, and every literal the
+// renderer itself writes. With only the catalog hashed, changing
+// BillingCurrency from "EUR" to "USD" left the checked-in TypeScript saying EUR
+// and the whole web suite green — the web-side guard is the one that has to
+// notice a control-plane-only edit, so it has to cover everything that reaches
+// the output.
+//
+// The engine files joined when demo mode stopped keeping a second copy of the
+// engine table. Every value in it disagreed with this package: the demo
+// advertised postgres:17-alpine against a control plane pinned to 16.6, and
+// minio/minio:latest against a product whose agent policy refuses a floating
+// tag outright. Left out of this list, the next version bump here would ship
+// the same disagreement again with the web suite green.
+//
+// clusters.go is the awkward one and is here deliberately. It is a whole store
+// file rather than a catalog table, so it changes for reasons that have nothing
+// to do with the dashboard — a new query, a fixed scan — and each of those now
+// moves the digest and asks for a regenerate that changes no rendered byte. That
+// is the cost of the alternative being silent: leave it out and an edit to
+// clusterExcludedKinds is invisible to the web suite, which is precisely the
+// drift the generated list was added to remove. A stale-catalog failure names
+// the command that fixes it; a demo mode offering a cluster for a Postgres does
+// not announce itself at all. The engine catalogs are deliberately NOT that:
+// they live in files of their own (the S3 one was split out of s3.go for this),
+// so a query edit beside them cannot cost a regenerate.
 var CatalogSourceFiles = []string{
 	"server_catalog.go",    // the canonical catalog: types, matrix, requirements
 	"server_catalog_ts.go", // the renderer — its literals are output too
 	"billing.go",           // unit price, free tier, currency
+	"clusters.go",          // the kinds a cluster refuses
+	"db_engines.go",        // database images, URL shapes, the mesh port base
+	"s3_engines.go",        // object-storage images and endpoint shapes
 }
 
 // CatalogSourceDigest returns the hex sha256 over the given sources, in the

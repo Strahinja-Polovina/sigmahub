@@ -201,6 +201,60 @@ export const envServers = pgTable(
   (t) => ({ pk: primaryKey({ columns: [t.environmentId, t.serverId] }) })
 );
 
+// ── Kubernetes clusters, demo side (SIGMA-215) ──────────────────────────────
+//
+// In CP mode a cluster lives in the control plane and never touches these
+// tables; getServers-style mirroring is not enough for it, because a cluster is
+// not a server and the dashboard reads a whole node list off it. Demo mode has
+// no control plane at all, so the rows ARE the clusters: the seed writes them,
+// the panel reads them, and creating one in the dashboard inserts here.
+//
+// The columns are CpCluster/CpClusterNode field for field. That is deliberate:
+// listClusters returns one type in both modes, and a demo shape that only
+// mostly matched would put the divergence inside the mapping function rather
+// than in the type checker.
+export const clusters = pgTable("clusters", {
+  id: text("id").primaryKey(),
+  orgId: text("org_id")
+    .notNull()
+    .references(() => orgs.id, { onDelete: "cascade" }),
+  // One cluster per environment, so "deploy to the cluster" is unambiguous —
+  // the same rule the control plane enforces, and what makes clusterOptions'
+  // environment filter meaningful rather than decorative.
+  environmentId: text("environment_id")
+    .notNull()
+    .references(() => environments.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  status: text("status").notNull().default("provisioning"), // provisioning | ready | degraded
+  apiEndpoint: text("api_endpoint").notNull().default(""),
+  kubernetesVersion: text("kubernetes_version").notNull().default(""),
+  createdBy: text("created_by").notNull().default(""),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const clusterNodes = pgTable(
+  "cluster_nodes",
+  {
+    clusterId: text("cluster_id")
+      .notNull()
+      .references(() => clusters.id, { onDelete: "cascade" }),
+    serverId: text("server_id")
+      .notNull()
+      .references(() => servers.id, { onDelete: "cascade" }),
+    role: text("role").notNull().default("worker"), // control-plane | worker
+    // What the node reported about k3s ON it — pending | ready | error. Kept
+    // apart from the server's own status for the reason the panel already
+    // renders separately: an agent can heartbeat perfectly on a host where
+    // Kubernetes never installed, and collapsing the two is how a cluster looks
+    // healthy while nothing can be scheduled on it.
+    nodeStatus: text("node_status").notNull().default("pending"),
+    nodeMessage: text("node_message").notNull().default(""),
+    joinedAt: timestamp("joined_at").notNull().defaultNow(),
+    reportedAt: timestamp("reported_at"),
+  },
+  (t) => ({ pk: primaryKey({ columns: [t.clusterId, t.serverId] }) })
+);
+
 export const resources = pgTable("resources", {
   id: text("id").primaryKey(),
   projectId: text("project_id")
@@ -212,12 +266,34 @@ export const resources = pgTable("resources", {
   serverId: text("server_id").references(() => servers.id, {
     onDelete: "set null",
   }),
+  // A workload deployed INTO a cluster has no server: the scheduler picks the
+  // node. Exactly one of server_id and cluster_id is set, which is what
+  // resolveDeployTarget decides and what the control plane enforces.
+  //
+  // Demo mode had neither column filled for a cluster deploy, so a resource the
+  // user targeted at a cluster was written with no target at all and rendered
+  // as unassigned — the wizard's cluster choice reached the create call and
+  // then evaporated (SIGMA-215).
+  clusterId: text("cluster_id").references(() => clusters.id, {
+    onDelete: "set null",
+  }),
   name: text("name").notNull(),
   kind: text("kind").notNull(), // app | postgres | mysql | mongodb | redis | s3 | llm
   status: text("status").notNull().default("provisioning"),
   repo: text("repo"),
   domain: text("domain"),
   version: text("version"),
+  // Which engine serves this resource — the local mirror of the control
+  // plane's `spec.engine`, which carries an object-storage engine (minio |
+  // seaweedfs) and an inference runtime through the same field.
+  //
+  // Demo mode had nowhere to put it, so the wizard's engine choice reached
+  // createResource and stopped there: every demo S3 resource described itself
+  // with the default engine's image and endpoint, and a user who picked
+  // SeaweedFS on the storage step opened the resource and was told MinIO
+  // (SIGMA-215). Null for the kinds that have no engine to choose — an app —
+  // and for a managed database, where the KIND is the engine.
+  engine: text("engine"),
   // SIGMA-194: PR-preview resources, torn down with their PR. Badged in the
   // UI and their Delete carries an explicit preview-breaking warning.
   ephemeral: boolean("ephemeral").notNull().default(false),

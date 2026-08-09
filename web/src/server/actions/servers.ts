@@ -7,7 +7,7 @@ import * as s from "../db/schema";
 import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../active-org";
 import { writeAudit } from "../audit";
 import type { ServerType } from "@/lib/server-catalog.generated";
-import { DECOMMISSION_TIMEOUT_MS } from "@/lib/decommission";
+import { DECOMMISSION_TIMEOUT_MS, forceReason } from "@/lib/decommission";
 import {
   checkServerCompatibility,
   nextServerStatus,
@@ -862,6 +862,44 @@ export async function simulateDecommission(input: {
   // can remove a server teaches the wrong permission model to the person
   // evaluating the product — the one audience demo mode exists for.
   const { user } = await requireProjectAdmin(server.orgId);
+  // Every event but "silence" is a report ABOUT a teardown, and two of them
+  // delete the row. A report on a teardown that was never requested is not a
+  // simulation of anything the product does, and the caller that sends one is
+  // wrong about the server's state — so say so instead of removing a server on
+  // the strength of it. The servers page used to fire "ack" at a row it had
+  // simply arrived late to, and this is the second line of defence against that
+  // class of caller: a demo fleet must not shrink by one because a page loaded.
+  if (input.event !== "silence" && server.status !== SERVER_STATUS.decommissioning) {
+    throw new Error(
+      `${server.name} is not being decommissioned, so there is no teardown to report on. ` +
+        "Open the server and press Disconnect first."
+    );
+  }
+  // And a teardown past the control plane's window is no longer one an agent
+  // can report on. This is the half the status check above cannot see, and the
+  // half the comment above used to claim it covered: a page arriving late finds
+  // a row that IS `decommissioning`, so the status alone waves it straight
+  // through. Adversarial review drove exactly that — the seeded fixture's own
+  // shape, five minutes old and still `decommissioning` — and the ack was
+  // accepted and the server deleted.
+  //
+  // Past the window the honest outcome is not a tombstone written on the
+  // agent's behalf; it is Force disconnect and the cleanup script, which is
+  // what the dialog already offers by then. `timeout` is excluded because
+  // ageing the row past the window is its entire job.
+  if (
+    (input.event === "ack" || input.event === "failed") &&
+    forceReason({
+      status: server.status,
+      decommissioningSince: server.decommissionStartedAt,
+    }) !== null
+  ) {
+    throw new Error(
+      `Nothing answered for ${server.name} inside the control plane's window, so this teardown ` +
+        "cannot be confirmed on the agent's behalf. Open the server and use Force disconnect, " +
+        "which also gives you the manual cleanup script."
+    );
+  }
 
   switch (input.event) {
     case "ack":

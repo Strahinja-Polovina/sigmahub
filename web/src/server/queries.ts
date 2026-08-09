@@ -116,6 +116,33 @@ export async function getServerCounts(
   return counts;
 }
 
+/** Environments a cluster could be built in, labelled with their project.
+ *
+ *  A cluster belongs to exactly one environment, so the create dialog needs the
+ *  list; it used to come out of getCommandIndex, which also loads every server
+ *  and every resource in the org to answer it. `visible` applies the P2-7
+ *  project scoping (null = everything) so a project-scoped user is not offered
+ *  an environment in a project they were never granted. */
+export async function getClusterEnvironments(
+  orgId: string,
+  visible?: Set<string> | null
+): Promise<{ id: string; name: string; projectName: string }[]> {
+  const rows = await db
+    .select({
+      id: s.environments.id,
+      name: s.environments.name,
+      projectId: s.environments.projectId,
+      projectName: s.projects.name,
+    })
+    .from(s.environments)
+    .innerJoin(s.projects, eq(s.environments.projectId, s.projects.id))
+    .where(eq(s.projects.orgId, orgId))
+    .orderBy(s.projects.name, s.environments.name);
+  return (visible ? rows.filter((r) => visible.has(r.projectId)) : rows).map(
+    ({ id, name, projectName }) => ({ id, name, projectName })
+  );
+}
+
 export type CommandIndex = {
   projects: { id: string; name: string; slug: string }[];
   environments: { id: string; name: string; projectId: string; projectName: string }[];
@@ -470,6 +497,20 @@ export async function getResourceDetail(resourceId: string) {
       .where(eq(s.servers.id, row.resource.serverId));
     server = sv ?? null;
   }
+  // The other kind of target. A cluster workload has no server — the scheduler
+  // picks the node — so a page that only ever resolved a server showed one
+  // deployed into a cluster as running nowhere (SIGMA-215). Demo-only by
+  // construction: the column is written only when there is no control plane,
+  // because in CP mode the control plane holds the target and this row is a
+  // read model of it.
+  let cluster: { id: string; name: string } | null = null;
+  if (row.resource.clusterId) {
+    const [c] = await db
+      .select({ id: s.clusters.id, name: s.clusters.name })
+      .from(s.clusters)
+      .where(eq(s.clusters.id, row.resource.clusterId));
+    cluster = c ?? null;
+  }
   const deployments = await db
     .select()
     .from(s.deployments)
@@ -482,6 +523,7 @@ export async function getResourceDetail(resourceId: string) {
     orgId: row.orgId,
     envName: row.envName,
     server,
+    cluster,
     deployments,
   };
 }
