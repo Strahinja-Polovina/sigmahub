@@ -1102,14 +1102,26 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 // deployment: a GitHub App installation token when the connection carries an
 // installation (SIGMA-55), else the connection's KMS-wrapped PAT (P1-6
 // envelope). Scoped to the REQUESTING server: an agent token can only fetch the
-// credential for a deployment targeting its own host (BOLA). The plaintext token
-// is returned to the agent for in-memory use and never persisted.
+// credential for a deployment its own host owns a part of (BOLA). The plaintext
+// token is returned to the agent for in-memory use and never persisted.
+//
+// "Owns a part of" is deploymentReporterClause, not `server_id` (SIGMA-228). The
+// server that asks for a clone credential is by definition the server the
+// git.clone op was RENDERED into, and that is not the deploy target whenever a
+// dedicated build server exists — the clone+build ops live in the build server's
+// document — nor for a cluster workload, whose deployment has no server_id at
+// all. Matching the deploy target alone 404s exactly the agent that has to
+// clone, so every private-repo deploy on those two shapes fails at clone with a
+// Git auth error that reads like a bad token. Release must use the same
+// predicate as render and report, or the three disagree about who owns a deploy.
 func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error) {
 	var orgID, connID string
 	err = s.Pool.QueryRow(ctx, `
 		SELECT d.org_id, d.connection_id, c.repo_full_name, c.provider
-		  FROM deployments d JOIN git_connections c ON c.id = d.connection_id
-		 WHERE d.id = $1 AND d.server_id = $2`, deploymentID, serverID).Scan(&orgID, &connID, &repo, &provider)
+		  FROM deployments d
+		  JOIN git_connections c ON c.id = d.connection_id
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.id = $2 AND`+deploymentReporterClause, serverID, deploymentID).Scan(&orgID, &connID, &repo, &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", "", ErrNotFound
 	}
