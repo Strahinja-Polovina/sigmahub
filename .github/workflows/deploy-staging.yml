@@ -114,10 +114,24 @@ jobs:
           docker compose -f cp/deploy/docker-compose.yml up -d
           docker logout ghcr.io >/dev/null || true
           docker image prune -f >/dev/null
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/readyz >/dev/null && { echo "cp ready"; break; }
-            [ "$i" = 30 ] && { echo "cp not ready after rollout" >&2; exit 1; }
-            sleep 2
-          done
-          curl -sf -o /dev/null http://localhost:3000/ && echo "web ready"
+          # Both checks poll. The dashboard's used to be a single curl fired
+          # immediately after `up -d`, which lost a race it could not win: the
+          # web container had been *started* about two tenths of a second
+          # earlier and Next.js had not bound :3000 yet, so curl exited 52
+          # (empty reply) and `set -e` failed a rollout that had in fact
+          # succeeded. Every staging deploy since the box moved reported
+          # failure while serving traffic normally — which is worse than no
+          # check at all, because it teaches you to ignore a red deploy.
+          wait_for() {
+            name="$1" url="$2"
+            for i in $(seq 1 30); do
+              curl -sf -o /dev/null "$url" && { echo "$name ready"; return 0; }
+              sleep 2
+            done
+            echo "$name did not answer $url within 60s after rollout" >&2
+            docker compose -f cp/deploy/docker-compose.yml logs --tail 50 "$name" >&2 || true
+            return 1
+          }
+          wait_for cp http://localhost:8080/readyz
+          wait_for web http://localhost:3000/
           EOS
