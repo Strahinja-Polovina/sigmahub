@@ -478,10 +478,17 @@ export function ResourceDetail({
                 <Boxes className="size-3.5" />
                 {projectName} / {envName}
               </span>
+              {/* A real link. This was an <a href> whose onClick called
+                  preventDefault, so clicking the hostname did nothing at all —
+                  it read as broken rather than as decoration. In CP mode the
+                  domain is a real hostname with a real Let's Encrypt
+                  certificate the proxy issued, so there is somewhere to go
+                  (SIGMA-238). */}
               {resource.domain && (
                 <a
                   href={`https://${resource.domain}`}
-                  onClick={(e) => e.preventDefault()}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="inline-flex items-center gap-1.5 hover:text-foreground"
                 >
                   <Globe className="size-3.5" />
@@ -510,11 +517,21 @@ export function ResourceDetail({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {/* Likewise an anchor, not a toast. `toast("Opening https://…")`
+                is the single most-hit dead control in the product: it is the
+                very next click after attaching a domain and watching its
+                certificate go green (SIGMA-238). */}
             {resource.domain && (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => toast(`Opening https://${resource.domain}`)}
+                render={
+                  <a
+                    href={`https://${resource.domain}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  />
+                }
               >
                 <ExternalLink className="size-4" />
                 Open

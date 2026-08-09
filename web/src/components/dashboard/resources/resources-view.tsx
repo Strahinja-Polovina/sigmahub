@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { toast } from "sonner";
 import {
   Rocket,
   MoreHorizontal,
@@ -78,15 +77,30 @@ function ResourceActions({ resource }: { resource: ResourceItem }) {
           <ScrollText className="size-4 text-muted-foreground" />
           View details
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          className="gap-2"
-          disabled={!resource.domain}
-          onClick={() => resource.domain && toast(`Opening https://${resource.domain}`)}
-        >
-          <ExternalLink className="size-4 text-muted-foreground" />
-          Open
-        </DropdownMenuItem>
+        {/* A real link to the running app. This was
+            `toast(`Opening https://${resource.domain}`)` — a menu item that
+            announced a navigation it never performed, leaving the user to
+            retype the hostname into a new tab (SIGMA-238). A resource with no
+            domain has nowhere to go, so the item is absent rather than present
+            and disabled. */}
+        {resource.domain && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              className="gap-2"
+              render={
+                <a
+                  href={`https://${resource.domain}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                />
+              }
+            >
+              <ExternalLink className="size-4 text-muted-foreground" />
+              Open
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

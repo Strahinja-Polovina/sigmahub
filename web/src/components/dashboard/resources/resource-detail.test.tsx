@@ -130,6 +130,33 @@ describe("ResourceDetail danger zone", () => {
   });
 });
 
+describe("ResourceDetail links to the running app", () => {
+  it("the Open control is an anchor to the resource's domain", () => {
+    renderCp();
+    const open = screen.getByRole("link", { name: /^Open$/ });
+    expect(open.getAttribute("href")).toBe("https://app.example.com");
+    expect(open.getAttribute("target")).toBe("_blank");
+    expect(open.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("the domain chip navigates instead of cancelling its own click", () => {
+    renderCp();
+    const chip = screen.getByRole("link", { name: /app\.example\.com/ });
+    expect(chip.getAttribute("href")).toBe("https://app.example.com");
+    expect(chip.getAttribute("target")).toBe("_blank");
+    // It used to be an <a> with onClick={(e) => e.preventDefault()} — an anchor
+    // that looks broken rather than decorative (SIGMA-238).
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    chip.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(false);
+  });
+
+  it("a resource with no domain offers no Open control at all", () => {
+    renderCp({ detail: makeDetail({ domain: null }) });
+    expect(screen.queryByRole("link", { name: /^Open$/ })).toBeNull();
+  });
+});
+
 describe("ResourceDetail telemetry states", () => {
   it("a telemetry fetch failure appears in the load-failure banner and not as the empty state", () => {
     renderCp({
