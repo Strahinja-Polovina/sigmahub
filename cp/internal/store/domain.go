@@ -544,7 +544,7 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		return Resource{}, ErrInvalid{Msg: "a target server or cluster is required"}
 	}
 
-	var serverType string
+	var serverType, serverStatus string
 	// Server placement checks. A cluster deploy has no server of its own — the
 	// scheduler picks the node — so the type matrix and env attachment are the
 	// cluster's concern, already validated above.
@@ -554,11 +554,23 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		// the two serialize, so the resource either blocks the delete or is rejected
 		// against an already-tombstoned server (SIGMA-132).
 		if err := tx.QueryRow(ctx,
-			`SELECT type FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
-			orgID, in.ServerID).Scan(&serverType); errors.Is(err, pgx.ErrNoRows) {
+			`SELECT type, status FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
+			orgID, in.ServerID).Scan(&serverType, &serverStatus); errors.Is(err, pgx.ErrNoRows) {
 			return Resource{}, ErrNotFound
 		} else if err != nil {
 			return Resource{}, err
+		}
+
+		// A host the enrollment gate refused is compatible with the matrix on
+		// paper and not in fact — that is the whole finding. Scheduling onto it
+		// anyway reproduces the exact failure SIGMA-203 exists to move earlier:
+		// the deploy is accepted, the container starts on hardware that cannot
+		// run it, and the operator debugs a rollout instead of reading a
+		// sentence about their server (SIGMA-203).
+		if serverStatus == ServerStatusIncompatible {
+			return Resource{}, ErrInvalid{Msg: fmt.Sprintf(
+				"that server is marked incompatible with its %q type — change its type or disconnect it before scheduling work onto it",
+				serverType)}
 		}
 
 		ok := false
@@ -738,6 +750,153 @@ func (s *Store) SetProxyRole(ctx context.Context, orgID, serverID string, proxy 
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// SetServerType re-files a server under a different type and re-runs the
+// compatibility gate against the facts already on record (SIGMA-203).
+//
+// This is one of the two exits from `incompatible`, and the one that keeps the
+// machine: an operator who connected their ordinary box as a GPU server has a
+// perfectly good general server, and the product's answer to that must not be
+// "disconnect it and start again". Because the verdict is recomputed here from
+// the stored facts, the change takes effect immediately — the operator does not
+// wait 30 seconds for a heartbeat to find out whether the new type sticks.
+//
+// It is not restricted to incompatible servers: re-filing a running host is the
+// same operation, and the gate is what makes it safe. What DOES block it is
+// hosted resources the new type cannot run — a Postgres on a host being re-filed
+// as `storage` would become unschedulable where it sits, which is the failure
+// this whole area exists to prevent, so it is refused with the names.
+func (s *Store) SetServerType(ctx context.Context, orgID, serverID, newType, actor string) error {
+	if !IsServerType(newType) {
+		return ErrInvalid{Msg: fmt.Sprintf("unknown server type %q; expected one of %s",
+			newType, strings.Join(ServerTypes(), ", "))}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var name, oldType, status string
+	var facts json.RawMessage
+	var lastSeenAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT name, type, status, facts, last_seen_at FROM servers
+		 WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL
+		 FOR UPDATE`, orgID, serverID).Scan(&name, &oldType, &status, &facts, &lastSeenAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load server: %w", err)
+	}
+
+	// A cluster member is committed in a way `resources` does not record. Its
+	// workloads are bound to the CLUSTER, not to this row's server_id, so the
+	// hosted-resource check below sees nothing and waves the change through —
+	// which let a cluster's control-plane node be re-filed from `k8s` (unit
+	// weight 2) to `general` (weight 1) while it was still running the cluster,
+	// halving the bill for a machine whose job had not changed. Membership is
+	// the cluster's to end, not a type edit's.
+	var clusterName string
+	err = tx.QueryRow(ctx, `
+		SELECT c.name FROM cluster_nodes n
+		  JOIN clusters c ON c.id = n.cluster_id
+		 WHERE n.server_id = $1 AND c.org_id = $2
+		 LIMIT 1`, serverID, orgID).Scan(&clusterName)
+	if err == nil {
+		return fmt.Errorf("%w: this server is a node of the %s cluster — remove it from the cluster before changing its type",
+			ErrConflict, clusterName)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check cluster membership: %w", err)
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT name, kind FROM resources WHERE org_id = $1 AND server_id = $2 ORDER BY name`, orgID, serverID)
+	if err != nil {
+		return fmt.Errorf("list hosted resources: %w", err)
+	}
+	var stranded []string
+	for rows.Next() {
+		var rn, kind string
+		if err := rows.Scan(&rn, &kind); err != nil {
+			rows.Close()
+			return err
+		}
+		if !CanHost(newType, kind) {
+			stranded = append(stranded, fmt.Sprintf("%s (%s)", rn, ResourceKindLabel(kind)))
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(stranded) > 0 {
+		return fmt.Errorf("%w: a %s server cannot host %s — move or delete %s first",
+			ErrConflict, newType, joinOr(stranded), pluralize(len(stranded), "it", "them"))
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE servers SET type = $2 WHERE id = $1`, serverID, newType); err != nil {
+		return fmt.Errorf("set server type: %w", err)
+	}
+	fails := CheckServerCompatibility(newType, ParseHostFacts(facts))
+	if err := writeCompatibilityTx(ctx, tx, serverID,
+		statusAfterTypeChange(status, fails, lastSeenAt, DefaultStaleAfter), fails); err != nil {
+		return err
+	}
+	if oldType != newType {
+		if err := auditTx(ctx, tx, orgID, actor,
+			fmt.Sprintf("Server type changed from %s to %s", oldType, newType), name); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// RenameServer gives a server an operator-chosen name, permanently taking it
+// out of the machine's hands: the connect form no longer asks for one and
+// registration fills it from the reported hostname, so name_auto must be
+// cleared here or the next registration of the same record would overwrite the
+// choice (SIGMA-202).
+func (s *Store) RenameServer(ctx context.Context, orgID, serverID, name, actor string) error {
+	name = sanitizeServerName(name)
+	if name == "" {
+		return ErrInvalid{Msg: "a server name is required"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var oldName string
+	err = tx.QueryRow(ctx, `
+		UPDATE servers SET name = $3, name_auto = FALSE
+		  FROM servers old
+		 WHERE servers.id = old.id AND servers.org_id = $1 AND servers.id = $2 AND servers.deleted_at IS NULL
+		 RETURNING old.name`, orgID, serverID, name).Scan(&oldName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("rename server: %w", err)
+	}
+	if oldName == name {
+		return tx.Commit(ctx)
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "Server renamed to "+name, oldName); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func pluralize(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // ── Audit read + shared helper ──────────────────────────────────────────────

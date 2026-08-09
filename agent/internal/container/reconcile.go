@@ -115,6 +115,16 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 		if want[c.Name] {
 			continue
 		}
+		// Never reap a peer's object. On a real host this is always false —
+		// one agent owns the daemon — but the fleet e2e runs several agents
+		// against ONE daemon, and without this each one deleted its peers'
+		// containers as orphans it had no ops for: the placed service came up,
+		// the other host's next reconcile removed it, and a multi-server deploy
+		// could never converge. An object with no owner label is still reaped:
+		// on a real host it can only be this agent's own, from an older build.
+		if ownedByAnotherServer(c.Labels, d.serverID) {
+			continue
+		}
 		if rid := c.Labels[LabelResourceID]; rid != "" && rolloutGroups[rolloutGroupKey(rid, c.Labels[LabelService])] {
 			continue // a live rollout-owned generation — never GC-reaped
 		}
@@ -123,6 +133,25 @@ func (d *Driver) GC(ctx context.Context, doc dsd.Document) {
 			d.log.Warn("gc: remove", "container", c.Name, "err", err)
 		}
 	}
+}
+
+// ownedByAnotherServer reports whether a managed object belongs to a DIFFERENT
+// agent than this one.
+//
+// On a real host it is always false — one agent owns the daemon, which is why
+// nothing stamped an owner and GC felt free to reap anything wearing the
+// managed label. The fleet e2e runs several agents against ONE daemon, and
+// there each agent saw its peers' containers as orphans it had no ops for and
+// removed them: a placed Compose service came up on its own host, the other
+// host's next reconcile deleted it, and a multi-server deploy could never
+// converge — with nothing in the log of the host that was trying to deploy.
+//
+// An object with NO owner label is ours: on a real host it can only be this
+// agent's own from an older build, and refusing to reap it would leak every
+// pre-upgrade container forever.
+func ownedByAnotherServer(labels map[string]string, serverID string) bool {
+	owner := labels[LabelServerID]
+	return owner != "" && serverID != "" && owner != serverID
 }
 
 // rolloutGroupKey identifies a (resource, service) rollout group; service is ""

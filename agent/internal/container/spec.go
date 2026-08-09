@@ -79,6 +79,17 @@ const (
 	// multi-service resource's rollout/recreate and GC scope to one service's
 	// generations. Empty (label absent) for a single-container app.
 	LabelService = "sigmahub.service"
+	// LabelServerID names the agent that created the object.
+	//
+	// On a real host there is one agent, so this is redundant — which is exactly
+	// why it went unstamped and why GC could reap anything wearing the managed
+	// label. The fleet e2e runs several agents against ONE Docker daemon, and
+	// there each agent's GC saw its peers' containers as orphans and removed
+	// them: the placed service came up, the other host's reconcile deleted it,
+	// and a multi-server deploy could never converge. Stamping the owner makes
+	// "not mine" expressible; an object with no owner label is still reaped,
+	// since on a real host it can only be this agent's own from an older build.
+	LabelServerID = "sigmahub.serverId"
 )
 
 // NetworkSpec is the payload of a network.ensure op.

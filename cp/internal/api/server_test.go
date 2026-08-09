@@ -20,10 +20,12 @@ func (f fakePinger) Ping(context.Context) error { return f.err }
 
 // fakeStore implements StoreAPI in-memory for handler tests.
 type fakeStore struct {
-	registerErr   error
-	servers       []store.Server
-	metrics       []store.MetricPoint
-	serviceTokens map[string]store.ServicePrincipal
+	registerErr    error
+	servers        []store.Server
+	metrics        []store.MetricPoint
+	serviceTokens  map[string]store.ServicePrincipal
+	provisioned    []store.ProvisionInput
+	registerResult *store.RegisterResult
 }
 
 func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, provider, region, createdBy string, ttl time.Duration) (string, string, time.Time, error) {
@@ -31,6 +33,9 @@ func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, pro
 }
 
 func (f *fakeStore) ProvisionServer(_ context.Context, orgID string, in store.ProvisionInput, createdBy string, ttl time.Duration) (store.ProvisionResult, error) {
+	// Recorded because SIGMA-202 made what the connect form sends the whole
+	// question: a handler that dropped hostIp or type would still answer 201.
+	f.provisioned = append(f.provisioned, in)
 	return store.ProvisionResult{
 		ServerID: "srv_pre", Token: "sbt_test", ExpiresAt: time.Now().Add(ttl),
 		BootstrapPubkey: "ssh-ed25519 AAAA sigmahub-bootstrap",
@@ -51,6 +56,12 @@ func (f *fakeStore) SetDesiredAgentVersion(_ context.Context, _, _, _, _ string)
 func (f *fakeStore) RegisterServer(_ context.Context, tok, name, ver string, facts json.RawMessage, pubkey string) (store.RegisterResult, error) {
 	if f.registerErr != nil {
 		return store.RegisterResult{}, f.registerErr
+	}
+	// A scripted result lets a test drive the register RESPONSE — the register
+	// path now decides a compatibility verdict, and the handler has to pass it
+	// through rather than answering with a shape of its own.
+	if f.registerResult != nil {
+		return *f.registerResult, nil
 	}
 	return store.RegisterResult{
 		Server:     store.Server{ID: "srv_1", OrgID: "org_1", Name: name, Facts: json.RawMessage(`{}`)},
@@ -85,7 +96,16 @@ func (f *fakeStore) ListServers(context.Context, string) ([]store.Server, error)
 	return f.servers, nil
 }
 
-func (f *fakeStore) GetServer(context.Context, string, string) (store.Server, error) {
+// GetServer reads from the same slice ListServers serves, so a test that seeds
+// one server can drive the handlers that answer WITH a server (the type-change
+// and rename exits re-read the row they just mutated). An unseeded id is still
+// a 404, which is what every pre-existing caller here relies on.
+func (f *fakeStore) GetServer(_ context.Context, orgID, serverID string) (store.Server, error) {
+	for _, srv := range f.servers {
+		if srv.ID == serverID && (orgID == "" || srv.OrgID == orgID) {
+			return srv, nil
+		}
+	}
 	return store.Server{}, store.ErrNotFound
 }
 func (f *fakeStore) ResolveSecretsForResource(context.Context, string, string, string, string) ([]store.ResolvedSecret, error) {
@@ -147,6 +167,11 @@ type fakeDomain struct {
 	// that it reached the last one.
 	noDeployHistory bool
 	reapplied       bool
+	// The SIGMA-202/203 exits, recorded as {orgID, serverID, value, actor} so a
+	// handler test can prove the path values and the body reached the store.
+	typeCalls   [][4]string
+	renameCalls [][4]string
+	typeErr     error
 }
 
 func (f *fakeDomain) CreateProject(_ context.Context, orgID, name, desc, actor string) (store.Project, error) {
@@ -213,6 +238,22 @@ func (f *fakeDomain) SetHardeningConfig(context.Context, string, string, bool, b
 }
 
 func (f *fakeDomain) SetProxyRole(context.Context, string, string, bool, string) error {
+	return nil
+}
+
+// The two SIGMA-202/203 mutations record their arguments: the handlers' whole
+// job is passing the right ones through, so a test that only checked the status
+// code would pass with the body ignored.
+func (f *fakeDomain) SetServerType(_ context.Context, orgID, serverID, serverType, actor string) error {
+	if f.typeErr != nil {
+		return f.typeErr
+	}
+	f.typeCalls = append(f.typeCalls, [4]string{orgID, serverID, serverType, actor})
+	return nil
+}
+
+func (f *fakeDomain) RenameServer(_ context.Context, orgID, serverID, name, actor string) error {
+	f.renameCalls = append(f.renameCalls, [4]string{orgID, serverID, name, actor})
 	return nil
 }
 func (f *fakeDomain) ListAudit(context.Context, string, int) ([]store.AuditEntry, error) {

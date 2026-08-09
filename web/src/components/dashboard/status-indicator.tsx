@@ -21,6 +21,10 @@ const FALLBACK_META = { label: "Unknown", dot: "bg-muted-foreground", text: "tex
 const RAW_LABELS: Record<string, string> = {
   unreachable: "Unreachable",
   skipped: "Not deployed",
+  // The host installed and is heartbeating; what is wrong is the TYPE it was
+  // enrolled as (SIGMA-203). "Error" would send the operator hunting for a
+  // crash instead of reading the sentence next to this badge.
+  incompatible: "Incompatible",
 };
 
 function rawKey(status: unknown): string {

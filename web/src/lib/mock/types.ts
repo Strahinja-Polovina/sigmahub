@@ -8,6 +8,7 @@
 // spelled MongoDB "mongo" while the CP, the agent and every migration said
 // "mongodb").
 import type { ServerType, ResourceKind } from "@/lib/server-catalog.generated";
+import type { HostFacts } from "@/lib/server-compat";
 
 export type { ServerType, ResourceKind };
 export type Status =
@@ -60,6 +61,12 @@ export interface Server {
   environmentIds: string[];
   resourceCount: number;
   byoVpn: boolean; // connected over a customer-provided VPN / jump host
+  /** What the agent reported about the host (SIGMA-201). Optional because most
+   *  demo servers predate it; where it IS set, the seed runs the real
+   *  compatibility gate over it rather than hand-writing a status — so a demo
+   *  server enrolled as the wrong type ends up incompatible for the same reason
+   *  a real one would, with the same sentence (SIGMA-203). */
+  facts?: HostFacts;
 }
 
 export interface Resource {

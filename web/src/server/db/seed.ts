@@ -10,6 +10,7 @@ import { db, client } from "./index";
 import * as s from "./schema";
 import { user, session, account, verification, twoFactor } from "./auth-schema";
 import { auth } from "../../lib/auth";
+import { checkServerCompatibility, SERVER_STATUS } from "../../lib/server-compat";
 import {
   orgs as mockOrgs,
   projects as mockProjects,
@@ -96,22 +97,34 @@ async function main() {
   );
 
   await db.insert(s.servers).values(
-    mockServers.map((sv) => ({
-      id: sv.id,
-      orgId: sv.orgId,
-      name: sv.name,
-      type: sv.type,
-      source: "byo",
-      provider: sv.provider,
-      region: sv.region,
-      status: sv.status,
-      agentVersion: sv.agentVersion,
-      ip: sv.ip,
-      cpu: sv.cpu,
-      memGb: sv.memGb,
-      byoVpn: sv.byoVpn,
-      connectedAt: new Date(sv.connectedAt),
-    }))
+    mockServers.map((sv) => {
+      // A seeded server's compatibility is DERIVED, never written down: the
+      // gate runs over whatever facts the fixture reports, exactly as it does
+      // at registration. A demo host filed under a type its facts contradict
+      // therefore lands in `incompatible` with the control plane's own
+      // sentences, and a fixture edit that fixes the hardware clears it —
+      // neither is a status somebody remembered to update (SIGMA-203).
+      const facts = sv.facts ?? {};
+      const incompatibleReasons = checkServerCompatibility(sv.type, facts);
+      return {
+        id: sv.id,
+        orgId: sv.orgId,
+        name: sv.name,
+        type: sv.type,
+        source: "byo",
+        provider: sv.provider,
+        region: sv.region,
+        status: incompatibleReasons.length > 0 ? SERVER_STATUS.incompatible : sv.status,
+        agentVersion: sv.agentVersion,
+        ip: sv.ip,
+        cpu: sv.cpu,
+        memGb: sv.memGb,
+        byoVpn: sv.byoVpn,
+        connectedAt: new Date(sv.connectedAt),
+        facts,
+        incompatibleReasons,
+      };
+    })
   );
 
   await db.insert(s.envServers).values(

@@ -9,6 +9,7 @@ import {
   text,
   integer,
   boolean,
+  jsonb,
   timestamp,
   primaryKey,
   unique,
@@ -16,6 +17,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { user } from "./auth-schema";
+import type { FailedRequirement, HostFacts } from "@/lib/server-compat";
 
 export const orgs = pgTable("orgs", {
   id: text("id").primaryKey(),
@@ -154,6 +156,25 @@ export const servers = pgTable("servers", {
   memGb: integer("mem_gb").notNull().default(0),
   byoVpn: boolean("byo_vpn").notNull().default(false),
   connectedAt: timestamp("connected_at").notNull().defaultNow(),
+  // The agent's host description (SIGMA-201). In CP mode this mirrors what the
+  // control plane stores; in demo mode the simulated check-in writes it. It is
+  // what the detail page reads for arch/disk/GPU — figures the row's own cpu
+  // and mem_gb columns never covered — and what the demo gate is evaluated
+  // against, so a demo server's state comes from facts rather than from a
+  // hardcoded status.
+  facts: jsonb("facts").$type<HostFacts>().notNull().default(sql`'{}'::jsonb`),
+  // Why a server is `incompatible` (SIGMA-203), rendered verbatim. Always an
+  // array: a nullable column would have every reader deciding for itself what
+  // null means, which is the distinction the facts column already taught us to
+  // keep explicit.
+  incompatibleReasons: jsonb("incompatible_reasons")
+    .$type<FailedRequirement[]>()
+    .notNull()
+    .default(sql`'[]'::jsonb`),
+  // The name was assigned by the product, not chosen by the operator — the
+  // connect form stopped asking, so registration fills it from the reported
+  // hostname while this is set (SIGMA-202).
+  nameAuto: boolean("name_auto").notNull().default(false),
 });
 
 export const envServers = pgTable(

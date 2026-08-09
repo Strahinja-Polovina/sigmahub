@@ -29,6 +29,13 @@ export const STATE_ALIASES: Record<string, Status> = {
   // A server the CP's staleness sweep flipped after 90s of silence. Without
   // this it rendered as a grey "Unknown" pill (SIGMA-184).
   unreachable: "stopped",
+  // A host whose facts do not satisfy the type it was enrolled as (SIGMA-203).
+  // It maps to `error` because it needs the operator to act — the two exits are
+  // changing the type or disconnecting — and it keeps its own LABEL in the
+  // badge (see RAW_LABELS): "Error" would send someone looking for a crash,
+  // and every aggregate that counts running servers must exclude it, which
+  // mapping to `provisioning` would not have done.
+  incompatible: "error",
 };
 
 /** Normalize any CP/agent state string (or a `{state}` object) to UI vocabulary.

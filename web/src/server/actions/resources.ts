@@ -7,6 +7,7 @@ import * as s from "../db/schema";
 import { requireProjectAdminForResource, requireProjectRole } from "../active-org";
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
+import { isIncompatible } from "@/lib/server-compat";
 import {
   buildResourceSpec,
   resolveDeployTarget,
@@ -89,11 +90,20 @@ export async function createResource(input: {
   // mirror happen below (cpMirrorServer 404s cross-org ids).
   if (target.serverId && !cpEnabled()) {
     const [sv] = await db
-      .select({ orgId: s.servers.orgId })
+      .select({ orgId: s.servers.orgId, status: s.servers.status, type: s.servers.type })
       .from(s.servers)
       .where(eq(s.servers.id, target.serverId));
     if (!sv || sv.orgId !== project.orgId) {
       throw new Error("Server does not belong to this organization.");
+    }
+    // The same refusal the control plane makes (store.CreateResource): a host
+    // the enrollment gate rejected matches the availability matrix on paper and
+    // not in fact, and scheduling onto it anyway reproduces exactly the failure
+    // SIGMA-203 exists to move earlier (SIGMA-203).
+    if (isIncompatible(sv.status)) {
+      throw new Error(
+        `That server is marked incompatible with its ${sv.type} type — change its type or disconnect it before scheduling work onto it.`
+      );
     }
   }
 

@@ -25,18 +25,24 @@ type issueTokenRequest struct {
 }
 
 type provisionRequest struct {
+	// Name is OPTIONAL. The dashboard's connect form stopped asking for one
+	// (SIGMA-202): the machine reports its hostname at registration, and that
+	// becomes the name unless the caller supplied one here.
 	Name      string `json:"name"`
 	Type      string `json:"type"`
 	Provider  string `json:"provider"`
 	Region    string `json:"region"`
 	ProxyRole bool   `json:"proxyRole"`
-	// Distro is what the operator PICKED in the connect wizard, before the
-	// machine had ever been asked. It is only the starting value now: the agent
-	// reports the real one from /etc/os-release at register and on every
-	// heartbeat, and that reading replaces this (SIGMA-201).
-	Distro string `json:"distro"` // validated server-side
-	// HostIP: the public address from the connect wizard, stored as the
-	// server's initial endpoint (SIGMA-187).
+	// Distro was what the operator PICKED in the connect wizard, before the
+	// machine had ever been asked. The dashboard no longer offers that choice —
+	// the agent reads /etc/os-release at register and on every heartbeat, and
+	// that reading replaces this (SIGMA-201/202). The field survives for API
+	// callers that still have a reason to declare one; it is only ever a
+	// starting value, and it is validated server-side.
+	Distro string `json:"distro"`
+	// HostIP: the public address from the connect form, stored as the server's
+	// initial endpoint (SIGMA-187) and used as the row's placeholder name until
+	// the agent reports a hostname.
 	HostIP string `json:"hostIp"`
 }
 
@@ -231,6 +237,65 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		// The agent pins this to verify every DSD it later receives.
 		"dsdPublicKey": s.dsdPublicKeyB64(),
 	})
+}
+
+// handleSetServerType re-files a server under a different type and re-runs the
+// registration compatibility gate against the facts already on record — the
+// "change the type" exit from `incompatible` (SIGMA-203). Project Admin+.
+//
+// Answers with the server as it now stands rather than a bare {"status":"ok"}:
+// the whole point of this endpoint is that the caller learns immediately
+// whether the new type sticks, and a client that had to re-GET would render a
+// success toast next to a still-incompatible row.
+func (s *Server) handleSetServerType(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	serverID := r.PathValue("serverId")
+	var req struct {
+		Type string `json:"type"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if msg := serverTypeError(req.Type); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	if err := s.domain.SetServerType(r.Context(), orgID, serverID, req.Type, principalFrom(r).Name); err != nil {
+		s.writeStoreErr(w, err, "set server type")
+		return
+	}
+	srv, err := s.store.GetServer(r.Context(), orgID, serverID)
+	if err != nil {
+		s.writeStoreErr(w, err, "get server")
+		return
+	}
+	writeJSON(w, http.StatusOK, srv)
+}
+
+// handleRenameServer gives a server an operator-chosen name. The connect form
+// stopped asking for one (the machine reports its hostname), so this is where
+// the ability to name a server now lives. Project Admin+.
+func (s *Server) handleRenameServer(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	serverID := r.PathValue("serverId")
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if err := s.domain.RenameServer(r.Context(), orgID, serverID, req.Name, principalFrom(r).Name); err != nil {
+		s.writeStoreErr(w, err, "rename server")
+		return
+	}
+	srv, err := s.store.GetServer(r.Context(), orgID, serverID)
+	if err != nil {
+		s.writeStoreErr(w, err, "get server")
+		return
+	}
+	writeJSON(w, http.StatusOK, srv)
 }
 
 func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
