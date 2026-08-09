@@ -33,7 +33,30 @@ export const servers: Server[] = [
   { id: "srv_gen_2", orgId: "org_acme", name: "fsn-general-02", type: "general", provider: "Hetzner", region: "eu-central · FSN1", status: "running", agentVersion: "1.4.2", ip: "10.8.0.12", cpu: 4, memGb: 16, connectedAt: "2027-01-14", environmentIds: ["env_webshop_staging", "env_api_dev"], resourceCount: 3, byoVpn: true },
   { id: "srv_db_1", orgId: "org_acme", name: "hel-db-01", type: "database", provider: "Hetzner", region: "eu-central · HEL1", status: "running", agentVersion: "1.4.2", ip: "10.8.0.21", cpu: 8, memGb: 64, connectedAt: "2027-01-12", environmentIds: ["env_webshop_prod", "env_api_prod"], resourceCount: 3, byoVpn: false },
   { id: "srv_store_1", orgId: "org_acme", name: "gra-store-01", type: "storage", provider: "OVH", region: "eu-west · GRA", status: "running", agentVersion: "1.4.1", ip: "10.8.0.31", cpu: 4, memGb: 16, connectedAt: "2027-01-20", environmentIds: ["env_api_prod"], resourceCount: 1, byoVpn: false },
-  { id: "srv_gpu_1", orgId: "org_acme", name: "gpu-a100-01", type: "gpu", provider: "BYO · bare metal", region: "on-prem · RS", status: "degraded", agentVersion: "1.4.2", ip: "10.8.0.41", cpu: 16, memGb: 128, connectedAt: "2027-02-02", environmentIds: ["env_mllab_prod"], resourceCount: 1, byoVpn: true },
+  // The demo's real GPU host. Its facts include the card's memory because that
+  // is what the model step's VRAM filter compares against (SIGMA-214): with no
+  // inventory reported the fit check correctly does nothing, and a demo where
+  // it does nothing hides the feature from everyone evaluating it. 42949672960
+  // bytes is what nvidia-smi reports for a 40 GB A100 — a real reading, so the
+  // demo's arithmetic is the same arithmetic a customer's fleet produces.
+  {
+    id: "srv_gpu_1", orgId: "org_acme", name: "gpu-a100-01", type: "gpu",
+    provider: "BYO · bare metal", region: "on-prem · RS", status: "degraded",
+    agentVersion: "1.4.2", ip: "10.8.0.41", cpu: 16, memGb: 128,
+    connectedAt: "2027-02-02", environmentIds: ["env_mllab_prod"], resourceCount: 1, byoVpn: true,
+    facts: {
+      hostname: "gpu-a100-01", os: "linux", arch: "amd64", numCpu: 16, memTotalMb: 131_072,
+      distro: "ubuntu-24.04", distroName: "Ubuntu 24.04.1 LTS",
+      diskTotalBytes: 2_000_000_000_000, diskFreeBytes: 1_240_000_000_000, diskPath: "/",
+      gpu: {
+        vendor: "nvidia", model: "NVIDIA A100-PCIE-40GB", count: 1,
+        vramBytesPerGpu: 42_949_672_960, vramBytesTotal: 42_949_672_960,
+        driverVersion: "550.54.15",
+        cards: [{ index: 0, model: "NVIDIA A100-PCIE-40GB", vramBytes: 42_949_672_960 }],
+      },
+      dockerAvailable: true, dockerVersion: "27.3.1",
+    },
+  },
   { id: "srv_gen_3", orgId: "org_acme", name: "ash-general-03", type: "general", provider: "Hetzner", region: "us-east · ASH", status: "provisioning", agentVersion: "1.4.2", ip: "10.8.0.13", cpu: 4, memGb: 16, connectedAt: "2027-03-01", environmentIds: [], resourceCount: 0, byoVpn: false },
   { id: "srv_nw_1", orgId: "org_northwind", name: "ams-general-01", type: "general", provider: "DigitalOcean", region: "eu · AMS3", status: "running", agentVersion: "1.4.2", ip: "10.9.0.11", cpu: 2, memGb: 4, connectedAt: "2027-02-10", environmentIds: ["env_site_prod"], resourceCount: 2, byoVpn: false },
   // The misfiled host: an ordinary box someone connected as a GPU server. Its

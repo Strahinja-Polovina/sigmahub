@@ -20,7 +20,8 @@ import {
   type ResourceKind,
   type ServerType,
 } from "@/lib/server-catalog.generated";
-import { SERVER_STATUS } from "@/lib/server-compat";
+import { SERVER_STATUS, type HostFacts } from "@/lib/server-compat";
+import { serverFitsModel, type ModelCard } from "./llm";
 
 /** A server as the wizard sees it — the deploy-target shape, plus the status
  *  the enrollment gate wrote. */
@@ -31,6 +32,11 @@ export type WizardServer = {
   provider?: string;
   region?: string;
   status?: string;
+  /** The host's GPU inventory as the agent reported it (SIGMA-201), and only
+   *  that slice of its facts: it is the one thing a target decision needs that
+   *  the type alone cannot answer. Absent means no agent ever reported one,
+   *  which is UNKNOWN and never zero — see serverFitsModel. */
+  gpu?: HostFacts["gpu"];
 };
 
 export type WizardEnvironment = {
@@ -172,7 +178,12 @@ export type ServerOption = {
 
 export function serverOptions(
   env: WizardEnvironment | undefined,
-  kind: ResourceKind | null | undefined
+  kind: ResourceKind | null | undefined,
+  /** The model an `llm` resource will serve, once one has been chosen
+   *  (SIGMA-214). Optional, and every other kind passes nothing: a Redis has no
+   *  model, and threading the card in as a required argument would make four
+   *  call sites pass null to say so. */
+  model?: ModelCard | null
 ): ServerOption[] {
   if (!env || !kind) return [];
   const allowed = new Set((ALLOWED_SERVER_TYPES[kind] ?? []) as string[]);
@@ -197,6 +208,15 @@ export function serverOptions(
         eligible: false,
         reason: `A ${typeLabel} server cannot host a ${kindLabel}.`,
       };
+    }
+    // Last, because it is the only reason here that depends on a choice made on
+    // an EARLIER step rather than on the host itself: the model. A GPU server
+    // whose card is too small for the chosen model is a target the control
+    // plane's create call refuses (store.checkModelFits) — so it is refused
+    // here too, in the same terms, one screen earlier and for free.
+    const fit = serverFitsModel(model, server);
+    if (!fit.fits) {
+      return { server, eligible: false, reason: fit.reason };
     }
     return { server, eligible: true };
   });

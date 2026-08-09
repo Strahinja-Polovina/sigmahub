@@ -83,6 +83,7 @@ type Server struct {
 	clusters            ClusterAPI
 	registry            RegistryAPI
 	llm                 LLMAPI
+	models              ModelCatalog
 	dns                 DNSAPI
 	inspector           RepoInspector
 	repoLister          RepoLister
@@ -156,6 +157,11 @@ type Options struct {
 	Registry RegistryAPI
 	// LLM backs GPU model-hosting endpoints.
 	LLM LLMAPI
+	// Models backs the Hugging Face model picker (SIGMA-213). Nil is a
+	// SUPPORTED state, not a broken one: search then answers an empty catalog
+	// with tokenConfigured=false, which the wizard renders as a free-text model
+	// field. Nothing here may 503 — see handleSearchModels.
+	Models ModelCatalog
 	// DNS derives and verifies the records a custom domain needs.
 	DNS DNSAPI
 	// InstallationAccounts names an installation's account for the dashboard.
@@ -202,6 +208,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		clusters:            opts.Clusters,
 		registry:            opts.Registry,
 		llm:                 opts.LLM,
+		models:              opts.Models,
 		dns:                 opts.DNS,
 		githubAppSlug:       opts.GitHubAppSlug,
 		dsdStore:            opts.DSDStore,
@@ -403,6 +410,13 @@ func (s *Server) routes() {
 	// runtimes this control plane can actually render.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/llm", s.requireService(store.RoleDeveloper, s.handleGetLLM))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/engines", s.requireService(store.RoleDeveloper, s.handleListLLMEngines))
+	// The Hugging Face model picker (SIGMA-213/214). Member-visible like the
+	// engine list: browsing the Hub is a read, and every card it returns is
+	// public information plus this control plane's own sizing arithmetic. They
+	// sit at the same Developer bar so the wizard needs exactly one role to
+	// complete its LLM step.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/models", s.requireService(store.RoleDeveloper, s.handleSearchModels))
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/llm/models/resolve", s.requireService(store.RoleDeveloper, s.handleResolveModel))
 	// DNS setup for a custom domain: which record to create and whether it is
 	// live. Member-visible — knowing why a domain doesn't route isn't a mutation.
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/domains/{domainId}/dns", s.requireService(store.RoleDeveloper, s.handleDomainDNS))

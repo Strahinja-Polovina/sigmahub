@@ -10,7 +10,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -121,13 +120,7 @@ type LLMTarget struct {
 // its runtime + model. Runs inside CreateResource's transaction, symmetric with
 // provisionDatabaseTx and provisionS3Tx.
 func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r Resource) error {
-	var spec struct {
-		Engine string `json:"engine"`
-		Model  string `json:"model"`
-	}
-	if len(r.Spec) > 0 {
-		_ = json.Unmarshal(r.Spec, &spec)
-	}
+	spec := parseLLMSpec(r.Spec)
 	engine := spec.Engine
 	if engine == "" {
 		engine = DefaultLLMEngine

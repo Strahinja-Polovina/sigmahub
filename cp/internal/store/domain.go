@@ -530,6 +530,17 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	if method := buildMethodFromSpec(in.Spec); method != "" && !gitdetect.ValidBuildMethod(method) {
 		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown build method %q", method)}
 	}
+	// SIGMA-214: size the requested model BEFORE the transaction opens. The
+	// lookup is a call to huggingface.co, and a transaction held open across a
+	// third party's latency is how a slow dependency becomes a lock queue on our
+	// own database. The answer is target-independent, so it is compared below
+	// against whichever host the resource is aimed at; an unknown size (the Hub
+	// is down, the model is an Ollama tag, nobody wired a sizer) is the
+	// fail-open state and skips the comparison entirely — see llm_fit.go.
+	var modelSize ModelSize
+	if IsLLMKind(in.Kind) {
+		modelSize = s.sizeModelForFit(ctx, in.Spec)
+	}
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -558,10 +569,10 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		if !ClusterKindAllowed(in.Kind) {
 			return Resource{}, ErrKindNotClusterable{Kind: in.Kind}
 		}
-		var clusterEnv string
+		var clusterEnv, clusterName string
 		if err := tx.QueryRow(ctx,
-			`SELECT environment_id FROM clusters WHERE org_id = $1 AND id = $2 FOR SHARE`,
-			orgID, in.ClusterID).Scan(&clusterEnv); errors.Is(err, pgx.ErrNoRows) {
+			`SELECT environment_id, name FROM clusters WHERE org_id = $1 AND id = $2 FOR SHARE`,
+			orgID, in.ClusterID).Scan(&clusterEnv, &clusterName); errors.Is(err, pgx.ErrNoRows) {
 			return Resource{}, ErrNotFound
 		} else if err != nil {
 			return Resource{}, err
@@ -569,11 +580,27 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		if clusterEnv != in.EnvironmentID {
 			return Resource{}, ErrInvalid{Msg: "that cluster belongs to a different environment"}
 		}
+		// A model aimed at a cluster is scheduled onto one of its nodes, so the
+		// capacity that matters is the biggest card any node has (maxVRAMPerGPU
+		// explains why the biggest and not the smallest). Without this branch the
+		// fit check would exist only on the server path, and "deploy it to the
+		// cluster instead" would be a way to walk around it.
+		if IsLLMKind(in.Kind) {
+			nodeFacts, err := clusterNodeFactsTx(ctx, tx, in.ClusterID)
+			if err != nil {
+				return Resource{}, err
+			}
+			if err := checkModelFits(parseLLMSpec(in.Spec).Model, modelSize,
+				maxVRAMPerGPU(nodeFacts), "the largest GPU node in "+clusterName); err != nil {
+				return Resource{}, err
+			}
+		}
 	} else if in.ServerID == "" {
 		return Resource{}, ErrInvalid{Msg: "a target server or cluster is required"}
 	}
 
-	var serverType, serverStatus string
+	var serverType, serverStatus, serverName string
+	var serverFacts json.RawMessage
 	// Server placement checks. A cluster deploy has no server of its own — the
 	// scheduler picks the node — so the type matrix and env attachment are the
 	// cluster's concern, already validated above.
@@ -582,9 +609,12 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		// cannot tombstone it between this liveness check and the resource insert —
 		// the two serialize, so the resource either blocks the delete or is rejected
 		// against an already-tombstoned server (SIGMA-132).
+		// facts and name ride along for the SIGMA-214 fit check below: the row is
+		// already locked and read here, so asking for them costs nothing and
+		// saves a second query that could observe a different row.
 		if err := tx.QueryRow(ctx,
-			`SELECT type, status FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
-			orgID, in.ServerID).Scan(&serverType, &serverStatus); errors.Is(err, pgx.ErrNoRows) {
+			`SELECT type, status, name, facts FROM servers WHERE org_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE`,
+			orgID, in.ServerID).Scan(&serverType, &serverStatus, &serverName, &serverFacts); errors.Is(err, pgx.ErrNoRows) {
 			return Resource{}, ErrNotFound
 		} else if err != nil {
 			return Resource{}, err
@@ -630,6 +660,21 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		}
 		if !attached {
 			return Resource{}, ErrInvalid{Msg: "server is not attached to the target environment"}
+		}
+
+		// SIGMA-214, last of the placement checks on purpose: it is the only one
+		// that is an ESTIMATE, so every certain refusal above gets to speak
+		// first. An operator whose server is also incompatible and also unattached
+		// should be told those, not handed a VRAM arithmetic lesson.
+		if IsLLMKind(in.Kind) {
+			gpu := ParseHostFacts(serverFacts).GPU
+			var perGPU uint64
+			if gpu != nil {
+				perGPU = gpu.VRAMBytesPerGPU
+			}
+			if err := checkModelFits(parseLLMSpec(in.Spec).Model, modelSize, perGPU, serverName); err != nil {
+				return Resource{}, err
+			}
 		}
 	}
 

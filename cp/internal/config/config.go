@@ -73,6 +73,16 @@ type Config struct {
 	PaddleWebhookSecret string
 	PaddleEnv           string
 	PaddlePriceID       string
+	// HuggingFaceToken authenticates the model picker's Hub calls
+	// (CP_HUGGING_FACE_TOKEN). OPTIONAL, and deliberately not defaulted or
+	// required: the Hub's model API serves public repos unauthenticated, so a
+	// self-hoster who sets nothing still gets a working picker over the models
+	// most people deploy. A token adds the org's private repos and the gated
+	// ones (Llama & co) it has been granted, and the search response says which
+	// of the two worlds the operator is looking at — see the API's
+	// tokenConfigured field, which exists so nobody has to guess why a model
+	// they can see on huggingface.co is missing from the picker.
+	HuggingFaceToken string
 	// RequireActor (CP_REQUIRE_ACTOR=true) makes a valid X-Sigmahub-Actor header
 	// mandatory on org-scoped service tokens (SIGMA-82). Off by default: the
 	// actor header only ever NARROWS a token's role and is self-signed by the
@@ -104,6 +114,7 @@ func FromEnv() (Config, error) {
 		PaddleWebhookSecret:     os.Getenv("CP_PADDLE_WEBHOOK_SECRET"),
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
+		HuggingFaceToken:        strings.TrimSpace(os.Getenv("CP_HUGGING_FACE_TOKEN")),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")

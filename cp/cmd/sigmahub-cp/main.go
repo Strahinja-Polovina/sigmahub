@@ -21,6 +21,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/billingsync"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
@@ -182,6 +183,29 @@ func loadGitHubApp(ctx context.Context, st *store.Store, cfg config.Config) (*gi
 	return githubapp.NewAppAuth(cfg.GitHubAppID, key), nil
 }
 
+// hubSizer adapts the Hugging Face client to store.ModelSizer.
+//
+// The adapter exists so the store's dependency stays two fields wide. Handing
+// it the hf.Client directly would work and would be a mistake: the store would
+// then be one autocomplete away from making a provisioning decision out of
+// `gated` or `pipelineTag`, which are the picker's business, and it would carry
+// an HTTP client into a package whose job is transactions.
+type hubSizer struct{ hub *hf.Client }
+
+func (h hubSizer) SizeModel(ctx context.Context, repoID string) (store.ModelSize, error) {
+	card, err := h.hub.Resolve(ctx, repoID)
+	if err != nil {
+		return store.ModelSize{}, err
+	}
+	return store.ModelSize{
+		ParametersKnown:   card.ParametersKnown,
+		VRAMBytesRequired: card.VRAMBytesRequired,
+		// Carried, not re-rendered: the refusal must quote the same string the
+		// picker put on screen for this model.
+		VRAMText: card.VRAMText,
+	}, nil
+}
+
 // runDeployDrain periodically drains queued deploy_requests into deployments and
 // nudges the reconciler for each affected server, so a git push produces a
 // rendered clone→build→rollout pipeline within a few seconds.
@@ -257,6 +281,30 @@ func run() error {
 		log.Info("github app configured", "appId", cfg.GitHubAppID, "slug", cfg.GitHubAppSlug)
 	}
 	inspector := githubapp.NewInspector()
+
+	// Hugging Face model catalog (SIGMA-213/214). Constructed UNCONDITIONALLY,
+	// token or no token, because the Hub's model API serves public repos
+	// unauthenticated and the alternative — wiring it only when
+	// CP_HUGGING_FACE_TOKEN is set — would hand a self-hoster an empty picker
+	// and no way to tell that from "the Hub is down". The token, when present,
+	// widens what the picker can see; it is not what makes the picker exist.
+	//
+	// The TTL is the picker's whole rate-limit story: a typeahead is many
+	// keystrokes over a few models, and ten minutes is long enough that a wizard
+	// session costs a handful of Hub calls while short enough that a repo which
+	// gains weights, a licence gate or a new revision is current well within the
+	// time it takes anyone to notice.
+	hubClient := &hf.Client{
+		HTTP:  &http.Client{Timeout: 10 * time.Second},
+		Token: cfg.HuggingFaceToken,
+		TTL:   10 * time.Minute,
+	}
+	// The store's create-time fit re-check reads the same client through a
+	// two-field interface, so an API-direct create hits the wall the wizard
+	// draws. Every failure of this call degrades to "no check" (llm_fit.go).
+	st.SetModelSizer(hubSizer{hub: hubClient})
+	log.Info("model catalog configured", "hubTokenConfigured", hubClient.TokenConfigured())
+
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
 	go rec.Run(ctx, 60*time.Second)
@@ -370,6 +418,7 @@ func run() error {
 			Clusters:             st,
 			Registry:             st,
 			LLM:                  st,
+			Models:               hubClient,
 			DNS:                  st,
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret:  cfg.GitHubWebhookSecret,

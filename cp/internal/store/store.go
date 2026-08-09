@@ -38,6 +38,10 @@ type Store struct {
 	// installTokens mints GitHub App installation tokens (SIGMA-55). Nil when
 	// no App is configured — connections then rely on their stored PAT.
 	installTokens InstallationTokenSource
+	// modelSizer estimates a model's VRAM for the create-time fit check
+	// (SIGMA-214). Nil — the default — means no fit check, which is also what
+	// every failure of a configured sizer degrades to; see llm_fit.go.
+	modelSizer ModelSizer
 }
 
 // InstallationTokenSource mints short-lived GitHub App installation access

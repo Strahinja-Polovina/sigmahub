@@ -7,6 +7,7 @@ import {
   serverOptions,
   type WizardProject,
 } from "./availability";
+import type { ModelCard } from "./llm";
 
 function projectWith(types: string[], status?: string): WizardProject[] {
   return [
@@ -113,6 +114,115 @@ describe("per-server eligibility carries its reason", () => {
     expect(gpu?.eligible).toBe(false);
     // Its type CAN host an app; the machine is what was refused.
     expect(gpu?.reason).toContain("refused as a GPU server");
+  });
+});
+
+describe("a GPU server too small for the chosen model is refused with both sizes", () => {
+  const GB = 1_000_000_000;
+
+  function modelCard(over: Partial<ModelCard> = {}): ModelCard {
+    return {
+      id: "meta-llama/Llama-3.1-70B-Instruct",
+      name: "Llama 3.1 70B Instruct",
+      gated: false,
+      downloads: 421_760,
+      likes: 1_205,
+      pipelineTag: "text-generation",
+      library: "transformers",
+      engine: "vllm",
+      parameters: 70_553_706_496,
+      parametersKnown: true,
+      quantization: "none",
+      bytesPerParam: 2,
+      vramBytesRequired: 188_143_217_323,
+      vramText: "~188 GB",
+      sizingBasis: "safetensors",
+      ...over,
+    };
+  }
+
+  const envWithCards = {
+    id: "env",
+    name: "production",
+    servers: [
+      {
+        id: "big",
+        name: "gpu-a100-01",
+        type: "gpu",
+        status: "running",
+        gpu: { vendor: "nvidia", count: 4, vramBytesPerGpu: 80 * GB },
+      },
+      {
+        id: "small",
+        name: "gpu-l4-01",
+        type: "gpu",
+        status: "running",
+        gpu: { vendor: "nvidia", count: 1, vramBytesPerGpu: 24 * GB },
+      },
+      // The fleet's older agent: it heartbeats, it hosts, it has simply never
+      // reported an inventory.
+      { id: "silent", name: "gpu-old-01", type: "gpu", status: "running" },
+    ],
+  };
+
+  it("refuses the card that cannot hold the model, and says by how much", () => {
+    const opts = serverOptions(envWithCards, "llm", modelCard());
+    const small = opts.find((o) => o.server.id === "small");
+    expect(small?.eligible).toBe(false);
+    expect(small?.reason).toBe(
+      "This model needs about 188 GB of VRAM; this server's GPU has 24 GB."
+    );
+  });
+
+  // Four 80 GB cards is 320 GB of VRAM and still cannot run a 188 GB model:
+  // the runtime loads it into one card. A filter that added them up would
+  // promise a deploy that OOMs.
+  it("compares against one card, not the host's total", () => {
+    const opts = serverOptions(envWithCards, "llm", modelCard());
+    expect(opts.find((o) => o.server.id === "big")?.eligible).toBe(false);
+  });
+
+  it("keeps every server eligible before a model is chosen", () => {
+    const opts = serverOptions(envWithCards, "llm");
+    expect(opts.every((o) => o.eligible)).toBe(true);
+  });
+
+  it("keeps a server whose agent never reported a GPU — absent is unknown", () => {
+    const opts = serverOptions(envWithCards, "llm", modelCard());
+    expect(opts.find((o) => o.server.id === "silent")?.eligible).toBe(true);
+  });
+
+  it("keeps every server when the model's size is unknown", () => {
+    const unsized = modelCard({
+      parametersKnown: false,
+      parameters: 0,
+      vramBytesRequired: 0,
+      vramText: "",
+      sizingBasis: "unknown",
+    });
+    expect(serverOptions(envWithCards, "llm", unsized).every((o) => o.eligible)).toBe(true);
+  });
+
+  it("offers the servers that can hold a smaller model", () => {
+    const small = modelCard({
+      id: "meta-llama/Llama-3.1-8B-Instruct",
+      parameters: 8_030_261_248,
+      vramBytesRequired: 21_414_029_995,
+      vramText: "~21 GB",
+    });
+    expect(serverOptions(envWithCards, "llm", small).every((o) => o.eligible)).toBe(true);
+  });
+
+  // The host is the wrong shape for the job regardless of which model was
+  // picked, and "a General server cannot host a Model endpoint" is the fact
+  // that gets them somewhere.
+  it("still leads with the type reason when the type is wrong", () => {
+    const env = {
+      id: "env",
+      name: "production",
+      servers: [{ id: "gen", name: "general-1", type: "general", status: "running" }],
+    };
+    expect(serverOptions(env, "llm", modelCard())[0].reason).toContain("cannot host");
   });
 });
 

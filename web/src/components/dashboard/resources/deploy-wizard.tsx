@@ -89,7 +89,6 @@ import { blockingGaps, type ReviewInput } from "@/lib/wizard/review";
 import {
   DEFAULT_LLM_ENGINE,
   DEFAULT_S3_ENGINE,
-  LLM_ENGINES,
   S3_ENGINES,
   defaultManagedName,
   isDatabaseKind,
@@ -97,6 +96,7 @@ import {
   managedSummary,
   resourceNameError,
 } from "@/lib/wizard/managed";
+import { modelStepError, serverFitsModel, type ModelCard } from "@/lib/wizard/llm";
 import {
   WIZARD_RESUME_KEY,
   decodeWizardDraft,
@@ -111,6 +111,8 @@ import { revealDatabaseConnection } from "@/server/actions/databases";
 import { revealS3Connection } from "@/server/actions/s3";
 import type { DeployTarget } from "./resource-meta";
 import { SourceStep } from "./wizard/source-step";
+import { ModelStep } from "./wizard/model-step";
+import { ResourceNameField } from "./wizard/resource-name-field";
 import { BuildStep } from "./wizard/build-step";
 import { NetworkStep } from "./wizard/network-step";
 import { TargetStep } from "./wizard/target-step";
@@ -204,8 +206,23 @@ export function DeployWizard({
 
   // Managed
   const [s3Engine, setS3Engine] = React.useState<string>(DEFAULT_S3_ENGINE);
-  const [llmEngine, setLlmEngine] = React.useState<string>(DEFAULT_LLM_ENGINE);
   const [llmModel, setLlmModel] = React.useState("");
+  /** The chosen model's card, when the catalogue could confirm it. Null covers
+   *  both "nothing picked yet" and "typed an id the Hub does not know", and the
+   *  second is deliberately not an error — see modelStepError. */
+  const [modelCard, setModelCard] = React.useState<ModelCard | null>(null);
+  /** Whether the control plane holds a Hub token. Published by every search;
+   *  held here because it is the model step's continue gate, not the picker's
+   *  private business. */
+  const [tokenConfigured, setTokenConfigured] = React.useState(false);
+
+  // The runtime is DERIVED, not chosen (SIGMA-213). vLLM cannot load GGUF
+  // weights and Ollama does not want a safetensors repository, so the question
+  // the old wizard asked had exactly one right answer per model — one the
+  // operator had to look up, and got wrong. The card carries the runtime the
+  // control plane would render; the default stands in only until a model is
+  // resolved, which is also what an unresolvable reference deploys with.
+  const llmEngine = modelCard?.engine || DEFAULT_LLM_ENGINE;
 
   // Create
   const [createState, setCreateState] = React.useState<
@@ -350,8 +367,9 @@ export function DeployWizard({
       setClusterId(draft?.clusterId ?? "");
       setEnvVars([blankEnvDraft()]);
       setS3Engine(DEFAULT_S3_ENGINE);
-      setLlmEngine(DEFAULT_LLM_ENGINE);
       setLlmModel("");
+      setModelCard(null);
+      setTokenConfigured(false);
       setCreateState("idle");
       setCreatedId(null);
       setCreateError(null);
@@ -477,7 +495,7 @@ export function DeployWizard({
         return resourceNameError(name);
       case "model":
         if (resourceNameError(name)) return resourceNameError(name);
-        return llmModel.trim() ? null : "Name the model this endpoint serves.";
+        return modelStepError(modelCard, llmModel, tokenConfigured);
       case "target":
         if (!projectId) return "Pick a project.";
         if (!environmentId) return "Pick an environment.";
@@ -502,6 +520,8 @@ export function DeployWizard({
     ports,
     domain,
     llmModel,
+    modelCard,
+    tokenConfigured,
     projectId,
     environmentId,
     serverId,
@@ -509,6 +529,28 @@ export function DeployWizard({
     envVars,
     reviewInput,
   ]);
+
+  /** A picked or typed model, and the consequences of changing it.
+   *
+   *  Changing the model after a target was chosen can invalidate that target —
+   *  a 70B model on the 24 GB card that was fine for the 8B one. The target
+   *  picker will refuse it with the reason, but a serverId already in state
+   *  would sail past the Target step's own gate and be refused by the create
+   *  call instead, which is the late failure this whole flow exists to remove.
+   *  So the selection is dropped here, where the fact that made it invalid is. */
+  const handleModelChange = React.useCallback(
+    (id: string, next: ModelCard | null) => {
+      setLlmModel(id);
+      setModelCard(next);
+      if (!serverId) return;
+      const chosen = projects
+        .flatMap((p) => p.environments)
+        .flatMap((e) => e.servers)
+        .find((s) => s.id === serverId);
+      if (chosen && !serverFitsModel(next, chosen).fits) setServerId("");
+    },
+    [projects, serverId]
+  );
 
   function goNext() {
     if (stepBlocked) return;
@@ -788,17 +830,26 @@ export function DeployWizard({
             />
           )}
 
-          {(step === "engine" || step === "storage" || step === "model") && kind && (
+          {(step === "engine" || step === "storage") && kind && (
             <ManagedStep
               kind={kind}
               name={name}
               onNameChange={setName}
               s3Engine={s3Engine}
               onS3EngineChange={setS3Engine}
-              llmEngine={llmEngine}
-              onLlmEngineChange={setLlmEngine}
-              llmModel={llmModel}
-              onLlmModelChange={setLlmModel}
+            />
+          )}
+
+          {step === "model" && (
+            <ModelStep
+              orgId={orgId}
+              name={name}
+              onNameChange={setName}
+              modelId={llmModel}
+              card={modelCard}
+              onModelChange={handleModelChange}
+              tokenConfigured={tokenConfigured}
+              onTokenConfiguredChange={setTokenConfigured}
             />
           )}
 
@@ -808,6 +859,7 @@ export function DeployWizard({
               projects={projects}
               clusters={clusters}
               inventory={inventory}
+              model={modelCard}
               projectId={projectId}
               environmentId={environmentId}
               serverId={serverId}
@@ -1021,53 +1073,34 @@ function KindStep({
   );
 }
 
-/** The managed path's single configuration step (SIGMA-212). */
+/** The managed path's single configuration step (SIGMA-212).
+ *
+ *  `llm` used to be here too and now has its own step: picking a model is a
+ *  search against the Hub, and the runtime it used to ask for is derived from
+ *  what comes back (SIGMA-213). See wizard/model-step.tsx. */
 function ManagedStep({
   kind,
   name,
   onNameChange,
   s3Engine,
   onS3EngineChange,
-  llmEngine,
-  onLlmEngineChange,
-  llmModel,
-  onLlmModelChange,
 }: {
   kind: ResourceKind;
   name: string;
   onNameChange: (v: string) => void;
   s3Engine: string;
   onS3EngineChange: (v: string) => void;
-  llmEngine: string;
-  onLlmEngineChange: (v: string) => void;
-  llmModel: string;
-  onLlmModelChange: (v: string) => void;
 }) {
-  const nameProblem = resourceNameError(name);
   const summary = managedSummary(kind);
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="wizard-managed-name">Name</Label>
-        <Input
-          id="wizard-managed-name"
-          value={name}
-          onChange={(e) => onNameChange(e.target.value)}
-          placeholder={kind}
-          className="font-mono"
-          spellCheck={false}
-          aria-invalid={nameProblem ? true : undefined}
-        />
-        <p
-          className={cn(
-            "text-xs",
-            nameProblem ? "text-destructive" : "text-muted-foreground"
-          )}
-        >
-          {nameProblem ?? "Other resources reach it by this name on the private network."}
-        </p>
-      </div>
+      <ResourceNameField
+        id="wizard-managed-name"
+        value={name}
+        onChange={onNameChange}
+        hint="Other resources reach it by this name on the private network."
+      />
 
       {kind === "s3" && (
         <div className="flex flex-col gap-1.5">
@@ -1090,53 +1123,13 @@ function ManagedStep({
         </div>
       )}
 
-      {kind === "llm" && (
-        <>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="wizard-llm-engine">Runtime</Label>
-            <Select
-              value={llmEngine}
-              onValueChange={(v) => onLlmEngineChange((v as string) ?? "")}
-            >
-              <SelectTrigger id="wizard-llm-engine" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {LLM_ENGINES.map((e) => (
-                  <SelectItem key={e.id} value={e.id}>
-                    {e.label} · {e.detail}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="wizard-llm-model">Model</Label>
-            <Input
-              id="wizard-llm-model"
-              value={llmModel}
-              onChange={(e) => onLlmModelChange(e.target.value)}
-              placeholder="meta-llama/Llama-3.1-8B-Instruct"
-              className="font-mono"
-              spellCheck={false}
-            />
-            <p className="text-xs text-muted-foreground">
-              Pulled on first start, so the endpoint takes a few minutes to become ready. It
-              listens on the private mesh only — never a public interface.
-            </p>
-          </div>
-        </>
-      )}
-
-      {kind !== "llm" && (
-        <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/40 p-3">
-          <p className="text-xs text-muted-foreground">{summary.line}</p>
-          <p className="flex items-start gap-2 text-xs text-muted-foreground">
-            <Lock className="mt-0.5 size-3.5 shrink-0" />
-            {summary.credentials}
-          </p>
-        </div>
-      )}
+      <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/40 p-3">
+        <p className="text-xs text-muted-foreground">{summary.line}</p>
+        <p className="flex items-start gap-2 text-xs text-muted-foreground">
+          <Lock className="mt-0.5 size-3.5 shrink-0" />
+          {summary.credentials}
+        </p>
+      </div>
     </div>
   );
 }

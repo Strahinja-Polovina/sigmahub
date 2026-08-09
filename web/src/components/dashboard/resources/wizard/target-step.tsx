@@ -21,6 +21,7 @@ import {
   type WizardCluster,
   type WizardProject,
 } from "@/lib/wizard/availability";
+import type { ModelCard } from "@/lib/wizard/llm";
 
 /**
  * Project → Environment → Server OR Cluster (SIGMA-210).
@@ -37,6 +38,7 @@ export function TargetStep({
   projects,
   clusters,
   inventory,
+  model,
   projectId,
   environmentId,
   serverId,
@@ -50,6 +52,9 @@ export function TargetStep({
   projects: WizardProject[];
   clusters: WizardCluster[];
   inventory: TargetInventory;
+  /** The model an `llm` resource will serve (SIGMA-214). Every other kind
+   *  passes nothing and is filtered exactly as before. */
+  model?: ModelCard | null;
   projectId: string;
   environmentId: string;
   serverId: string;
@@ -64,7 +69,7 @@ export function TargetStep({
     [projects, projectId]
   );
   const env = environments.find((e) => e.id === environmentId);
-  const servers = React.useMemo(() => serverOptions(env, kind), [env, kind]);
+  const servers = React.useMemo(() => serverOptions(env, kind, model), [env, kind, model]);
   const clusterChoices = React.useMemo(
     () => clusterOptions(clusters, environmentId, kind, inventory),
     [clusters, environmentId, kind, inventory]
@@ -176,11 +181,16 @@ export function TargetStep({
                     </span>
                     {/* Disabled-with-reason, everywhere. A greyed-out row whose
                         cause is a matrix the user has never seen is the pattern
-                        this flow is replacing. */}
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {reason ??
-                        [server.provider, server.region].filter(Boolean).join(" · ") ??
-                        ""}
+                        this flow is replacing — and a reason clipped at one line
+                        is the same thing with extra steps, so only the
+                        provider/region caption truncates. */}
+                    <span
+                      className={cn(
+                        "block text-xs text-muted-foreground",
+                        !reason && "truncate"
+                      )}
+                    >
+                      {reason ?? [server.provider, server.region].filter(Boolean).join(" · ")}
                     </span>
                   </span>
                   {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
