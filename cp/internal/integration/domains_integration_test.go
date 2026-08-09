@@ -69,6 +69,16 @@ func TestDomainsLifecycle(t *testing.T) {
 		}
 	}
 
+	// A domain on a server with no proxy role routes nowhere — no Traefik, and
+	// 80/443 closed at the host firewall — so the attach is refused until the
+	// role is on.
+	if _, _, err := st.AttachDomain(ctx, orgID, res.ID, "app.example.com", "http", "test"); err == nil {
+		t.Fatal("attaching to a server without the proxy role must be refused")
+	}
+	if err := st.SetProxyRole(ctx, orgID, serverID, true, "test"); err != nil {
+		t.Fatal(err)
+	}
+
 	dom, srvID, err := st.AttachDomain(ctx, orgID, res.ID, "App.Example.COM", "http", "test")
 	if err != nil {
 		t.Fatalf("attach: %v", err)

@@ -402,4 +402,50 @@ func TestConfigDeployments(t *testing.T) {
 	if len(refs) != 0 || n != 1 {
 		t.Fatalf("in-flight config deploy must not stack another: refs=%+v count=%d", refs, n)
 	}
+
+	// A FAILED latest deployment must not swallow the change. This is the case
+	// that matters most in practice — the user is editing an env var precisely
+	// because the last rollout died — and it used to mint nothing at all while
+	// the dashboard reported the secret saved.
+	if err := st.AdvanceDeploymentForResource(ctx, serverID, res.ID, "rollout", false,
+		"new version unhealthy, kept previous", 0); err != nil {
+		t.Fatal(err)
+	}
+	var lastStatus string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT status FROM deployments WHERE org_id = $1 AND resource_id = $2
+		 ORDER BY created_at DESC LIMIT 1`, orgID, res.ID).Scan(&lastStatus); err != nil {
+		t.Fatal(err)
+	}
+	if lastStatus != "failed" {
+		t.Fatalf("precondition: latest deployment should be failed, got %q", lastStatus)
+	}
+
+	refs, err = st.CreateConfigDeployments(ctx, orgID, []string{res.ID}, "admin", "secret changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("a failed latest deployment must still mint a config deploy, got refs=%+v", refs)
+	}
+
+	// And it re-ships the last SUCCESSFUL release, not the failed attempt's
+	// image: a rollout that fails its health gate leaves its predecessor
+	// serving, so that predecessor is what the new config belongs on.
+	var newPin, newSHA, newStatus string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT COALESCE(image_pin,''), COALESCE(git_sha,''), status
+		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND trigger = 'config'
+		 ORDER BY created_at DESC LIMIT 1`, orgID, res.ID).Scan(&newPin, &newSHA, &newStatus); err != nil {
+		t.Fatal(err)
+	}
+	if newStatus != "queued" {
+		t.Fatalf("new config row status = %q", newStatus)
+	}
+	if newSHA != "shacfg1" {
+		t.Fatalf("config deploy must carry the successful release's sha, got %q", newSHA)
+	}
+	if newPin != srcPin {
+		t.Fatalf("config deploy must re-ship the successful release's pin: want %q got %q", srcPin, newPin)
+	}
 }

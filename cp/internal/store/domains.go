@@ -72,6 +72,23 @@ func (s *Store) AttachDomain(ctx context.Context, orgID, resourceID, domain, cha
 	if kind != "app" {
 		return Domain{}, "", ErrInvalid{Msg: "a custom domain can only be attached to an app resource"}
 	}
+	// A domain on a server without the proxy role routes nowhere, and says so in
+	// the least useful way available: the proxy role is what renders Traefik AND
+	// what opens 80/443 in the host firewall, so with it off the host answers
+	// nothing on either port, ACME never completes, and the dashboard reports a
+	// domain "not pointing here yet" — blaming DNS for a missing listener. Refuse
+	// instead, and name the switch. A cluster workload has no server id and is
+	// fronted by an Ingress rather than Traefik, so it is exempt.
+	if serverID != "" {
+		var proxyRole bool
+		if err := tx.QueryRow(ctx,
+			`SELECT proxy_role FROM servers WHERE org_id = $1 AND id = $2`, orgID, serverID).Scan(&proxyRole); err != nil {
+			return Domain{}, "", err
+		}
+		if !proxyRole {
+			return Domain{}, "", ErrInvalid{Msg: "this resource's server does not have the proxy role, so nothing on it terminates TLS or routes hostnames — turn the proxy role on for the server first, then attach the domain"}
+		}
+	}
 
 	d := Domain{
 		ID: newID("dom"), OrgID: orgID, ResourceID: resourceID, Domain: domain,
