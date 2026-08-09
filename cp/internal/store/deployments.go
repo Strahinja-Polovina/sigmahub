@@ -96,25 +96,45 @@ func deployInFlight(status string) bool {
 	return false
 }
 
-// supersedeInFlightTx freezes any still-in-flight deployment for a (server,
-// resource) as 'superseded' — called in the same tx that creates a newer
-// deployment, so there is at most ONE in-flight deployment per (server,resource).
-// That single-in-flight invariant is what lets the op-status path advance "the
-// in-flight deployment" unambiguously, and it makes the promised "superseded when
-// a newer deploy wins the race" state actually hold (no lingering orphan rows).
+// supersedeInFlightTx freezes any still-in-flight deployment for a resource as
+// 'superseded' — called in the same tx that creates a newer deployment, so there
+// is at most ONE in-flight deployment per resource. That single-in-flight
+// invariant is what lets the op-status path advance "the in-flight deployment"
+// unambiguously, and it makes the promised "superseded when a newer deploy wins
+// the race" state actually hold (no lingering orphan rows).
+//
+// A cluster-deployed resource has no server of its own: its rows are inserted
+// with server_id NULL. Returning early on an empty server id therefore meant the
+// invariant simply did not hold for cluster workloads (SIGMA-232) — two pushes a
+// few minutes apart left the FIRST deployment in flight forever while every
+// subsequent op status advanced the second, and 45 minutes later
+// TimeoutStaleDeployments failed the abandoned row, which enqueues a
+// deploy_failed alert. The operator got paged, and a red entry in the deploy
+// feed, for a deploy that was correctly replaced and whose successor shipped
+// fine. Every rapid push pair on every cluster app produced one, which is the
+// fastest way to teach a team to ignore deploy alerts.
+//
+// So the key is (org, resource) with the server-bound and serverless cases kept
+// apart: a server-bound deploy still supersedes only rows on ITS server (two
+// hosts running the same resource are two independent pipelines), while a
+// serverless deploy supersedes the resource's serverless rows.
 func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resourceID string) error {
-	if serverID == "" {
+	if resourceID == "" {
 		return nil
 	}
-	// Serialize concurrent creators of a new deployment for this (server,
-	// resource). Without this, a git-drain and a manual redeploy can each run
-	// their supersede BEFORE the other's insert is visible, both pass, and two
-	// in-flight deployments survive — breaking the at-most-one-in-flight
-	// invariant the op-status path relies on (SIGMA-131). The lock is
-	// transaction-scoped, released only after the caller's INSERT commits, so
-	// the next creator blocks until it can see the freshly-queued row.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-		"deploy:"+serverID+":"+resourceID); err != nil {
+	// Serialize concurrent creators of a new deployment for this key. Without
+	// this, a git-drain and a manual redeploy can each run their supersede
+	// BEFORE the other's insert is visible, both pass, and two in-flight
+	// deployments survive — breaking the at-most-one-in-flight invariant the
+	// op-status path relies on (SIGMA-131). The lock is transaction-scoped,
+	// released only after the caller's INSERT commits, so the next creator
+	// blocks until it can see the freshly-queued row. A serverless (cluster)
+	// deploy locks on the resource alone, which is its whole identity.
+	lockKey := "deploy:" + resourceID
+	if serverID != "" {
+		lockKey = "deploy:" + serverID + ":" + resourceID
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `
@@ -122,7 +142,8 @@ func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resour
 			status = 'superseded',
 			finished_at = now(),
 			duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int)
-		 WHERE org_id = $1 AND server_id = $2 AND resource_id = $3
+		 WHERE org_id = $1 AND resource_id = $3
+		   AND (($2 = '' AND server_id IS NULL) OR server_id = NULLIF($2,''))
 		   AND status IN ('queued','building','deploying')`,
 		orgID, serverID, resourceID)
 	return err
