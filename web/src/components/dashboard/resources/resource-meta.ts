@@ -1,3 +1,5 @@
+import type { HostFacts } from "@/lib/server-compat";
+
 // Nested deploy target (project → environment → servers) fed to the wizard.
 export type DeployTargetServer = {
   id: string;
@@ -10,6 +12,11 @@ export type DeployTargetServer = {
    *  onto it — so the wizard has to stop offering it as a target rather than
    *  let the operator find out at create (SIGMA-203). */
   status?: string;
+  /** The host's GPU inventory — the ONLY slice of its facts a target decision
+   *  needs, and the one the VRAM fit check compares the chosen model against
+   *  (SIGMA-214). Absent means no agent ever reported one, which is unknown
+   *  rather than none, and unknown never filters a server out. */
+  gpu?: HostFacts["gpu"];
 };
 export type DeployTarget = {
   id: string;

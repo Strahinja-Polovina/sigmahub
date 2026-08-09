@@ -101,6 +101,14 @@ export function ClustersPanel({
   const claimed = new Set(clusters.flatMap((c) => c.nodes.map((n) => n.serverId)));
   const available = servers.filter((s) => !claimed.has(s.id));
 
+  // The excluded kinds are excluded for two unrelated reasons, and the panel
+  // gives each its own sentence rather than one that is only true of the
+  // stateful ones.
+  const statefulExcluded = excludedKinds
+    .filter((k) => k !== "llm")
+    .map((k) => resourceKindLabel(k))
+    .sort();
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -144,15 +152,27 @@ export function ClustersPanel({
       {excludedKinds.length > 0 && (
         <Alert>
           <ShieldAlert className="size-4" />
-          <AlertTitle>Databases run outside the cluster, on purpose</AlertTitle>
+          <AlertTitle>Some resources run outside the cluster, on purpose</AlertTitle>
           <AlertDescription>
-            {excludedKinds
-              .map((k) => resourceKindLabel(k))
-              .sort()
-              .join(", ")}{" "}
-            stay on their own server. A stateful engine rescheduled onto a node without its
-            data is data loss, not a slow deploy — so your app runs in the cluster and
-            reaches its database over the mesh, exactly as it would from any other server.
+            {statefulExcluded.length > 0 && (
+              <>
+                {statefulExcluded.join(", ")} stay on their own server. A stateful engine
+                rescheduled onto a node without its data is data loss, not a slow deploy —
+                so your app runs in the cluster and reaches its database over the mesh,
+                exactly as it would from any other server.
+              </>
+            )}
+            {/* A model endpoint is not a database and loses nothing it cannot
+                re-download. Folding it into the sentence above told operators
+                their inference server was at risk of data loss and left the
+                actual reason — no cluster render path — unsaid. */}
+            {excludedKinds.includes("llm") && (
+              <>
+                {statefulExcluded.length > 0 && " "}
+                {resourceKindLabel("llm")} runs on a GPU server of its own for a different
+                reason: the scheduler has no path for a model endpoint yet.
+              </>
+            )}
           </AlertDescription>
         </Alert>
       )}

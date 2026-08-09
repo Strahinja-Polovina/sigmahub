@@ -28,8 +28,8 @@ type llmResourceSpec struct {
 // container.apply. Returns ok=false before mesh enrollment, so the caller falls
 // back to the resource.sync stub rather than publishing an inference endpoint
 // on an undefined interface (same contract as databases and object storage).
-func renderLLMOps(rs store.ResourceSpec, meshIP string, port int, refs []store.SecretRefMeta) (ops []dsd.Op, networkID string, ok bool) {
-	if meshIP == "" || port == 0 {
+func renderLLMOps(rs store.ResourceSpec, target store.LLMTarget, meshIP string, refs []store.SecretRefMeta) (ops []dsd.Op, networkID string, ok bool) {
+	if meshIP == "" || target.Port == 0 {
 		return nil, "", false
 	}
 	var spec llmResourceSpec
@@ -77,9 +77,14 @@ func renderLLMOps(rs store.ResourceSpec, meshIP string, port int, refs []store.S
 		// Mesh-only exposure. An inference endpoint is expensive to run and
 		// trivially abusable if reachable publicly, so it gets exactly the
 		// treatment a database gets.
-		Ports:   []portMapping{{Container: def.ContainerPort, Host: port, HostIP: meshIP}},
+		Ports:   []portMapping{{Container: def.ContainerPort, Host: target.Port, HostIP: meshIP}},
 		Volumes: []volumeMount{{Name: cacheVol, MountPath: def.ModelCacheMount}},
-		Command: def.Command(spec.Model),
+		// The served context window is the endpoint's own, decided at provision
+		// against the model's ceiling and stored. The reconciler does not compute
+		// it and must not: a render happens on the agent's poll path, and asking
+		// huggingface.co here would put a third party's latency in front of every
+		// document in the fleet.
+		Command: def.Command(spec.Model, target.ContextTokens),
 		// Without this the runtime silently falls back to CPU and serves tokens
 		// at a useless rate on hardware the customer is paying a lot for.
 		GPUs: gpuRequest(spec.GPUs),
@@ -87,7 +92,23 @@ func renderLLMOps(rs store.ResourceSpec, meshIP string, port int, refs []store.S
 		// large shared-memory segment as a requirement.
 		ShmSizeMB: llmShmSizeMB,
 	}
+	// The runtime's own credentials, but only the ones the control plane will
+	// actually answer for. An unresolvable reference is FATAL agent-side
+	// ("secret %q referenced but not provided by the control plane"), so naming
+	// HUGGING_FACE_HUB_TOKEN unconditionally — which is what this did — turned
+	// the most ordinary deploy there is, a public model on a control plane
+	// holding no Hub token, into a container that never started. The store
+	// decides: it seeded the value, so it is the one that knows (LLMTarget).
 	for _, name := range def.SecretEnvNames {
+		if name == store.HubTokenSecretName && !target.WeightsToken {
+			continue
+		}
+		// A tenant secret of the same name is already in refs below and carries
+		// the value the resolve will return, so emitting ours too would put two
+		// references to one environment variable in the document.
+		if hasSecretRef(refs, name) {
+			continue
+		}
 		cs.SecretRefs = append(cs.SecretRefs, secretRef{Name: name, EnvVar: true})
 	}
 	// Resource-scoped secrets (an API key the app presents, say) ride along.
@@ -103,6 +124,17 @@ func renderLLMOps(rs store.ResourceSpec, meshIP string, port int, refs []store.S
 		Spec:      csBytes,
 	})
 	return ops, networkID, true
+}
+
+// hasSecretRef reports whether the resource's own secrets already provide a
+// name, so the runtime catalog does not emit a second reference to it.
+func hasSecretRef(refs []store.SecretRefMeta, name string) bool {
+	for _, r := range refs {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // llmShmSizeMB is the shared-memory segment the inference runtimes need for

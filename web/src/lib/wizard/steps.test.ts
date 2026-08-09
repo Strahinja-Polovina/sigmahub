@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { RESOURCE_KINDS } from "@/lib/server-catalog.generated";
+import {
+  RESOURCE_CATEGORIES,
+  RESOURCE_CATEGORY_CATALOG,
+  RESOURCE_KINDS,
+  categoryForKind,
+  type ResourceKind,
+} from "@/lib/server-catalog.generated";
 import {
   decisionCount,
   hasStep,
+  kindPickerPhase,
   nextStepId,
+  pickCategory,
   prevStepId,
   resolveStep,
   stepsForKind,
@@ -51,6 +59,69 @@ describe("step sequences are per type", () => {
       expect(steps[steps.length - 1].id, kind).toBe("create");
     }
   });
+
+  // Categories went in FRONT of the kinds on step 1, and the one thing that
+  // could not survive that is the count: a category rendered as its own step id
+  // would add a screen to every flow. Stated per kind rather than as an
+  // inequality, so a flow that grows one is named by the failure.
+  it("costs no kind a decision to have gained a category", () => {
+    // Keyed on ResourceKind so a kind added to the control plane's catalog
+    // cannot reach this file without someone stating what it costs to deploy.
+    const expected: Record<ResourceKind, number> = {
+      app: 5, // source, build, network, target, variables
+      postgres: 2,
+      mysql: 2,
+      mongodb: 2,
+      redis: 2,
+      s3: 2,
+      llm: 2,
+    };
+    for (const kind of RESOURCE_KINDS) {
+      expect(decisionCount(kind), kind).toBe(expected[kind]);
+    }
+    // And the picker itself is still one step, not two.
+    expect(stepsForKind(null).map((s) => s.id)).toEqual(["kind"]);
+  });
+});
+
+// Step 1 asks for a category and then, only when the category holds more than
+// one kind, for the kind inside it. Both faces are the SAME step: the sequence
+// above is what a category id would have grown.
+describe("step 1 picks a category, then the kinds inside it", () => {
+  // The decision this screen exists to make, and the one it must not undo: a
+  // question with a single possible answer is not asked.
+  it("resolves a category holding one kind straight through to it", () => {
+    for (const id of RESOURCE_CATEGORIES) {
+      const { kinds } = RESOURCE_CATEGORY_CATALOG[id];
+      if (kinds.length !== 1) continue;
+      expect(pickCategory(id), id).toEqual({ category: id, kind: kinds[0] });
+      // …and it never opened a list, so the picker is still on the categories.
+      expect(kindPickerPhase(id), id).toBe("categories");
+    }
+  });
+
+  it("shows the kinds of a category holding more than one, choosing none of them", () => {
+    expect(pickCategory("database")).toEqual({ category: "database", kind: null });
+    expect(kindPickerPhase("database")).toBe("kinds");
+    expect(RESOURCE_CATEGORY_CATALOG.database.kinds.length).toBeGreaterThan(1);
+  });
+
+  it("offers every category before one is picked", () => {
+    expect(kindPickerPhase(null)).toBe("categories");
+    expect(pickCategory(null)).toEqual({ category: null, kind: null });
+  });
+
+  // Application holds one kind TODAY. The structure is what is being asserted:
+  // whichever categories hold one, resolve; whichever hold several, list.
+  it("puts every kind inside exactly one category the picker can reach", () => {
+    const reachable = RESOURCE_CATEGORIES.flatMap((id) => RESOURCE_CATEGORY_CATALOG[id].kinds);
+    expect([...reachable].sort()).toEqual([...RESOURCE_KINDS].sort());
+    for (const kind of RESOURCE_KINDS) {
+      const category = categoryForKind(kind);
+      expect(category, kind).not.toBeNull();
+      expect(RESOURCE_CATEGORY_CATALOG[category!].kinds, kind).toContain(kind);
+    }
+  });
 });
 
 describe("movement", () => {
@@ -88,5 +159,25 @@ describe("changing type mid-flow", () => {
   it("keeps a step both types share", () => {
     expect(resolveStep("redis", "target")).toBe("target");
     expect(resolveStep("app", "target")).toBe("target");
+  });
+
+  // Changing CATEGORY is the same event: what resolves the step is the kind
+  // pickCategory settles on, which is null while a category's list is open.
+  it("cannot strand a half-configured Redis on the application's Build screen", () => {
+    // Standing on Target with a Redis, the user goes back to step 1 and opens
+    // Application. Its single kind resolves, and the app flow has no engine
+    // step to hold the target they had picked.
+    const application = pickCategory("application");
+    expect(resolveStep(application.kind, "engine")).toBe("kind");
+    // The other direction: an app on Build, switching to the Database list.
+    const database = pickCategory("database");
+    expect(database.kind).toBeNull();
+    expect(resolveStep(database.kind, "build")).toBe("kind");
+    // And backing out of a category leaves nothing standing either.
+    expect(resolveStep(pickCategory(null).kind, "source")).toBe("kind");
+  });
+
+  it("keeps a step the resolved kind still has", () => {
+    expect(resolveStep(pickCategory("storage").kind, "target")).toBe("target");
   });
 });

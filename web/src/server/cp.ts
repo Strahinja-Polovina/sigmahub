@@ -15,6 +15,7 @@ import { createHmac } from "node:crypto";
 import { db, client } from "./db";
 import * as schema from "./db/schema";
 import { createResourceBody } from "@/lib/deploy-spec";
+import type { ModelCard } from "@/lib/wizard/llm";
 import type { FailedRequirement, HostFacts } from "@/lib/server-compat";
 import type * as s from "./db/schema";
 
@@ -163,11 +164,19 @@ type CpFetchOpts = {
   actor?: CpActor;
   /** Idempotency key for POSTs. */
   idempotencyKey?: string;
+  /** Abandon the call after this many milliseconds.
+   *
+   *  Opt-in, and deliberately not a default for every call: a create that gives
+   *  up after five seconds may have already created the resource, and the
+   *  caller cannot tell. It is set on reads whose caller is a person waiting on
+   *  a spinner — the model picker (SIGMA-213), whose upstream is huggingface.co
+   *  and therefore not this control plane's to promise anything about. */
+  timeoutMs?: number;
 };
 
 async function cpFetch<T>(path: string, init: RequestInit | undefined, opts: CpFetchOpts): Promise<T> {
   const token = await getOrgToken(opts.orgId);
-  const res = await fetch(`${cpBase()}${path}`, {
+  const request: RequestInit = {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -177,7 +186,23 @@ async function cpFetch<T>(path: string, init: RequestInit | undefined, opts: CpF
       ...init?.headers,
     },
     cache: "no-store",
-  });
+    ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+  };
+  let res: Response;
+  try {
+    res = await fetch(`${cpBase()}${path}`, request);
+  } catch (err) {
+    // A timeout is reported as a 504 rather than as a DOMException nobody up
+    // the stack can classify: callers already branch on CpRequestError.status,
+    // and "the control plane did not answer" is exactly a gateway timeout.
+    if (opts.timeoutMs && err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new CpRequestError(
+        `Control plane 504: no answer within ${Math.round(opts.timeoutMs / 1000)}s`,
+        504
+      );
+    }
+    throw err;
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     let message = `Control plane ${res.status}`;
@@ -2052,4 +2077,89 @@ export async function cpDomainDNS(orgId: string, domainId: string): Promise<CpDN
   return cpFetch(`${org(orgId)}/domains/${encodeURIComponent(domainId)}/dns`, undefined, {
     orgId,
   });
+}
+
+// ── Hugging Face model catalogue (SIGMA-213/214) ─────────────────────────────
+//
+// The picker's two reads. The control plane is what talks to huggingface.co —
+// the Hub token is a credential that cannot reach a browser, and the VRAM
+// estimate has to be computed in exactly one place — so the dashboard's whole
+// view of the Hub is these two calls and the cards they answer with.
+//
+// The card shape is imported from @/lib/wizard/llm rather than redeclared here:
+// it is the same object the picker renders and the fit check compares, and a
+// second declaration is how the two would come to disagree about a field name.
+
+/** How long the picker waits for a search or a resolve.
+ *
+ *  cpFetch has no timeout by default, and this is the one call whose upstream
+ *  is a third party: a slow Hub, a hung connection or a control plane mid-deploy
+ *  would otherwise leave the picker spinning with no way out. Eight seconds is
+ *  past the Hub's ordinary latency and well short of a person's patience; the
+ *  step remains finishable when it expires, because a model can be typed and is
+ *  used as typed. */
+const MODEL_LOOKUP_TIMEOUT_MS = 8_000;
+
+/**
+ * The picker's typeahead, and the answer to "will a model created here be able
+ * to download its weights".
+ *
+ * `projectId` is what makes the second half true, and WHICH route the wizard
+ * was opened from decides which answer comes back:
+ *
+ *   - From a project (/dashboard/projects/…), the id is sent and the control
+ *     plane answers about THAT project: its own HUGGING_FACE_HUB_TOKEN secret
+ *     counts, and so does a token configured on the control plane. That is the
+ *     credential the agent injects on the GPU host, so it is the one that
+ *     decides whether a gated pull 401s.
+ *   - From the standalone /dashboard/resources route there is no project yet —
+ *     it is chosen on the target step, two screens later — so nothing is sent
+ *     and the control plane answers on its own token alone. An operator whose
+ *     only token lives in a project secret is warned there about gated models;
+ *     the warning is honest ("no token is configured HERE") and never a block.
+ *
+ * The control plane also accepts an `environmentId`, which narrows the answer
+ * to secrets that would actually resolve in one environment. The wizard cannot
+ * send it: the environment is picked after the model, so there is nothing to
+ * send at search time. The effect is a false NEGATIVE for an operator whose
+ * token is scoped to a single environment — a warning they can read, which is
+ * the direction this whole check errs in.
+ */
+export async function cpSearchModels(
+  orgId: string,
+  query: string,
+  limit?: number,
+  projectId?: string
+): Promise<{ models: ModelCard[]; tokenConfigured: boolean }> {
+  const params = new URLSearchParams({ q: query });
+  if (limit) params.set("limit", String(limit));
+  if (projectId) params.set("projectId", projectId);
+  const res = await cpFetch<{ models: ModelCard[] | null; tokenConfigured: boolean }>(
+    `${org(orgId)}/llm/models?${params.toString()}`,
+    undefined,
+    { orgId, timeoutMs: MODEL_LOOKUP_TIMEOUT_MS }
+  );
+  // The route promises an array and a current control plane sends one; this
+  // defends the picker's `.map` against an older one that answered `null`.
+  return { models: res.models ?? [], tokenConfigured: res.tokenConfigured };
+}
+
+/** One repo id, or null when the Hub does not know it.
+ *
+ *  A 404 is an ANSWER here, not a failure: the control plane returns it for a
+ *  withdrawn repo, for a mistyped id, for an Ollama tag, and for a control plane
+ *  with no Hub catalogue configured at all. All four end the same way — the id
+ *  is used exactly as typed and the fit check is skipped — so they must not
+ *  reach the caller as an exception it would have to treat as an outage. */
+export async function cpResolveModel(orgId: string, repoId: string): Promise<ModelCard | null> {
+  try {
+    return await cpFetch<ModelCard>(
+      `${org(orgId)}/llm/models/resolve?id=${encodeURIComponent(repoId)}`,
+      undefined,
+      { orgId, timeoutMs: MODEL_LOOKUP_TIMEOUT_MS }
+    );
+  } catch (err) {
+    if (err instanceof CpRequestError && err.status === 404) return null;
+    throw err;
+  }
 }

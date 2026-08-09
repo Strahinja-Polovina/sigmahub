@@ -18,7 +18,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "9f5e4d8eede18b0b1090f74c6839637775e69ff69b11847cdbd26def344b9c01";
+export const CATALOG_SOURCE_SHA256 = "b43f1cb5658245e74ad00fed226e3d491e82cbd266d9ab7db2e23ae4dfbad202";
 
 export type ServerType =
   | "general"
@@ -37,6 +37,12 @@ export type ResourceKind =
   | "redis"
   | "s3"
   | "llm";
+
+export type ResourceCategoryId =
+  | "application"
+  | "database"
+  | "model"
+  | "storage";
 
 export type RequirementId =
   | "distro"
@@ -77,6 +83,19 @@ export type ServerTypeSpec = {
   connectable: boolean;
   unitWeight: number;
   requires: ServerRequirements;
+};
+
+/** One bucket of the New Resource wizard's first screen. */
+export type ResourceCategorySpec = {
+  id: ResourceCategoryId;
+  label: string;
+  hint: string;
+  /** The kinds inside it, in catalog order. Exactly one means the category is a
+   *  question with a single possible answer, and the picker answers it rather
+   *  than asking — see web/src/lib/wizard/steps.ts. Never empty: a card that
+   *  opens an empty list is a dead end, and the control plane refuses to load
+   *  a catalog containing one. */
+  kinds: ResourceKind[];
 };
 
 export const SERVER_CATALOG: Record<ServerType, ServerTypeSpec> = {
@@ -243,6 +262,49 @@ export const RESOURCE_KIND_LABELS: Record<ResourceKind, string> = {
   llm: "LLM",
 };
 
+/** Step 1 of the wizard: the categories, and the kinds each one holds. */
+export const RESOURCE_CATEGORY_CATALOG: Record<ResourceCategoryId, ResourceCategorySpec> = {
+  application: {
+    id: "application",
+    label: "Application",
+    hint: "Build and deploy a repository.",
+    kinds: ["app"],
+  },
+  database: {
+    id: "database",
+    label: "Database",
+    hint: "A managed engine with generated credentials.",
+    kinds: ["postgres", "mysql", "mongodb", "redis"],
+  },
+  model: {
+    id: "model",
+    label: "Model endpoint",
+    hint: "Serve a model from the Hub on GPU hardware.",
+    kinds: ["llm"],
+  },
+  storage: {
+    id: "storage",
+    label: "Object storage",
+    hint: "S3-compatible buckets on a storage host.",
+    kinds: ["s3"],
+  },
+};
+
+/** Every category, in the order step 1 offers them. */
+export const RESOURCE_CATEGORIES: ResourceCategoryId[] = ["application", "database", "model", "storage"];
+
+/** The same membership, kind-first — what a resumed draft needs to reopen
+ *  the picker on the screen the user left it on. */
+export const KIND_CATEGORY: Record<ResourceKind, ResourceCategoryId> = {
+  app: "application",
+  postgres: "database",
+  mysql: "database",
+  mongodb: "database",
+  redis: "database",
+  s3: "storage",
+  llm: "model",
+};
+
 /** One line explaining what each type is for, shown in the connect dialog. */
 export const SERVER_TYPE_HINTS: Record<ServerType, string> = {
   general: "Apps and databases on a machine you control end to end.",
@@ -326,6 +388,17 @@ export function serverTypeLabel(type: string): string {
 /** Label for a resource kind that may not be one. */
 export function resourceKindLabel(kind: string): string {
   return RESOURCE_KIND_LABELS[kind as ResourceKind] ?? kind;
+}
+
+/** The kinds inside a category, in catalog order. Never empty. */
+export function kindsInCategory(id: ResourceCategoryId): ResourceKind[] {
+  return RESOURCE_CATEGORY_CATALOG[id].kinds;
+}
+
+/** The category a kind sits in, or null for a string that is not a kind —
+ *  restored drafts and CP rows carry plain strings. */
+export function categoryForKind(kind: string): ResourceCategoryId | null {
+  return KIND_CATEGORY[kind as ResourceKind] ?? null;
 }
 
 /** Billing weight of a server type. An unknown type bills as an ordinary

@@ -10,17 +10,22 @@
  *
  * A card that cannot lead anywhere has to say so where it is offered, with the
  * one thing that would fix it. That is what this module decides; the wizard only
- * renders it.
+ * renders it. "Where it is offered" is now two places — a category card and the
+ * kind cards inside it — so the verdict rolls up as well as down.
  */
 
 import {
   ALLOWED_SERVER_TYPES,
+  RESOURCE_CATEGORY_CATALOG,
   RESOURCE_KIND_LABELS,
   SERVER_TYPE_LABELS,
+  kindsInCategory,
+  type ResourceCategoryId,
   type ResourceKind,
   type ServerType,
 } from "@/lib/server-catalog.generated";
-import { SERVER_STATUS } from "@/lib/server-compat";
+import { SERVER_STATUS, type HostFacts } from "@/lib/server-compat";
+import { serverFitsModel, vramNeedText, type ModelCard } from "./llm";
 
 /** A server as the wizard sees it — the deploy-target shape, plus the status
  *  the enrollment gate wrote. */
@@ -31,6 +36,11 @@ export type WizardServer = {
   provider?: string;
   region?: string;
   status?: string;
+  /** The host's GPU inventory as the agent reported it (SIGMA-201), and only
+   *  that slice of its facts: it is the one thing a target decision needs that
+   *  the type alone cannot answer. Absent means no agent ever reported one,
+   *  which is UNKNOWN and never zero — see serverFitsModel. */
+  gpu?: HostFacts["gpu"];
 };
 
 export type WizardEnvironment = {
@@ -45,7 +55,13 @@ export type WizardProject = {
   environments: WizardEnvironment[];
 };
 
-/** A cluster, scoped to the environment it was built in. */
+/** A cluster, scoped to the environment it was built in.
+ *
+ *  It carries no GPU figure. The cluster listing used to publish its largest
+ *  node's card so a model could be fit-checked against it, and that number was
+ *  deleted along with the whole idea: `llm` is on the control plane's cluster
+ *  exclusion list now, so a model endpoint never reaches a cluster and there is
+ *  nothing here to size. */
 export type WizardCluster = {
   id: string;
   name: string;
@@ -135,12 +151,17 @@ export function kindAvailability(kind: ResourceKind, inv: TargetInventory): Kind
   if (allowed.some((t) => inv.serverTypes.has(t))) return { available: true };
   if (inv.clusterCount > 0 && clusterEligible(kind, inv)) return { available: true };
 
-  const types = joinOr(allowed.map((t) => SERVER_TYPE_LABELS[t] ?? t));
-  const label = RESOURCE_KIND_LABELS[kind] ?? kind;
-
   // The GPU case gets its own sentence because it is the one where the reason
   // is about HARDWARE, and "connect a General server" would be actively
   // misleading advice.
+  //
+  // It is reached even by an org whose only deploy target is a Kubernetes
+  // cluster, because `llm` is on the control plane's cluster exclusion list —
+  // nothing renders a cluster-targeted model endpoint and its provisioning is
+  // server-scoped — so the cluster branch above cannot answer "available" for
+  // it. An org with one cluster and no GPU server has to be told about the
+  // missing hardware; being offered the card and refused at the target step
+  // would be the dead end this module exists to remove.
   if (kind === "llm") {
     return {
       available: false,
@@ -149,10 +170,65 @@ export function kindAvailability(kind: ResourceKind, inv: TargetInventory): Kind
       action: CONNECT_SERVER,
     };
   }
+  return nothingToRunOn(RESOURCE_KIND_LABELS[kind] ?? kind, allowed, {
+    clusterRefused: inv.clusterCount > 0 && !clusterEligible(kind, inv),
+  });
+}
+
+/**
+ * The same verdict for a whole CATEGORY, because that is where step 1 now
+ * offers things (SIGMA-216).
+ *
+ * A card that leads nowhere has to say so where it is offered — the contract a
+ * kind card has kept since SIGMA-207 — and after the categories went in front
+ * of the kinds, "where it is offered" is the category. It rolls up rather than
+ * being decided separately: a category is available when ANY kind inside it is,
+ * so a fleet with a Postgres box but no cluster still opens Database, and the
+ * kinds inside keep their own sentences.
+ *
+ * A category holding one kind answers with that kind's own verdict, verbatim.
+ * The category IS the kind there — resolving it costs no click (see
+ * pickCategory) — so a generated category sentence would be a second, blander
+ * way of saying something we already say well: "connect a General server" is
+ * not what a missing GPU needs to hear.
+ */
+export function categoryAvailability(
+  category: ResourceCategoryId,
+  inv: TargetInventory
+): KindAvailability {
+  const kinds = kindsInCategory(category);
+  const verdicts = kinds.map((kind) => kindAvailability(kind, inv));
+  if (verdicts.some((v) => v.available)) return { available: true };
+  if (verdicts.length === 1) return verdicts[0];
+
+  // Every kind refused, and more than one of them. The reasons are per-kind
+  // ("a PostgreSQL needs one to run on") and stacking four of them under one
+  // card is a wall, not an answer — so it is stated once, in the category's
+  // terms, over the union of everything that could have hosted any of them.
+  const allowed = new Set<ServerType>();
+  for (const kind of kinds) {
+    for (const type of (ALLOWED_SERVER_TYPES[kind] ?? []) as ServerType[]) allowed.add(type);
+  }
+  return nothingToRunOn(RESOURCE_CATEGORY_CATALOG[category].label, [...allowed], {
+    // Named only when it is true of the WHOLE category: one kind a cluster
+    // refuses is not a reason the category is unreachable.
+    clusterRefused: inv.clusterCount > 0 && !kinds.some((kind) => clusterEligible(kind, inv)),
+  });
+}
+
+/** "No X server is connected. A Y needs one to run on." — the one sentence a
+ *  kind and a category both end at, so the two cannot drift into saying the
+ *  same thing differently. */
+function nothingToRunOn(
+  label: string,
+  allowed: ServerType[],
+  opts: { clusterRefused: boolean }
+): KindAvailability {
+  const types = joinOr(allowed.map((t) => SERVER_TYPE_LABELS[t] ?? t));
   return {
     available: false,
     reason: `No ${types} server is connected${
-      inv.clusterCount > 0 && !clusterEligible(kind, inv)
+      opts.clusterRefused
         ? ", and a cluster cannot host this kind — it keeps its data on one host"
         : ""
     }. A ${label} needs one to run on.`,
@@ -168,11 +244,22 @@ export type ServerOption = {
   server: WizardServer;
   eligible: boolean;
   reason?: string;
+  /** Set when the MODEL is what this row was refused for, rather than anything
+   *  about the host. A caller summarising a whole environment needs to tell
+   *  "every GPU here is too small for this model" from "there is no GPU here",
+   *  because the two have different fixes — and telling them apart by matching
+   *  on the prose above would be a parser over a sentence we write ourselves. */
+  refusedForModel?: boolean;
 };
 
 export function serverOptions(
   env: WizardEnvironment | undefined,
-  kind: ResourceKind | null | undefined
+  kind: ResourceKind | null | undefined,
+  /** The model an `llm` resource will serve, once one has been chosen
+   *  (SIGMA-214). Optional, and every other kind passes nothing: a Redis has no
+   *  model, and threading the card in as a required argument would make four
+   *  call sites pass null to say so. */
+  model?: ModelCard | null
 ): ServerOption[] {
   if (!env || !kind) return [];
   const allowed = new Set((ALLOWED_SERVER_TYPES[kind] ?? []) as string[]);
@@ -198,37 +285,156 @@ export function serverOptions(
         reason: `A ${typeLabel} server cannot host a ${kindLabel}.`,
       };
     }
+    // Last, because it is the only reason here that depends on a choice made on
+    // an EARLIER step rather than on the host itself: the model. A GPU server
+    // whose card is too small for the chosen model is a target the control
+    // plane's create call refuses (store.checkModelFits) — so it is refused
+    // here too, in the same terms, one screen earlier and for free.
+    const fit = serverFitsModel(model, server);
+    if (!fit.fits) {
+      return { server, eligible: false, reason: fit.reason, refusedForModel: true };
+    }
     return { server, eligible: true };
   });
 }
+
+/** A cluster, annotated exactly as a server is. */
+export type ClusterOption = {
+  cluster: WizardCluster;
+  eligible: boolean;
+  reason?: string;
+};
 
 /**
  * Clusters offered for an environment. A cluster picker that showed every
  * cluster in the org would offer a target the control plane refuses — a cluster
  * belongs to exactly one environment, and it says so.
+ *
+ * No model is compared here, and that is not the gap it was. A cluster row used
+ * to be fit-checked against the largest GPU its nodes reported, because the
+ * create call refused an oversized model and the wizard could otherwise only
+ * find that out from the 422 (SIGMA-214). The control plane now refuses the
+ * KIND instead: `llm` is on its cluster exclusion list, so a model endpoint is
+ * turned away by the eligibility branch below — before any card size could
+ * matter — and the cluster listing stopped publishing the figure. A comparison
+ * kept here would be reading a field nothing sends.
  */
+/**
+ * Why a kind the control plane excluded runs outside the cluster.
+ *
+ * There are two different reasons and they were being told as one. The managed
+ * engines are excluded because a stateful container rescheduled onto a node
+ * without its data is data loss — that is the sentence, and it is true of
+ * Postgres, MySQL, MongoDB, Redis and object storage. It is NOT true of a model
+ * endpoint, which keeps nothing it cannot re-download; that one is excluded
+ * because the cluster renderer has no path for it, and telling an operator
+ * their inference server is a database they might lose data from is a sentence
+ * that answers a question they did not ask and leaves theirs open.
+ */
+export function outsideClusterReason(kind: ResourceKind): string {
+  const label = RESOURCE_KIND_LABELS[kind] ?? kind;
+  if (kind === "llm") {
+    return `${label} runs on a GPU server of its own rather than inside a cluster — the scheduler has no path for a model endpoint yet.`;
+  }
+  return `${label} keeps its data on one host, so it runs on its own server rather than inside a cluster.`;
+}
+
 export function clusterOptions(
   clusters: WizardCluster[],
   environmentId: string,
   kind: ResourceKind | null | undefined,
   inv: TargetInventory
-): { cluster: WizardCluster; eligible: boolean; reason?: string }[] {
+): ClusterOption[] {
   if (!environmentId || !kind) return [];
   return clusters
     .filter((c) => c.environmentId === environmentId)
     .map((cluster) => {
       if (!clusterEligible(kind, inv)) {
-        return {
-          cluster,
-          eligible: false,
-          reason: `${
-            RESOURCE_KIND_LABELS[kind] ?? kind
-          } keeps its data on one host, so it runs on its own server rather than inside a cluster.`,
-        };
+        return { cluster, eligible: false, reason: outsideClusterReason(kind) };
       }
       if (cluster.status === "provisioning") {
         return { cluster, eligible: false, reason: "This cluster is still coming up." };
       }
       return { cluster, eligible: true };
     });
+}
+
+/** Every offer the target step renders, and the sentence to show when it can
+ *  render nothing pickable. */
+export type TargetChoices = {
+  /** The chosen project's environments — the environment select's options. */
+  environments: WizardEnvironment[];
+  servers: ServerOption[];
+  clusters: ClusterOption[];
+  /** Set only when there WERE offers and every one of them was refused. An
+   *  environment with nothing attached is a different state with its own
+   *  sentence, and saying "nothing here can run this model" about an empty
+   *  environment would name the wrong cause. */
+  deadEnd: string | null;
+};
+
+/**
+ * The target step's whole content, decided in one pure place.
+ *
+ * It exists because the step's rendering is not what was ever wrong: the
+ * arguments were. `model` reached serverOptions and never reached
+ * clusterOptions, so a cluster was offered for a model no node could hold, and
+ * nothing could catch it because the wiring lived in JSX — this repository's
+ * suites run in node with no DOM, so a component's props are exactly the thing
+ * they cannot see. Assembling them here makes the wiring a value a test can
+ * hold, which is the same reason createResourceInput and reviewSummary are
+ * functions rather than inline objects.
+ */
+export function targetChoices(input: {
+  projects: WizardProject[];
+  clusters: WizardCluster[];
+  inventory: TargetInventory;
+  kind: ResourceKind | null | undefined;
+  /** The chosen model, for an `llm`. Every other kind passes nothing and is
+   *  filtered exactly as before. */
+  model?: ModelCard | null;
+  projectId: string;
+  environmentId: string;
+}): TargetChoices {
+  const environments = input.projects.find((p) => p.id === input.projectId)?.environments ?? [];
+  const env = environments.find((e) => e.id === input.environmentId);
+  const servers = serverOptions(env, input.kind, input.model);
+  // The model reaches the SERVER filter only: a cluster is refused for the kind
+  // (`llm` is excluded control-plane side), so there is no cluster row a model
+  // could be measured against.
+  const clusters = clusterOptions(
+    input.clusters,
+    input.environmentId,
+    input.kind,
+    input.inventory
+  );
+  return { environments, servers, clusters, deadEnd: deadEnd(servers, clusters, input.model) };
+}
+
+/**
+ * The one sentence for an environment where every row is refused.
+ *
+ * Each row already carries its own reason, and a column of them still leaves
+ * "so what do I do" unanswered — the fix for "no GPU here is big enough" is a
+ * different model, and it is not deducible from a list of servers. Which
+ * sentence to show is decided from the refusals themselves rather than from the
+ * kind, because an environment can hold a too-small GPU and a Postgres box at
+ * once and only one of those facts is worth acting on.
+ */
+function deadEnd(
+  servers: ServerOption[],
+  clusters: ClusterOption[],
+  model?: ModelCard | null
+): string | null {
+  const offers = [...servers, ...clusters];
+  if (offers.length === 0 || offers.some((o) => o.eligible)) return null;
+  // Servers only: a cluster is never refused FOR the model — it is refused for
+  // the kind, and "pick a smaller model" is no help to someone whose target
+  // cannot host a model endpoint at any size.
+  if (model && servers.some((s) => s.refusedForModel)) {
+    return `Nothing in this environment can run this model — it needs about ${vramNeedText(
+      model
+    )} of VRAM and every GPU here is smaller. Pick a smaller or quantized build of it (an AWQ or GPTQ repository of the same model), or an environment with a bigger card.`;
+  }
+  return "Nothing in this environment can host this resource. Attach a compatible server to it, or pick a different environment.";
 }

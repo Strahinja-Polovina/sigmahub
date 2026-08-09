@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { Boxes, Server as ServerIcon, Check, Network, CircleAlert } from "lucide-react";
 
 import { Label } from "@/components/ui/label";
@@ -13,14 +12,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { SERVER_TYPE_LABELS, type ResourceKind, type ServerType } from "@/lib/server-catalog.generated";
-import {
-  clusterOptions,
-  serverOptions,
-  type TargetInventory,
-  type WizardCluster,
-  type WizardProject,
-} from "@/lib/wizard/availability";
+import { SERVER_TYPE_LABELS, type ServerType } from "@/lib/server-catalog.generated";
+import type { TargetChoices, WizardProject } from "@/lib/wizard/availability";
 
 /**
  * Project → Environment → Server OR Cluster (SIGMA-210).
@@ -31,12 +24,21 @@ import {
  * flow. The picker is filtered to the chosen environment because a cluster
  * belongs to exactly one, and offering the others would offer a target the
  * control plane refuses.
+ *
+ * WHICH targets are offered is not decided here. This component renders a
+ * TargetChoices and nothing else, because the defect it shipped with was an
+ * argument that never got passed, and an argument list inside JSX is the one
+ * thing this repository's suites cannot reach (they run in node, with no DOM).
+ * The decision lives in availability.targetChoices, where a test can hold it.
+ *
+ * A cluster row is never refused for the MODEL any more, only for the kind: a
+ * model endpoint cannot run inside a cluster on this control plane, so the row
+ * says that instead of comparing VRAM figures the cluster listing no longer
+ * publishes. Server rows still carry the fit refusal.
  */
 export function TargetStep({
-  kind,
   projects,
-  clusters,
-  inventory,
+  choices,
   projectId,
   environmentId,
   serverId,
@@ -46,10 +48,10 @@ export function TargetStep({
   onServerChange,
   onClusterChange,
 }: {
-  kind: ResourceKind;
   projects: WizardProject[];
-  clusters: WizardCluster[];
-  inventory: TargetInventory;
+  /** Every offer for the chosen project + environment, already filtered against
+   *  the kind and the model. */
+  choices: TargetChoices;
   projectId: string;
   environmentId: string;
   serverId: string;
@@ -59,19 +61,7 @@ export function TargetStep({
   onServerChange: (id: string) => void;
   onClusterChange: (id: string) => void;
 }) {
-  const environments = React.useMemo(
-    () => projects.find((p) => p.id === projectId)?.environments ?? [],
-    [projects, projectId]
-  );
-  const env = environments.find((e) => e.id === environmentId);
-  const servers = React.useMemo(() => serverOptions(env, kind), [env, kind]);
-  const clusterChoices = React.useMemo(
-    () => clusterOptions(clusters, environmentId, kind, inventory),
-    [clusters, environmentId, kind, inventory]
-  );
-
-  const noEligibleServer =
-    Boolean(environmentId) && servers.length > 0 && servers.every((s) => !s.eligible);
+  const { environments, servers, clusters: clusterChoices, deadEnd } = choices;
 
   return (
     <div className="flex flex-col gap-4">
@@ -176,11 +166,16 @@ export function TargetStep({
                     </span>
                     {/* Disabled-with-reason, everywhere. A greyed-out row whose
                         cause is a matrix the user has never seen is the pattern
-                        this flow is replacing. */}
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {reason ??
-                        [server.provider, server.region].filter(Boolean).join(" · ") ??
-                        ""}
+                        this flow is replacing — and a reason clipped at one line
+                        is the same thing with extra steps, so only the
+                        provider/region caption truncates. */}
+                    <span
+                      className={cn(
+                        "block text-xs text-muted-foreground",
+                        !reason && "truncate"
+                      )}
+                    >
+                      {reason ?? [server.provider, server.region].filter(Boolean).join(" · ")}
                     </span>
                   </span>
                   {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
@@ -237,13 +232,14 @@ export function TargetStep({
           </div>
         )}
 
-        {noEligibleServer && clusterChoices.every((c) => !c.eligible) && (
+        {/* Every row above carries its own reason, and a column of reasons still
+            leaves "so what do I do" unanswered — most sharply when the cause is
+            the model, whose fix is a different model rather than a different
+            server. */}
+        {deadEnd && (
           <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-            <p className="min-w-0 text-xs text-destructive/90">
-              Nothing in this environment can host this resource. Attach a compatible
-              server to it, or pick a different environment.
-            </p>
+            <p className="min-w-0 text-xs text-destructive/90">{deadEnd}</p>
           </div>
         )}
       </div>

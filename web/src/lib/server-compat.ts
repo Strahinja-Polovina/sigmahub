@@ -93,8 +93,14 @@ function formatDiskFloor(bytes: number): string {
 }
 
 /** A REPORTED size, which is not: a real 2 TB disk is 1968526655488 bytes, and
- *  "1.968526655488 TB" in a rejection message reads like a bug. */
-function formatDiskReported(bytes: number): string {
+ *  "1.968526655488 TB" in a rejection message reads like a bug.
+ *
+ *  Exported because the VRAM fit check (SIGMA-214) states a GPU's capacity in
+ *  the same breath as the model's requirement, and the control plane's
+ *  create-time refusal renders that capacity with store.humanBytes — which is
+ *  these four lines, in Go. One renderer on this side, so the dashboard and the
+ *  API cannot quote two different sizes for one card. */
+export function formatReportedBytes(bytes: number): string {
   const gb = 1_000_000_000;
   if (bytes >= 1000 * gb) {
     return `${(bytes / (1000 * gb)).toFixed(1)} TB`;
@@ -141,7 +147,7 @@ export function checkServerCompatibility(
   }
 
   if (req.minDiskBytes > 0 && f.diskTotalBytes && f.diskTotalBytes < req.minDiskBytes) {
-    const got = formatDiskReported(f.diskTotalBytes);
+    const got = formatReportedBytes(f.diskTotalBytes);
     fail("disk", got, `it has ${got} of disk — that type needs at least ${formatDiskFloor(req.minDiskBytes)}`);
   }
 

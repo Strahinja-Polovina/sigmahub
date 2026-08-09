@@ -60,18 +60,34 @@ const (
 
 // clusterExcludedKinds are resource kinds that must NOT run inside a cluster.
 //
-// Every one of them is a stateful engine whose data lives in a volume on one
-// host. In a scheduler that means node affinity, PV lifecycle and eviction
+// The stateful engines are excluded because each one's data lives in a volume on
+// one host. In a scheduler that means node affinity, PV lifecycle and eviction
 // semantics we do not model — and a database silently rescheduled onto a node
 // without its data is data loss, not a degraded deploy. Managed databases and
 // object storage stay on their own server; the cluster reaches them over the
 // mesh exactly like anything else.
+//
+// `llm` is here for a different reason, and it is a statement about THIS control
+// plane rather than about Kubernetes. Nothing renders a cluster-targeted model
+// endpoint: renderClusterWorkloadOps only knows how to turn a git deploy into a
+// workload, so the resource produces no k8s object anywhere. And provisioning is
+// server-scoped by construction — provisionLLMTx allocates a mesh port against
+// resources.server_id and inserts into llm_endpoints, whose server_id is NOT
+// NULL REFERENCES servers(id). A cluster resource has no server, so the create
+// died on llm_endpoints_server_id_fkey: a raw SQLSTATE 23503 surfaced as a 500
+// naming a database constraint, AFTER the wizard had drawn the cluster as an
+// eligible target with a real GPU figure behind it and the fit check had passed
+// it green. Excluding the kind turns that dead end back into the sentence
+// ErrKindNotClusterable already writes, at the moment the target is picked.
+// Whoever completes the k8s render path for `llm` deletes this line — and has to
+// give provisionLLMTx a port and a host first.
 var clusterExcludedKinds = map[string]bool{
 	"postgres": true,
 	"mysql":    true,
 	"redis":    true,
 	"mongodb":  true,
 	"s3":       true,
+	"llm":      true,
 }
 
 // ClusterKindAllowed reports whether a resource kind may be deployed INTO a
@@ -349,7 +365,10 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 			out[i].Nodes = append(out[i].Nodes, n)
 		}
 	}
-	return out, nodeRows.Err()
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // DeleteCluster removes a cluster. Resources deployed into it lose their

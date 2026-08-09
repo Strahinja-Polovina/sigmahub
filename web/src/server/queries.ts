@@ -430,6 +430,14 @@ export async function getDeployTargets(orgId: string, visible?: Set<string> | nu
                 // already refused, instead of offering it and letting the
                 // create call be the first thing that says no (SIGMA-203).
                 status: sv.status,
+                // The GPU inventory, and nothing else out of the facts blob:
+                // it is what the VRAM fit check compares a model against
+                // (SIGMA-214), and the rest of a host's facts — its kernel, its
+                // disks, its docker version — is weight on every deploy-target
+                // payload for a screen that never reads it. Undefined when the
+                // agent reported no inventory, which the fit check reads as
+                // UNKNOWN and never as "no GPU".
+                gpu: sv.facts?.gpu ?? undefined,
               })),
           };
         })

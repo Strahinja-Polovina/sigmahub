@@ -157,23 +157,33 @@ func TestDisconnectIntegrationGuardsLiveConnections(t *testing.T) {
 // A cluster refuses stateful kinds outright — the rule lives in the store, not
 // only in the UI, because losing a database to a rescheduling event is data
 // loss rather than a degraded deploy.
-func TestClusterRefusesStatefulKinds(t *testing.T) {
+func TestAClusterRefusesEveryKindItCannotActuallyRun(t *testing.T) {
+	// The stateful engines: their data lives in a volume on one host, and a
+	// reschedule without it is data loss rather than a degraded deploy.
 	for _, kind := range []string{"postgres", "mysql", "redis", "mongodb", "s3"} {
 		if store.ClusterKindAllowed(kind) {
 			t.Fatalf("%s must not be deployable into a cluster", kind)
 		}
 	}
-	for _, kind := range []string{"app", "llm"} {
-		if !store.ClusterKindAllowed(kind) {
-			t.Fatalf("%s must be deployable into a cluster", kind)
-		}
+	// And `llm`, for a reason about this control plane rather than about
+	// Kubernetes: nothing renders a cluster-targeted model endpoint, and
+	// provisionLLMTx needs a server id it would not have. Allowed, it was offered
+	// by the wizard, passed the fit check, and died on a foreign key as a 500.
+	if store.ClusterKindAllowed("llm") {
+		t.Fatal("an llm aimed at a cluster is accepted, and there is nothing on the other side of " +
+			"that create: no k8s workload is rendered and no mesh port can be allocated")
 	}
-	// The published list is what the dashboard renders, so it must match.
+	if !store.ClusterKindAllowed("app") {
+		t.Fatal("app must be deployable into a cluster; it is what clusters are for")
+	}
+	// The published list is what the dashboard renders its eligible targets
+	// from, so it must carry every rule the create enforces — otherwise the
+	// operator meets the refusal only after Review.
 	published := map[string]bool{}
 	for _, k := range store.ClusterExcludedKinds() {
 		published[k] = true
 	}
-	if len(published) != 5 || !published["postgres"] || !published["s3"] {
+	if len(published) != 6 || !published["postgres"] || !published["s3"] || !published["llm"] {
 		t.Fatalf("excluded kinds published to the UI = %v", store.ClusterExcludedKinds())
 	}
 }
