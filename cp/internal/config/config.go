@@ -4,16 +4,12 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
-
-// knownDBEngines validates CP_DB_ENGINES entries; a typo must fail boot, not
-// silently disable an engine.
-var knownDBEngines = map[string]bool{"postgres": true, "mysql": true, "redis": true, "mongodb": true}
-
-// knownS3Engines validates CP_S3_ENGINES entries (P2-2), same fail-loud rule.
-var knownS3Engines = map[string]bool{"minio": true, "seaweedfs": true}
 
 type Config struct {
 	// Addr is the HTTP listen address, e.g. ":8080".
@@ -51,11 +47,12 @@ type Config struct {
 	ACMEEmail    string
 	ACMECADirURL string
 	// DBEngines is the P1-10 engine allowlist (CP_DB_ENGINES, comma-separated).
-	// Defaults to all four engines; "postgres" alone is the pre-agreed M6
-	// fallback build — a configuration cut, not a rewrite.
+	// Unset enables every engine the catalog defines; "postgres" alone is the
+	// pre-agreed M6 fallback build — a configuration cut, not a rewrite.
 	DBEngines []string
 	// S3Engines is the P2-2 object-storage engine allowlist (CP_S3_ENGINES).
-	// Defaults to minio,seaweedfs; "minio" alone is the MinIO-only build.
+	// Unset enables every engine the catalog defines; "minio" alone is the
+	// MinIO-only build.
 	S3Engines []string
 	// Telemetry sinks (P1-13). VMWriteURL/VMReadURL point at the
 	// VictoriaMetrics cluster's vminsert/vmselect; LokiURL at Loki. Empty
@@ -165,38 +162,56 @@ func FromEnv() (Config, error) {
 		return Config{}, fmt.Errorf(`CP_PADDLE_ENV must be "sandbox" or "production", got %q`, cfg.PaddleEnv)
 	}
 
-	// P1-10 engine allowlist. Empty = all engines enabled.
-	raw := getenv("CP_DB_ENGINES", "postgres,mysql,redis,mongodb")
-	for _, e := range strings.Split(raw, ",") {
-		e = strings.TrimSpace(e)
-		if e == "" {
-			continue
-		}
-		if !knownDBEngines[e] {
-			return Config{}, fmt.Errorf("CP_DB_ENGINES: unknown engine %q (known: postgres, mysql, redis, mongodb)", e)
-		}
-		cfg.DBEngines = append(cfg.DBEngines, e)
+	// P1-10 engine allowlist, and P2-2's for object storage. Both ask the store
+	// catalog what exists instead of holding a list — see parseEngineList.
+	if cfg.DBEngines, err = parseEngineList("CP_DB_ENGINES", store.DBEngineKinds()); err != nil {
+		return Config{}, err
 	}
-	if len(cfg.DBEngines) == 0 {
-		return Config{}, fmt.Errorf("CP_DB_ENGINES must enable at least one engine")
-	}
-
-	// P2-2 S3 engine allowlist. Empty = both engines enabled.
-	rawS3 := getenv("CP_S3_ENGINES", "minio,seaweedfs")
-	for _, e := range strings.Split(rawS3, ",") {
-		e = strings.TrimSpace(e)
-		if e == "" {
-			continue
-		}
-		if !knownS3Engines[e] {
-			return Config{}, fmt.Errorf("CP_S3_ENGINES: unknown engine %q (known: minio, seaweedfs)", e)
-		}
-		cfg.S3Engines = append(cfg.S3Engines, e)
-	}
-	if len(cfg.S3Engines) == 0 {
-		return Config{}, fmt.Errorf("CP_S3_ENGINES must enable at least one engine")
+	if cfg.S3Engines, err = parseEngineList("CP_S3_ENGINES", store.S3EngineNames()); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// parseEngineList reads a comma-separated engine allowlist from key, defaulting
+// to every engine in known and rejecting anything that is not one of them. A
+// typo must fail boot, not silently disable an engine an operator believes is
+// on.
+//
+// known is passed in from the store catalog rather than written down here, and
+// the message RENDERS it rather than restating it. Both halves of that were
+// wrong before SIGMA-216: this file kept a knownDBEngines map AND spelled the
+// same four names again inside the error text AND a third time as the default
+// value, so an engine added to the catalog left the map rejecting it, and an
+// engine removed left the message advertising it. Nothing read the sentence, so
+// nothing could notice it had gone stale — the operator who mistyped an engine
+// name was handed a list of the engines this product supported on whatever day
+// that string was last edited.
+//
+// Deriving it needs `config` to import `store`, which is not a cycle: store's
+// own imports are kms, dsd, gitdetect and hf, none of which read configuration,
+// and config is a leaf that only cmd/sigmahub-cp imports. The alternative —
+// moving the check up to main.go, where store is already imported — would leave
+// FromEnv returning a Config whose engine list had not been validated, and split
+// "what CP_DB_ENGINES may say" from the function that parses it. That is the
+// same two-places-for-one-fact shape as the map this replaced, so it is not the
+// fix.
+func parseEngineList(key string, known []string) ([]string, error) {
+	var enabled []string
+	for _, e := range strings.Split(getenv(key, strings.Join(known, ",")), ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !slices.Contains(known, e) {
+			return nil, fmt.Errorf("%s: unknown engine %q (known: %s)", key, e, strings.Join(known, ", "))
+		}
+		enabled = append(enabled, e)
+	}
+	if len(enabled) == 0 {
+		return nil, fmt.Errorf("%s must enable at least one engine", key)
+	}
+	return enabled, nil
 }
 
 func getenv(key, fallback string) string {

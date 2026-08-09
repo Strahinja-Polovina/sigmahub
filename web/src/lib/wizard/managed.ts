@@ -20,11 +20,13 @@ import {
 /**
  * Asked of the control plane's catalog rather than of a list kept here.
  *
- * The list used to be `["postgres", "mysql", "mongodb", "redis"]`, typed out
- * beside a control plane that already knew the same fact — so adding an engine
- * meant remembering a table in the dashboard, and forgetting it meant a new
- * database whose credentials were never revealed after create. The category IS
- * that fact now (SIGMA-216).
+ * The list used to be the four engine names, typed out beside a control plane
+ * that already knew the same fact — so adding an engine meant remembering a
+ * table in the dashboard, and forgetting it meant a new database whose
+ * credentials were never revealed after create. The category IS that fact now
+ * (SIGMA-216). The names are deliberately not repeated here either: a comment
+ * is a copy of the vocabulary that nothing generates and nothing checks, which
+ * is the smallest and longest-lived form of this same bug.
  */
 export function isDatabaseKind(kind: ResourceKind | null | undefined): boolean {
   return !!kind && categoryForKind(kind) === "database";

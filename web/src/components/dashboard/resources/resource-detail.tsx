@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import { getMetrics, getLogs } from "@/lib/sample-telemetry";
+import { isDatabaseEngine } from "@/lib/server-catalog.generated";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import {
   advanceDeployment,
@@ -207,10 +208,6 @@ function RedeployButton({ resourceId }: { resourceId: string }) {
   );
 }
 
-/** Kinds whose deletion also destroys the only copy of their restic repo key,
- *  so the confirm dialog must say so (SIGMA-170/185). */
-const DB_KINDS = ["postgres", "mysql", "redis", "mongodb"];
-
 /** Delete is confirm-gated and typed: it cascades the resource's entire
  *  deployment history — every sibling destructive action on this page already
  *  confirms, this one used to fire straight from onClick (SIGMA-185).
@@ -235,7 +232,14 @@ function DeleteResourceButton({
   const router = useRouter();
   const [pending, startTransition] = React.useTransition();
   const [typed, setTyped] = React.useState("");
-  const isDatabase = DB_KINDS.includes(kind);
+  // Which sentence this dialog owes the operator turns on whether the resource
+  // is a managed engine — its volumes and its restic repo key survive the
+  // cascade, an app's volumes merely stay behind (SIGMA-170/185). That is the
+  // control plane's engine table, so it is asked rather than restated: the four
+  // kinds used to be typed out here, and a fifth engine added to the Go catalog
+  // would have been deleted under the wrong warning, telling its owner nothing
+  // about the snapshots still sitting in their bucket (SIGMA-216).
+  const isDatabase = isDatabaseEngine(kind);
 
   function confirmDelete() {
     startTransition(async () => {

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -87,18 +86,23 @@ var dbEngines = map[string]DBEngineDef{
 }
 
 // The catalog is rendered into a checked-in file and read by name everywhere
-// else, so the two ways it can be quietly wrong are worth failing at package
-// load rather than at the first CreateResource of the week: an engine whose
-// name is not a resource kind never reaches DBEngineCatalog (the dashboard
-// would simply never hear of it), and an engine with no URL template renders an
-// empty connection string on both sides.
+// else, so the ways one entry can be quietly wrong ON ITS OWN TERMS are worth
+// failing at package load rather than at the first CreateResource of the week:
+// an engine that calls itself something other than its key resolves to a
+// definition describing a different database, and an engine with no image or no
+// URL template renders an empty connection string on both sides.
+//
+// The other half of being right — that every key here is a resource kind in the
+// catalog's database category, and that every such kind has an entry here — is
+// checked in server_catalog.go's init instead of this one, with a comment there
+// naming the defect each direction catches (SIGMA-216). That is not a
+// preference: package init functions run in file-name order, db_engines.go sorts
+// before server_catalog.go, and the category transpose those checks read does
+// not exist yet when this function runs.
 func init() {
 	for kind, def := range dbEngines {
 		if def.Engine != kind {
 			panic("store: db engine keyed " + kind + " calls itself " + def.Engine)
-		}
-		if !slices.Contains(ResourceKinds(), kind) {
-			panic("store: db engine " + kind + " is not a resource kind, so nothing renders it")
 		}
 		if def.URLTemplate == "" {
 			panic("store: db engine " + kind + " has no connection-URL template")
@@ -136,6 +140,13 @@ func DBEngineCatalog() []DBEngineDef {
 }
 
 // DBEngineKinds lists the database kinds in the same order.
+//
+// It is also the answer to "which engines may an operator enable" — config.go
+// validates CP_DB_ENGINES against this rather than keeping a fourth spelling of
+// the same four names. That is sound rather than convenient: server_catalog.go's
+// init refuses to load a package in which this list and the catalog's database
+// category differ, so "engines with a definition" and "kinds the wizard calls a
+// database" cannot come apart behind the allowlist's back.
 func DBEngineKinds() []string {
 	out := make([]string, 0, len(dbEngines))
 	for _, def := range DBEngineCatalog() {
@@ -146,6 +157,15 @@ func DBEngineKinds() []string {
 
 // PlainEnv is the engine's NON-secret environment (usernames and database
 // names are identifiers, not secrets — the password never appears here).
+//
+// Redis is a named case rather than the default arm, which is the difference
+// between "this engine has no user or database concept" and "we have not
+// thought about this engine". The default arm used to carry a comment saying it
+// belonged to redis, so an engine added to dbEngines silently inherited Redis's
+// semantics — a container started with no credentials env at all, while the
+// connection panel printed a URL naming a user the engine was never told to
+// create. Falling through now returns nil under a name nobody claimed, and
+// TestEveryEngineIsStartedWithCredentialsAndACommand refuses it.
 func (d DBEngineDef) PlainEnv(username, dbname string) map[string]string {
 	switch d.Engine {
 	case "postgres":
@@ -154,7 +174,11 @@ func (d DBEngineDef) PlainEnv(username, dbname string) map[string]string {
 		return map[string]string{"MYSQL_USER": username, "MYSQL_DATABASE": dbname}
 	case "mongodb":
 		return map[string]string{"MONGO_INITDB_ROOT_USERNAME": username}
-	default: // redis has no user/db concept
+	case "redis":
+		// No user or database concept: the password is the whole credential and
+		// it is injected as a secret reference, never here.
+		return nil
+	default:
 		return nil
 	}
 }

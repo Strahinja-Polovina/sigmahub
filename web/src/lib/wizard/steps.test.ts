@@ -6,6 +6,7 @@ import {
   categoryForKind,
   type ResourceKind,
 } from "@/lib/server-catalog.generated";
+import { isManagedKind } from "./managed";
 import {
   decisionCount,
   hasStep,
@@ -39,13 +40,19 @@ describe("step sequences are per type", () => {
   // is a number that drifts: a managed Redis walked FIVE screens to make two
   // decisions, two of which were about a git repository it does not have.
   it("keeps every managed kind to two decisions beyond the type", () => {
-    for (const kind of ["postgres", "mysql", "mongodb", "redis", "s3", "llm"] as const) {
+    // Every kind that is not an application, from the catalog. Typed out, the
+    // list was the six kinds that existed when SIGMA-212 was written, so a
+    // seventh could arrive with five screens and this test would still say the
+    // requirement held (SIGMA-216).
+    for (const kind of RESOURCE_KINDS.filter((k) => k !== "app")) {
       expect(decisionCount(kind), kind).toBeLessThanOrEqual(2);
     }
   });
 
   it("never asks a managed kind about a repository, a build or variables", () => {
-    for (const kind of ["postgres", "mysql", "mongodb", "redis", "s3"] as const) {
+    // "Managed" is one predicate, in one place — the same one the wizard
+    // branches on — rather than the list of kinds it happened to return.
+    for (const kind of RESOURCE_KINDS.filter(isManagedKind)) {
       for (const step of ["source", "build", "env", "networking"] as const) {
         expect(hasStep(kind, step), `${kind} must not have a ${step} step`).toBe(false);
       }

@@ -30,6 +30,13 @@ type DecommissionState struct {
 	Status       string    `json:"status"`
 	PurgeVolumes bool      `json:"purgeVolumes"`
 	StartedAt    time.Time `json:"startedAt"`
+	// Removed says the server is already gone and there is no teardown to
+	// watch — the host's agent never registered, so there was nothing on it to
+	// remove. It is a separate field rather than a new Status value on purpose:
+	// the status vocabulary is shared with the dashboard and the compatibility
+	// gate, and a value that only ever appears on a row nobody can load again
+	// would be a word in that vocabulary with no state behind it.
+	Removed bool `json:"removed,omitempty"`
 }
 
 // BeginDecommission starts a graceful decommission: the server moves to
@@ -81,6 +88,52 @@ func (s *Store) BeginDecommission(ctx context.Context, orgID, serverID string, p
 	}
 	if len(bound) > 0 {
 		return DecommissionState{}, ErrBoundResources{Names: bound}
+	}
+
+	// A host whose agent never registered has nothing to tear down, and nothing
+	// that could ever tell us it did.
+	//
+	// agent_version is written by exactly one call — the agent's registration —
+	// so an empty one means sigmad never ran here: the operator connected the
+	// server, was handed an install command, and did not run it (or it failed).
+	// There is no mesh interface, no systemd unit, no container and no binary on
+	// that machine, and no credential was ever used.
+	//
+	// Sending that row down the graceful path was a dead end of the exact kind
+	// this lifecycle exists to remove. It went to 'decommissioning' and waited
+	// for an ack that could not arrive; the dialog withholds Force disconnect
+	// for the whole ten-minute window precisely because the graceful path is
+	// supposed to be working; and the operator was left staring at a row stuck
+	// mid-teardown with no affordance and no explanation, for a machine the
+	// product had never touched. The sweeper does clear it eventually, which
+	// made this look like slowness rather than a defect.
+	//
+	// So it is removed here and now, on the same transaction and by the same
+	// tombstone every other ending uses. Waiting is only honest when there is
+	// something to wait FOR.
+	var enrolled bool
+	if err := tx.QueryRow(ctx,
+		`SELECT agent_version <> '' FROM servers WHERE id = $1`, serverID).Scan(&enrolled); err != nil {
+		return DecommissionState{}, fmt.Errorf("read agent enrolment: %w", err)
+	}
+	if !enrolled {
+		if err := tombstoneServerTx(ctx, tx, orgID, serverID, name, actor,
+			"Server disconnected before its agent ever registered — nothing was installed to remove"); err != nil {
+			return DecommissionState{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return DecommissionState{}, err
+		}
+		// Removed is reported by the ABSENCE of a started-at: the caller uses it
+		// to tell the operator this is finished rather than under way, and the
+		// dashboard has nowhere to send them to watch a teardown that did not
+		// happen.
+		return DecommissionState{
+			ServerID: serverID,
+			Name:     name,
+			Status:   ServerStatusDecommissioning,
+			Removed:  true,
+		}, nil
 	}
 
 	var startedAt time.Time

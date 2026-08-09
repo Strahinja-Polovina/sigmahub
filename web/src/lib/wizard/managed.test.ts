@@ -11,13 +11,20 @@ import {
   resourceNameError,
 } from "./managed";
 import {
+  DB_ENGINE_KINDS,
   DEFAULT_S3_ENGINE as CATALOG_DEFAULT_S3_ENGINE,
   S3_ENGINE_NAMES,
+  type ResourceKind,
 } from "@/lib/server-catalog.generated";
 
 describe("which kinds skip the application flow", () => {
   it("classes every engine as managed and the app as not", () => {
-    for (const kind of ["postgres", "mysql", "mongodb", "redis", "s3"] as const) {
+    // Every engine the control plane provisions, plus the bucket — asked of the
+    // catalog, because the point of the assertion is that a NEW engine is
+    // managed too, and a list typed out here could only ever cover the ones
+    // somebody remembered (SIGMA-216).
+    const managed: ResourceKind[] = [...DB_ENGINE_KINDS, "s3"];
+    for (const kind of managed) {
       expect(isManagedKind(kind), kind).toBe(true);
     }
     expect(isManagedKind("app")).toBe(false);

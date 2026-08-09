@@ -141,7 +141,15 @@ export const servers = pgTable("servers", {
     .notNull()
     .references(() => orgs.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
-  type: text("type").notNull(), // general | storage | database | gpu
+  // A server type from the control plane's catalog: SERVER_TYPES in
+  // @/lib/server-catalog.generated, rendered from cp/internal/store. The types
+  // are NOT restated here. They used to be, and the list stayed four names long
+  // through the arrival of the VPS, the cluster node and the build server — the
+  // file that defines the column described a fleet three types smaller than the
+  // one it stores, and nothing could notice, because a comment is the one copy
+  // of a vocabulary that no generator writes and no test used to read. So the
+  // only thing written down here is where the vocabulary lives (SIGMA-216).
+  type: text("type").notNull(),
   source: text("source").notNull().default("byo"), // byo | provider_integration
   provider: text("provider").notNull(),
   region: text("region").notNull(),
@@ -278,7 +286,20 @@ export const resources = pgTable("resources", {
     onDelete: "set null",
   }),
   name: text("name").notNull(),
-  kind: text("kind").notNull(), // app | postgres | mysql | mongodb | redis | s3 | llm
+  // A resource kind from the same catalog: RESOURCE_KINDS in
+  // @/lib/server-catalog.generated. Named rather than listed, for the reason
+  // the servers.type comment gives — a hand-typed vocabulary in a comment
+  // cannot be generated and cannot be checked, so it goes stale in silence.
+  //
+  // Stored as plain text rather than `.$type<ResourceKind>()` on purpose: this
+  // table is a MIRROR of the control plane, and the control plane is what
+  // decides which kinds exist. Declaring the column to be a member of the union
+  // THIS build was generated against would be a claim about rows this process
+  // did not write — a newer control plane's kind would arrive typed as a member
+  // of a set it is not in, and every exhaustive read of it would be wrong with
+  // no error to show for it. Readers narrow with isResourceKind or print
+  // through resourceKindLabel, which is why both of those take a plain string.
+  kind: text("kind").notNull(),
   status: text("status").notNull().default("provisioning"),
   repo: text("repo"),
   domain: text("domain"),
