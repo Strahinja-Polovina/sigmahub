@@ -13,8 +13,6 @@ import {
   cpListServers,
   cpListBackupTargets,
   cpListBackupRuns,
-  cpQueryResourceMetrics,
-  cpQueryLogs,
   type CpDatabaseInfo,
   type CpS3Info,
   type CpBackupTarget,
@@ -23,7 +21,7 @@ import {
 import { isDatabaseEngine } from "@/lib/server-catalog.generated";
 import { getDatabaseInfo } from "@/server/actions/databases";
 import { getS3Info } from "@/server/actions/s3";
-import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
+import { loadResourceTelemetry } from "@/server/resource-telemetry";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -172,25 +170,6 @@ async function loadStatusError(
   }
 }
 
-/** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
- *  the explicit not-configured state — CP mode never shows synthetic data. */
-async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
-  if (!cpEnabled()) return null;
-  try {
-    const [metrics, logs] = await Promise.all([
-      cpQueryResourceMetrics(orgId, resourceId),
-      cpQueryLogs(orgId, { resourceId, limit: 200 }),
-    ]);
-    return {
-      pipeline: metrics !== null || logs !== null,
-      metrics: metrics ?? [],
-      logs: logs ?? [],
-    };
-  } catch {
-    return { pipeline: true, metrics: [], logs: [] };
-  }
-}
-
 /** Load a database's backup targets + run history (P1-11, CP mode only). */
 async function loadBackups(
   orgId: string,
@@ -259,7 +238,10 @@ export default async function ResourceDetailPage({
   const database = await loadDatabase(loadFailures, orgId, resourceId, detail.resource.kind);
   const s3 = await loadS3(loadFailures, orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null, loadFailures);
-  const telemetry = await loadTelemetry(orgId, resourceId);
+  // Telemetry reports its own read failure into loadFailures like every other
+  // loader here — an unreachable control plane must not render as "the pipeline
+  // is configured and nothing arrived" (SIGMA-236).
+  const telemetry = await loadResourceTelemetry(orgId, resourceId, loadFailures);
   const statusError = await loadStatusError(
     orgId,
     resourceId,

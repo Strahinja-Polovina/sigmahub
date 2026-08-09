@@ -93,9 +93,19 @@ import type {
 } from "@/server/cp";
 
 /** CP-mode telemetry payload. `pipeline` false = VictoriaMetrics/Loki are not
- *  configured — the UI shows an explicit state, never fabricated series. */
+ *  configured — the UI shows an explicit state, never fabricated series.
+ *
+ *  There are THREE states here, not two, and the page must be able to tell them
+ *  apart: not configured, configured-but-empty, and could-not-ask. The loader
+ *  used to collapse the third into the second — a failed read answered
+ *  `pipeline: true` with empty series, which is the page asserting the pipeline
+ *  is configured and the container produced no output (SIGMA-236). */
 export type CpTelemetry = {
   pipeline: boolean;
+  /** The control plane did not answer. Not "there is nothing", but "we could
+   *  not ask" — the distinction an operator acts on when a container is
+   *  crash-looping. */
+  unreadable?: boolean;
   metrics: CpTelemetryPoint[];
   logs: CpLogLine[];
 };
@@ -413,9 +423,18 @@ export function ResourceDetail({
   const metrics = isCp ? cpTelemetry.metrics : demoMetrics;
   const logs = isCp ? cpTelemetry.logs : demoLogs;
   const pipelineOff = isCp && !cpTelemetry.pipeline;
+  const telemetryUnreadable = isCp && Boolean(cpTelemetry.unreadable);
   const latest = metrics[metrics.length - 1];
 
-  const telemetryEmptyState = pipelineOff ? (
+  // Three states, three sentences. Saying "no telemetry received yet" when the
+  // read FAILED sends an operator whose container is crash-looping off to hunt
+  // on the host for output that was in fact never asked for (SIGMA-236).
+  const telemetryEmptyState = telemetryUnreadable ? (
+    <p className="py-8 text-center text-sm text-muted-foreground">
+      Couldn’t read logs and metrics — the control plane didn’t answer. This is
+      not the same as “nothing was produced”: reload once it is reachable.
+    </p>
+  ) : pipelineOff ? (
     <p className="py-8 text-center text-sm text-muted-foreground">
       Telemetry pipeline not configured — set CP_VM_WRITE_URL / CP_VM_READ_URL /
       CP_LOKI_URL on the control plane to collect metrics and logs.

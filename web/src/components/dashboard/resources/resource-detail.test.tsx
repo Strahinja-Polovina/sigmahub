@@ -129,3 +129,32 @@ describe("ResourceDetail danger zone", () => {
     expect(labels).not.toContain("Stop");
   });
 });
+
+describe("ResourceDetail telemetry states", () => {
+  it("a telemetry fetch failure appears in the load-failure banner and not as the empty state", () => {
+    renderCp({
+      loadFailures: ["logs and metrics"],
+      cpTelemetry: { pipeline: true, unreadable: true, metrics: [], logs: [] },
+    });
+    openTab("Logs");
+
+    expect(screen.getByText(/Some of this page couldn't be loaded/i)).toBeTruthy();
+    expect(screen.getByText(/didn't answer for logs and metrics/i)).toBeTruthy();
+    // "No telemetry received yet" asserts the pipeline is configured and the
+    // container produced nothing — the opposite of the truth when the read
+    // failed (SIGMA-236).
+    expect(screen.queryByText(/No telemetry received yet/i)).toBeNull();
+  });
+
+  it("a reachable but empty pipeline still says no telemetry has arrived", () => {
+    renderCp({ cpTelemetry: { pipeline: true, metrics: [], logs: [] } });
+    openTab("Logs");
+    expect(screen.getByText(/No telemetry received yet/i)).toBeTruthy();
+  });
+
+  it("an unconfigured pipeline says so", () => {
+    renderCp({ cpTelemetry: { pipeline: false, metrics: [], logs: [] } });
+    openTab("Logs");
+    expect(screen.getByText(/Telemetry pipeline not configured/i)).toBeTruthy();
+  });
+});
