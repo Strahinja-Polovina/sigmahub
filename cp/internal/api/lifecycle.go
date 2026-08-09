@@ -55,13 +55,18 @@ func (s *Server) handleDecommissionServer(w http.ResponseWriter, r *http.Request
 	}
 	// Render the uninstall op now rather than at the next 60s resync: the whole
 	// point of the graceful path is that the operator watches it happen.
-	if s.reconcile != nil {
+	//
+	// Skipped when the server is already gone: there is no document to render
+	// for a tombstoned row, and asking the reconciler for one would be work
+	// whose only possible output is nothing.
+	if s.reconcile != nil && !state.Removed {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":       state.Status,
 		"purgeVolumes": state.PurgeVolumes,
 		"startedAt":    state.StartedAt,
+		"removed":      state.Removed,
 	})
 }
 

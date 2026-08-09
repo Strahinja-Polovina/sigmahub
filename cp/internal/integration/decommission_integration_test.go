@@ -641,3 +641,60 @@ func TestForceDisconnectClearsClusterMembership(t *testing.T) {
 		t.Fatalf("cluster_nodes still points at a tombstoned server (%d rows)", rows)
 	}
 }
+
+// A host the agent never reached is removed at once, not waited on.
+//
+// This is what a stuck row looked like in production: a server connected
+// through the wizard, an install command that was never run, and a Disconnect
+// that put the row into `decommissioning` to wait for an ack from a machine
+// that had never heard of us. The dialog withholds Force disconnect for the
+// whole ten-minute window — correctly, while a teardown is genuinely under way
+// — so the operator had a row stuck mid-teardown, no affordance and no
+// explanation, for a machine the product had never touched. The sweeper cleared
+// it after ten minutes, which made a defect look like slowness.
+func TestAServerWhoseAgentNeverRegisteredIsRemovedImmediately(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_never_enrolled"
+
+	// Provisioned and never heard from again — the row the connect wizard
+	// leaves behind when nobody runs the install command it printed.
+	// agent_version is written by the agent's registration and by nothing else,
+	// so an empty one is the whole signal.
+	prov, err := st.ProvisionServer(ctx, orgID, store.ProvisionInput{
+		Name: "203.0.113.9", Type: "general", Provider: "BYO", HostIP: "203.0.113.9",
+	}, "operator", time.Hour)
+	if err != nil {
+		t.Fatalf("ProvisionServer: %v", err)
+	}
+
+	state, err := st.BeginDecommission(ctx, orgID, prov.ServerID, false, "operator")
+	if err != nil {
+		t.Fatalf("BeginDecommission: %v", err)
+	}
+	if !state.Removed {
+		t.Fatalf("state.Removed = false; the dashboard then sends the operator to watch a "+
+			"teardown that cannot happen (state = %+v)", state)
+	}
+	if !state.StartedAt.IsZero() {
+		t.Errorf("StartedAt = %v, want zero: nothing was started", state.StartedAt)
+	}
+
+	// Gone, not waiting.
+	if _, err := st.GetServer(ctx, orgID, prov.ServerID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the server still loads after disconnect: err = %v", err)
+	}
+
+	// And the credential is dead, which is what makes "removed" true rather
+	// than merely hidden: a host that later runs the install command it was
+	// given must not be able to register against this row.
+	var live int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_tokens WHERE server_id = $1 AND revoked_at IS NULL`,
+		prov.ServerID).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 0 {
+		t.Errorf("%d agent token(s) still live for a removed server", live)
+	}
+}
