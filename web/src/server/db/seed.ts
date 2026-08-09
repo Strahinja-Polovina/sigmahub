@@ -5,8 +5,10 @@
 // Demo login → strahinja@sigmajunction.com / sigmahub123
 // Run: pnpm db:seed
 import { fileURLToPath } from "node:url";
+import { sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import { db, client } from "./index";
+import { repairMigrationLedger } from "./migrate-repair";
 import * as s from "./schema";
 import { user, session, account, verification, twoFactor } from "./auth-schema";
 import { auth } from "../../lib/auth";
@@ -30,6 +32,11 @@ function sha7(x: string) {
 }
 
 async function main() {
+  // Before the migrator, never after: it reads a high-water mark that one
+  // journal entry poisoned, and the demo's PGlite directory persists across
+  // runs, so a developer's local copy carries the same bad row a server does.
+  // See migrate-repair.ts.
+  await repairMigrationLedger((stmt) => db.execute(sql.raw(stmt)));
   await migrate(db, { migrationsFolder: "drizzle" });
 
   // Idempotent: clear (child → parent) then identity tables.
