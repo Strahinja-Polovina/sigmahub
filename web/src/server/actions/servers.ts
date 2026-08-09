@@ -31,37 +31,76 @@ import {
   cpRenameServer,
   cpSetServerType,
   cpUpdateServerAgent,
+  type CpInstallerRelease,
 } from "../cp";
 
-/** GitHub repo whose releases host install.sh + the pinned sigmad assets. */
-const RELEASE_REPO = process.env.SIGMAHUB_RELEASE_REPO ?? "Strahinja-Polovina/sigmahub";
-
-/** The released tag the installer pins. The installer needs a concrete release
- *  (its assets embed the version), so a missing value or "latest" is rejected
- *  loudly rather than rendered into a command that 404s at download time
- *  (SIGMA-157). */
-function agentVersion(): string {
-  const v = process.env.SIGMAHUB_AGENT_VERSION;
-  if (!v || v === "latest") {
+/** The one-line, cosign-verified install command the wizard hands the operator.
+ *
+ *  Every URL in it is the control plane's. It serves install.sh, and
+ *  SIGMAHUB_DOWNLOAD_BASE sends the five asset downloads the script then makes
+ *  (the sigmad archive, checksums.txt and its .sig/.pem, sigmad.service) back
+ *  through it as well — agent/packaging/install.sh honours that variable for
+ *  all of them, which is why this is a URL to hand over rather than a fetching
+ *  strategy to reimplement.
+ *
+ *  It used to point curl straight at github.com, and that worked only while the
+ *  release repository was PUBLIC: an operator with a private one watched all
+ *  five assets 404 and could not onboard a single server. The control plane
+ *  authenticates to GitHub with its own credential, so the fix costs the
+ *  command nothing — no token appears in a string that gets pasted into a
+ *  terminal, screenshotted into a ticket and left in shell history.
+ *
+ *  What the proxy explicitly does NOT do is vouch for the bytes, and it was
+ *  never asked to. install.sh cosign-verifies checksums.txt against the release
+ *  workflow's keyless OIDC identity before executing anything, and verifies the
+ *  archive and the unit against that checksums.txt; the signature is the
+ *  authenticity and the transport is only reachability. A control plane that
+ *  served a tampered asset would fail that verification exactly as a tampered
+ *  github.com would. */
+function installCommand(token: string, release: CpInstallerRelease): string {
+  const ep = cpPublicUrl();
+  // install.sh is the ONE artifact cosign does not cover, because install.sh is
+  // what runs cosign. Its integrity has always rested on TLS: the old command
+  // hard-coded https://github.com/…, and moving the fetch to the control plane
+  // moved that trust to TLS against the control plane without moving the
+  // requirement with it. The deployment guide shipped
+  // SIGMAHUB_CP_PUBLIC_URL=http://your-host:8080 and the control plane
+  // terminates no TLS of its own, so the documented default piped plaintext
+  // into `sudo bash` — an on-path attacker goes from reading a bootstrap token
+  // to root on every host being onboarded.
+  //
+  // Refused here rather than warned about, and for the same reason the missing
+  // release below is: the alternative is a command that looks fine, works, and
+  // is a remote code execution primitive on the network between the operator
+  // and their control plane.
+  if (!ep.startsWith("https://")) {
     throw new Error(
-      "SIGMAHUB_AGENT_VERSION must be set to a released tag (e.g. v0.3.0) to onboard a server; " +
-        `"latest" has no release asset. Set it in the control-plane deployment's environment.`
+      `The install command pipes a script from ${ep || "the control plane"} straight into sudo bash, so it ` +
+        "must be fetched over TLS. Set SIGMAHUB_CP_PUBLIC_URL to an https:// URL — put the control plane " +
+        "behind the TLS terminator you already run, and use its address here."
     );
   }
-  return v;
-}
-
-/** The one-line, cosign-verified install command the wizard hands the operator.
- *  install.sh is fetched from the pinned GitHub release (the CP does not serve
- *  it), while SIGMAHUB_ENDPOINT points at the CP's public URL. */
-function installCommand(token: string): string {
-  const ep = cpPublicUrl();
-  const version = agentVersion();
-  const scriptUrl = `https://github.com/${RELEASE_REPO}/releases/download/${version}/install.sh`;
+  // The version comes back with the token, from the control plane that is going
+  // to serve every URL in this line. The dashboard used to read its own
+  // SIGMAHUB_AGENT_VERSION here, which meant the /dl/{version} paths and the
+  // release GET /install.sh actually serves were two settings that happened to
+  // be equal in a working deployment — and in a mismatched one the operator got
+  // one release's installer pointed at another release's assets, or a 404 from
+  // a control plane refusing a version it does not serve. Neither half was
+  // wrong; there were simply two of them.
+  const version = release.agentVersion;
+  if (!version) {
+    // The control plane's own sentence, not a paraphrase: it names the setting
+    // (CP_AGENT_VERSION / CP_RELEASE_REPO) on the machine that has to change.
+    throw new Error(
+      release.agentVersionError ??
+        "The control plane is not pinned to a released agent version, so there is no install command to render. Set CP_AGENT_VERSION on the control plane to a released tag such as v0.3.0."
+    );
+  }
   return (
-    `curl -fsSL ${scriptUrl} | ` +
+    `curl -fsSL ${ep}/install.sh | ` +
     `SIGMAHUB_ENDPOINT=${ep} SIGMAHUB_BOOTSTRAP_TOKEN=${token} ` +
-    `SIGMAHUB_VERSION=${version} sudo -E bash`
+    `SIGMAHUB_VERSION=${version} SIGMAHUB_DOWNLOAD_BASE=${ep}/dl/${version} sudo -E bash`
   );
 }
 
@@ -346,7 +385,7 @@ export async function provisionServer(input: {
   return {
     mode: "cp",
     serverId: res.serverId,
-    command: installCommand(res.token),
+    command: installCommand(res.token, res),
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
   };
@@ -549,22 +588,25 @@ export async function reissueInstallCommand(input: { serverId: string }): Promis
   });
   revalidatePath("/dashboard", "layout");
   return {
-    command: installCommand(res.token),
+    command: installCommand(res.token, res),
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
   };
 }
 
-/** Request a dashboard-driven agent upgrade to the platform's pinned release
- *  (SIGMAHUB_AGENT_VERSION). The agent downloads the cosign-verified release,
- *  swaps its binary and restarts — no operator SSH. Returns a readable result
- *  (thrown server-action errors are redacted in production). */
+/** Request a dashboard-driven agent upgrade to the platform's pinned release.
+ *  The agent downloads the cosign-verified release, swaps its binary and
+ *  restarts — no operator SSH. Returns a readable result (thrown server-action
+ *  errors are redacted in production).
+ *
+ *  Which release that is, is the control plane's to say and not this process's:
+ *  the agent fetches it through the control plane's /dl route, which serves one
+ *  version. So no version is sent, and the one it applied comes back. */
 export async function updateServerAgent(input: { serverId: string }): Promise<
   { ok: true; version: string } | { ok: false; error: string }
 > {
   try {
     if (!cpEnabled()) throw new Error("Agent updates need a control plane.");
-    const version = agentVersion();
     const [server] = await db
       .select()
       .from(s.servers)
@@ -572,7 +614,7 @@ export async function updateServerAgent(input: { serverId: string }): Promise<
     const orgId = server?.orgId ?? (await getActiveOrgId());
     if (!orgId) throw new Error("No active organization.");
     const { user, role } = await requireProjectAdmin(orgId);
-    await cpUpdateServerAgent(orgId, input.serverId, version, { name: user.name, role });
+    const { version } = await cpUpdateServerAgent(orgId, input.serverId, { name: user.name, role });
     await writeAudit({
       orgId,
       actor: user.name,

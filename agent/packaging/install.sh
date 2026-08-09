@@ -7,17 +7,47 @@
 # removes the one-time bootstrap SSH key from authorized_keys (Phase-0 invariant:
 # the bootstrap key is never reused).
 #
-# Usage (the connect-server wizard renders this):
-#   curl -fsSL https://<host>/install.sh | \
+# Usage — this is verbatim the shape the connect-server wizard renders
+# (web/src/server/actions/servers.ts, installCommand):
+#
+#   curl -fsSL https://cp.example.com/install.sh | \
 #     SIGMAHUB_ENDPOINT=https://cp.example.com \
 #     SIGMAHUB_BOOTSTRAP_TOKEN=sbt_... \
-#     SIGMAHUB_VERSION=v0.3.0 sudo -E bash
+#     SIGMAHUB_VERSION=v0.3.0 \
+#     SIGMAHUB_DOWNLOAD_BASE=https://cp.example.com/dl/v0.3.0 sudo -E bash
+#
+# Every URL an operator pastes is the control plane's — the script itself and,
+# through SIGMAHUB_DOWNLOAD_BASE, each release asset it goes on to fetch. The
+# control plane proxies those assets with a server-side GitHub credential, which
+# is what makes a PRIVATE release repository onboardable at all: unauthenticated
+# curls at github.com 404 on all five assets, and the only workaround an operator
+# has is to make the repository public.
+#
+# The proxy moves nothing about the trust model, and that is the first thing to
+# check when reading this file. Authenticity comes from the cosign verification
+# below — checksums.txt is verified against the release workflow's keyless OIDC
+# identity, and the archive and the systemd unit are verified against that
+# checksums.txt — never from who served the bytes. A signed artifact handed over
+# by a proxy is still the signed artifact, and a control plane that tampered with
+# one would fail verification here exactly as GitHub would.
 set -euo pipefail
 
 : "${SIGMAHUB_ENDPOINT:?SIGMAHUB_ENDPOINT is required}"
 : "${SIGMAHUB_BOOTSTRAP_TOKEN:?SIGMAHUB_BOOTSTRAP_TOKEN is required}"
 : "${SIGMAHUB_VERSION:?SIGMAHUB_VERSION is required (e.g. v0.3.0)}"
+# SIGMAHUB_REPO is the cosign TRUST ANCHOR: the certificate-identity regexp
+# below is built from it, so it decides whose release workflow may have signed
+# what this host is about to run as root. It is deliberately not something the
+# rendered install command sets — a repository named by the same command that
+# names the download server would let one input choose both the bytes and the
+# identity they are checked against, which is no check at all.
 SIGMAHUB_REPO="${SIGMAHUB_REPO:-Strahinja-Polovina/sigmahub}"
+# Where the assets come from, which the control plane overrides so the host
+# talks to one host it can already reach. The github.com default is what a
+# hand-run install against a PUBLIC release still needs, and it is the fallback
+# a typo in the wizard's variable name would silently land on — hence the test
+# in web/src/server/actions/install-command.test.ts that pins the two names
+# together.
 SIGMAHUB_DOWNLOAD_BASE="${SIGMAHUB_DOWNLOAD_BASE:-https://github.com/${SIGMAHUB_REPO}/releases/download/${SIGMAHUB_VERSION}}"
 SIGMAHUB_WG_UP="${SIGMAHUB_WG_UP:-1}"
 
@@ -109,6 +139,18 @@ need wg-quick || { echo "installing wireguard-tools..."; apt-get update -qq && a
 apt-get install -y -qq auditd >/dev/null 2>&1 || echo "warning: could not install auditd; the CIS auditd control will score as unmet"
 # restic executes the P1-11 backup/verify ops (client-side encrypted backups).
 ensure_tool restic restic
+# --- Third-party tooling ------------------------------------------------------
+#
+# The three downloads that follow — nixpacks, sigstore's cosign, Docker Engine —
+# are other people's software, not this repository's release assets, so they
+# keep their own upstream URLs and deliberately do NOT follow
+# SIGMAHUB_DOWNLOAD_BASE. Putting them behind the control plane would make it a
+# mirror for binaries it neither builds nor signs, which is a separate decision
+# from serving our own release and buys nothing for the private-repository case
+# this base exists for: these three are public downloads that never 404 on
+# account of our repository's visibility. A host firewalled off from them could
+# not have installed Docker before this change either.
+#
 # nixpacks builds a repo that carries no Dockerfile — the wizard's answer to
 # "this repository does not say how to build itself". Without it the auto-build
 # method the dashboard offers fails on the host with "executable file not
@@ -135,6 +177,14 @@ if ! need docker; then
 fi
 
 # --- Download + verify --------------------------------------------------------
+#
+# Every sigmahub release asset this script fetches goes through
+# SIGMAHUB_DOWNLOAD_BASE: the four here and sigmad.service further down. That is
+# the complete set, and a fifth one written with a hard-coded github.com URL is
+# the private-repository 404 coming back for a single asset — a host that gets
+# most of the way through an install and stops, with the one-time bootstrap key
+# already spent, instead of being refused cleanly. install_script_test.go reads
+# this file and fails on the commit that adds one.
 work="$(mktemp -d)"; trap 'rm -rf "$work"; remove_bootstrap_key' EXIT
 archive="sigmad_${ver_noV}_linux_${arch}.tar.gz"
 echo "downloading ${archive}..."

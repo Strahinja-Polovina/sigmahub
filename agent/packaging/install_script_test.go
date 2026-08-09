@@ -31,6 +31,15 @@
 // one-time bootstrap key, so the operator's retry needs a fresh token from the
 // dashboard. Both are edits that pass review and every existing suite; both fail
 // here on the commit that makes them.
+//
+// The other thing checked here is WHERE the release assets are fetched from.
+// install.sh routes every asset this repository publishes through
+// SIGMAHUB_DOWNLOAD_BASE, which the control plane overrides so it can serve
+// them with a server-side GitHub credential; that is what makes a private
+// release repository onboardable, because an unauthenticated curl at github.com
+// 404s on all of them. The variable is defaulted, so an asset fetched from a
+// hard-coded URL instead still works on a public repository and fails only for
+// the operator the indirection exists for — a silence this suite is the end of.
 package packaging
 
 import (
@@ -226,6 +235,98 @@ func TestTheReleaseArchiveIsNamedWhatTheInstallerAndSelfUpdateExpect(t *testing.
 		t.Errorf("the sigmad archive overrides its format; ArchiveName's .tar.gz suffix is "+
 			"goreleaser's default and is not rendered from the config:\n%s", joined)
 	}
+}
+
+// downloadBase is the expansion install.sh must fetch every one of this
+// repository's release assets through.
+const downloadBase = "${SIGMAHUB_DOWNLOAD_BASE}"
+
+// releaseAssets is the complete set of assets install.sh downloads from the
+// release, written out so that ADDING one is a decision rather than a habit:
+// the sixth asset is exactly where a hard-coded github.com URL gets typed, and
+// on a public repository it works.
+var releaseAssets = []string{
+	downloadBase + "/${archive}",
+	downloadBase + "/checksums.txt",
+	downloadBase + "/checksums.txt.sig",
+	downloadBase + "/checksums.txt.pem",
+	downloadBase + "/sigmad.service",
+}
+
+// thirdPartyDownloads is the complete list of hosts install.sh may fetch from
+// directly, and every entry is somebody else's software: sigstore's cosign,
+// nixpacks, Docker Engine. They keep their upstream URLs deliberately. Serving
+// them through the control plane would make it a mirror for binaries it neither
+// builds nor signs, and it would fix nothing — these are public downloads that
+// do not 404 on account of THIS repository's visibility, which is the only
+// problem SIGMAHUB_DOWNLOAD_BASE exists to solve. A host that cannot reach them
+// could not have installed Docker before the base existed either.
+var thirdPartyDownloads = []string{
+	"https://nixpacks.com/",
+	"https://github.com/sigstore/cosign/",
+	"https://get.docker.com",
+}
+
+// The private-repository outage, written as a check on the file that caused it.
+//
+// Every asset this repository publishes is fetched through
+// SIGMAHUB_DOWNLOAD_BASE, because that variable is the only handle the control
+// plane has: the connect-server wizard renders it into the install command
+// (web/src/server/actions/servers.ts) and the script follows it. A curl that
+// names github.com directly is unauthenticated, and against a private release
+// repository it 404s — which is the outage this indirection ended, and it comes
+// back one asset at a time.
+//
+// It comes back INVISIBLY, which is why this is worth a test rather than a
+// review comment. The base is defaulted to github.com, so an asset fetched from
+// a hard-coded URL behaves identically on a public repository and on every
+// developer's machine; it fails only on the operator's private one, halfway
+// through an install, with the one-time bootstrap key already spent by the EXIT
+// trap.
+func TestEveryReleaseAssetIsFetchedThroughTheDownloadBase(t *testing.T) {
+	var proxied []string
+	for _, line := range strings.Split(readInstaller(t), "\n") {
+		trimmed := strings.TrimSpace(line)
+		// Comments name these URLs to explain them; the header even renders the
+		// install command in full. Only what the shell executes counts.
+		if strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, "curl ") {
+			continue
+		}
+		for _, url := range downloadTargets(trimmed) {
+			switch {
+			case strings.HasPrefix(url, downloadBase+"/"):
+				proxied = append(proxied, url)
+			case isThirdPartyDownload(url):
+			default:
+				t.Errorf("install.sh fetches %s directly instead of through %s/:\n  %s\n"+
+					"A release asset behind a hard-coded URL cannot be served by the control plane, "+
+					"so it 404s on a private release repository — the one case the base exists for.",
+					url, downloadBase, trimmed)
+			}
+		}
+	}
+	if !sameSet(proxied, releaseAssets) {
+		t.Errorf("install.sh downloads %v through the base, this test expects %v.\n"+
+			"If an asset was added, add it to releaseAssets here; if one was dropped, drop it there.",
+			proxied, releaseAssets)
+	}
+}
+
+// downloadTargets returns the URLs a curl line fetches: absolute ones and those
+// built on the download base. The -o destinations are ${work}-relative paths and
+// match neither, which is what keeps this from reading a temp file as a host.
+func downloadTargets(line string) []string {
+	re := regexp.MustCompile(`(\$\{SIGMAHUB_DOWNLOAD_BASE\}[^"'\s]*|https?://[^"'\s]*)`)
+	return re.FindAllString(line, -1)
+}
+
+func isThirdPartyDownload(url string) bool {
+	for _, prefix := range thirdPartyDownloads {
+		if strings.HasPrefix(url, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Both scripts are executed by root on a machine the operator has just handed

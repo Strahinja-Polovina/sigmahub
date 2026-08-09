@@ -46,6 +46,27 @@ services:
       # CP's own public base URL (e.g. https://cp.example.com). With the
       # webhook secret set, connecting a repo auto-registers its push webhook.
       CP_PUBLIC_URL: ${CP_PUBLIC_URL:-}
+      # The agent installer the control plane serves (SIGMA-217). The host being
+      # onboarded fetches install.sh and every release asset from the CP, which
+      # fetches them from GitHub with the token below — so a PRIVATE release
+      # repository can be onboarded from without the credential ever appearing
+      # in the command an operator pastes into a root shell.
+      #
+      # Both are OPTIONAL: empty repo falls through to the upstream slug, and
+      # empty token means an unauthenticated fetch, which is what a public
+      # release wants (GitHub's anonymous REST API allows 60 requests an hour
+      # and one onboarding costs six). A self-hoster with a private fork sets
+      # both.
+      CP_RELEASE_REPO: ${CP_RELEASE_REPO:-}
+      CP_RELEASE_TOKEN: ${CP_RELEASE_TOKEN:-}
+      # Which release the CP installs. This is the ONLY place the version is
+      # configured: the dashboard no longer has a setting of its own, it asks the
+      # control plane and renders the answer, so there is nothing here for a
+      # second key to disagree with. Unset falls back to the release this
+      # control-plane binary was built from, which is already correct for a
+      # released image (goreleaser stamps cp and sigmad from one tag) and is
+      # "dev" for a source build — onboarding then refuses, naming this setting.
+      CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
       # uncomment the volume below; the key is imported into KMS custody on
@@ -98,9 +119,12 @@ services:
       # agent install command; without it onboarding prints an unusable endpoint
       # (SIGMA-157).
       SIGMAHUB_CP_PUBLIC_URL: ${SIGMAHUB_CP_PUBLIC_URL:?set SIGMAHUB_CP_PUBLIC_URL in .env}
-      # Released agent tag the installer pins (e.g. v0.3.0). Must be a real
-      # release — install.sh 404s on "latest".
-      SIGMAHUB_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:?set SIGMAHUB_AGENT_VERSION in .env}
+      # No agent version here on purpose. The dashboard renders the install
+      # command around the version the control plane hands back with the
+      # bootstrap token, so a setting on this side would be a second opinion
+      # about which release gets installed — and the losing half of that
+      # disagreement is a host that fetches one release's installer and asks it
+      # to install another. See CP_AGENT_VERSION on the cp service.
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}

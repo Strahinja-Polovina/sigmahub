@@ -266,11 +266,32 @@ export async function cpServerMetrics(
   return points;
 }
 
+/** The release the control plane installs, handed back with every bootstrap
+ *  token it issues.
+ *
+ *  The version rides along with the token because the install command needs
+ *  both, and it used to assemble them from two sources: the token from the
+ *  control plane, the version from the dashboard's own SIGMAHUB_AGENT_VERSION.
+ *  Nothing kept those in step, so a deployment could render a command that
+ *  fetched one release's installer and asked it to install another — each half
+ *  correct, the pair a version nobody chose. Reading it back from the control
+ *  plane that will have to serve it is what makes them one value. */
+export type CpInstallerRelease = {
+  /** The tag GET /install.sh and /dl/{version} serve. Empty when the control
+   *  plane is not pinned to a release, in which case no install command can be
+   *  rendered — see agentVersionError. */
+  agentVersion: string;
+  /** Present exactly when agentVersion is empty: the control plane's own
+   *  sentence naming the setting an operator has to fix. Shown as-is rather
+   *  than paraphrased here, so the dashboard cannot drift from it either. */
+  agentVersionError?: string;
+};
+
 export async function cpIssueBootstrapToken(
   orgId: string,
   input: { name: string; type: string; provider: string; region: string },
   actor?: CpActor
-): Promise<{ token: string; serverId: string; expiresAt: string }> {
+): Promise<{ token: string; serverId: string; expiresAt: string } & CpInstallerRelease> {
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/bootstrap-tokens`, {
     method: "POST",
     body: JSON.stringify(input),
@@ -295,7 +316,9 @@ export async function cpProvisionServer(
     hostIp?: string;
   },
   actor: CpActor
-): Promise<{ serverId: string; token: string; expiresAt: string; bootstrapPubkey: string }> {
+): Promise<
+  { serverId: string; token: string; expiresAt: string; bootstrapPubkey: string } & CpInstallerRelease
+> {
   return cpFetch(`/v1/orgs/${encodeURIComponent(orgId)}/servers/provision`, {
     method: "POST",
     body: JSON.stringify(input),
@@ -308,7 +331,9 @@ export async function cpReissueBootstrapToken(
   orgId: string,
   serverId: string,
   actor: CpActor
-): Promise<{ serverId: string; token: string; expiresAt: string; bootstrapPubkey: string }> {
+): Promise<
+  { serverId: string; token: string; expiresAt: string; bootstrapPubkey: string } & CpInstallerRelease
+> {
   return cpFetch(
     `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/reissue-token`,
     { method: "POST", body: JSON.stringify({}) },
@@ -317,16 +342,20 @@ export async function cpReissueBootstrapToken(
 }
 
 /** Dashboard-driven agent upgrade: the CP renders an agent.update op until the
- *  agent's heartbeat reports the requested version. Project Admin+. */
+ *  agent's heartbeat reports the requested version. Project Admin+.
+ *
+ *  No version is sent. The agent downloads the new binary through this control
+ *  plane's own /dl route, which serves exactly one release — so "upgrade to the
+ *  platform's pinned version" is a question only the control plane can answer,
+ *  and the version it answers with is the one it comes back with here. */
 export async function cpUpdateServerAgent(
   orgId: string,
   serverId: string,
-  version: string,
   actor: CpActor
-): Promise<void> {
-  await cpFetch(
+): Promise<{ status: string; version: string }> {
+  return cpFetch(
     `/v1/orgs/${encodeURIComponent(orgId)}/servers/${encodeURIComponent(serverId)}/agent-update`,
-    { method: "POST", body: JSON.stringify({ version }) },
+    { method: "POST", body: JSON.stringify({}) },
     { orgId, actor }
   );
 }

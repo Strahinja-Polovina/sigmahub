@@ -1,0 +1,933 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+)
+
+// The installer routes are the only unauthenticated read path in the control
+// plane that holds a credential to a private repository, so these tests are
+// mostly about what the routes REFUSE. Everything runs against an httptest fake
+// of GitHub — both shapes of it, the browser download URL and the REST API,
+// because the proxy uses a different one depending on whether a token is
+// configured and each has its own way of going wrong.
+
+const (
+	testReleaseRepo    = "acme/sigmahub"
+	testReleaseVersion = "v0.3.0"
+	// A value that must never appear in a response, an error body or a header.
+	testReleaseToken = "ghp_the_release_credential"
+)
+
+type recordedRequest struct {
+	method string
+	path   string
+	auth   string
+	accept string
+}
+
+type fakeAsset struct {
+	tag  string
+	name string
+	body []byte
+	// declared is the size the release listing reports, when it should differ
+	// from len(body) — an upstream's declaration is not a guarantee and the
+	// proxy has to be tested against one that lies.
+	declared int64
+	// chunked serves the body without a Content-Length, which is what forces
+	// the streaming half of the size cap to be the thing under test.
+	chunked bool
+}
+
+// fakeGitHub answers both URL shapes the proxy knows, and records every request
+// so a test can assert that a refusal happened BEFORE any outbound call.
+type fakeGitHub struct {
+	mu          sync.Mutex
+	assets      []fakeAsset // index+1 is the asset id, mirroring GitHub's numeric ids
+	forceStatus int         // when set, every request answers this instead
+	requests    []recordedRequest
+}
+
+func (g *fakeGitHub) add(a fakeAsset) { g.assets = append(g.assets, a) }
+
+func (g *fakeGitHub) seen() []recordedRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]recordedRequest, len(g.requests))
+	copy(out, g.requests)
+	return out
+}
+
+func (g *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	g.requests = append(g.requests, recordedRequest{
+		method: r.Method, path: r.URL.Path,
+		auth: r.Header.Get("Authorization"), accept: r.Header.Get("Accept"),
+	})
+	forced := g.forceStatus
+	g.mu.Unlock()
+
+	if forced != 0 {
+		// GitHub's own error bodies are JSON; serving one here is what proves
+		// the proxy never forwards an upstream body into a root shell.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(forced)
+		_, _ = w.Write([]byte(`{"message":"Not Found","documentation_url":"https://docs.github.com"}`))
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/repos/") {
+		g.serveAPI(w, r)
+		return
+	}
+	g.serveDownload(w, r)
+}
+
+func (g *fakeGitHub) serveAPI(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/repos/"), "/")
+	if len(parts) != 5 || parts[0]+"/"+parts[1] != testReleaseRepo || parts[2] != "releases" {
+		http.NotFound(w, r)
+		return
+	}
+	switch parts[3] {
+	case "tags":
+		var listing struct {
+			Assets []releaseAsset `json:"assets"`
+		}
+		for i, a := range g.assets {
+			if a.tag != parts[4] {
+				continue
+			}
+			size := a.declared
+			if size == 0 {
+				size = int64(len(a.body))
+			}
+			listing.Assets = append(listing.Assets, releaseAsset{
+				ID: int64(i + 1), Name: a.name, Size: size,
+			})
+		}
+		if len(listing.Assets) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(listing)
+	case "assets":
+		var id int
+		if _, err := fmt.Sscanf(parts[4], "%d", &id); err != nil || id < 1 || id > len(g.assets) {
+			http.NotFound(w, r)
+			return
+		}
+		writeFakeAsset(w, g.assets[id-1])
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (g *fakeGitHub) serveDownload(w http.ResponseWriter, r *http.Request) {
+	// /acme/sigmahub/releases/download/v0.3.0/checksums.txt
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	if len(parts) != 6 || parts[0]+"/"+parts[1] != testReleaseRepo ||
+		parts[2] != "releases" || parts[3] != "download" {
+		http.NotFound(w, r)
+		return
+	}
+	for _, a := range g.assets {
+		if a.tag == parts[4] && a.name == parts[5] {
+			writeFakeAsset(w, a)
+			return
+		}
+	}
+	http.NotFound(w, r)
+}
+
+func writeFakeAsset(w http.ResponseWriter, a fakeAsset) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if a.chunked {
+		// Flushing before the body commits the response to chunked encoding,
+		// so the client sees Content-Length -1 and the cap has to be enforced
+		// on the stream rather than on a declaration.
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	_, _ = w.Write(a.body)
+}
+
+// installerServer wires an api.Server whose release source points at the fake.
+func installerServer(t *testing.T, gh *fakeGitHub, rs ReleaseSource) (*Server, *httptest.Server) {
+	t.Helper()
+	upstream := httptest.NewServer(gh)
+	t.Cleanup(upstream.Close)
+	if rs.Repo == "" {
+		rs.Repo = testReleaseRepo
+	}
+	if rs.Version == "" {
+		rs.Version = testReleaseVersion
+	}
+	rs.DownloadBase = upstream.URL
+	rs.APIBase = upstream.URL
+	return New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+		DevServiceToken: testServiceToken,
+		Release:         rs,
+	}), upstream
+}
+
+func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec
+}
+
+func releaseWithInstaller() *fakeGitHub {
+	gh := &fakeGitHub{}
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "install.sh", body: []byte("#!/usr/bin/env bash\necho installing\n")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "checksums.txt", body: []byte("abc  sigmad_0.3.0_linux_amd64.tar.gz\n")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "checksums.txt.sig", body: []byte("signature")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "checksums.txt.pem", body: []byte("-----BEGIN CERTIFICATE-----")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "sigmad.service", body: []byte("[Unit]\n")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "sigmad_0.3.0_linux_amd64.tar.gz", body: []byte("archive-amd64")})
+	gh.add(fakeAsset{tag: testReleaseVersion, name: "sigmad_0.3.0_linux_arm64.tar.gz", body: []byte("archive-arm64")})
+	return gh
+}
+
+func TestTheInstallScriptIsServedForTheVersionTheControlPlaneIsPinnedTo(t *testing.T) {
+	gh := releaseWithInstaller()
+	s, _ := installerServer(t, gh, ReleaseSource{})
+
+	rec := get(t, s, "/install.sh")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /install.sh = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "echo installing") {
+		t.Errorf("served body is not the release's install.sh: %q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/x-shellscript") {
+		t.Errorf("Content-Type = %q, want the shell-script type so a browser does not render the installer as a page", ct)
+	}
+}
+
+func TestEveryAssetTheInstallerFetchesIsServedFromTheVersionedRoute(t *testing.T) {
+	gh := releaseWithInstaller()
+	s, _ := installerServer(t, gh, ReleaseSource{})
+
+	for _, tc := range []struct{ asset, want string }{
+		{"install.sh", "echo installing"},
+		{"checksums.txt", "sigmad_0.3.0_linux_amd64.tar.gz"},
+		{"checksums.txt.sig", "signature"},
+		{"checksums.txt.pem", "BEGIN CERTIFICATE"},
+		{"sigmad.service", "[Unit]"},
+		{"sigmad_0.3.0_linux_amd64.tar.gz", "archive-amd64"},
+		{"sigmad_0.3.0_linux_arm64.tar.gz", "archive-arm64"},
+	} {
+		t.Run(tc.asset, func(t *testing.T) {
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/"+tc.asset)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET /dl/%s/%s = %d, want 200; body: %s", testReleaseVersion, tc.asset, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("body = %q, want it to contain %q", rec.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
+// The names install.sh actually fetches are read out of the script itself, so
+// the allowlist cannot quietly stop covering one of them. Leaving sigmad.service
+// off is the failure this exists for: it 404s nothing an operator can see,
+// because install.sh falls back to an embedded unit — it just silently undoes
+// SIGMA-155, which is there so a root ExecStart is checked against the
+// cosign-signed checksums.txt.
+func TestTheAllowlistCoversEveryAssetInstallShFetches(t *testing.T) {
+	script := readInstallScriptForAllowlist(t)
+
+	// The archive name is built from shell variables; expand it the way the
+	// script does so the pattern half of the allowlist is covered too.
+	archiveExpr := regexp.MustCompile(`(?m)^archive="([^"]+)"`).FindStringSubmatch(script)
+	if archiveExpr == nil {
+		t.Fatal(`install.sh has no top-level archive="..." assignment; if it was renamed, this test and allowedAsset must follow it`)
+	}
+
+	refs := regexp.MustCompile(`\$\{SIGMAHUB_DOWNLOAD_BASE\}/([^"'\s]+)`).FindAllStringSubmatch(script, -1)
+	if len(refs) == 0 {
+		t.Fatal("install.sh no longer fetches anything from ${SIGMAHUB_DOWNLOAD_BASE}; if the variable was renamed, the control plane's allowlist is now pinned to nothing")
+	}
+
+	for _, ref := range refs {
+		for _, name := range expandAssetRef(ref[1], archiveExpr[1]) {
+			if _, ok := allowedAsset(testReleaseVersion, name); !ok {
+				t.Errorf("install.sh fetches %q from the control plane and the proxy's allowlist refuses it.\n"+
+					"Add it to fixedAssets in installer.go — an asset the script fetches and the proxy will not serve either "+
+					"fails the install outright or, for sigmad.service, degrades it silently to the unsigned fallback unit.", name)
+			}
+		}
+	}
+}
+
+// expandAssetRef turns one ${SIGMAHUB_DOWNLOAD_BASE}/<ref> occurrence into the
+// concrete asset names it can resolve to. Only ${archive} is a variable today,
+// and it expands to one name per architecture the release publishes.
+func expandAssetRef(ref, archiveExpr string) []string {
+	if ref != "${archive}" {
+		return []string{ref}
+	}
+	var out []string
+	for _, arch := range store.SupportedArches() {
+		name := strings.ReplaceAll(archiveExpr, "${ver_noV}", strings.TrimPrefix(testReleaseVersion, "v"))
+		out = append(out, strings.ReplaceAll(name, "${arch}", arch))
+	}
+	return out
+}
+
+func readInstallScriptForAllowlist(t *testing.T) string {
+	t.Helper()
+	// Across the module boundary, the same way store/installer_vocabulary_test.go
+	// reads it: cp cannot import agent, and this file is what both can read.
+	b, err := os.ReadFile("../../../agent/packaging/install.sh")
+	if err != nil {
+		t.Fatalf("read agent/packaging/install.sh: %v", err)
+	}
+	return string(b)
+}
+
+func TestAnAssetOutsideTheAllowlistIsRefusedWithoutAskingGitHub(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		asset string
+	}{
+		// A real asset of the same release — the control-plane archive is
+		// published beside sigmad's and is still none of an onboarding host's
+		// business.
+		{"another product's archive", "sigmahub-cp_0.3.0_linux_amd64.tar.gz"},
+		{"a file the release never published", ".env"},
+		{"a plausible neighbour", "checksums.txt.bak"},
+		{"an sbom", "sigmad_0.3.0_linux_amd64.tar.gz.sbom.json"},
+		{"an escaped traversal out of the release", "..%2f..%2fchecksums.txt"},
+		{"an escaped traversal to a dotfile", "..%2F..%2F.env"},
+		{"a dot-dot prefix", "%2e%2e%2finstall.sh"},
+		{"an absolute path", "%2fetc%2fpasswd"},
+		{"an archive for a version this route did not name", "sigmad_9.9.9_linux_amd64.tar.gz"},
+		{"an architecture the release does not publish", "sigmad_0.3.0_linux_riscv64.tar.gz"},
+		{"a windows archive", "sigmad_0.3.0_windows_amd64.tar.gz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/"+tc.asset)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET /dl/%s/%s = %d, want 404; body: %s", testReleaseVersion, tc.asset, rec.Code, rec.Body.String())
+			}
+			// The refusal must cost nothing upstream: an open proxy that asks
+			// GitHub first is still an oracle for what a private repository
+			// holds, and it spends the control plane's rate-limit budget on
+			// whoever is probing it.
+			if seen := gh.seen(); len(seen) != 0 {
+				t.Errorf("a refused asset reached GitHub anyway: %+v", seen)
+			}
+		})
+	}
+}
+
+func TestAVersionThatIsNotAReleaseTagIsRefusedWithoutAskingGitHub(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version string
+	}{
+		{"latest has no release assets", "latest"},
+		{"an incomplete version", "v0.3"},
+		{"an unprefixed version", "0.3.0"},
+		{"a branch name", "main"},
+		{"an escaped traversal", "..%2f..%2fsecret"},
+		{"an escaped slash into another path", "v0.3.0%2f..%2fv9.9.9"},
+		{"a query string smuggled into the segment", "v0.3.0%3Ffoo=bar"},
+		{"an absolute url", "https:%2f%2fevil.example"},
+		{"a dotfile", ".git"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+			rec := get(t, s, "/dl/"+tc.version+"/checksums.txt")
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("GET /dl/%s/checksums.txt = %d, want 404; body: %s", tc.version, rec.Code, rec.Body.String())
+			}
+			if seen := gh.seen(); len(seen) != 0 {
+				t.Errorf("a refused version reached GitHub anyway: %+v", seen)
+			}
+		})
+	}
+}
+
+// The unescaped forms never reach the handler — net/http cleans the path and
+// redirects — but the assertion that matters is the same one either way: no
+// release bytes come back and GitHub is never asked.
+func TestAnUnescapedTraversalNeverServesReleaseBytes(t *testing.T) {
+	for _, path := range []string{
+		"/dl/v0.3.0/../../etc/passwd",
+		"/dl/../../../install.sh",
+		"/dl/v0.3.0/./checksums.txt/../../../secret",
+		"//dl/v0.3.0/checksums.txt",
+	} {
+		t.Run(path, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+			rec := get(t, s, path)
+			if rec.Code == http.StatusOK {
+				t.Fatalf("GET %s = 200 and served %q", path, rec.Body.String())
+			}
+			if seen := gh.seen(); len(seen) != 0 {
+				t.Errorf("GET %s reached GitHub: %+v", path, seen)
+			}
+		})
+	}
+}
+
+func TestTheReleaseTokenReachesGitHubAndNeverTheOperator(t *testing.T) {
+	gh := releaseWithInstaller()
+	s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET checksums.txt = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	seen := gh.seen()
+	if len(seen) != 2 {
+		t.Fatalf("authenticated fetch made %d upstream requests, want 2 (release lookup, then asset download): %+v", len(seen), seen)
+	}
+	for _, req := range seen {
+		if req.auth != "Bearer "+testReleaseToken {
+			t.Errorf("upstream request %s carried Authorization %q, want the configured release credential", req.path, req.auth)
+		}
+	}
+	if !strings.Contains(seen[0].path, "/releases/tags/"+testReleaseVersion) {
+		t.Errorf("first upstream request was %q, want the release-by-tag lookup: the browser download URL does not accept a token on a private repository", seen[0].path)
+	}
+	if seen[1].accept != "application/octet-stream" {
+		t.Errorf("asset download sent Accept %q; without application/octet-stream GitHub describes the asset instead of serving it", seen[1].accept)
+	}
+
+	// The whole response, headers included, must be free of the credential.
+	dump := rec.Body.String()
+	for k, v := range rec.Header() {
+		dump += "\n" + k + ": " + strings.Join(v, ",")
+	}
+	if strings.Contains(dump, testReleaseToken) {
+		t.Error("the release credential appeared in the response served to an unauthenticated caller")
+	}
+}
+
+func TestAPublicReleaseIsProxiedWithNoCredentialConfigured(t *testing.T) {
+	gh := releaseWithInstaller()
+	s, _ := installerServer(t, gh, ReleaseSource{}) // no Token
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unauthenticated fetch = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	seen := gh.seen()
+	if len(seen) != 1 {
+		t.Fatalf("unauthenticated fetch made %d upstream requests, want 1: %+v", len(seen), seen)
+	}
+	if seen[0].auth != "" {
+		t.Errorf("unauthenticated fetch sent Authorization %q", seen[0].auth)
+	}
+	// The browser download URL, not the REST API. The API's anonymous limit is
+	// 60 requests an hour and one onboarding costs six, so routing public
+	// installs through it would break them at ten hosts an hour.
+	if !strings.Contains(seen[0].path, "/releases/download/") {
+		t.Errorf("unauthenticated fetch used %q, want the unmetered browser download URL", seen[0].path)
+	}
+}
+
+func TestAnUpstream404NamesTheLikelyCause(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"public", ""},
+		{"authenticated", testReleaseToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// An empty release: the tag is well-formed and the asset is
+			// allowlisted, so the refusal can only come from GitHub.
+			s, _ := installerServer(t, &fakeGitHub{}, ReleaseSource{Token: tc.token})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("upstream 404 answered %d, want it passed through as 404; body: %s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			for _, want := range []string{"checksums.txt", testReleaseVersion, "draft", "contents:read", "CP_RELEASE_TOKEN"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("404 body does not mention %q, so it does not name the fix:\n%s", want, body)
+				}
+			}
+			if strings.Contains(body, "documentation_url") {
+				t.Errorf("GitHub's own error body was forwarded to the caller:\n%s", body)
+			}
+		})
+	}
+}
+
+func TestARefusedCredentialIsNotReportedAsTheOperatorsForbidden(t *testing.T) {
+	for _, upstream := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(upstream), func(t *testing.T) {
+			gh := releaseWithInstaller()
+			gh.forceStatus = upstream
+			s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+			// Passing 403 straight through would tell the operator that THEY
+			// are forbidden. They are not; the control plane is.
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("upstream %d answered %d, want 502: the caller is not the one being refused", upstream, rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "CP_RELEASE_TOKEN") {
+				t.Errorf("credential refusal does not name the setting that fixes it:\n%s", rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), testReleaseToken) {
+				t.Error("the credential leaked into the error body")
+			}
+		})
+	}
+}
+
+func TestAGitHubRateLimitIsReportedAsTemporaryAndNamesTheTokenAsTheFix(t *testing.T) {
+	gh := releaseWithInstaller()
+	gh.forceStatus = http.StatusTooManyRequests
+	s, _ := installerServer(t, gh, ReleaseSource{})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("upstream 429 answered %d, want 503 (retryable), body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CP_RELEASE_TOKEN") {
+		t.Errorf("rate-limit message does not mention that a token raises the limit:\n%s", rec.Body.String())
+	}
+}
+
+func TestAnAssetLargerThanTheCapIsRefusedRatherThanStreamed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"public path checks Content-Length", ""},
+		{"authenticated path checks the declared size", testReleaseToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := &fakeGitHub{}
+			// Small enough that net/http declares a Content-Length for it, and
+			// still far past the cap this proxy is given.
+			gh.add(fakeAsset{tag: testReleaseVersion, name: "checksums.txt", body: []byte(strings.Repeat("A", 512))})
+			s, _ := installerServer(t, gh, ReleaseSource{Token: tc.token, MaxBytes: 64})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("oversized asset answered %d, want 502; body: %s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "AAAA") {
+				t.Error("an oversized asset was streamed anyway; the declared size must be refused before a byte moves")
+			}
+		})
+	}
+}
+
+// An upstream that declares nothing is the case the pre-flight size check
+// cannot cover, so the copy itself has to stop. The host then fails checksum
+// verification, which is the safe outcome — the unsafe one is buffering an
+// unbounded body on an unauthenticated route.
+func TestAStreamWithNoDeclaredLengthIsCutOffAtTheCap(t *testing.T) {
+	gh := &fakeGitHub{}
+	gh.add(fakeAsset{
+		tag: testReleaseVersion, name: "checksums.txt",
+		body: []byte(strings.Repeat("x", 4096)), chunked: true,
+	})
+	s, _ := installerServer(t, gh, ReleaseSource{MaxBytes: 64})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Body.Len() != 64 {
+		t.Fatalf("streamed %d bytes past a 64-byte cap; the cap must bound the copy, not only the declaration", rec.Body.Len())
+	}
+}
+
+// Reaching the cap exactly is a complete asset, not a truncated one. Worth its
+// own test because the obvious `n >= cap` spelling of the check calls it a
+// truncation and tells the operator to go looking for a corrupted download that
+// is not there.
+func TestAnAssetOfExactlyTheCapIsServedWhole(t *testing.T) {
+	gh := &fakeGitHub{}
+	gh.add(fakeAsset{
+		tag: testReleaseVersion, name: "checksums.txt",
+		body: []byte(strings.Repeat("x", 64)), chunked: true,
+	})
+	s, _ := installerServer(t, gh, ReleaseSource{MaxBytes: 64})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusOK || rec.Body.Len() != 64 {
+		t.Fatalf("an asset of exactly the cap answered %d with %d bytes, want 200 with 64", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestAnUnpinnedControlPlaneSaysHowToPinIt(t *testing.T) {
+	for _, version := range []string{"", "dev", "latest", "v0.3"} {
+		t.Run("version="+version, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			s, _ := installerServer(t, gh, ReleaseSource{Version: "unset"})
+			s.release.Version = version // "" cannot travel through installerServer's default
+
+			rec := get(t, s, "/install.sh")
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET /install.sh with version %q = %d, want 503; body: %s", version, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "CP_AGENT_VERSION") || !strings.Contains(body, "/dl/") {
+				t.Errorf("the message names neither the setting nor the version-explicit URL:\n%s", body)
+			}
+			if seen := gh.seen(); len(seen) != 0 {
+				t.Errorf("an unpinned control plane still asked GitHub: %+v", seen)
+			}
+		})
+	}
+}
+
+func TestAControlPlaneWithNoReleaseRepositorySaysSoRatherThanGuessingOne(t *testing.T) {
+	// newTestServer configures no Release at all, which is the shape every
+	// handler unit test in this package builds.
+	s := newTestServer(t, nil)
+	for _, path := range []string{"/install.sh", "/dl/" + testReleaseVersion + "/checksums.txt"} {
+		rec := get(t, s, path)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("GET %s = %d, want 503; body: %s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "CP_RELEASE_REPO") {
+			t.Errorf("GET %s does not name the setting that configures it:\n%s", path, rec.Body.String())
+		}
+	}
+}
+
+// Every failure body on these two routes ends up as stdin to `sudo bash` the
+// moment an install command loses its -f, so each line has to be inert there.
+func TestErrorBodiesAreInertWhenPipedIntoARootShell(t *testing.T) {
+	gh := &fakeGitHub{}
+	gh.forceStatus = http.StatusInternalServerError
+	s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+	for _, path := range []string{
+		"/install.sh",
+		"/dl/" + testReleaseVersion + "/checksums.txt",
+		"/dl/" + testReleaseVersion + "/not-an-asset",
+		"/dl/not-a-tag/checksums.txt",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := get(t, s, path)
+			if rec.Code == http.StatusOK {
+				t.Fatalf("GET %s unexpectedly succeeded", path)
+			}
+			if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+				t.Errorf("error Content-Type = %q, want text/plain", ct)
+			}
+			lines := strings.Split(strings.TrimRight(rec.Body.String(), "\n"), "\n")
+			for _, line := range lines[:len(lines)-1] {
+				if !strings.HasPrefix(line, "#") {
+					t.Errorf("error body line %q is not a shell comment; piped into `sudo bash` it is a command run as root", line)
+				}
+			}
+			if last := lines[len(lines)-1]; last != "exit 1" {
+				t.Errorf("error body ends with %q, want `exit 1` so a pipe into bash fails instead of succeeding silently", last)
+			}
+		})
+	}
+}
+
+// The allowlist is derived from the catalog's architecture list rather than
+// retyped, so this asserts the derivation rather than the names: adding an
+// architecture to the release makes its archive proxyable with no edit here.
+func TestTheArchiveAllowlistFollowsTheArchitecturesTheReleasePublishes(t *testing.T) {
+	for _, arch := range store.SupportedArches() {
+		name := "sigmad_0.3.0_linux_" + arch + ".tar.gz"
+		if _, ok := allowedAsset(testReleaseVersion, name); !ok {
+			t.Errorf("%s is published by the release and the proxy refuses it", name)
+		}
+	}
+	if _, ok := allowedAsset(testReleaseVersion, "sigmad_0.3.0_linux_s390x.tar.gz"); ok {
+		t.Error("the proxy serves an architecture the release does not build, which is a free-form segment in the upstream URL")
+	}
+}
+
+// The proxy serves ONE release: the one this control plane is pinned to.
+//
+// Validating only the tag's shape turned an unauthenticated route into an
+// anonymous mirror of every release the repository has ever published — the
+// private binaries and checksums for all of them, to anyone who can reach the
+// control plane, which is the exact property an operator keeps a repository
+// private for. The 200/404 split was a tag-existence oracle on top of it.
+//
+// It costs onboarding nothing: the command the wizard renders carries the
+// pinned version, so the only caller asking for another one is not onboarding.
+func TestOnlyThePinnedReleaseIsServed(t *testing.T) {
+	gh := releaseWithInstaller()
+	// A second, older release the repository also published.
+	gh.add(fakeAsset{tag: "v0.1.0", name: "sigmad_0.1.0_linux_amd64.tar.gz", body: []byte("PRIVATE BINARY v0.1.0")})
+	gh.add(fakeAsset{tag: "v0.1.0", name: "checksums.txt", body: []byte("old checksums")})
+	s, _ := installerServer(t, gh, ReleaseSource{})
+
+	for _, path := range []string{
+		"/dl/v0.1.0/sigmad_0.1.0_linux_amd64.tar.gz",
+		"/dl/v0.1.0/checksums.txt",
+		"/dl/v0.1.0/install.sh",
+	} {
+		rec := get(t, s, path)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: an unpinned release is a private artifact this route "+
+				"has no business republishing (body: %s)", path, rec.Code, rec.Body.String())
+		}
+	}
+	// A tag that does not exist upstream answers the same way as one that does
+	// but is not served, so the route is not an existence oracle either.
+	missing := get(t, s, "/dl/v9.9.9/checksums.txt")
+	present := get(t, s, "/dl/v0.1.0/checksums.txt")
+	if missing.Code != present.Code {
+		t.Errorf("an unpublished tag answers %d and a published-but-unserved one %d; the difference "+
+			"tells an anonymous caller which releases exist", missing.Code, present.Code)
+	}
+
+	// And the pinned one still works, so the refusal is about the version
+	// rather than about the route.
+	if rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt"); rec.Code != http.StatusOK {
+		t.Fatalf("the pinned release stopped being served: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The version in the install command and the version this control plane serves
+// used to be two settings.
+//
+// The dashboard read its own SIGMAHUB_AGENT_VERSION to build the command's
+// /dl/{version} paths; GET /install.sh served whatever CP_AGENT_VERSION said.
+// Each was correct on its own terms, and nothing made them agree — so a
+// deployment that set one and not the other, or set them to different tags,
+// handed an operator a line that fetched one release's installer and pointed it
+// at another release's assets. That is a version nobody chose, and the pinning
+// added alongside these tests turns it from a silent wrong install into a 404
+// halfway through onboarding, which is better and still not the fix.
+//
+// The fix is that there is one value. The control plane hands the version back
+// WITH the bootstrap token, the dashboard renders what it was given, and the
+// tests below are what makes "renders what it was given" checkable from this
+// side: whatever comes out of the token route is exactly what the download
+// route will serve, and any other tag is refused.
+func TestTheVersionHandedToTheWizardIsTheVersionTheProxyServes(t *testing.T) {
+	// Two pins, and the second is the one that earns its keep: a handler that
+	// answered with a hard-coded v0.3.0, or with the tag this binary was built
+	// from, would satisfy every assertion below against the fixture's default
+	// and prove nothing about where the answer came from.
+	for _, pinned := range []string{testReleaseVersion, "v7.1.4"} {
+		s, _ := installerServer(t, releaseAtTag(pinned), ReleaseSource{Version: pinned})
+
+		for _, route := range []string{
+			"/v1/orgs/org_1/bootstrap-tokens",
+			"/v1/orgs/org_1/servers/provision",
+			"/v1/orgs/org_1/servers/srv_pre/reissue-token",
+		} {
+			rec := postAsToken(s, testServiceToken, route, `{"type":"general"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST %s = %d, want 201; body %s", route, rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Token             string `json:"token"`
+				AgentVersion      string `json:"agentVersion"`
+				AgentVersionError string `json:"agentVersionError"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("POST %s returned unreadable JSON: %v", route, err)
+			}
+			if body.Token == "" {
+				t.Fatalf("POST %s returned no bootstrap token", route)
+			}
+			if body.AgentVersion != pinned {
+				t.Fatalf("POST %s handed out agentVersion %q (error %q) for a control plane pinned to "+
+					"%s; the wizard renders this into the command's /dl paths, so anything but the pin "+
+					"is a version nobody chose", route, body.AgentVersion, body.AgentVersionError, pinned)
+			}
+			if body.AgentVersionError != "" {
+				t.Errorf("POST %s returned both a version and a refusal (%q); one of them is wrong and "+
+					"the dashboard cannot tell which", route, body.AgentVersionError)
+			}
+			// The whole point: the command built from this response works
+			// against this same control plane. install.sh is fetched
+			// unversioned and every asset from /dl/<that version>/, so both are
+			// checked.
+			if rec := get(t, s, "/install.sh"); rec.Code != http.StatusOK {
+				t.Fatalf("GET /install.sh = %d while the token route handed out %s; the command's first "+
+					"line would fail before any asset was reached", rec.Code, body.AgentVersion)
+			}
+			for _, asset := range []string{"install.sh", "checksums.txt", "sigmad.service", archiveName(pinned, "amd64")} {
+				path := "/dl/" + body.AgentVersion + "/" + asset
+				if rec := get(t, s, path); rec.Code != http.StatusOK {
+					t.Errorf("GET %s = %d, want 200: the version this control plane handed the wizard is "+
+						"one it refuses to serve, which is the disagreement this change removes (body: %s)",
+						path, rec.Code, rec.Body.String())
+				}
+			}
+		}
+	}
+}
+
+// releaseAtTag is releaseWithInstaller for a repository whose published release
+// is some other tag, so a test can tell "the version this control plane serves"
+// apart from "the version the fixtures happen to use".
+func releaseAtTag(tag string) *fakeGitHub {
+	gh := &fakeGitHub{}
+	for _, name := range []string{"install.sh", "checksums.txt", "checksums.txt.sig", "checksums.txt.pem", "sigmad.service"} {
+		gh.add(fakeAsset{tag: tag, name: name, body: []byte("body of " + name)})
+	}
+	for _, arch := range store.SupportedArches() {
+		gh.add(fakeAsset{tag: tag, name: archiveName(tag, arch), body: []byte("archive-" + arch)})
+	}
+	return gh
+}
+
+// The other half of "one value": when the control plane cannot serve an
+// installer it must say so on the token route, not hand out a token the wizard
+// renders into a command that 503s in the operator's terminal.
+func TestAnUnpinnedControlPlaneTellsTheWizardWhyRatherThanAVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*testing.T) *Server
+		wants string
+	}{
+		{
+			// A source build stamps main.version as "dev", which is what a
+			// self-hoster who never set CP_AGENT_VERSION is running.
+			name: "a source build with no pin",
+			build: func(t *testing.T) *Server {
+				s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: "dev"})
+				return s
+			},
+			wants: "CP_AGENT_VERSION",
+		},
+		{
+			// installerServer fills an empty Repo in, so an unconfigured
+			// release source has to be built directly.
+			name: "no release repository",
+			build: func(t *testing.T) *Server {
+				return New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{DevServiceToken: testServiceToken})
+			},
+			wants: "CP_RELEASE_REPO",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.build(t)
+
+			rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/bootstrap-tokens", `{"type":"general"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST bootstrap-tokens = %d, want 201; body %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				AgentVersion      string `json:"agentVersion"`
+				AgentVersionError string `json:"agentVersionError"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("unreadable JSON: %v", err)
+			}
+			if body.AgentVersion != "" {
+				t.Errorf("agentVersion = %q, want empty: this control plane cannot serve an installer, "+
+					"and a version here is a command that fails after the operator has already pasted it",
+					body.AgentVersion)
+			}
+			if !strings.Contains(body.AgentVersionError, tc.wants) {
+				t.Errorf("agentVersionError = %q, want it to name %s — the setting is on this side, so "+
+					"the sentence naming it has to come from this side too", body.AgentVersionError, tc.wants)
+			}
+			// And it is the SAME sentence the installer route answers with, so
+			// an operator reading the dialog and an operator reading a curl get
+			// one explanation rather than two paraphrases.
+			script := get(t, s, "/install.sh")
+			if script.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET /install.sh = %d, want 503", script.Code)
+			}
+			if !strings.Contains(script.Body.String(), body.AgentVersionError) {
+				t.Errorf("the dialog is told %q and the terminal %q; two wordings of one problem is two "+
+					"things to keep true", body.AgentVersionError, script.Body.String())
+			}
+		})
+	}
+}
+
+// The dashboard's agent-upgrade button sends no version, because which release
+// an agent upgrades TO is the same question this file already answers: the agent
+// downloads it through /dl, which serves exactly one.
+func TestAnAgentUpgradeWithNoVersionTakesTheOneTheControlPlaneServes(t *testing.T) {
+	// Deliberately NOT the fixture's default tag: a handler that answered with a
+	// hard-coded v0.3.0 — or with the version it was built from — would pass
+	// against testReleaseVersion and prove nothing about where the answer came
+	// from.
+	const pinned = "v7.1.4"
+	s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: pinned})
+
+	rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent-update with no version = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var body struct{ Version string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unreadable JSON: %v", err)
+	}
+	if body.Version != pinned {
+		t.Errorf("queued version = %q, want %q — the agent fetches its new binary from this control "+
+			"plane's /dl route, so any other answer is an upgrade to something it will refuse to serve",
+			body.Version, pinned)
+	}
+
+	// An unpinned control plane refuses rather than queueing an upgrade to "dev".
+	unpinned, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{Version: "dev"})
+	rec = postAsToken(unpinned, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update", `{}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("agent-update on an unpinned control plane = %d, want 422; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CP_AGENT_VERSION") {
+		t.Errorf("the refusal does not name the setting to fix: %s", rec.Body.String())
+	}
+}
+
+// A tag the caller names explicitly is still accepted — that is how a fleet is
+// pinned or rolled back — and it is checked against the SAME pattern the
+// installer routes use. It used to have its own stricter spelling, which would
+// have refused a prerelease tag the proxy serves happily: a disagreement waiting
+// for the first `-rc` release.
+func TestAnExplicitAgentVersionIsCheckedAgainstTheInstallerRoutesOwnPattern(t *testing.T) {
+	s, _ := installerServer(t, releaseWithInstaller(), ReleaseSource{})
+
+	for _, tc := range []struct {
+		version string
+		want    int
+	}{
+		{"v0.4.0", http.StatusOK},
+		{"v0.4.0-rc.1", http.StatusOK},
+		{"latest", http.StatusUnprocessableEntity},
+		{"../../etc/passwd", http.StatusUnprocessableEntity},
+	} {
+		rec := postAsToken(s, testServiceToken, "/v1/orgs/org_1/servers/srv_1/agent-update",
+			`{"version":"`+tc.version+`"}`)
+		if rec.Code != tc.want {
+			t.Errorf("agent-update %q = %d, want %d; body %s", tc.version, rec.Code, tc.want, rec.Body.String())
+		}
+		if tc.want == http.StatusOK && !releaseTagPattern.MatchString(tc.version) {
+			t.Errorf("%q is accepted here but is not a tag the /dl route would serve", tc.version)
+		}
+	}
+}

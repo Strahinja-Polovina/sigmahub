@@ -115,7 +115,11 @@ type Server struct {
 	// requireActor rejects org-scoped tokens presented with no actor header
 	// (SIGMA-82); off by default. The dev wildcard token is exempt.
 	requireActor bool
-	mux          *http.ServeMux
+	// release is where GET /install.sh and GET /dl/{version}/{asset} fetch from,
+	// and the only place the release credential lives. Zero value (no Repo) =
+	// both routes answer 503 naming the setting. See installer.go.
+	release ReleaseSource
+	mux     *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
@@ -192,6 +196,12 @@ type Options struct {
 	// RequireActor makes a valid actor header mandatory on org-scoped tokens
 	// (SIGMA-82); off by default (the dev wildcard token is always exempt).
 	RequireActor bool
+	// Release configures the two unauthenticated installer routes: which
+	// repository's releases they serve, which tag GET /install.sh is pinned to,
+	// and the server-side GitHub credential that makes a PRIVATE release
+	// repository onboardable. Zero value = the routes answer 503 rather than
+	// guessing a repository. See installer.go for the whole security argument.
+	Release ReleaseSource
 }
 
 // New builds the HTTP surface.
@@ -227,6 +237,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		paddleWebhookSecret: opts.PaddleWebhookSecret,
 		paddlePriceID:       opts.PaddlePriceID,
 		requireActor:        opts.RequireActor,
+		release:             opts.Release.normalized(),
 		mux:                 http.NewServeMux(),
 	}
 	s.routes()
@@ -236,6 +247,18 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// Agent onboarding downloads. UNAUTHENTICATED by necessity — the host being
+	// onboarded holds no credential yet, and the bootstrap token in the rendered
+	// command belongs to the agent, not to a download. They exist so a PRIVATE
+	// release repository can be onboarded from: the control plane fetches from
+	// GitHub with a server-side credential, so nothing an operator pastes into a
+	// terminal carries one. installer.go argues the whole surface — why the
+	// asset name is an allowlist rather than a sanitised path, why cosign
+	// verification is untouched by a proxy, and why neither route is rate
+	// limited or cached here.
+	s.mux.HandleFunc("GET /install.sh", s.handleInstallScript)
+	s.mux.HandleFunc("GET /dl/{version}/{asset}", s.handleReleaseAsset)
 
 	// Org provisioning (dedicated token; mints the org's web credential).
 	s.mux.HandleFunc("POST /v1/orgs", s.requireProvision(s.handleProvisionOrg))

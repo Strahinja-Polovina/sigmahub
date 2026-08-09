@@ -4,12 +4,24 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
+
+// DefaultReleaseRepo is the repository whose releases publish install.sh and the
+// sigmad assets. It is the same default agent/packaging/install.sh spells as
+// SIGMAHUB_REPO and the dashboard spells as SIGMAHUB_RELEASE_REPO, so an
+// unmodified deployment of all three agrees with itself out of the box.
+const DefaultReleaseRepo = "Strahinja-Polovina/sigmahub"
+
+// releaseRepoPattern is GitHub's own owner/name vocabulary. Nothing outside it —
+// no scheme, no second slash, no query string, no traversal — reaches a URL that
+// a release credential is attached to.
+var releaseRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Config struct {
 	// Addr is the HTTP listen address, e.g. ":8080".
@@ -90,6 +102,39 @@ type Config struct {
 	// credential rather than this one, because that is the question the wizard
 	// is really asking.
 	HuggingFaceToken string
+	// Agent-installer serving (SIGMA-217). The control plane serves
+	// GET /install.sh and proxies the pinned release assets from
+	// GET /dl/{version}/{asset}, so a host being onboarded talks only to the
+	// control plane it already has to reach.
+	//
+	// ReleaseToken (CP_RELEASE_TOKEN) is the whole point: a GitHub token with
+	// contents:read, held SERVER-SIDE, which is what makes a PRIVATE release
+	// repository onboardable at all. Before it, every asset was an
+	// unauthenticated curl at github.com and a private repository 404'd all six,
+	// leaving an operator no way forward except making the repository public.
+	//
+	// It is OPTIONAL, and deliberately so: with no token the proxy falls through
+	// to the unauthenticated browser-download URL, which is both correct and
+	// cheaper for a public release — GitHub's anonymous REST API allows 60
+	// requests an hour and one onboarding costs six, so routing public installs
+	// through the authenticated path would break them at ten hosts an hour.
+	//
+	// ReleaseRepo (CP_RELEASE_REPO) is which repository's releases those are. It
+	// defaults to the upstream slug — the same default agent/packaging/install.sh
+	// and the dashboard already carry — so an unmodified deployment needs no
+	// configuration; a self-hoster running their own (private) fork points it at
+	// theirs, which is exactly the case that produced this work.
+	//
+	// AgentVersion (CP_AGENT_VERSION) pins which release GET /install.sh serves.
+	// Empty means "the release this control plane was itself built from", which
+	// is the honest default: cp and agent ship from one tag (.goreleaser.yaml
+	// builds both), so a control plane from v0.3.0 serves the v0.3.0 installer
+	// with nothing set. It is settable for the two cases where that is wrong — a
+	// source build, whose version stamp is "dev", and an operator holding the
+	// fleet's agents at an older tag than the control plane.
+	ReleaseRepo  string
+	ReleaseToken string
+	AgentVersion string
 	// RequireActor (CP_REQUIRE_ACTOR=true) makes a valid X-Sigmahub-Actor header
 	// mandatory on org-scoped service tokens (SIGMA-82). Off by default: the
 	// actor header only ever NARROWS a token's role and is self-signed by the
@@ -122,6 +167,9 @@ func FromEnv() (Config, error) {
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
 		HuggingFaceToken:        strings.TrimSpace(os.Getenv("CP_HUGGING_FACE_TOKEN")),
+		ReleaseRepo:             strings.TrimSpace(getenv("CP_RELEASE_REPO", DefaultReleaseRepo)),
+		ReleaseToken:            strings.TrimSpace(os.Getenv("CP_RELEASE_TOKEN")),
+		AgentVersion:            strings.TrimSpace(os.Getenv("CP_AGENT_VERSION")),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("CP_DATABASE_URL is required")
@@ -153,6 +201,36 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.Env == "dev" && cfg.ProvisionToken == "" {
 		cfg.ProvisionToken = "dev-provision-token"
+	}
+	// The release slug is concatenated into the GitHub URLs the installer proxy
+	// fetches, so a value with a slash, a scheme or a query string in it would
+	// be an operator-supplied redirect of a credentialed request. Fail boot on
+	// anything that is not owner/name — an unauthenticated route holding a
+	// private-repository token is not the place to be lenient about input.
+	if !releaseRepoPattern.MatchString(cfg.ReleaseRepo) {
+		return Config{}, fmt.Errorf(`CP_RELEASE_REPO must be "owner/name" (e.g. %s), got %q`, DefaultReleaseRepo, cfg.ReleaseRepo)
+	}
+	// And it must be the repository install.sh verifies against.
+	//
+	// SIGMAHUB_REPO in agent/packaging/install.sh is the cosign TRUST ANCHOR —
+	// the certificate-identity regexp the release signature is checked against —
+	// and the install command deliberately does not pass it, because a command
+	// that carried its own trust anchor would let whoever wrote the command
+	// choose who to trust. So the anchor is the literal baked into the script.
+	//
+	// Pointing this at a fork therefore proxies the fork's artifacts to a script
+	// that verifies them against THIS repository, and the operator finds out at
+	// `cosign verification failed — refusing to install`: on the host, after the
+	// one-time bootstrap key has already been dropped and spent. Serving a fork
+	// needs the anchor to move with the bytes, which is a change to the script
+	// and not to a setting, so the honest answer today is a startup error rather
+	// than a promise the install cannot keep.
+	if cfg.ReleaseRepo != DefaultReleaseRepo {
+		return Config{}, fmt.Errorf("CP_RELEASE_REPO is %q, but the agent installer cosign-verifies releases "+
+			"against %s and the install command does not carry a trust anchor — a host would download the fork's "+
+			"artifacts and refuse to install them. Serve releases from %s, or change SIGMAHUB_REPO in "+
+			"agent/packaging/install.sh and ship your own agent build",
+			cfg.ReleaseRepo, DefaultReleaseRepo, DefaultReleaseRepo)
 	}
 	// Paddle env must be sandbox|production; a typo must not silently point
 	// live billing at the wrong API base.
