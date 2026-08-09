@@ -210,6 +210,28 @@ func FromEnv() (Config, error) {
 	if !releaseRepoPattern.MatchString(cfg.ReleaseRepo) {
 		return Config{}, fmt.Errorf(`CP_RELEASE_REPO must be "owner/name" (e.g. %s), got %q`, DefaultReleaseRepo, cfg.ReleaseRepo)
 	}
+	// And it must be the repository install.sh verifies against.
+	//
+	// SIGMAHUB_REPO in agent/packaging/install.sh is the cosign TRUST ANCHOR —
+	// the certificate-identity regexp the release signature is checked against —
+	// and the install command deliberately does not pass it, because a command
+	// that carried its own trust anchor would let whoever wrote the command
+	// choose who to trust. So the anchor is the literal baked into the script.
+	//
+	// Pointing this at a fork therefore proxies the fork's artifacts to a script
+	// that verifies them against THIS repository, and the operator finds out at
+	// `cosign verification failed — refusing to install`: on the host, after the
+	// one-time bootstrap key has already been dropped and spent. Serving a fork
+	// needs the anchor to move with the bytes, which is a change to the script
+	// and not to a setting, so the honest answer today is a startup error rather
+	// than a promise the install cannot keep.
+	if cfg.ReleaseRepo != DefaultReleaseRepo {
+		return Config{}, fmt.Errorf("CP_RELEASE_REPO is %q, but the agent installer cosign-verifies releases "+
+			"against %s and the install command does not carry a trust anchor — a host would download the fork's "+
+			"artifacts and refuse to install them. Serve releases from %s, or change SIGMAHUB_REPO in "+
+			"agent/packaging/install.sh and ship your own agent build",
+			cfg.ReleaseRepo, DefaultReleaseRepo, DefaultReleaseRepo)
+	}
 	// Paddle env must be sandbox|production; a typo must not silently point
 	// live billing at the wrong API base.
 	switch cfg.PaddleEnv {

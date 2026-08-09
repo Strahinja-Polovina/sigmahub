@@ -1,6 +1,9 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -220,9 +223,15 @@ func TestReleaseRepoMustBeAnOwnerAndNameOrBootFails(t *testing.T) {
 		want    string
 	}{
 		{"unset uses the upstream release repository", "", false, DefaultReleaseRepo},
-		{"a fork is one setting", "acme/sigmahub", false, "acme/sigmahub"},
-		{"dots and dashes are legal repository names", "acme-co/sigma.hub_v2", false, "acme-co/sigma.hub_v2"},
-		{"whitespace tolerated", "  acme/sigmahub  ", false, "acme/sigmahub"},
+		{"whitespace tolerated", "  " + DefaultReleaseRepo + "  ", false, DefaultReleaseRepo},
+		// A well-formed FORK is refused, and that is the point rather than an
+		// omission: install.sh cosign-verifies against DefaultReleaseRepo and
+		// the install command carries no trust anchor, so proxying a fork's
+		// artifacts produces "cosign verification failed" on the host, after
+		// the one-time bootstrap key has been spent. A startup error is the
+		// honest form of a promise the install cannot keep.
+		{"a well-formed fork is refused, because the script would not trust it", "acme/sigmahub", true, ""},
+		{"dots and dashes are legal repository names but still not the anchor", "acme-co/sigma.hub_v2", true, ""},
 		{"an owner with no repository", "acme", true, ""},
 		{"a trailing path segment", "acme/sigmahub/releases", true, ""},
 		{"a full url", "https://github.com/acme/sigmahub", true, ""},
@@ -280,5 +289,32 @@ func TestTheReleaseCredentialAndVersionPinAreOptional(t *testing.T) {
 	// header GitHub rejects with a 401 that reads like a permissions problem.
 	if cfg.ReleaseToken != "ghp_x" || cfg.AgentVersion != "v0.3.0" {
 		t.Fatalf("ReleaseToken = %q, AgentVersion = %q, want both trimmed", cfg.ReleaseToken, cfg.AgentVersion)
+	}
+}
+
+// The cosign trust anchor and the repository the control plane proxies are one
+// fact in two languages, and nothing tied them together.
+//
+// install.sh bakes SIGMAHUB_REPO in as the certificate-identity the release
+// signature is verified against, and deliberately does not accept it from the
+// install command — a command carrying its own trust anchor lets whoever wrote
+// the command choose who to trust. So if CP_RELEASE_REPO ever names a different
+// repository, the control plane proxies artifacts the script will refuse, and
+// the operator learns it on the host after the one-time bootstrap key is spent.
+func TestTheReleaseRepoIsTheRepositoryInstallShVerifiesAgainst(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "agent", "packaging", "install.sh"))
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	// The default assignment, as the script writes it:
+	//   SIGMAHUB_REPO="${SIGMAHUB_REPO:-owner/name}"
+	m := regexp.MustCompile(`SIGMAHUB_REPO="\$\{SIGMAHUB_REPO:-([^}"]+)\}"`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("install.sh no longer assigns a default SIGMAHUB_REPO; the cosign trust anchor moved " +
+			"and this guard can no longer see it")
+	}
+	if got := string(m[1]); got != DefaultReleaseRepo {
+		t.Errorf("install.sh verifies against %q, DefaultReleaseRepo is %q — the control plane would "+
+			"serve one repository's artifacts to a script that trusts another's", got, DefaultReleaseRepo)
 	}
 }

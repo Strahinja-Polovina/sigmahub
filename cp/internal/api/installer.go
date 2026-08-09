@@ -320,6 +320,25 @@ func (s *Server) handleReleaseAsset(w http.ResponseWriter, r *http.Request) {
 			"%q is not a release tag. The version segment must be a published tag such as v0.3.0.", version))
 		return
 	}
+	// One version, and it is the one this control plane is pinned to.
+	//
+	// Validating only the tag's SHAPE turned the route into an anonymous mirror
+	// of every release the repository has ever published — the private binaries
+	// and checksums for all of them, to anyone who can reach the control plane,
+	// which is the exact property an operator keeps a repository private for.
+	// The 200/404 split was a tag-existence oracle on top.
+	//
+	// The pin is not a restriction on onboarding: the command the wizard renders
+	// carries this same version, so the only caller that ever asks for another
+	// one is not onboarding a host. It is checked BEFORE the allowlist so that
+	// nothing about which assets exist leaks for a tag we do not serve.
+	if version != s.release.Version {
+		s.log.Warn("release proxy refused a version it does not serve", "version", version, "asset", asset)
+		s.writeInstallerError(w, http.StatusNotFound, fmt.Sprintf(
+			"this control plane serves release %s, not %s. Re-open the connect dialog to get a command for the release it is pinned to.",
+			s.release.Version, version))
+		return
+	}
 	if _, ok := allowedAsset(version, asset); !ok {
 		s.log.Warn("release proxy refused an asset", "version", version, "asset", asset)
 		s.writeInstallerError(w, http.StatusNotFound, fmt.Sprintf(

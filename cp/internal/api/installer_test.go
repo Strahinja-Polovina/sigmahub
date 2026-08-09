@@ -668,3 +668,47 @@ func TestTheArchiveAllowlistFollowsTheArchitecturesTheReleasePublishes(t *testin
 		t.Error("the proxy serves an architecture the release does not build, which is a free-form segment in the upstream URL")
 	}
 }
+
+// The proxy serves ONE release: the one this control plane is pinned to.
+//
+// Validating only the tag's shape turned an unauthenticated route into an
+// anonymous mirror of every release the repository has ever published — the
+// private binaries and checksums for all of them, to anyone who can reach the
+// control plane, which is the exact property an operator keeps a repository
+// private for. The 200/404 split was a tag-existence oracle on top of it.
+//
+// It costs onboarding nothing: the command the wizard renders carries the
+// pinned version, so the only caller asking for another one is not onboarding.
+func TestOnlyThePinnedReleaseIsServed(t *testing.T) {
+	gh := releaseWithInstaller()
+	// A second, older release the repository also published.
+	gh.add(fakeAsset{tag: "v0.1.0", name: "sigmad_0.1.0_linux_amd64.tar.gz", body: []byte("PRIVATE BINARY v0.1.0")})
+	gh.add(fakeAsset{tag: "v0.1.0", name: "checksums.txt", body: []byte("old checksums")})
+	s, _ := installerServer(t, gh, ReleaseSource{})
+
+	for _, path := range []string{
+		"/dl/v0.1.0/sigmad_0.1.0_linux_amd64.tar.gz",
+		"/dl/v0.1.0/checksums.txt",
+		"/dl/v0.1.0/install.sh",
+	} {
+		rec := get(t, s, path)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: an unpinned release is a private artifact this route "+
+				"has no business republishing (body: %s)", path, rec.Code, rec.Body.String())
+		}
+	}
+	// A tag that does not exist upstream answers the same way as one that does
+	// but is not served, so the route is not an existence oracle either.
+	missing := get(t, s, "/dl/v9.9.9/checksums.txt")
+	present := get(t, s, "/dl/v0.1.0/checksums.txt")
+	if missing.Code != present.Code {
+		t.Errorf("an unpublished tag answers %d and a published-but-unserved one %d; the difference "+
+			"tells an anonymous caller which releases exist", missing.Code, present.Code)
+	}
+
+	// And the pinned one still works, so the refusal is about the version
+	// rather than about the route.
+	if rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt"); rec.Code != http.StatusOK {
+		t.Fatalf("the pinned release stopped being served: %d %s", rec.Code, rec.Body.String())
+	}
+}

@@ -23,6 +23,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const CP_URL = "https://cp.example.com";
+/** What cpPublicUrl() answers. Mutable because the scheme is now part of the
+ *  contract — the command pipes this URL into `sudo bash`, so a test has to be
+ *  able to hand it a plaintext one. */
+let publicUrl = CP_URL;
 const VERSION = "v0.3.0";
 const TOKEN = "sbt_testtoken";
 
@@ -49,7 +53,7 @@ vi.mock("@/server/cp", () => {
   };
   return {
     cpEnabled: () => true,
-    cpPublicUrl: () => CP_URL,
+    cpPublicUrl: () => publicUrl,
     cpReissueBootstrapToken: async () => ({
       token: TOKEN,
       bootstrapPubkey: "ssh-ed25519 AAAA sigmahub-bootstrap",
@@ -167,5 +171,30 @@ describe("the install command the connect wizard renders", () => {
   it("refuses \"latest\", which is a tag no release asset is published under", async () => {
     process.env.SIGMAHUB_AGENT_VERSION = "latest";
     await expect(renderedCommand()).rejects.toThrow(/released tag/);
+  });
+});
+
+// install.sh is the ONE artifact cosign does not cover, because install.sh is
+// what runs cosign. Its integrity has always rested on TLS — the command used
+// to hard-code https://github.com/… — and moving the fetch to the control plane
+// moved that trust without moving the requirement with it. The deployment guide
+// shipped an http:// public URL and the control plane terminates no TLS itself,
+// so the documented default piped plaintext into `sudo bash`: an on-path
+// attacker goes from reading a bootstrap token to root on every host onboarded.
+describe("the install command refuses to pipe plaintext into sudo bash", () => {
+  afterEach(() => {
+    publicUrl = CP_URL;
+  });
+
+  it("throws when the control plane's public URL is not https", async () => {
+    for (const url of ["http://cp.example.com", "http://10.0.0.5:8080"]) {
+      publicUrl = url;
+      await expect(renderedCommand()).rejects.toThrow(/https/i);
+    }
+  });
+
+  it("names the setting to change rather than the symptom", async () => {
+    publicUrl = "http://cp.example.com";
+    await expect(renderedCommand()).rejects.toThrow(/SIGMAHUB_CP_PUBLIC_URL/);
   });
 });

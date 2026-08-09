@@ -78,6 +78,27 @@ function agentVersion(): string {
  *  github.com would. */
 function installCommand(token: string): string {
   const ep = cpPublicUrl();
+  // install.sh is the ONE artifact cosign does not cover, because install.sh is
+  // what runs cosign. Its integrity has always rested on TLS: the old command
+  // hard-coded https://github.com/…, and moving the fetch to the control plane
+  // moved that trust to TLS against the control plane without moving the
+  // requirement with it. The deployment guide shipped
+  // SIGMAHUB_CP_PUBLIC_URL=http://your-host:8080 and the control plane
+  // terminates no TLS of its own, so the documented default piped plaintext
+  // into `sudo bash` — an on-path attacker goes from reading a bootstrap token
+  // to root on every host being onboarded.
+  //
+  // Refused here rather than warned about, and for the same reason
+  // agentVersion() refuses "latest" below: the alternative is a command that
+  // looks fine, works, and is a remote code execution primitive on the network
+  // between the operator and their control plane.
+  if (!ep.startsWith("https://")) {
+    throw new Error(
+      `The install command pipes a script from ${ep || "the control plane"} straight into sudo bash, so it ` +
+        "must be fetched over TLS. Set SIGMAHUB_CP_PUBLIC_URL to an https:// URL — put the control plane " +
+        "behind the TLS terminator you already run, and use its address here."
+    );
+  }
   const version = agentVersion();
   return (
     `curl -fsSL ${ep}/install.sh | ` +
