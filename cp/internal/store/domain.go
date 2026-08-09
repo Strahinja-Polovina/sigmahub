@@ -496,6 +496,28 @@ func buildMethodFromSpec(spec json.RawMessage) string {
 	return s.Build.Method
 }
 
+// specHasComposeServices reports whether the spec carries a non-empty compose
+// service graph.
+//
+// Non-empty is the test, not merely present: `"compose": {"services": []}` is
+// the same nothing as an absent block — it renders no containers — and it is
+// what a detection that found a compose file it could not parse would leave
+// behind.
+func specHasComposeServices(spec json.RawMessage) bool {
+	if len(bytes.TrimSpace(spec)) == 0 {
+		return false
+	}
+	var s struct {
+		Compose *struct {
+			Services []json.RawMessage `json:"services"`
+		} `json:"compose"`
+	}
+	if err := json.Unmarshal(spec, &s); err != nil || s.Compose == nil {
+		return false
+	}
+	return len(s.Compose.Services) > 0
+}
+
 // CreateResource enforces the domain rules the UI can't be trusted with:
 // known kind, availability matrix against the server's type, and the server
 // actually being attached to the target environment.
@@ -527,8 +549,31 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// terrible first one: by then the resource exists, the operator has closed
 	// the wizard, and the failure surfaces as a red deployment. Refuse it here,
 	// symmetric with the engine gates above.
-	if method := buildMethodFromSpec(in.Spec); method != "" && !gitdetect.ValidBuildMethod(method) {
-		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown build method %q", method)}
+	if method := buildMethodFromSpec(in.Spec); method != "" {
+		if !gitdetect.ValidBuildMethod(method) {
+			return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown build method %q", method)}
+		}
+		// A Compose app IS its service graph, and spec.compose is the only thing
+		// that tells the reconciler to treat it as one. Without it the render
+		// takes the single-container path: one image built from a Dockerfile the
+		// repository may not have, and every other service never built, never
+		// started and never mentioned anywhere.
+		//
+		// That combination used to be accepted. What the operator saw was an app
+		// that simply never came up, next to a service-graph panel answering 404
+		// — which the dashboard reports as "the control plane didn't answer",
+		// because a resource with no graph and a control plane that cannot be
+		// reached are the same response to a page that only asked one question.
+		// Nothing anywhere said the resource was missing the one field its build
+		// method depends on.
+		//
+		// Refused here for the reason stated above about builders: the agent is
+		// the right LAST line of defence and a terrible first one, since by then
+		// the resource exists and the wizard has closed.
+		if method == gitdetect.BuildCompose && !specHasComposeServices(in.Spec) {
+			return Resource{}, ErrInvalid{Msg: "this app is set to build from Docker Compose but carries no service graph — " +
+				"re-run detection on the repository so the compose file's services are read, or pick a different build method"}
+		}
 	}
 	// SIGMA-214: look the requested model up BEFORE the transaction opens. The
 	// lookup is a call to huggingface.co, and a transaction held open across a
