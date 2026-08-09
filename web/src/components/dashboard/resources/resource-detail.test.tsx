@@ -157,6 +157,16 @@ describe("ResourceDetail links to the running app", () => {
   });
 });
 
+describe("ResourceDetail logs", () => {
+  it("Refresh re-fetches the log tail", () => {
+    renderCp();
+    openTab("Logs");
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+    // The tail is a server render, so refreshing it is refreshing the route.
+    expect(refresh).toHaveBeenCalled();
+  });
+});
+
 describe("ResourceDetail telemetry states", () => {
   it("a telemetry fetch failure appears in the load-failure banner and not as the empty state", () => {
     renderCp({
