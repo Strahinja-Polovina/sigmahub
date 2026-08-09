@@ -160,6 +160,9 @@ func run() error {
 		return out, nil
 	}
 	driver := container.NewDriver(docker, cstore, log, secretFetcher)
+	// Stamp everything this agent creates with its own server id, so its GC can
+	// tell its objects from a peer's on a shared Docker daemon.
+	driver.SetServerID(st.ServerID)
 	// A health-gate failure removes the container it just started, taking the
 	// output that explains the failure with it. Ship that tail to the deploy log
 	// first, under the "startup" stream, so a crash-on-boot deploy shows the

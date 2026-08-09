@@ -31,6 +31,9 @@ type Driver struct {
 	// leaves the behaviour as it was: the container is removed and its account
 	// of why it never started goes with it.
 	startup startupSink
+	// serverID stamps every object this agent creates with its owner, so GC can
+	// leave a peer's containers alone. Empty until registration completes.
+	serverID string
 	// mu serialises the reconcile loop's per-container converge against GC's
 	// prune+remove, so a container GC just removed cannot be resurrected by a
 	// concurrent reconcile working from a stale desired snapshot.
@@ -39,6 +42,11 @@ type Driver struct {
 
 // NewDriver builds a driver. The allowlist ships disabled (see allowlist.go).
 // fetcher may be nil to disable secret injection.
+// SetServerID tells the driver which server it is, so everything it creates
+// carries an owner and GC can tell its own objects from a peer's. Set after
+// registration, because the id does not exist before it.
+func (d *Driver) SetServerID(id string) { d.serverID = id }
+
 func NewDriver(docker *DockerClient, store *Store, log *slog.Logger, fetcher SecretFetcher) *Driver {
 	return &Driver{
 		docker:  docker,
@@ -79,11 +87,15 @@ func (d *Driver) throttle() error {
 	return nil
 }
 
-func managedLabels(resourceID string) map[string]string {
-	return map[string]string{
+func (d *Driver) managedLabels(resourceID string) map[string]string {
+	l := map[string]string{
 		LabelManaged:    "true",
 		LabelResourceID: resourceID,
 	}
+	if d.serverID != "" {
+		l[LabelServerID] = d.serverID
+	}
+	return l
 }
 
 func (d *Driver) opNetworkEnsure(ctx context.Context, op dsd.Op) error {
@@ -119,7 +131,7 @@ func (d *Driver) opVolumeEnsure(ctx context.Context, op dsd.Op) error {
 	if exists {
 		return nil
 	}
-	return d.docker.VolumeCreate(ctx, spec.Name, managedLabels(spec.ResourceID))
+	return d.docker.VolumeCreate(ctx, spec.Name, d.managedLabels(spec.ResourceID))
 }
 
 func (d *Driver) opImagePull(ctx context.Context, op dsd.Op) error {
@@ -340,7 +352,7 @@ func (d *Driver) buildCreateBody(spec ContainerSpec, specHash string) map[string
 	for k, v := range spec.Labels {
 		labels[k] = v
 	}
-	for k, v := range managedLabels(spec.ResourceID) {
+	for k, v := range d.managedLabels(spec.ResourceID) {
 		labels[k] = v
 	}
 	labels[LabelSpecHash] = specHash
