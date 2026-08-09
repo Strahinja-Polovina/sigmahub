@@ -67,6 +67,15 @@ services:
       # released image (goreleaser stamps cp and sigmad from one tag) and is
       # "dev" for a source build — onboarding then refuses, naming this setting.
       CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
+      # Hugging Face account the control plane acts as (SIGMA-213/214, optional).
+      # One setting doing both halves of the LLM path: it authenticates the
+      # model picker's Hub calls, and it is seeded into each inference
+      # endpoint's HUGGING_FACE_HUB_TOKEN so the agent downloads weights as the
+      # same account. Empty is supported — public models search and download
+      # unauthenticated — but then a gated repo (Llama & co) is invisible to the
+      # picker. Missing here entirely was worse than empty: the key could be set
+      # in .env and never reach the process.
+      CP_HUGGING_FACE_TOKEN: ${CP_HUGGING_FACE_TOKEN:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
       # uncomment the volume below; the key is imported into KMS custody on
@@ -75,6 +84,11 @@ services:
       CP_GITHUB_APP_SLUG: ${CP_GITHUB_APP_SLUG:-}
       CP_GITHUB_APP_PRIVATE_KEY_FILE: ${CP_GITHUB_APP_PRIVATE_KEY_FILE:-}
       CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
+      # Overrides the ACME directory for managed-domain TLS (P1-8). Empty means
+      # Let's Encrypt production; point it at LE staging or Pebble on a staging
+      # box, whose repeated bring-ups would otherwise spend the real CA's
+      # per-domain issuance budget.
+      CP_ACME_CA_DIR_URL: ${CP_ACME_CA_DIR_URL:-}
       CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
       # Object-storage engines (P2-2). MinIO-only build: CP_S3_ENGINES=minio.
       CP_S3_ENGINES: ${CP_S3_ENGINES:-minio,seaweedfs}
