@@ -33,13 +33,15 @@ import {
   cpUpdateServerAgent,
 } from "../cp";
 
-/** GitHub repo whose releases host install.sh + the pinned sigmad assets. */
-const RELEASE_REPO = process.env.SIGMAHUB_RELEASE_REPO ?? "Strahinja-Polovina/sigmahub";
-
 /** The released tag the installer pins. The installer needs a concrete release
  *  (its assets embed the version), so a missing value or "latest" is rejected
  *  loudly rather than rendered into a command that 404s at download time
- *  (SIGMA-157). */
+ *  (SIGMA-157).
+ *
+ *  That requirement got stronger, not weaker, once the control plane started
+ *  serving the assets: the version is now a path segment of the download base
+ *  every asset is fetched from, so "latest" would not even reach GitHub to be
+ *  turned down. */
 function agentVersion(): string {
   const v = process.env.SIGMAHUB_AGENT_VERSION;
   if (!v || v === "latest") {
@@ -52,16 +54,35 @@ function agentVersion(): string {
 }
 
 /** The one-line, cosign-verified install command the wizard hands the operator.
- *  install.sh is fetched from the pinned GitHub release (the CP does not serve
- *  it), while SIGMAHUB_ENDPOINT points at the CP's public URL. */
+ *
+ *  Every URL in it is the control plane's. It serves install.sh, and
+ *  SIGMAHUB_DOWNLOAD_BASE sends the five asset downloads the script then makes
+ *  (the sigmad archive, checksums.txt and its .sig/.pem, sigmad.service) back
+ *  through it as well — agent/packaging/install.sh honours that variable for
+ *  all of them, which is why this is a URL to hand over rather than a fetching
+ *  strategy to reimplement.
+ *
+ *  It used to point curl straight at github.com, and that worked only while the
+ *  release repository was PUBLIC: an operator with a private one watched all
+ *  five assets 404 and could not onboard a single server. The control plane
+ *  authenticates to GitHub with its own credential, so the fix costs the
+ *  command nothing — no token appears in a string that gets pasted into a
+ *  terminal, screenshotted into a ticket and left in shell history.
+ *
+ *  What the proxy explicitly does NOT do is vouch for the bytes, and it was
+ *  never asked to. install.sh cosign-verifies checksums.txt against the release
+ *  workflow's keyless OIDC identity before executing anything, and verifies the
+ *  archive and the unit against that checksums.txt; the signature is the
+ *  authenticity and the transport is only reachability. A control plane that
+ *  served a tampered asset would fail that verification exactly as a tampered
+ *  github.com would. */
 function installCommand(token: string): string {
   const ep = cpPublicUrl();
   const version = agentVersion();
-  const scriptUrl = `https://github.com/${RELEASE_REPO}/releases/download/${version}/install.sh`;
   return (
-    `curl -fsSL ${scriptUrl} | ` +
+    `curl -fsSL ${ep}/install.sh | ` +
     `SIGMAHUB_ENDPOINT=${ep} SIGMAHUB_BOOTSTRAP_TOKEN=${token} ` +
-    `SIGMAHUB_VERSION=${version} sudo -E bash`
+    `SIGMAHUB_VERSION=${version} SIGMAHUB_DOWNLOAD_BASE=${ep}/dl/${version} sudo -E bash`
   );
 }
 

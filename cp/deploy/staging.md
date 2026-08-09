@@ -81,9 +81,12 @@ provisions a uniquely-named throwaway org each run.
 
 In the dashboard (or via `POST /v1/orgs/{org}/servers/provision`), add a server;
 drop the returned bootstrap public key onto the host's `authorized_keys` and run
-the printed one-liner to install `sigmad`. The one-liner fetches `install.sh`
-from the pinned GitHub release (`SIGMAHUB_AGENT_VERSION`) and points the agent at
-`SIGMAHUB_CP_PUBLIC_URL`, so both must be set correctly in `.env` for it to run.
+the printed one-liner to install `sigmad`. Every URL in that one-liner is the
+control plane's: it serves `install.sh` and proxies the pinned release's assets
+(`SIGMAHUB_AGENT_VERSION`) with a server-side GitHub credential, so a PRIVATE
+release repository onboards without the host ever talking to github.com. It
+points the agent at `SIGMAHUB_CP_PUBLIC_URL`, so both that and the version must
+be set correctly in `.env` for it to run.
 The agent enrolls, joins the WireGuard mesh, and appears under **Servers**.
 Attach it to the `prod` environment to schedule resources on it.
 

@@ -206,3 +206,79 @@ func TestS3EnginesFromEnv(t *testing.T) {
 		})
 	}
 }
+
+// The installer proxy's settings (SIGMA-217). The repository slug is
+// concatenated into GitHub URLs that a server-side credential is attached to, so
+// this is the one of the three that fails boot: an operator-supplied value with
+// a scheme, a second slash or a traversal in it would redirect a credentialed
+// request, and the routes that use it are unauthenticated.
+func TestReleaseRepoMustBeAnOwnerAndNameOrBootFails(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		val     string // "" ⇒ leave unset (fall through to the default)
+		wantErr bool
+		want    string
+	}{
+		{"unset uses the upstream release repository", "", false, DefaultReleaseRepo},
+		{"a fork is one setting", "acme/sigmahub", false, "acme/sigmahub"},
+		{"dots and dashes are legal repository names", "acme-co/sigma.hub_v2", false, "acme-co/sigma.hub_v2"},
+		{"whitespace tolerated", "  acme/sigmahub  ", false, "acme/sigmahub"},
+		{"an owner with no repository", "acme", true, ""},
+		{"a trailing path segment", "acme/sigmahub/releases", true, ""},
+		{"a full url", "https://github.com/acme/sigmahub", true, ""},
+		{"a traversal", "acme/../../etc", true, ""},
+		{"a query string", "acme/sigmahub?ref=main", true, ""},
+		{"an at-host slug", "acme/sigmahub@evil.example", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CP_DATABASE_URL", "postgres://x")
+			t.Setenv("CP_DB_ENGINES", "")
+			t.Setenv("CP_S3_ENGINES", "")
+			t.Setenv("CP_RELEASE_REPO", tc.val)
+			cfg, err := FromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("CP_RELEASE_REPO accepted %q, which reaches a credentialed GitHub URL", tc.val)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.ReleaseRepo != tc.want {
+				t.Fatalf("ReleaseRepo = %q, want %q", cfg.ReleaseRepo, tc.want)
+			}
+		})
+	}
+}
+
+// The token and the version pin are OPTIONAL on purpose: an unmodified
+// deployment against a public release must onboard with nothing set, and the
+// version falls back to the release this control plane was built from.
+func TestTheReleaseCredentialAndVersionPinAreOptional(t *testing.T) {
+	t.Setenv("CP_DATABASE_URL", "postgres://x")
+	t.Setenv("CP_DB_ENGINES", "")
+	t.Setenv("CP_S3_ENGINES", "")
+	t.Setenv("CP_RELEASE_REPO", "")
+	t.Setenv("CP_RELEASE_TOKEN", "")
+	t.Setenv("CP_AGENT_VERSION", "")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("a control plane with no release settings must still boot: %v", err)
+	}
+	if cfg.ReleaseToken != "" || cfg.AgentVersion != "" {
+		t.Fatalf("ReleaseToken = %q, AgentVersion = %q, want both empty", cfg.ReleaseToken, cfg.AgentVersion)
+	}
+
+	t.Setenv("CP_RELEASE_TOKEN", "  ghp_x  ")
+	t.Setenv("CP_AGENT_VERSION", "  v0.3.0  ")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trimmed, because a token with a stray newline becomes an Authorization
+	// header GitHub rejects with a 401 that reads like a permissions problem.
+	if cfg.ReleaseToken != "ghp_x" || cfg.AgentVersion != "v0.3.0" {
+		t.Fatalf("ReleaseToken = %q, AgentVersion = %q, want both trimmed", cfg.ReleaseToken, cfg.AgentVersion)
+	}
+}

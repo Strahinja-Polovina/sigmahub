@@ -27,9 +27,16 @@ export const MANUAL_UNINSTALL_SCRIPT = `#!/usr/bin/env bash
 # Named volumes are KEPT unless you ask for them: they hold database data
 # directories and uploaded files, which are yours and outlive this machine.
 #
-# Usage:
-#   curl -fsSL https://<host>/uninstall.sh | sudo bash
-#   curl -fsSL https://<host>/uninstall.sh | sudo bash -s -- --purge-volumes
+# Usage — the dashboard's Force disconnect dialog renders this script in full,
+# to be copied onto the host and run there:
+#
+#   sudo bash uninstall.sh
+#   sudo bash uninstall.sh --purge-volumes
+#
+# It used to say \`curl -fsSL https://<host>/uninstall.sh | sudo bash\`. No host
+# has ever served that path, so the one instruction on the page was a dead end —
+# followed by someone whose graceful teardown had just failed, on a machine they
+# were trying to get back.
 set -uo pipefail
 
 PURGE_VOLUMES=0

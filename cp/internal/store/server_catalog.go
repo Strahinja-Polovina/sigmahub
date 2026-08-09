@@ -687,6 +687,22 @@ func SupportedDistros() []string {
 	return out
 }
 
+// SupportedArches lists the CPU architectures a host can run sigmad on at all —
+// the release's build matrix, not any one server type's narrowing of it (that is
+// ServerRequirementsFor(t).Arches, and gpu narrows it).
+//
+// It exists so callers outside this package stop retyping "amd64", "arm64".
+// api/installer.go builds the release-asset allowlist from it, which means the
+// set of archives the control plane will proxy follows the set of archives the
+// release publishes: installer_vocabulary_test.go already pins this list to
+// agent/packaging/install.sh, and the agent module pins that same line to
+// selfupdate.SupportedArches and the goreleaser matrix.
+func SupportedArches() []string {
+	out := make([]string, len(bothArches))
+	copy(out, bothArches)
+	return out
+}
+
 // SupportedDistroSentence renders the operator-facing list ("Ubuntu 22.04,
 // Ubuntu 24.04 or Debian 12") so the rejection message follows the catalog
 // instead of being retyped next to every check.

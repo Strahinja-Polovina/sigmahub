@@ -46,6 +46,25 @@ services:
       # CP's own public base URL (e.g. https://cp.example.com). With the
       # webhook secret set, connecting a repo auto-registers its push webhook.
       CP_PUBLIC_URL: ${CP_PUBLIC_URL:-}
+      # The agent installer the control plane serves (SIGMA-217). The host being
+      # onboarded fetches install.sh and every release asset from the CP, which
+      # fetches them from GitHub with the token below — so a PRIVATE release
+      # repository can be onboarded from without the credential ever appearing
+      # in the command an operator pastes into a root shell.
+      #
+      # Both are OPTIONAL: empty repo falls through to the upstream slug, and
+      # empty token means an unauthenticated fetch, which is what a public
+      # release wants (GitHub's anonymous REST API allows 60 requests an hour
+      # and one onboarding costs six). A self-hoster with a private fork sets
+      # both.
+      CP_RELEASE_REPO: ${CP_RELEASE_REPO:-}
+      CP_RELEASE_TOKEN: ${CP_RELEASE_TOKEN:-}
+      # Which release the CP serves the installer for. Fed from the SAME .env
+      # value the dashboard renders into the install command, deliberately: two
+      # keys for one version is a control plane serving the v0.3.0 installer to
+      # a command that asks it to install v0.4.0. Unset falls back to the
+      # release this control-plane binary was built from.
+      CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
       # uncomment the volume below; the key is imported into KMS custody on

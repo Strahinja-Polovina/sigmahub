@@ -421,6 +421,23 @@ func run() error {
 		}
 	}()
 
+	// Which release the installer routes serve. Unset means "the one this
+	// binary was built from": .goreleaser.yaml builds sigmahub-cp and sigmad
+	// from a single tag and stamps both with it, so a released control plane is
+	// already pinned to a matching agent and needs no configuration. A source
+	// build stamps "dev", which is not a release tag — GET /install.sh then
+	// answers 503 naming CP_AGENT_VERSION rather than fetching a tag that does
+	// not exist.
+	agentVersion := cfg.AgentVersion
+	if agentVersion == "" {
+		agentVersion = version
+	}
+	// The credential itself is never logged, here or anywhere else — only
+	// whether one is configured, which is the question an operator debugging a
+	// 404 from a private repository actually has.
+	log.Info("agent installer served from release repository",
+		"repo", cfg.ReleaseRepo, "version", agentVersion, "authenticated", cfg.ReleaseToken != "")
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: api.New(log, st, st, st, api.Options{
@@ -453,6 +470,11 @@ func run() error {
 			PaddleWebhookSecret:  cfg.PaddleWebhookSecret,
 			PaddlePriceID:        cfg.PaddlePriceID,
 			RequireActor:         cfg.RequireActor,
+			Release: api.ReleaseSource{
+				Repo:    cfg.ReleaseRepo,
+				Version: agentVersion,
+				Token:   cfg.ReleaseToken,
+			},
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
