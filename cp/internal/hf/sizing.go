@@ -17,8 +17,8 @@ package hf
 // is not entirely ours to use; each is documented at its declaration. A third,
 // SizedContextTokens, does not appear in the expression and is the reason the
 // expression is true at all: the KV term budgets ONE context length, and the
-// runtime has to be started at that same length or this arithmetic describes a
-// deployment nobody made.
+// runtime has to be started at that length or shorter (see ServedContextTokens)
+// or this arithmetic describes a deployment nobody made.
 //
 // The estimate is deliberately a little pessimistic, and it errs in the safe
 // direction ONLY when the parameter count is real. When it is a guess there is
@@ -48,8 +48,11 @@ const (
 	KVActivationFactor = 1.20
 
 	// SizedContextTokens is the context window the formula above is arithmetic
-	// FOR, and so the window the runtime must be pinned to — vLLM's
-	// --max-model-len, rendered by the store from this constant.
+	// FOR, and so the CEILING on the window the runtime may be pinned to —
+	// vLLM's --max-model-len. It is not the flag's value on its own: a model
+	// whose own maximum is shorter is pinned to that instead, because vLLM
+	// refuses to start otherwise. ServedContextTokens is the whole decision, and
+	// the store renders the flag from it, never from this constant.
 	//
 	// It is the half of SIGMA-214 the first cut left out. With no --max-model-len
 	// vLLM takes the model's max_position_embeddings, and for Llama-3.1 that is
@@ -65,9 +68,9 @@ const (
 	// 8192 is long enough for the chat and retrieval shapes people deploy and
 	// short enough that the 20% headroom is real at 8B on a 24 GB card, which is
 	// the machine this feature was designed against. It is EXPORTED because the
-	// store renders it into the start command: a literal there and a factor here
-	// drift apart on the first change to either, and the drift is invisible
-	// until a container exits.
+	// start command the store renders derives from it: a literal there and a
+	// factor here drift apart on the first change to either, and the drift is
+	// invisible until a container exits.
 	SizedContextTokens = 8192
 
 	// UtilizationCap is vLLM's default --gpu-memory-utilization. The runtime
@@ -77,6 +80,61 @@ const (
 	// check at all.
 	UtilizationCap = 0.90
 )
+
+// ServedContextTokens is the context window an endpoint for this model may
+// actually be started at: the smaller of what the sizing paid for
+// (SizedContextTokens) and what the model itself allows
+// (maxPositionEmbeddings, as carried on ModelCard). It is the number the store
+// renders into vLLM's --max-model-len.
+//
+// The clamp is not politeness. vLLM's _get_and_verify_max_len RAISES on a
+// window longer than the model's own:
+//
+//	ValueError: User-specified max_model_len (8192) is greater than the derived
+//	max_model_len (max_position_embeddings=2048 ...). To allow overriding this
+//	maximum, set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+//
+// Pinning every endpoint to SizedContextTokens therefore killed precisely the
+// models that fit best. TinyLlama-1.1B-Chat (2048 tokens) is the catalogue's
+// "fits anything" pick — 2.9 GB against a 40 GiB card, a green tick on every
+// screen — and Llama-2-13B-chat-AWQ (4096) is its quantized one; both were
+// approved by the fit check and both exited at startup on a host billed at GPU
+// rates. That is SIGMA-214's own failure inverted: long-context models used to
+// die, and then short-context ones did.
+//
+// Clamping DOWN cannot disturb the VRAM estimate. The KV term budgets
+// SizedContextTokens of cache, and a window shorter than that spends less of
+// it, so a clamped endpoint leaves the estimate MORE conservative — the one
+// direction a fit check is allowed to be wrong in.
+//
+// An UNKNOWN ceiling falls back to SizedContextTokens, and this is the third
+// answer to the same question — the first two were both wrong, in opposite
+// directions, so the reasoning is worth stating fully.
+//
+// Pinning everything to 8192 killed short-context models. Rendering no flag at
+// all killed long-context ones, and worse: it made the estimate and the runtime
+// disagree exactly when nothing could check them, because the VRAM formula
+// budgets a SizedContextTokens KV term UNCONDITIONALLY while an unpinned vLLM
+// takes 131072. The fit check would still draw green.
+//
+// The asymmetry that settles it is which models land in the unknown branch.
+// A ceiling is unknown when config.json could not be read, and that is the
+// GATED repositories — Llama and its kin, whose ceilings are far above 8192, so
+// clamping them is exactly right. A model whose real ceiling is BELOW 8192 is a
+// small, ungated one whose config.json reads fine, so it never arrives here. And
+// the two failures are not equal even when the guess is wrong: a window pinned
+// too high is a container that never starts, while one pinned too low is an
+// endpoint that serves shorter prompts than it could — visible, recoverable, and
+// not a crash loop on a GPU-billed host.
+//
+// Zero is therefore never returned. The store's render-time guard against a
+// zero still stands, for rows written before any of this existed.
+func ServedContextTokens(maxPositionEmbeddings int) int {
+	if maxPositionEmbeddings <= 0 {
+		return SizedContextTokens
+	}
+	return min(SizedContextTokens, maxPositionEmbeddings)
+}
 
 // maxPlausibleParameters is where a parameter count stops being a parameter
 // count. Ten trillion is an order of magnitude past the largest model anyone has
@@ -282,12 +340,24 @@ func EngineForModel(library, quantization string) string {
 	return "vllm"
 }
 
-// applySizing fills in everything a ModelCard derives from its own metadata. It
-// is the only writer of Parameters, VRAMBytesRequired and VRAMText.
-func applySizing(card *ModelCard, tags []string, dtype string, safetensorsTotal uint64) {
+// applyRuntime fills in what follows from the repository's FORMAT rather than
+// its size: how it is stored, what would serve it, and what one parameter of it
+// costs on the card.
+//
+// It is separate from applySizing because the two questions have different
+// answers when the Hub refuses to describe a repository at all — a gated model
+// read without a token still gets a runtime, and does NOT get a size (see
+// gatedCard).
+func applyRuntime(card *ModelCard, tags []string, dtype string) {
 	card.Quantization = detectQuantization(card.ID, tags, dtype)
 	card.Engine = EngineForModel(card.Library, card.Quantization)
 	card.BytesPerParam = BytesPerParam(dtype, card.Quantization)
+}
+
+// applySizing fills in everything a ModelCard derives from its own metadata. It
+// is the only writer of Parameters, VRAMBytesRequired and VRAMText.
+func applySizing(card *ModelCard, tags []string, dtype string, safetensorsTotal uint64) {
+	applyRuntime(card, tags, dtype)
 
 	switch {
 	// The upper bound is the one the name path applies, for the same reason:

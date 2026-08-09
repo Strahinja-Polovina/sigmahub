@@ -53,7 +53,7 @@ function modelCard(over: Partial<ModelCard> = {}): ModelCard {
     quantization: "none",
     bytesPerParam: 2,
     vramBytesRequired: 188_143_217_323,
-    vramText: "~188 GB",
+    vramText: "~189 GB",
     sizingBasis: "safetensors",
     ...over,
   };
@@ -251,11 +251,11 @@ describe("a GPU server too small for the chosen model is refused with both sizes
     const small = opts.find((o) => o.server.id === "small");
     expect(small?.eligible).toBe(false);
     expect(small?.reason).toBe(
-      "This model needs about 188 GB of VRAM; this server's GPU has 24 GB."
+      "This model needs about 189 GB of VRAM; this server's GPU has 24 GB."
     );
   });
 
-  // Four 80 GB cards is 320 GB of VRAM and still cannot run a 188 GB model:
+  // Four 80 GB cards is 320 GB of VRAM and still cannot run a 189 GB model:
   // the runtime loads it into one card. A filter that added them up would
   // promise a deploy that OOMs.
   it("compares against one card, not the host's total", () => {
@@ -289,7 +289,7 @@ describe("a GPU server too small for the chosen model is refused with both sizes
       id: "meta-llama/Llama-3.1-8B-Instruct",
       parameters: 8_030_261_248,
       vramBytesRequired: 21_414_029_995,
-      vramText: "~21 GB",
+      vramText: "~21.4 GB",
     });
     expect(serverOptions(envWithCards, "llm", small).every((o) => o.eligible)).toBe(true);
   });
@@ -338,45 +338,51 @@ describe("cluster options are scoped to the environment", () => {
   });
 });
 
-// A cluster was offered for any model at all: it carried no GPU figure, so the
-// wizard had nothing to compare and said yes to everything. The operator picked
-// a 70B model, targeted the cluster, walked Review and got a 422 from the create
-// call — the dead end the whole type-first flow exists to delete, surviving on
-// the one target nobody filtered.
-describe("a cluster is fit-checked against the model exactly as a server is", () => {
-  const inv = buildInventory([], [], []);
+// A model endpoint cannot run inside a cluster on this control plane: nothing
+// renders a cluster-targeted one, and its provisioning is server-scoped, so the
+// create used to die on a foreign-key violation surfaced as a 500. The wizard's
+// answer is the refusal it already had for the stateful engines, one screen
+// earlier — and no VRAM comparison, which is why the cluster listing stopped
+// publishing a GPU figure at all.
+describe("a model endpoint is refused for the cluster itself, at any size", () => {
+  const clusters = [{ id: "cl", name: "prod", environmentId: "env" }];
+  const inv = buildInventory([], clusters, ["postgres", "mysql", "redis", "mongodb", "s3", "llm"]);
 
-  function cluster(maxVramBytesPerGpu?: number) {
-    return [{ id: "cl", name: "prod", environmentId: "env", maxVramBytesPerGpu }];
-  }
-
-  it("refuses a cluster whose largest node is too small, and states both sizes", () => {
-    const [opt] = clusterOptions(cluster(24 * GB), "env", "llm", inv, modelCard());
+  it("refuses the cluster and names where a model endpoint does run", () => {
+    const [opt] = clusterOptions(clusters, "env", "llm", inv);
     expect(opt.eligible).toBe(false);
-    expect(opt.reason).toBe(
-      "This model needs about 188 GB of VRAM; this cluster's largest GPU node has 24 GB."
-    );
+    expect(opt.reason).toContain("GPU server");
+    expect(opt.reason).toContain("rather than inside a cluster");
   });
 
-  it("offers a cluster whose largest node can hold the model", () => {
-    const small = modelCard({
-      id: "meta-llama/Llama-3.1-8B-Instruct",
-      parameters: 8_030_261_248,
-      vramBytesRequired: 21_414_029_995,
-      vramText: "~21 GB",
-    });
-    expect(clusterOptions(cluster(80 * GB), "env", "llm", inv, small).at(0)?.eligible).toBe(true);
+  // The stateful engines and the model endpoint are excluded for unrelated
+  // reasons, and saying the database one about an inference server tells an
+  // operator their model is at risk of data loss — which is false, and leaves
+  // the real reason unsaid.
+  it("does not tell a model endpoint it is a database", () => {
+    const [llm] = clusterOptions(clusters, "env", "llm", inv);
+    expect(llm.reason).not.toContain("data");
+    const [pg] = clusterOptions(clusters, "env", "postgres", inv);
+    expect(pg.reason).toContain("keeps its data on one host");
   });
 
-  // Identical to a server whose agent never reported an inventory: absent is
-  // UNKNOWN, and an unknown must never be the thing that stops a deploy.
-  it("fails open when no node has reported a GPU figure", () => {
-    expect(clusterOptions(cluster(), "env", "llm", inv, modelCard()).at(0)?.eligible).toBe(true);
-    expect(clusterOptions(cluster(0), "env", "llm", inv, modelCard()).at(0)?.eligible).toBe(true);
+  // Not "this model is too big". A cluster row can no longer be handed a model
+  // at all, so nothing here can produce a size sentence — and a size sentence
+  // would be the wrong advice anyway, since no smaller model would help.
+  it("says nothing about VRAM", () => {
+    expect(clusterOptions(clusters, "env", "llm", inv)[0].reason).not.toContain("VRAM");
   });
 
-  it("offers every cluster before a model is chosen", () => {
-    expect(clusterOptions(cluster(24 * GB), "env", "llm", inv).at(0)?.eligible).toBe(true);
+  // The kind exclusion has to reach step ONE as well, and it does by a route
+  // worth pinning: kindAvailability answers "available" for anything a cluster
+  // can host BEFORE it reaches the GPU sentence, so an org with a cluster and no
+  // GPU server would have been offered Model endpoint with no hardware sentence
+  // and no way to deploy it.
+  it("still explains the missing GPU to an org whose only target is a cluster", () => {
+    const verdict = kindAvailability("llm", inv);
+    expect(verdict.available).toBe(false);
+    expect(verdict.reason).toContain("GPU");
+    expect(verdict.action?.href).toBe("/dashboard/servers");
   });
 });
 
@@ -384,7 +390,7 @@ describe("a cluster is fit-checked against the model exactly as a server is", ()
 // `model` reached serverOptions and never reached clusterOptions, and no suite
 // could see it because the wiring lived in JSX and these tests have no DOM.
 // Assembling the props here is what makes that wiring assertable.
-describe("the target step is handed the model, for both kinds of target", () => {
+describe("the target step is handed the model, and each target answers in its own terms", () => {
   const projects: WizardProject[] = [
     {
       id: "prj",
@@ -406,10 +412,8 @@ describe("the target step is handed the model, for both kinds of target", () => 
       ],
     },
   ];
-  const clusters = [
-    { id: "cl", name: "prod", environmentId: "env", maxVramBytesPerGpu: 24 * GB },
-  ];
-  const inv = buildInventory(projects, clusters, []);
+  const clusters = [{ id: "cl", name: "prod", environmentId: "env" }];
+  const inv = buildInventory(projects, clusters, ["llm"]);
   const at = (model?: ModelCard) =>
     targetChoices({
       projects,
@@ -424,19 +428,23 @@ describe("the target step is handed the model, for both kinds of target", () => 
   it("filters the servers by the chosen model", () => {
     const [server] = at(modelCard()).servers;
     expect(server.eligible).toBe(false);
-    expect(server.reason).toContain("188 GB");
+    expect(server.reason).toContain("189 GB");
   });
 
-  it("filters the clusters by the same model", () => {
+  // The cluster row is refused whatever the model is, and for the other reason:
+  // it is not a place a model endpoint runs.
+  it("refuses the cluster for the kind, never for the model", () => {
     const [cluster] = at(modelCard()).clusters;
     expect(cluster.eligible).toBe(false);
-    expect(cluster.reason).toContain("188 GB");
+    expect(cluster.reason).toContain("rather than inside a cluster");
+    expect(cluster.reason).not.toContain("GB");
   });
 
-  it("offers both when the model fits", () => {
-    const fits = at(modelCard({ vramBytesRequired: 20 * GB, vramText: "~20 GB" }));
+  it("offers the server once the model fits, with the cluster still refused", () => {
+    const fits = at(modelCard({ vramBytesRequired: 20 * GB, vramText: "~20.0 GB" }));
     expect(fits.servers.every((s) => s.eligible)).toBe(true);
-    expect(fits.clusters.every((c) => c.eligible)).toBe(true);
+    expect(fits.clusters.every((c) => c.eligible)).toBe(false);
+    // Something IS pickable, so there is no dead end to explain.
     expect(fits.deadEnd).toBeNull();
   });
 
@@ -446,10 +454,12 @@ describe("the target step is handed the model, for both kinds of target", () => 
 
   // Every row carrying its own reason still leaves "so what do I do"
   // unanswered, and the Continue button's own message was "Pick a server or a
-  // cluster" — advice for a screen where something is pickable.
+  // cluster" — advice for a screen where something is pickable. The cluster in
+  // this environment is refused too, for a reason no smaller model would fix,
+  // and that must not change the advice the GPU rows earned.
   it("says what to do when nothing here can run the model", () => {
     const dead = at(modelCard()).deadEnd;
-    expect(dead).toContain("188 GB");
+    expect(dead).toContain("189 GB");
     expect(dead).toContain("quantized");
   });
 

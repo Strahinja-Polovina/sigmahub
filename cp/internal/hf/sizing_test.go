@@ -60,6 +60,53 @@ func TestTheBudgetedHeadroomCoversTheContextTheRuntimeIsPinnedTo(t *testing.T) {
 	}
 }
 
+// The window the runtime is started at is a negotiation with the model, not a
+// number this package gets to pick on its own. vLLM's _get_and_verify_max_len
+// RAISES when --max-model-len exceeds the model's own maximum —
+//
+//	ValueError: User-specified max_model_len (8192) is greater than the derived
+//	max_model_len (max_position_embeddings=2048 ...)
+//
+// — so pinning every endpoint to SizedContextTokens killed the models that fit
+// best: TinyLlama at 2048 tokens and Llama-2-13B-chat-AWQ at 4096 are the
+// catalogue's easiest picks, both drew a green tick against every card in the
+// product, and both exited at startup on a host billed at GPU rates.
+func TestTheServedContextNeverExceedsTheModelsOwnMaximum(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		maxPositionEmbeddings int
+		want                  int
+	}{
+		{"TinyLlama's 2048 is served whole", 2048, 2048},
+		{"the 13B AWQ build's 4096 is served whole", 4096, 4096},
+		{"Llama 3.1's 131072 is cut to the window the sizing paid for", 131072, SizedContextTokens},
+		{"a model that ends exactly where the sizing does", SizedContextTokens, SizedContextTokens},
+		{"one token short of the sized window", SizedContextTokens - 1, SizedContextTokens - 1},
+		// An unknown ceiling gets the window the VRAM estimate was actually paid
+		// for, so the flag and the arithmetic never disagree. Rendering nothing
+		// here was the second wrong answer to this question: unknown is the
+		// GATED repositories, whose ceilings are far ABOVE 8192, and leaving
+		// them unpinned is the 131072-token KV-cache crash with a green fit
+		// check in front of it.
+		{"an unknown maximum falls back to the window that was estimated", 0, SizedContextTokens},
+		{"a maximum that makes no sense is treated as unknown, not as short", -1, SizedContextTokens},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ServedContextTokens(tc.maxPositionEmbeddings)
+			if got != tc.want {
+				t.Fatalf("ServedContextTokens(%d) = %d, want %d", tc.maxPositionEmbeddings, got, tc.want)
+			}
+			// The other half of the same statement, and the reason clamping down
+			// cannot disturb the estimate: the KV term budgets SizedContextTokens
+			// of cache, and a served window is never longer than that, so a
+			// clamped endpoint only leaves the VRAM figure more conservative.
+			if got > SizedContextTokens {
+				t.Errorf("served %d tokens against a KV budget bought for %d", got, SizedContextTokens)
+			}
+		})
+	}
+}
+
 func TestParseParameterCountReadsTheSizeOutOfARepositoryName(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

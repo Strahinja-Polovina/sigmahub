@@ -1,0 +1,31 @@
+-- The context window an inference endpoint is started at (SIGMA-214).
+--
+-- The start command used to render --max-model-len from hf.SizedContextTokens
+-- for every vLLM endpoint, and a constant is the wrong shape for this number.
+-- vLLM's _get_and_verify_max_len RAISES when the flag exceeds the model's own
+-- max_position_embeddings, so pinning 8192 unconditionally crash-looped exactly
+-- the models that fit best: TinyLlama-1.1B-Chat tops out at 2048 tokens and is
+-- the catalogue's "fits anything" pick, Llama-2-13B-chat-AWQ at 4096. Both were
+-- approved by the fit check, drawn green on every screen, and exited at startup
+-- on a host already billed at GPU rates.
+--
+-- So the served window becomes a per-endpoint fact, decided once at provision by
+-- hf.ServedContextTokens (the smaller of what the VRAM estimate paid for and
+-- what the model itself allows) and rendered from here. It is stored rather than
+-- recomputed because the reconciler must not call huggingface.co: a render is on
+-- the agent's poll path, and putting a third party's latency there would make a
+-- Hub outage an outage of every document in the fleet.
+--
+-- 0 means "the model's own ceiling is unknown, render NO flag" — the runtime
+-- then derives its window from the weights it actually pulled, which is the only
+-- honest answer when nobody could look the repository up. It is not a fallback
+-- to 8192: inventing a ceiling for a model whose ceiling nobody knows is how the
+-- TinyLlama failure above was written in the first place.
+--
+-- The DEFAULT is 8192 for exactly one reason and then never applies again: it
+-- backfills endpoints that already exist, and 8192 is precisely what their
+-- documents render today, so no running endpoint changes its command on the
+-- first reconcile after this migration. Every new row is written explicitly by
+-- provisionLLMTx.
+ALTER TABLE llm_endpoints
+    ADD COLUMN IF NOT EXISTS context_tokens INT NOT NULL DEFAULT 8192;

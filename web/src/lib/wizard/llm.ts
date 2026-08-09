@@ -64,7 +64,7 @@ export type ModelCard = {
   bytesPerParam: number;
   /** The estimate, in bytes. 0 when parametersKnown is false. */
   vramBytesRequired: number;
-  /** The same figure rendered CP-side ("~21 GB"), empty when unsized. */
+  /** The same figure rendered CP-side ("~21.4 GB"), empty when unsized. */
   vramText: string;
   /** safetensors | name | unknown */
   sizingBasis: string;
@@ -75,12 +75,23 @@ export type ModelCard = {
  *  with. */
 export type ModelSearchResult = {
   models: ModelCard[];
-  /** Whether the control plane holds a usable HUGGING_FACE_HUB_TOKEN for this
-   *  target — the token the agent injects so the runtime can pull the weights,
-   *  NOT the CP_HUGGING_FACE_TOKEN its own metadata calls use. The wire name is
+  /** Whether a usable HUGGING_FACE_HUB_TOKEN could be confirmed — the token the
+   *  agent injects so the runtime can pull the weights, NOT the
+   *  CP_HUGGING_FACE_TOKEN the picker's own metadata calls use. The wire name is
    *  unchanged and its meaning is not: it used to report the picker's token,
-   *  which answered a question nobody was asking (see gatedWarning). False also
-   *  covers "we could not confirm one", so it warns rather than blocks. */
+   *  which answered a question nobody was asking (see gatedWarning).
+   *
+   *  HOW WIDE the answer is depends on which route opened the wizard, because
+   *  only one of them knows a project when the model is picked. Opened from a
+   *  project, the search sends its id and the control plane counts that
+   *  project's own secret as well as its own token. Opened from
+   *  /dashboard/resources, the project is not chosen until the target step, so
+   *  nothing is sent and the answer is the control plane's token alone — a
+   *  project token is invisible there, and the operator is warned about gated
+   *  models they may well be able to pull.
+   *
+   *  False also covers "we could not confirm one" in both routes, which is why
+   *  it warns rather than blocks. */
   tokenConfigured: boolean;
   /** Set when the lookup itself failed — a timeout, an unreachable control
    *  plane. Distinct from "no matches", which is `models: []` and no error,
@@ -120,17 +131,15 @@ export type GpuHostFacts = { gpu?: HostFacts["gpu"] };
  *     UNKNOWN, never empty — the rule the registration gate holds (see
  *     server-compat.ts) and the reason an agent too old to report facts does not
  *     take a fleet's worth of GPU servers out of the deploy flow.
+ *
+ * A SERVER is the only target this is ever asked about. It used to take the
+ * hardware's name as an argument so a cluster row could say "this cluster's
+ * largest GPU node" instead; a model endpoint cannot be deployed into a cluster
+ * at all now, so the phrase is fixed and there is one sentence again.
  */
 export function serverFitsModel(
   card: ModelCard | null | undefined,
-  facts: GpuHostFacts | null | undefined,
-  /** How the refusal names the hardware it just measured. Prose only — it
-   *  changes no arithmetic and no verdict. A cluster row says "this cluster's
-   *  largest GPU node" because "this server's GPU" under a row badged Cluster
-   *  reads as a bug in the picker rather than a fact about the fleet, and the
-   *  alternative — a second fit function for clusters — is how the two targets
-   *  would come to answer the same question differently. */
-  hardware = "this server's GPU"
+  facts: GpuHostFacts | null | undefined
 ): ModelFit {
   if (!card || !card.parametersKnown || card.vramBytesRequired <= 0) return { fits: true };
   const perGpu = facts?.gpu?.vramBytesPerGpu ?? 0;
@@ -138,9 +147,9 @@ export function serverFitsModel(
   if (card.vramBytesRequired <= perGpu) return { fits: true };
   return {
     fits: false,
-    reason: `This model needs about ${vramNeedText(card)} of VRAM; ${hardware} has ${formatReportedBytes(
-      perGpu
-    )}.`,
+    reason: `This model needs about ${vramNeedText(
+      card
+    )} of VRAM; this server's GPU has ${formatReportedBytes(perGpu)}.`,
   };
 }
 
@@ -148,7 +157,7 @@ export function serverFitsModel(
  * The model's requirement as prose, from the string the control plane already
  * rendered.
  *
- * vramText arrives as "~21 GB" and the tilde is dropped because every sentence
+ * vramText arrives as "~21.4 GB" and the tilde is dropped because every sentence
  * that uses this already says "about" — the NUMBER is still the control plane's,
  * and that is the part that must not be recomputed here. Exported so the picker
  * and the refusal share one phrasing rather than each stripping the tilde their
@@ -167,31 +176,35 @@ export function vramNeedText(card: ModelCard): string {
  *
  * A warning, not a refusal, and the difference is the whole point. A gated
  * repository serves its weights only to an account that has been granted
- * access, and `tokenConfigured` tells us whether this control plane holds a
- * HUGGING_FACE_HUB_TOKEN to pull them with — which is not the same as whether
- * the operator HAS access. They may have accepted the licence months ago and
- * hold a token in a secret this process cannot read, and blocking Continue on
- * our guess would leave them on a step with no way forward and nothing to fix.
- * Warning costs a paragraph; blocking costs them the feature.
+ * access, and `tokenConfigured` tells us whether a HUGGING_FACE_HUB_TOKEN could
+ * be found to pull them with — which is not the same as whether the operator
+ * HAS access. They may have accepted the licence months ago; they may hold a
+ * token this search could not see (see ModelSearchResult.tokenConfigured for
+ * exactly which ones each route can see). Blocking Continue on our guess would
+ * leave them on a step with no way forward and nothing to fix. Warning costs a
+ * paragraph; blocking costs them the feature.
  *
  * It names HUGGING_FACE_HUB_TOKEN because that is the variable the runtime reads
  * on the GPU host (store.HubTokenSecretName). CP_HUGGING_FACE_TOKEN — which this
  * sentence used to name — authenticates the picker's metadata calls and would
- * not have helped a single failing pull.
+ * not have helped a single failing pull. The fix it offers leads with the
+ * project's secrets, because that is the half of the answer an operator on a
+ * hosted control plane can act on: the other half is an environment variable on
+ * a process they may not run.
  */
 export function gatedWarning(
   card: ModelCard | null | undefined,
   tokenConfigured: boolean
 ): string | null {
   if (!card?.gated || tokenConfigured) return null;
-  return `${card.id} is gated — Hugging Face serves its weights only to an account that has been granted access, and no HUGGING_FACE_HUB_TOKEN is configured here. Accept the model's licence on huggingface.co and set HUGGING_FACE_HUB_TOKEN on the control plane to a token from that account, or the first pull fails with a 401. Continue if you have already done both — this check cannot see your account.`;
+  return `${card.id} is gated — Hugging Face serves its weights only to an account that has been granted access, and no HUGGING_FACE_HUB_TOKEN was found for this deploy. Accept the model's licence on huggingface.co, then add a token from that account as a HUGGING_FACE_HUB_TOKEN secret on the project you deploy into (or set one on the control plane), or the first pull fails with a 401. Continue if you have already done both — this check cannot see your account.`;
 }
 
 /** The Hub's task for the models an endpoint can serve, spelled exactly as the
  *  control plane spells it (hf.TextGenerationTask): the search asks the Hub for
- *  this task and the refusal below compares against it, so one string decides
- *  both. */
-const TEXT_GENERATION_TASK = "text-generation";
+ *  this task, the refusal below compares against it, and demo mode's catalogue
+ *  filters its own listing by it — so one string decides all three. */
+export const TEXT_GENERATION_TASK = "text-generation";
 
 /**
  * Why this repository cannot be served AT ALL, or null.

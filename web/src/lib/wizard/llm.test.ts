@@ -29,7 +29,7 @@ function card(over: Partial<ModelCard> = {}): ModelCard {
     quantization: "none",
     bytesPerParam: 2,
     vramBytesRequired: 21_414_029_995,
-    vramText: "~21 GB",
+    vramText: "~21.4 GB",
     sizingBasis: "safetensors",
     ...over,
   };
@@ -55,7 +55,7 @@ describe("a model that cannot fit the card is refused before the deploy", () => 
     // operator reading the wizard and the API error must see one pair of
     // numbers, not two.
     expect(verdict.reason).toBe(
-      "This model needs about 21 GB of VRAM; this server's GPU has 16 GB."
+      "This model needs about 21.4 GB of VRAM; this server's GPU has 16 GB."
     );
   });
 
@@ -208,7 +208,7 @@ describe("the estimate is the control plane's own, not a second one", () => {
   // The tilde belongs to the picker's compact rendering; a sentence that says
   // "about" does not need it twice. The digits are never touched.
   it("quotes vramText, dropping only the tilde", () => {
-    expect(vramNeedText(card())).toBe("21 GB");
+    expect(vramNeedText(card())).toBe("21.4 GB");
     expect(vramNeedText(card({ vramText: "~700 MB" }))).toBe("700 MB");
   });
 

@@ -13,7 +13,7 @@
 // A failure here is a spinner someone is watching, so it comes back as text with
 // a Retry next to it.
 
-import { requireMembership } from "../active-org";
+import { assertProjectVisible, requireMembership } from "../active-org";
 import { cpEnabled, cpResolveModel, cpSearchModels } from "../cp";
 import { MOCK_TOKEN_CONFIGURED, findMockModel, searchMockModels } from "@/lib/mock/models";
 import type { ModelCard, ModelSearchResult } from "@/lib/wizard/llm";
@@ -33,8 +33,20 @@ export async function searchModels(input: {
   orgId: string;
   query: string;
   limit?: number;
+  /** The project this endpoint is being created in, when the wizard knows it —
+   *  it is what turns `tokenConfigured` into an answer about THIS operator's
+   *  weights credential rather than about the control plane's own. Absent from
+   *  the standalone /dashboard/resources route, where the project is not chosen
+   *  until the target step; see cpSearchModels for what each route is told. */
+  projectId?: string;
 }): Promise<ModelSearchResult> {
   await requireMembership(input.orgId);
+  // The project id arrives from a client, and the answer it buys is drawn from
+  // that project's secrets — so it goes through the same read gate every other
+  // client-supplied project id does (SIGMA-84). Without it a scoped member
+  // could ask whether a project they cannot see holds a Hub token.
+  const projectId = input.projectId?.trim() ?? "";
+  if (projectId) await assertProjectVisible(input.orgId, projectId);
   if (!cpEnabled()) {
     // Demo mode has no control plane and therefore no Hub and no token. The
     // catalogue is a recording of real cards so the picker, the VRAM filter and
@@ -45,7 +57,7 @@ export async function searchModels(input: {
     };
   }
   try {
-    return await cpSearchModels(input.orgId, input.query.trim(), input.limit);
+    return await cpSearchModels(input.orgId, input.query.trim(), input.limit, projectId);
   } catch (err) {
     return {
       models: [],

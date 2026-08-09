@@ -79,7 +79,12 @@ func renderLLMOps(rs store.ResourceSpec, target store.LLMTarget, meshIP string, 
 		// treatment a database gets.
 		Ports:   []portMapping{{Container: def.ContainerPort, Host: target.Port, HostIP: meshIP}},
 		Volumes: []volumeMount{{Name: cacheVol, MountPath: def.ModelCacheMount}},
-		Command: def.Command(spec.Model),
+		// The served context window is the endpoint's own, decided at provision
+		// against the model's ceiling and stored. The reconciler does not compute
+		// it and must not: a render happens on the agent's poll path, and asking
+		// huggingface.co here would put a third party's latency in front of every
+		// document in the fleet.
+		Command: def.Command(spec.Model, target.ContextTokens),
 		// Without this the runtime silently falls back to CPU and serves tokens
 		// at a useless rate on hardware the customer is paying a lot for.
 		GPUs: gpuRequest(spec.GPUs),

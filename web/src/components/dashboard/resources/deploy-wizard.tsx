@@ -42,7 +42,6 @@ import {
 } from "@/lib/server-catalog.generated";
 import {
   buildInventory,
-  clusterFitsModel,
   kindAvailability,
   targetChoices,
   type WizardCluster,
@@ -137,8 +136,10 @@ export function DeployWizard({
   orgId = "",
   clusters = [],
   clusterExcludedKinds = [],
-  /** The project this wizard was opened from, when it was opened from one. Used
-   *  to bring the GitHub install round trip back to the right page. */
+  /** The project this wizard was opened from, when it was opened from one. It
+   *  brings the GitHub install round trip back to the right page, and it SEEDS
+   *  the target project — which is the only reason the model step can ask the
+   *  weights-token question about a project at all (see the reset below). */
   originProjectId,
   /** Reopened after a GitHub install — restore the draft the user left. */
   resume = false,
@@ -373,7 +374,17 @@ export function DeployWizard({
       setPorts([]);
       setDomain("");
       setHealthPath("/");
-      setProjectId(draft?.projectId ?? "");
+      // Seeded from the project this wizard was opened FROM, when there was
+      // one. The step order is kind → model → target, so the project is
+      // otherwise unknown while the model is being picked — and the model
+      // step's weights-token question is asked per project. Without this seed
+      // it was always asked with no project, which collapsed the answer to "is
+      // a token set on the control plane" and told an operator whose token
+      // lives in their project's secrets that none was configured, on every
+      // gated model. It is also simply the right default for a wizard opened
+      // inside a project: the target step lands pre-filled, and the user may
+      // still change it.
+      setProjectId(draft?.projectId ?? originProjectId ?? "");
       setEnvironmentId(draft?.environmentId ?? "");
       setServerId(draft?.serverId ?? "");
       setClusterId(draft?.clusterId ?? "");
@@ -558,10 +569,9 @@ export function DeployWizard({
    *  call instead, which is the late failure this whole flow exists to remove.
    *  So the selection is dropped here, where the fact that made it invalid is.
    *
-   *  A CLUSTER is dropped on the same terms and for the same reason: it carries
-   *  its largest node's card and the control plane's create check compares
-   *  against exactly that (SIGMA-214), so leaving one selected would recreate
-   *  the 422 for the other kind of target. */
+   *  A CLUSTER needs no such check: a model endpoint cannot be aimed at one at
+   *  all (`llm` is on the control plane's cluster exclusion list), so there is
+   *  no clusterId a model change could invalidate. */
   const handleModelChange = React.useCallback(
     (id: string, next: ModelCard | null) => {
       setLlmModel(id);
@@ -573,12 +583,8 @@ export function DeployWizard({
           .find((s) => s.id === serverId);
         if (chosen && !serverFitsModel(next, chosen).fits) setServerId("");
       }
-      if (clusterId) {
-        const chosen = clusters.find((c) => c.id === clusterId);
-        if (chosen && !clusterFitsModel(next, chosen).fits) setClusterId("");
-      }
     },
-    [projects, clusters, serverId, clusterId]
+    [projects, serverId]
   );
 
   // Step 1 has an inside, so Back does too: from a category's kind list it
@@ -906,6 +912,7 @@ export function DeployWizard({
           {step === "model" && (
             <ModelStep
               orgId={orgId}
+              projectId={projectId}
               name={name}
               onNameChange={setName}
               modelId={llmModel}

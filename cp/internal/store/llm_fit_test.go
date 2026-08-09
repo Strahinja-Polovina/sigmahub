@@ -1,19 +1,20 @@
 package store
 
-// The SIGMA-214 fit check has exactly two jobs, and the tests below are split
-// along them: refuse a model that provably cannot fit, and refuse NOTHING the
-// moment either number stops being provable. The second job is the one worth
-// testing hardest — every fail-open path here is a huggingface.co incident that
-// would otherwise stop an entire fleet from deploying model endpoints on
-// hardware it already owns.
+// The create-time model checks have exactly two jobs, and the tests below are
+// split along them: refuse a model this control plane provably cannot serve or
+// cannot fit, and refuse NOTHING the moment the fact behind the refusal stops
+// being provable. The second job is the one worth testing hardest — every
+// fail-open path here is a huggingface.co incident that would otherwise stop an
+// entire fleet from deploying model endpoints on hardware it already owns.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
 )
 
 // L40S / A10G / H100 figures as an agent reports them, so the arithmetic in
@@ -22,10 +23,22 @@ const (
 	vram24GB  = 23_609_344_000  // NVIDIA A10G
 	vram48GB  = 48_301_604_864  // NVIDIA L40S
 	vram80GB  = 85_520_809_984  // NVIDIA H100 80GB
-	llama8B   = 21_281_019_494  // 8.03B params × 2 bytes × 1.2 ÷ 0.9
+	llama8B   = 21_414_029_995  // 8.03B params × 2 bytes × 1.2 ÷ 0.9
 	llama70B  = 187_904_819_200 // 70B at bf16 — fits nothing below an H100 cluster
 	llama70B4 = 46_976_204_800  // the same model as a 4-bit AWQ build
 )
+
+// sized is a model the control plane could size, with its sentence RENDERED
+// rather than typed.
+//
+// Typing it is how these fixtures went stale: they said "~21 GB" while
+// FormatVRAM emits "~21.4 GB", so every one of them described a refusal this
+// control plane cannot produce — and the tests stayed green, because nothing
+// here had ever called the formatter. The refusal quotes VRAMText verbatim, so
+// the fixture has to come from the same function the picker's card does.
+func sized(bytes uint64) ModelSize {
+	return ModelSize{ParametersKnown: true, VRAMBytesRequired: bytes, VRAMText: hf.FormatVRAM(bytes)}
+}
 
 // fakeSizer stands in for the Hub. It records what it was asked so a test can
 // prove the store did NOT ask — "we never dialled huggingface.co for an Ollama
@@ -45,18 +58,8 @@ func (f *fakeSizer) SizeModel(_ context.Context, repoID string) (ModelSize, erro
 	return f.size, nil
 }
 
-// gpuFacts renders the fragment of an agent facts payload the check reads,
-// written out as JSON rather than built from GPUInventory so a rename of the
-// wire tag fails here instead of silently sizing every cluster as unknown.
-func gpuFacts(perGPU uint64, count int) json.RawMessage {
-	return json.RawMessage(fmt.Sprintf(
-		`{"gpu":{"vendor":"nvidia","count":%d,"vramBytesPerGpu":%d}}`, count, perGPU))
-}
-
 func TestAModelBiggerThanTheCardIsRefusedWithBothNumbers(t *testing.T) {
-	err := checkModelFits("meta-llama/Llama-3.1-70B-Instruct",
-		ModelSize{ParametersKnown: true, VRAMBytesRequired: llama70B, VRAMText: "~188 GB"},
-		vram24GB, "gpu-hel-01")
+	err := checkModelFits("meta-llama/Llama-3.1-70B-Instruct", sized(llama70B), vram24GB, "gpu-hel-01")
 	if err == nil {
 		t.Fatal("a 188 GB model on a 24 GB card was accepted; the create-time re-check is not running")
 	}
@@ -85,17 +88,17 @@ func TestTheFitCheckAcceptsWhatActuallyFits(t *testing.T) {
 		perGPU  uint64
 		wantErr bool
 	}{
-		{"8B on a 24 GB card", ModelSize{ParametersKnown: true, VRAMBytesRequired: llama8B, VRAMText: "~21 GB"}, vram24GB, false},
-		{"8B on an 80 GB card", ModelSize{ParametersKnown: true, VRAMBytesRequired: llama8B, VRAMText: "~21 GB"}, vram80GB, false},
-		{"70B on a 48 GB card", ModelSize{ParametersKnown: true, VRAMBytesRequired: llama70B, VRAMText: "~188 GB"}, vram48GB, true},
+		{"8B on a 24 GB card", sized(llama8B), vram24GB, false},
+		{"8B on an 80 GB card", sized(llama8B), vram80GB, false},
+		{"70B on a 48 GB card", sized(llama70B), vram48GB, true},
 		// The quantized build of the model above is the remedy the refusal
 		// suggests, so it had better be accepted where the bf16 one is not.
-		{"the same 70B as 4-bit AWQ on a 48 GB card", ModelSize{ParametersKnown: true, VRAMBytesRequired: llama70B4, VRAMText: "~47 GB"}, vram48GB, false},
+		{"the same 70B as 4-bit AWQ on a 48 GB card", sized(llama70B4), vram48GB, false},
 		// Exactly at the line is a fit: the 20% KV/activation margin and the 90%
 		// utilization cap are already inside the required figure, so subtracting
 		// a second safety margin here would refuse models that run.
-		{"a model sized exactly to the card", ModelSize{ParametersKnown: true, VRAMBytesRequired: vram24GB, VRAMText: "~24 GB"}, vram24GB, false},
-		{"one byte over the card", ModelSize{ParametersKnown: true, VRAMBytesRequired: vram24GB + 1, VRAMText: "~24 GB"}, vram24GB, true},
+		{"a model sized exactly to the card", sized(vram24GB), vram24GB, false},
+		{"one byte over the card", sized(vram24GB + 1), vram24GB, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := checkModelFits("some/model", tc.size, tc.perGPU, "gpu-1")
@@ -161,9 +164,9 @@ func TestAnUnreachableHubSizesAsUnknownRatherThanFailingTheCreate(t *testing.T) 
 
 	// The success path still has to work, or the two fail-open branches above
 	// would pass on a check that never fires.
-	sizer = &fakeSizer{size: ModelSize{ParametersKnown: true, VRAMBytesRequired: llama70B, VRAMText: "~188 GB"}}
+	sizer = &fakeSizer{size: sized(llama70B)}
 	got := (&Store{modelSizer: sizer}).sizeModelForFit(context.Background(), spec)
-	if !got.ParametersKnown || got.VRAMBytesRequired != llama70B || got.VRAMText != "~188 GB" {
+	if !got.ParametersKnown || got.VRAMBytesRequired != llama70B || got.VRAMText != hf.FormatVRAM(llama70B) {
 		t.Fatalf("size = %+v, want the sizer's answer passed through verbatim", got)
 	}
 }
@@ -189,7 +192,7 @@ func TestOnlyAHubRepoIdIsEverSizedAgainstTheHub(t *testing.T) {
 		{"an empty spec", ``, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sizer := &fakeSizer{size: ModelSize{ParametersKnown: true, VRAMBytesRequired: llama8B}}
+			sizer := &fakeSizer{size: sized(llama8B)}
 			st := &Store{modelSizer: sizer}
 			size := st.sizeModelForFit(context.Background(), json.RawMessage(tc.spec))
 			if tc.wantAsk == "" {
@@ -208,42 +211,59 @@ func TestOnlyAHubRepoIdIsEverSizedAgainstTheHub(t *testing.T) {
 	}
 }
 
-// A cluster deploy is scheduled onto ONE node, so the honest capacity is the
-// biggest card in the cluster. Taking the smallest (or refusing to answer
-// because a CPU-only node is a member) would refuse models the cluster can in
-// fact run — and this check is only ever allowed to be wrong permissively.
-func TestAClusterIsSizedByItsLargestGPUNode(t *testing.T) {
+// A repository vLLM cannot open is refused here and not only in the wizard.
+// This is the one refusal whose absence is INVISIBLE: the container starts,
+// reports healthy, and answers 404 to every completion on a GPU-billed host, so
+// nothing in the product notices until somebody tries to use the endpoint.
+func TestAModelNoRuntimeHereCanServeIsRefusedWithSomethingToPickInstead(t *testing.T) {
+	err := checkModelServable("TheBloke/phi-2-GGUF", ModelSize{Quantization: "gguf"})
+	var inv ErrInvalid
+	if !errors.As(err, &inv) {
+		t.Fatalf("a GGUF repository err = %v, want ErrInvalid — an API-direct create of one is "+
+			"accepted today and serves nothing", err)
+	}
+	// The remedy is the point: "GGUF is unsupported" leaves an operator who
+	// picked it to save VRAM with no idea that AWQ exists.
+	for _, want := range []string{"TheBloke/phi-2-GGUF", "safetensors", "AWQ"} {
+		if !strings.Contains(inv.Msg, want) {
+			t.Errorf("refusal does not mention %q: %s", want, inv.Msg)
+		}
+	}
+
+	err = checkModelServable("sentence-transformers/all-MiniLM-L6-v2",
+		ModelSize{PipelineTag: "sentence-similarity"})
+	if !errors.As(err, &inv) {
+		t.Fatalf("an embedding model err = %v, want ErrInvalid", err)
+	}
+	for _, want := range []string{"sentence-similarity", hf.TextGenerationTask} {
+		if !strings.Contains(inv.Msg, want) {
+			t.Errorf("refusal does not name the task it got or the task it wants: %s", inv.Msg)
+		}
+	}
+}
+
+// The same fail-open contract the fit check holds, on the same input: a model
+// nobody could look up carries no format and no task, and neither absence is a
+// reason to refuse.
+func TestAModelTheHubWouldNotDescribeIsStillDeployable(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		nodes []json.RawMessage
-		want  uint64
+		name string
+		size ModelSize
 	}{
-		{"empty cluster", nil, 0},
-		{"one gpu node", []json.RawMessage{gpuFacts(vram24GB, 1)}, vram24GB},
-		{
-			"mixed fleet takes the biggest",
-			[]json.RawMessage{gpuFacts(vram24GB, 1), gpuFacts(vram80GB, 2), gpuFacts(vram48GB, 1)},
-			vram80GB,
-		},
-		{
-			"cpu-only nodes contribute nothing but do not veto",
-			[]json.RawMessage{json.RawMessage(`{"arch":"amd64"}`), gpuFacts(vram48GB, 1)},
-			vram48GB,
-		},
-		{
-			"a node that looked and found no card",
-			[]json.RawMessage{json.RawMessage(`{"gpu":{"vendor":"","count":0}}`)},
-			0,
-		},
-		{
-			"unparsable facts are simply unknown",
-			[]json.RawMessage{json.RawMessage(`{"gpu":`), gpuFacts(vram24GB, 1)},
-			vram24GB,
-		},
+		// Hub down, Hub slow, no sizer wired, an Ollama tag that was never looked
+		// up: every one of them is the zero ModelSize.
+		{"nothing came back from the Hub at all", ModelSize{}},
+		// The case that makes empty mean UNKNOWN rather than "not a text model":
+		// a gated repository read without a token carries no metadata, and
+		// refusing on it would block every gated repo on a tokenless control
+		// plane — the one operator who can do least about it.
+		{"a gated repo resolved without a token has no task", ModelSize{Quantization: "none"}},
+		{"a quantization we serve fine", sized(llama70B4)},
+		{"the task the runtime is for", ModelSize{PipelineTag: hf.TextGenerationTask, Quantization: "awq"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := maxVRAMPerGPU(tc.nodes); got != tc.want {
-				t.Fatalf("maxVRAMPerGPU = %d, want %d", got, tc.want)
+			if err := checkModelServable("some/model", tc.size); err != nil {
+				t.Fatalf("create was refused on an unknown: %v", err)
 			}
 		})
 	}

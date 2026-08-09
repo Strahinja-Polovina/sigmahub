@@ -31,13 +31,21 @@ import (
 
 // llama8B is a card as cp/internal/hf renders one: an exactly-sized model whose
 // VRAM figure the wizard shows and the store's create-time check re-uses.
+//
+// Its two sizing fields are COMPUTED by the same functions that produce a real
+// card rather than typed out beside it. Typed, they went stale and nothing
+// noticed: this fixture claimed "~21 GB" long after FormatVRAM began emitting
+// "~21.4 GB", so the assertion below described a string the control plane cannot
+// produce and passed anyway.
 var llama8B = hf.ModelCard{
 	ID: "meta-llama/Llama-3.1-8B-Instruct", Name: "Llama 3.1 8B Instruct",
 	Gated: true, Downloads: 1234567, Likes: 4321,
-	PipelineTag: "text-generation", Library: "transformers", Engine: "vllm",
+	PipelineTag: hf.TextGenerationTask, Library: "transformers", Engine: "vllm",
 	Parameters: 8030261248, ParametersKnown: true,
-	Quantization: "none", BytesPerParam: 2,
-	VRAMBytesRequired: 21281019494, VRAMText: "~21 GB", SizingBasis: "safetensors",
+	Quantization: "none", BytesPerParam: 2, MaxPositionEmbeddings: 131072,
+	VRAMBytesRequired: hf.RequiredVRAMBytes(8030261248, 2),
+	VRAMText:          hf.FormatVRAM(hf.RequiredVRAMBytes(8030261248, 2)),
+	SizingBasis:       "safetensors",
 }
 
 // fakeCatalog implements ModelCatalog. It records the arguments because the
@@ -72,22 +80,24 @@ func (f *fakeCatalog) Resolve(_ context.Context, repoID string) (hf.ModelCard, e
 
 func (f *fakeCatalog) TokenConfigured() bool { return f.token }
 
-// fakeWeights stands in for the store's answer to "could a model created in
-// this project fetch its weights". It records the project it was asked about,
-// because the handler forwarding that argument is the difference between an
-// org-wide guess and an answer about the target the operator picked.
+// fakeWeights stands in for the store's answer to "could a model created here
+// fetch its weights". It records the project AND environment it was asked
+// about, because the handler forwarding both is the difference between an
+// org-wide guess and an answer about the target the operator picked — a
+// HUGGING_FACE_HUB_TOKEN scoped to staging resolves in staging only, and
+// reporting it in production is a gated pull that 401s tens of gigabytes in.
 type fakeWeights struct {
 	available bool
 	err       error
-	projects  []string
+	asked     []string // "project|environment" per call
 }
 
 func (f *fakeWeights) GetLLM(context.Context, string, string) (store.LLMInfo, error) {
 	return store.LLMInfo{}, nil
 }
 
-func (f *fakeWeights) WeightsTokenAvailable(_ context.Context, _, projectID string) (bool, error) {
-	f.projects = append(f.projects, projectID)
+func (f *fakeWeights) WeightsTokenAvailable(_ context.Context, _, projectID, environmentID string) (bool, error) {
+	f.asked = append(f.asked, projectID+"|"+environmentID)
 	return f.available, f.err
 }
 
@@ -146,7 +156,8 @@ func TestModelSearchAnswersCardsWithTheirSizing(t *testing.T) {
 	// The sizing numbers are the whole reason the CP does this lookup instead of
 	// the browser: the wizard renders vramText and compares vramBytesRequired,
 	// and a handler that dropped either would leave the picker with no verdict.
-	if out.Models[0].VRAMBytesRequired != llama8B.VRAMBytesRequired || out.Models[0].VRAMText != "~21 GB" {
+	if out.Models[0].VRAMBytesRequired != llama8B.VRAMBytesRequired ||
+		out.Models[0].VRAMText != llama8B.VRAMText {
 		t.Fatalf("card lost its sizing: %+v", out.Models[0])
 	}
 	if len(cat.queries) != 1 || cat.queries[0] != "llama 3.1" {
@@ -190,14 +201,17 @@ func TestGatedApprovalFollowsTheWeightsTokenAndNotThePickersOwn(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cat := &fakeCatalog{cards: []hf.ModelCard{llama8B}, token: tc.pickerToken}
 			s := newModelServerWithWeights(t, cat, tc.weights)
-			out := decodeSearch(t, getAsDev(s, "/v1/orgs/org_1/llm/models?q=llama&projectId=prj_1"))
+			out := decodeSearch(t, getAsDev(s,
+				"/v1/orgs/org_1/llm/models?q=llama&projectId=prj_1&environmentId=env_prod"))
 			if out.TokenConfigured != tc.wantConfigred {
 				t.Fatalf("tokenConfigured = %v, want %v", out.TokenConfigured, tc.wantConfigred)
 			}
-			// The project has to reach the store, or the answer is about the
-			// org in general and the operator's target in particular is a guess.
-			if len(tc.weights.projects) != 1 || tc.weights.projects[0] != "prj_1" {
-				t.Fatalf("weights source saw projects %v, want [prj_1]", tc.weights.projects)
+			// BOTH scopes have to reach the store, or the answer is about the org
+			// in general while the operator's target in particular is a guess —
+			// and the environment is the half that used to be dropped, which is
+			// how a staging-scoped token promised a download in production.
+			if len(tc.weights.asked) != 1 || tc.weights.asked[0] != "prj_1|env_prod" {
+				t.Fatalf("weights source was asked about %v, want [prj_1|env_prod]", tc.weights.asked)
 			}
 		})
 	}

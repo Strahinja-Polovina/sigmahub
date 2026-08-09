@@ -1962,13 +1962,6 @@ export type CpCluster = {
   createdBy: string;
   createdAt: string;
   nodes: CpClusterNode[];
-  /** The largest per-card GPU memory across its nodes, 0 when no node ever
-   *  reported an inventory (store.Cluster.MaxVRAMBytesPerGPU). The wizard
-   *  compares a chosen model against it exactly as it compares against a
-   *  server's own card — the create call already refuses what does not fit, and
-   *  before this figure crossed the boundary the dashboard could only find that
-   *  out from the 422 (SIGMA-214). */
-  maxVramBytesPerGpu?: number;
 };
 
 export async function cpListClusters(
@@ -2107,13 +2100,40 @@ export async function cpDomainDNS(orgId: string, domainId: string): Promise<CpDN
  *  used as typed. */
 const MODEL_LOOKUP_TIMEOUT_MS = 8_000;
 
+/**
+ * The picker's typeahead, and the answer to "will a model created here be able
+ * to download its weights".
+ *
+ * `projectId` is what makes the second half true, and WHICH route the wizard
+ * was opened from decides which answer comes back:
+ *
+ *   - From a project (/dashboard/projects/…), the id is sent and the control
+ *     plane answers about THAT project: its own HUGGING_FACE_HUB_TOKEN secret
+ *     counts, and so does a token configured on the control plane. That is the
+ *     credential the agent injects on the GPU host, so it is the one that
+ *     decides whether a gated pull 401s.
+ *   - From the standalone /dashboard/resources route there is no project yet —
+ *     it is chosen on the target step, two screens later — so nothing is sent
+ *     and the control plane answers on its own token alone. An operator whose
+ *     only token lives in a project secret is warned there about gated models;
+ *     the warning is honest ("no token is configured HERE") and never a block.
+ *
+ * The control plane also accepts an `environmentId`, which narrows the answer
+ * to secrets that would actually resolve in one environment. The wizard cannot
+ * send it: the environment is picked after the model, so there is nothing to
+ * send at search time. The effect is a false NEGATIVE for an operator whose
+ * token is scoped to a single environment — a warning they can read, which is
+ * the direction this whole check errs in.
+ */
 export async function cpSearchModels(
   orgId: string,
   query: string,
-  limit?: number
+  limit?: number,
+  projectId?: string
 ): Promise<{ models: ModelCard[]; tokenConfigured: boolean }> {
   const params = new URLSearchParams({ q: query });
   if (limit) params.set("limit", String(limit));
+  if (projectId) params.set("projectId", projectId);
   const res = await cpFetch<{ models: ModelCard[] | null; tokenConfigured: boolean }>(
     `${org(orgId)}/llm/models?${params.toString()}`,
     undefined,

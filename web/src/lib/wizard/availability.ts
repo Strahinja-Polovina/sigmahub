@@ -25,7 +25,7 @@ import {
   type ServerType,
 } from "@/lib/server-catalog.generated";
 import { SERVER_STATUS, type HostFacts } from "@/lib/server-compat";
-import { serverFitsModel, vramNeedText, type ModelCard, type ModelFit } from "./llm";
+import { serverFitsModel, vramNeedText, type ModelCard } from "./llm";
 
 /** A server as the wizard sees it — the deploy-target shape, plus the status
  *  the enrollment gate wrote. */
@@ -55,21 +55,18 @@ export type WizardProject = {
   environments: WizardEnvironment[];
 };
 
-/** A cluster, scoped to the environment it was built in. */
+/** A cluster, scoped to the environment it was built in.
+ *
+ *  It carries no GPU figure. The cluster listing used to publish its largest
+ *  node's card so a model could be fit-checked against it, and that number was
+ *  deleted along with the whole idea: `llm` is on the control plane's cluster
+ *  exclusion list now, so a model endpoint never reaches a cluster and there is
+ *  nothing here to size. */
 export type WizardCluster = {
   id: string;
   name: string;
   environmentId: string;
   status?: string;
-  /** The largest per-card GPU memory any of its nodes reports, as the cluster
-   *  listing publishes it (store.Cluster.MaxVRAMBytesPerGPU). The LARGEST,
-   *  because the scheduler only has to place the workload somewhere; absent or
-   *  0 means no node ever reported an inventory, which is UNKNOWN and never
-   *  zero — the same rule a server's missing facts follow. Carried because the
-   *  control plane's create call already refuses a model that cannot fit it, and
-   *  without the number here the wizard offered the cluster anyway and let the
-   *  422 land after Review (SIGMA-214). */
-  maxVramBytesPerGpu?: number;
 };
 
 /**
@@ -157,6 +154,14 @@ export function kindAvailability(kind: ResourceKind, inv: TargetInventory): Kind
   // The GPU case gets its own sentence because it is the one where the reason
   // is about HARDWARE, and "connect a General server" would be actively
   // misleading advice.
+  //
+  // It is reached even by an org whose only deploy target is a Kubernetes
+  // cluster, because `llm` is on the control plane's cluster exclusion list —
+  // nothing renders a cluster-targeted model endpoint and its provisioning is
+  // server-scoped — so the cluster branch above cannot answer "available" for
+  // it. An org with one cluster and no GPU server has to be told about the
+  // missing hardware; being offered the card and refused at the target step
+  // would be the dead end this module exists to remove.
   if (kind === "llm") {
     return {
       available: false,
@@ -293,79 +298,62 @@ export function serverOptions(
   });
 }
 
-/**
- * Does this model fit the biggest card in that cluster?
- *
- * serverFitsModel's comparison, against the one number a cluster publishes
- * instead of a facts blob. It is a function rather than an object literal at
- * each call site because the mapping from "the cluster's largest node" to "a
- * host's GPU facts" is the kind of two-line translation that gets written a
- * third way the third time it is needed — and the third caller is a wizard
- * dropping an invalidated selection, which must reach the same verdict the
- * picker did or it will keep a target the picker just refused.
- */
-export function clusterFitsModel(
-  model: ModelCard | null | undefined,
-  cluster: WizardCluster
-): ModelFit {
-  return serverFitsModel(
-    model,
-    { gpu: { vramBytesPerGpu: cluster.maxVramBytesPerGpu } },
-    "this cluster's largest GPU node"
-  );
-}
-
 /** A cluster, annotated exactly as a server is. */
 export type ClusterOption = {
   cluster: WizardCluster;
   eligible: boolean;
   reason?: string;
-  /** As on ServerOption: the model, not the target, is what refused this. */
-  refusedForModel?: boolean;
 };
 
 /**
  * Clusters offered for an environment. A cluster picker that showed every
  * cluster in the org would offer a target the control plane refuses — a cluster
  * belongs to exactly one environment, and it says so.
+ *
+ * No model is compared here, and that is not the gap it was. A cluster row used
+ * to be fit-checked against the largest GPU its nodes reported, because the
+ * create call refused an oversized model and the wizard could otherwise only
+ * find that out from the 422 (SIGMA-214). The control plane now refuses the
+ * KIND instead: `llm` is on its cluster exclusion list, so a model endpoint is
+ * turned away by the eligibility branch below — before any card size could
+ * matter — and the cluster listing stopped publishing the figure. A comparison
+ * kept here would be reading a field nothing sends.
  */
+/**
+ * Why a kind the control plane excluded runs outside the cluster.
+ *
+ * There are two different reasons and they were being told as one. The managed
+ * engines are excluded because a stateful container rescheduled onto a node
+ * without its data is data loss — that is the sentence, and it is true of
+ * Postgres, MySQL, MongoDB, Redis and object storage. It is NOT true of a model
+ * endpoint, which keeps nothing it cannot re-download; that one is excluded
+ * because the cluster renderer has no path for it, and telling an operator
+ * their inference server is a database they might lose data from is a sentence
+ * that answers a question they did not ask and leaves theirs open.
+ */
+export function outsideClusterReason(kind: ResourceKind): string {
+  const label = RESOURCE_KIND_LABELS[kind] ?? kind;
+  if (kind === "llm") {
+    return `${label} runs on a GPU server of its own rather than inside a cluster — the scheduler has no path for a model endpoint yet.`;
+  }
+  return `${label} keeps its data on one host, so it runs on its own server rather than inside a cluster.`;
+}
+
 export function clusterOptions(
   clusters: WizardCluster[],
   environmentId: string,
   kind: ResourceKind | null | undefined,
-  inv: TargetInventory,
-  /** The model an `llm` resource will serve, as serverOptions takes it. A
-   *  cluster used to be offered without this check at all: its rows had no GPU
-   *  facts to compare, so a 70B model against a fleet of 24 GB nodes walked
-   *  through Review and was refused by the create call with a 422 — the same
-   *  dead end the server rows were fixed to remove, one target across
-   *  (SIGMA-214). */
-  model?: ModelCard | null
+  inv: TargetInventory
 ): ClusterOption[] {
   if (!environmentId || !kind) return [];
   return clusters
     .filter((c) => c.environmentId === environmentId)
     .map((cluster) => {
       if (!clusterEligible(kind, inv)) {
-        return {
-          cluster,
-          eligible: false,
-          reason: `${
-            RESOURCE_KIND_LABELS[kind] ?? kind
-          } keeps its data on one host, so it runs on its own server rather than inside a cluster.`,
-        };
+        return { cluster, eligible: false, reason: outsideClusterReason(kind) };
       }
       if (cluster.status === "provisioning") {
         return { cluster, eligible: false, reason: "This cluster is still coming up." };
-      }
-      // The SAME comparison the server rows run, against the same kind of
-      // number: one card's memory, never a sum. A cluster that reported no GPU
-      // figure at all is left eligible, identically to a server whose agent
-      // never reported an inventory — absent is UNKNOWN, and an unknown must
-      // not be the thing that stops a deploy.
-      const fit = clusterFitsModel(model, cluster);
-      if (!fit.fits) {
-        return { cluster, eligible: false, reason: fit.reason, refusedForModel: true };
       }
       return { cluster, eligible: true };
     });
@@ -411,12 +399,14 @@ export function targetChoices(input: {
   const environments = input.projects.find((p) => p.id === input.projectId)?.environments ?? [];
   const env = environments.find((e) => e.id === input.environmentId);
   const servers = serverOptions(env, input.kind, input.model);
+  // The model reaches the SERVER filter only: a cluster is refused for the kind
+  // (`llm` is excluded control-plane side), so there is no cluster row a model
+  // could be measured against.
   const clusters = clusterOptions(
     input.clusters,
     input.environmentId,
     input.kind,
-    input.inventory,
-    input.model
+    input.inventory
   );
   return { environments, servers, clusters, deadEnd: deadEnd(servers, clusters, input.model) };
 }
@@ -438,7 +428,10 @@ function deadEnd(
 ): string | null {
   const offers = [...servers, ...clusters];
   if (offers.length === 0 || offers.some((o) => o.eligible)) return null;
-  if (model && offers.some((o) => o.refusedForModel)) {
+  // Servers only: a cluster is never refused FOR the model — it is refused for
+  // the kind, and "pick a smaller model" is no help to someone whose target
+  // cannot host a model endpoint at any size.
+  if (model && servers.some((s) => s.refusedForModel)) {
     return `Nothing in this environment can run this model — it needs about ${vramNeedText(
       model
     )} of VRAM and every GPU here is smaller. Pick a smaller or quantized build of it (an AWQ or GPTQ repository of the same model), or an environment with a bigger card.`;

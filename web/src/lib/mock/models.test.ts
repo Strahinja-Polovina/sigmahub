@@ -54,6 +54,18 @@ describe("the demo catalogue walks every branch of the model step", () => {
     const gguf = MOCK_MODELS.filter((m) => m.quantization === "gguf");
     expect(gguf.length).toBeGreaterThan(0);
     expect(unservableReason(gguf[0])).toContain("safetensors");
+    expect(modelStepError(gguf[0], gguf[0].id)).toContain("GGUF");
+  });
+
+  // The refusal the SIZE check cannot make: whisper is ~4 GB, fits every card
+  // in the demo fleet, and serves nothing a model endpoint offers. It is
+  // reachable by pasting the id — which is exactly how it is reachable in
+  // production, because no search returns it.
+  it("carries a model whose task is wrong, and blocks the step on it", () => {
+    const whisper = findMockModel("openai/whisper-large-v3");
+    expect(whisper).toBeDefined();
+    expect(serverFitsModel(whisper, DEMO_GPU).fits).toBe(true);
+    expect(modelStepError(whisper!, whisper!.id)).toContain("text generation");
   });
 
   // The runtime is read from the card rather than asked for, and the control
@@ -77,18 +89,44 @@ describe("every recorded card is internally consistent", () => {
     if (model.parametersKnown) {
       expect(model.parameters).toBeGreaterThan(0);
       expect(model.vramBytesRequired).toBeGreaterThan(0);
-      expect(model.vramText).toMatch(/^~\d+ (MB|GB)$/);
+      // A tenth of a gigabyte is the format hf.FormatVRAM emits below 100 GB,
+      // and this guard used to demand a whole number — so it PASSED for the
+      // stale fixtures and would have failed anyone who re-recorded them from a
+      // live control plane, with a red suite telling them the truth was
+      // malformed. It now accepts what the control plane actually sends.
+      expect(model.vramText).toMatch(/^~\d+(\.\d)? (MB|GB)$/);
     } else {
       expect(model.parameters).toBe(0);
       expect(model.vramBytesRequired).toBe(0);
       expect(model.vramText).toBe("");
     }
   });
+
+  // Both branches of the rendering the fixtures had drifted from: a tenth of a
+  // gigabyte below 100 GB, because the GPU capacity this figure is set against
+  // is TRUNCATED and "needs ~21 GB, has 21 GB" reads as a broken refusal; a
+  // whole number rounded UP above it, where a tenth is noise.
+  it("records each estimate the way the control plane renders it", () => {
+    expect(findMockModel("meta-llama/Llama-3.1-8B-Instruct")?.vramText).toBe("~21.4 GB");
+    expect(findMockModel("meta-llama/Llama-3.1-70B-Instruct")?.vramText).toBe("~189 GB");
+  });
 });
 
 describe("the demo picker answers like the control plane's search", () => {
-  it("lists everything before anything is typed", () => {
-    expect(searchMockModels("")).toHaveLength(MOCK_MODELS.length);
+  it("lists every text-generation model before anything is typed", () => {
+    expect(searchMockModels("").map((m) => m.id)).toEqual(
+      MOCK_MODELS.filter((m) => m.pipelineTag === "text-generation").map((m) => m.id)
+    );
+  });
+
+  // hf.Client.Search sends pipeline_tag=text-generation, so no control plane
+  // can return a speech or embedding repository from a search. A demo that
+  // listed one would be demonstrating behaviour the product does not have.
+  it("never offers a model whose task the endpoint cannot serve", () => {
+    expect(searchMockModels("whisper")).toEqual([]);
+    expect(new Set(searchMockModels("").map((m) => m.pipelineTag))).toEqual(
+      new Set(["text-generation"])
+    );
   });
 
   it("matches on the repo id and on the display name", () => {

@@ -31,18 +31,6 @@ type Cluster struct {
 	CreatedBy     string        `json:"createdBy"`
 	CreatedAt     time.Time     `json:"createdAt"`
 	Nodes         []ClusterNode `json:"nodes"`
-	// MaxVRAMBytesPerGPU is the largest per-card GPU memory any node reports,
-	// and 0 means nobody has reported any — the same "absent is UNKNOWN, not
-	// zero" rule the rest of the fleet runs on.
-	//
-	// It is published because CreateResource already refuses a model that
-	// cannot fit it (SIGMA-214), and the wizard had no way to know the number:
-	// it offered every cluster as an eligible target and the API refused the
-	// create after Review, which is precisely the dead end the type-first
-	// wizard exists to remove. maxVRAMPerGPU computes it, here and at create,
-	// so the two walls quote one figure — and it is the LARGEST node's card
-	// because the scheduler only has to place the workload somewhere.
-	MaxVRAMBytesPerGPU uint64 `json:"maxVramBytesPerGpu"`
 }
 
 // ClusterNode is one server's membership in a cluster.
@@ -72,18 +60,34 @@ const (
 
 // clusterExcludedKinds are resource kinds that must NOT run inside a cluster.
 //
-// Every one of them is a stateful engine whose data lives in a volume on one
-// host. In a scheduler that means node affinity, PV lifecycle and eviction
+// The stateful engines are excluded because each one's data lives in a volume on
+// one host. In a scheduler that means node affinity, PV lifecycle and eviction
 // semantics we do not model — and a database silently rescheduled onto a node
 // without its data is data loss, not a degraded deploy. Managed databases and
 // object storage stay on their own server; the cluster reaches them over the
 // mesh exactly like anything else.
+//
+// `llm` is here for a different reason, and it is a statement about THIS control
+// plane rather than about Kubernetes. Nothing renders a cluster-targeted model
+// endpoint: renderClusterWorkloadOps only knows how to turn a git deploy into a
+// workload, so the resource produces no k8s object anywhere. And provisioning is
+// server-scoped by construction — provisionLLMTx allocates a mesh port against
+// resources.server_id and inserts into llm_endpoints, whose server_id is NOT
+// NULL REFERENCES servers(id). A cluster resource has no server, so the create
+// died on llm_endpoints_server_id_fkey: a raw SQLSTATE 23503 surfaced as a 500
+// naming a database constraint, AFTER the wizard had drawn the cluster as an
+// eligible target with a real GPU figure behind it and the fit check had passed
+// it green. Excluding the kind turns that dead end back into the sentence
+// ErrKindNotClusterable already writes, at the moment the target is picked.
+// Whoever completes the k8s render path for `llm` deletes this line — and has to
+// give provisionLLMTx a port and a host first.
 var clusterExcludedKinds = map[string]bool{
 	"postgres": true,
 	"mysql":    true,
 	"redis":    true,
 	"mongodb":  true,
 	"s3":       true,
+	"llm":      true,
 }
 
 // ClusterKindAllowed reports whether a resource kind may be deployed INTO a
@@ -339,12 +343,9 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 	for _, c := range out {
 		ids = append(ids, c.ID)
 	}
-	// s.facts rides along for MaxVRAMBytesPerGPU: the node rows are being read
-	// anyway, so the GPU figure the wizard needs costs a column rather than a
-	// second query that could observe different membership.
 	nodeRows, err := s.Pool.Query(ctx, `
 		SELECT n.cluster_id, n.server_id, s.name, s.type, s.status, COALESCE(s.mesh_ip,''), n.role, n.joined_at,
-		       n.node_status, n.node_message, n.reported_at, s.facts
+		       n.node_status, n.node_message, n.reported_at
 		  FROM cluster_nodes n JOIN servers s ON s.id = n.server_id
 		 WHERE n.cluster_id = ANY($1)
 		 ORDER BY n.role, s.name`, ids)
@@ -352,26 +353,20 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 		return nil, err
 	}
 	defer nodeRows.Close()
-	facts := map[string][]json.RawMessage{}
 	for nodeRows.Next() {
 		var clusterID string
-		var nodeFacts json.RawMessage
 		var n ClusterNode
 		if err := nodeRows.Scan(&clusterID, &n.ServerID, &n.ServerName, &n.ServerType,
 			&n.Status, &n.MeshIP, &n.Role, &n.JoinedAt,
-			&n.NodeStatus, &n.NodeMessage, &n.ReportedAt, &nodeFacts); err != nil {
+			&n.NodeStatus, &n.NodeMessage, &n.ReportedAt); err != nil {
 			return nil, err
 		}
 		if i, ok := index[clusterID]; ok {
 			out[i].Nodes = append(out[i].Nodes, n)
-			facts[clusterID] = append(facts[clusterID], nodeFacts)
 		}
 	}
 	if err := nodeRows.Err(); err != nil {
 		return nil, err
-	}
-	for id, nodeFacts := range facts {
-		out[index[id]].MaxVRAMBytesPerGPU = maxVRAMPerGPU(nodeFacts)
 	}
 	return out, nil
 }

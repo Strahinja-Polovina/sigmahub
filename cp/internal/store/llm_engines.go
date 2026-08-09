@@ -97,26 +97,34 @@ func LLMEngineNames() []string {
 // Command builds the runtime's start command for a model reference. vLLM takes
 // the model as a flag; ollama serves and pulls on first request, so the model
 // rides the environment instead.
-func (d LLMEngineDef) Command(model string) []string {
+//
+// contextTokens is the window this endpoint may be served at, already decided by
+// hf.ServedContextTokens and stored on the endpoint (LLMTarget.ContextTokens).
+// It is an ARGUMENT and not a constant because both ends of the range are fatal.
+// Unpinned, vLLM takes the model's own max_position_embeddings — 128k on the
+// Llama 3.1 family, sixteen times what the fit check's KV-cache term budgets —
+// so the check approves the model onto a card and the runtime then demands a KV
+// cache nobody estimated. Pinned to hf.SizedContextTokens unconditionally, which
+// is what this used to render, vLLM refuses to start any model whose own ceiling
+// is SHORTER: TinyLlama-1.1B-Chat (2048) and Llama-2-13B-chat-AWQ (4096) both
+// exited at startup with "User-specified max_model_len is greater than the
+// derived max_model_len", after being approved and drawn green everywhere.
+//
+// 0 means the model's ceiling is unknown, and the flag is then OMITTED
+// entirely — the runtime derives its window from the weights it pulled, which is
+// the only honest answer when the Hub could not be asked. That is the same
+// fail-open direction the fit check takes on the same input.
+func (d LLMEngineDef) Command(model string, contextTokens int) []string {
 	switch d.Engine {
 	case "vllm":
 		if model == "" {
 			return nil
 		}
-		return []string{
-			"--model", model, "--host", "0.0.0.0", "--port", "8000",
-			// --max-model-len is NOT a preference and NOT a tuning knob left at a
-			// round number: it is the context length the VRAM estimate was paid
-			// for. hf.SizedContextTokens is the window the fit check's KV-cache
-			// term budgets, and vLLM's default is the model's own
-			// max_position_embeddings — 128k on the Llama 3.1 family, sixteen
-			// times what we sized. Left unpinned, the check approves a model onto
-			// a card, the runtime then demands a KV cache nobody estimated, and it
-			// exits on a host already billed at GPU rates: the exact failure
-			// SIGMA-214 exists to move earlier. The estimate and the flag have to
-			// move together, so they come from one constant in one package.
-			"--max-model-len", strconv.Itoa(hf.SizedContextTokens),
+		cmd := []string{"--model", model, "--host", "0.0.0.0", "--port", "8000"}
+		if contextTokens > 0 {
+			cmd = append(cmd, "--max-model-len", strconv.Itoa(contextTokens))
 		}
+		return cmd
 	default:
 		return nil
 	}
@@ -156,6 +164,11 @@ type LLMTarget struct {
 	// unconditionally turned the most ordinary case there is (a public model on
 	// a control plane holding no Hub token) into a container that never started.
 	WeightsToken bool
+	// ContextTokens is the window this endpoint is started at, decided at
+	// provision from the model's own ceiling (hf.ServedContextTokens) and stored
+	// so a render never has to call huggingface.co. 0 means the ceiling was never
+	// known and Command renders no --max-model-len at all.
+	ContextTokens int
 }
 
 // hubTokenAAD binds a stored Hugging Face token to its endpoint row, exactly as
@@ -164,10 +177,21 @@ type LLMTarget struct {
 func hubTokenAAD(orgID, resourceID string) []byte { return []byte(orgID + "|llm|" + resourceID) }
 
 // provisionLLMTx allocates the resource's mesh-bound inference port, records
-// its runtime + model, and seeds the weights credential. Runs inside
-// CreateResource's transaction, symmetric with provisionDatabaseTx and
-// provisionS3Tx.
-func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r Resource) error {
+// its runtime, model and served context window, and seeds the weights
+// credential. Runs inside CreateResource's transaction, symmetric with
+// provisionDatabaseTx and provisionS3Tx.
+//
+// size is what the Hub said about this model a moment ago, and the only part of
+// it that outlives the create is the context window: the fit check is a decision
+// made here and then over, while --max-model-len has to be rendered into every
+// document for as long as the endpoint exists. Resolving it now rather than at
+// render time is what keeps huggingface.co off the agent's poll path.
+//
+// It is server-scoped by construction — allocateDBPort numbers ports per server
+// and llm_endpoints.server_id is NOT NULL REFERENCES servers(id) — which is why
+// clusterExcludedKinds refuses an `llm` aimed at a cluster before it can reach
+// this function with an empty server id.
+func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r Resource, size ModelSize) error {
 	spec := parseLLMSpec(r.Spec)
 	engine := spec.Engine
 	if engine == "" {
@@ -182,13 +206,36 @@ func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r R
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO llm_endpoints (resource_id, org_id, server_id, engine, model, port)
-		VALUES ($1,$2,$3,$4,$5,$6)`,
-		r.ID, orgID, r.ServerID, engine, spec.Model, port); err != nil {
+		INSERT INTO llm_endpoints (resource_id, org_id, server_id, engine, model, port, context_tokens)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		r.ID, orgID, r.ServerID, engine, spec.Model, port,
+		hf.ServedContextTokens(size.MaxPositionEmbeddings)); err != nil {
 		return err
 	}
 	return s.seedHubTokenTx(ctx, tx, orgID, def, r)
 }
+
+// operatorHubTokenClause matches an operator's own HUGGING_FACE_HUB_TOKEN
+// secrets that would ACTUALLY resolve for a resource in one environment, and it
+// is one constant because two callers ask that question at two moments and must
+// not answer it differently.
+//
+// They did. seedHubTokenTx carried the environment predicate — a secret scoped
+// to staging does not reach production, which is what ResolveSecretsForResource
+// enforces when the agent drains the value — and WeightsTokenAvailable had none.
+// So an org whose only Hub token was scoped to staging was told by the wizard
+// that a gated model would download, in production, where nothing resolves it:
+// the create was accepted, the control plane seeded nothing because it holds no
+// token of its own, and the pull 401'd tens of gigabytes in on a GPU-billed
+// host. That is SIGMA-213's own defect re-created by a missing WHERE clause.
+//
+// $1 org, $2 project, $3 secret name, $4 environment. The query it is spliced
+// into must read from `secrets`. An EMPTY $4 matches org-wide secrets only
+// (environment_id IS NULL): the caller has not said which environment it is
+// asking about, and a secret pinned to one is not an answer about another.
+const operatorHubTokenClause = `
+		org_id = $1 AND project_id = $2 AND lower(name) = lower($3)
+		  AND (environment_id IS NULL OR environment_id = $4)`
 
 // seedHubTokenTx stores this control plane's Hugging Face token as the
 // endpoint's weights credential, encrypted under the org DEK exactly the way
@@ -216,11 +263,8 @@ func (s *Store) seedHubTokenTx(ctx context.Context, tx pgx.Tx, orgID string, def
 		return nil
 	}
 	var operatorHasOne bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM secrets
-			 WHERE org_id = $1 AND project_id = $2 AND lower(name) = lower($3)
-			   AND (environment_id IS NULL OR environment_id = $4))`,
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM secrets WHERE`+operatorHubTokenClause+`)`,
 		orgID, r.ProjectID, HubTokenSecretName, r.EnvironmentID).Scan(&operatorHasOne); err != nil {
 		return fmt.Errorf("look up hugging face token secret: %w", err)
 	}
@@ -305,7 +349,14 @@ func (s *Store) resolveLLMSecretsTx(ctx context.Context, tx pgx.Tx, orgID, serve
 // seedHubTokenTx). An empty projectID answers on that half alone: the caller
 // has not said which project it is asking about, and inventing one would be a
 // guess about someone's secrets.
-func (s *Store) WeightsTokenAvailable(ctx context.Context, orgID, projectID string) (bool, error) {
+//
+// environmentID narrows the operator's half to the secrets that would actually
+// reach a resource created there, through operatorHubTokenClause — the SAME
+// predicate the seeding path applies, because the wizard must not promise a
+// token the create then cannot find. An empty environmentID counts only
+// org-wide secrets, for the same reason an empty projectID counts none: an
+// unstated scope is not permission to assume the widest one.
+func (s *Store) WeightsTokenAvailable(ctx context.Context, orgID, projectID, environmentID string) (bool, error) {
 	if s.hubToken != "" {
 		return true, nil
 	}
@@ -313,11 +364,9 @@ func (s *Store) WeightsTokenAvailable(ctx context.Context, orgID, projectID stri
 		return false, nil
 	}
 	var exists bool
-	err := s.Pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM secrets
-			 WHERE org_id = $1 AND project_id = $2 AND lower(name) = lower($3))`,
-		orgID, projectID, HubTokenSecretName).Scan(&exists)
+	err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM secrets WHERE`+operatorHubTokenClause+`)`,
+		orgID, projectID, HubTokenSecretName, environmentID).Scan(&exists)
 	return exists, err
 }
 
@@ -325,7 +374,7 @@ func (s *Store) WeightsTokenAvailable(ctx context.Context, orgID, projectID stri
 // resource id.
 func (s *Store) LLMTargetsForServer(ctx context.Context, serverID string) (map[string]LLMTarget, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT resource_id, engine, model, port, token_ciphertext IS NOT NULL
+		SELECT resource_id, engine, model, port, token_ciphertext IS NOT NULL, context_tokens
 		  FROM llm_endpoints WHERE server_id = $1`, serverID)
 	if err != nil {
 		return nil, err
@@ -335,7 +384,7 @@ func (s *Store) LLMTargetsForServer(ctx context.Context, serverID string) (map[s
 	for rows.Next() {
 		var id string
 		var t LLMTarget
-		if err := rows.Scan(&id, &t.Engine, &t.Model, &t.Port, &t.WeightsToken); err != nil {
+		if err := rows.Scan(&id, &t.Engine, &t.Model, &t.Port, &t.WeightsToken, &t.ContextTokens); err != nil {
 			return nil, err
 		}
 		out[id] = t

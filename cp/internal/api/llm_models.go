@@ -118,11 +118,15 @@ func (s *Server) handleSearchModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // weightsTokenAvailable answers "will a model created here be able to fetch its
-// weights", from the optional `projectId` the picker sends.
+// weights", from the optional `projectId` and `environmentId` the picker sends.
 //
-// projectId is optional, and its absence is not an error: without it the answer
-// is the control-plane half alone (a token here is seeded into every endpoint
-// the org creates), which is right for every project that has not set its own.
+// Both are optional, and their absence is not an error: without them the answer
+// narrows rather than fails. With no project it is the control-plane half alone
+// (a token here is seeded into every endpoint the org creates), which is right
+// for every project that has not set its own; with a project but no environment
+// it counts only the org-wide secrets, because a HUGGING_FACE_HUB_TOKEN scoped
+// to staging is not a promise about production — the create there would seed
+// nothing and the pull would 401 forty gigabytes in.
 //
 // Unknown answers FALSE, and that direction is chosen, not defaulted. False
 // makes the wizard warn about gated models — noise for someone who has a token
@@ -134,8 +138,9 @@ func (s *Server) weightsTokenAvailable(r *http.Request) bool {
 	if s.llm == nil {
 		return false
 	}
-	ok, err := s.llm.WeightsTokenAvailable(r.Context(),
-		r.PathValue("orgId"), strings.TrimSpace(r.URL.Query().Get("projectId")))
+	q := r.URL.Query()
+	ok, err := s.llm.WeightsTokenAvailable(r.Context(), r.PathValue("orgId"),
+		strings.TrimSpace(q.Get("projectId")), strings.TrimSpace(q.Get("environmentId")))
 	if err != nil {
 		s.log.Error("weights token lookup", "err", err)
 		return false

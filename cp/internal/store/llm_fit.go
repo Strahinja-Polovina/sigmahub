@@ -1,16 +1,19 @@
 package store
 
-// The create-time VRAM fit re-check (SIGMA-214).
+// The create-time model re-checks (SIGMA-213, SIGMA-214): can we serve this
+// repository at all, and does it fit the card.
 //
 // The wizard already tells the operator, before they click Create, that a 70B
-// model will not fit a 24 GB card. This file is the same answer on the API
-// boundary, and it exists because the wizard is a courtesy while this is the
-// rule: an API-direct caller, a script, a replayed request or a dashboard built
-// against last month's contract must hit the same wall, or the guarantee the
-// wizard makes is decoration. The failure it replaces is expensive and late —
-// the resource is created, the reconciler renders it, the runtime pulls tens of
-// gigabytes of weights onto a host billed at GPU rates, and CUDA reports an
-// out-of-memory that names no model and suggests no fix.
+// model will not fit a 24 GB card and that a GGUF repository is not something
+// vLLM opens. This file is the same answer on the API boundary, and it exists
+// because the wizard is a courtesy while this is the rule: an API-direct caller,
+// a script, a replayed request or a dashboard built against last month's
+// contract must hit the same wall, or the guarantee the wizard makes is
+// decoration. The failures it replaces are expensive and late — the resource is
+// created, the reconciler renders it, the runtime pulls tens of gigabytes of
+// weights onto a host billed at GPU rates, and then either CUDA reports an
+// out-of-memory that names no model and suggests no fix, or worse, the container
+// comes up HEALTHY and 404s every completion.
 //
 // EVERYTHING HERE FAILS OPEN, and that is the load-bearing design decision, not
 // a caveat. The estimate is weights × dtype × a margin; it does not know the
@@ -18,20 +21,25 @@ package store
 // or what a future quantization does to the arithmetic. Weighed against that,
 // consider what a fail-CLOSED version costs: huggingface.co has an incident,
 // and nobody in the world can deploy a model endpoint on their own hardware
-// until it ends. So there is no fit check at all whenever
+// until it ends. So NOTHING is checked at all whenever
 //
-//   - the model's parameter count is unknown (see hf.ModelCard.parametersKnown:
-//     neither the safetensors index nor the repo id yielded a number — refusing
-//     on a guess is the one thing this must never do), or
 //   - the Hub could not be reached, or was too slow, or answered with something
 //     unparsable, or
 //   - the model reference is not a Hub repo id at all (an Ollama tag such as
 //     `llama3.2:3b` names nothing on the Hub), or
-//   - the target host has never reported a GPU inventory — an agent older than
-//     SIGMA-201, or one whose nvidia probe failed this tick.
+//   - no sizer was ever wired, which is a supported control plane.
 //
-// A refusal therefore requires two independently KNOWN numbers, and says both
-// of them out loud.
+// Each check then drops out again on the fact IT needs. The fit check needs two
+// numbers, so it skips when the parameter count is unknown (see
+// hf.ModelCard.parametersKnown: neither the safetensors index nor the repo id
+// yielded one — refusing on a guess is the one thing this must never do) or when
+// the target host has never reported a GPU inventory, which is an agent older
+// than SIGMA-201 or one whose nvidia probe failed this tick. The servability
+// check needs a declared format or task, so an empty one — the shape a gated
+// repository read without a token comes back in — refuses nothing.
+//
+// A refusal therefore requires a fact the Hub actually stated, and says it out
+// loud along with the way out.
 
 import (
 	"context"
@@ -40,17 +48,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
 )
 
-// ModelSize is what the control plane worked out about one model reference: the
-// VRAM its weights plus runtime overhead will need, and the sentence the
-// dashboard is already showing for the same model.
+// ModelSize is what the control plane worked out about one model reference, and
+// it carries exactly the facts a CREATE decides on: can any runtime we render
+// serve this repository, will it fit the card, and how long a context may it be
+// started at.
 //
-// It is a deliberately tiny type, and it does NOT reuse hf.ModelCard. The store
-// must not learn what a Hugging Face repo is — it needs a number and a phrase,
-// and a struct with fifteen fields would invite the next author to make a store
-// decision out of `gated` or `pipelineTag`, which belong to the picker.
+// It is deliberately small, and it does NOT reuse hf.ModelCard. The store must
+// not learn what a Hugging Face repo is, and a struct with fifteen fields would
+// invite the next author to make a provisioning decision out of `gated`,
+// `likes` or `sizingBasis` — presentation the picker owns.
+//
+// Quantization and PipelineTag are on the list because the wall they draw has
+// to exist on the API boundary and not only in the browser. The wizard already
+// refuses a GGUF repository and a non-text-generation task at the model step;
+// with the same rules living nowhere else, an API-direct create of
+// TheBloke/phi-2-GGUF was ACCEPTED, and vLLM served a container that reported
+// healthy and 404'd every completion on a host billed at GPU rates.
 type ModelSize struct {
 	// ParametersKnown is the ONLY field that decides whether a fit check
 	// happens. False means the sizing was a guess or an absence, and a guess
@@ -60,15 +76,29 @@ type ModelSize struct {
 	// the wizard rendered: weights × bytesPerParam × KV/activation factor ÷ the
 	// runtime's utilization cap.
 	VRAMBytesRequired uint64
-	// VRAMText is that figure already rendered ("~21 GB"). Carried rather than
+	// VRAMText is that figure already rendered ("~21.4 GB"). Carried rather than
 	// re-derived so the refusal quotes character-for-character what the picker
 	// showed — an operator comparing the two screens must not find two spellings
 	// of one number and wonder which is real.
 	VRAMText string
+	// Quantization is the storage format the Hub reported ("gguf", "awq",
+	// "none"). Empty means the lookup produced nothing, which is UNKNOWN and
+	// never a refusal.
+	Quantization string
+	// PipelineTag is the Hub's task for the repository. Empty is UNKNOWN and
+	// must stay permitted: a gated repository read without a token carries no
+	// metadata at all, so reading empty as "not a text model" would make a
+	// tokenless control plane refuse every gated repo there is.
+	PipelineTag string
+	// MaxPositionEmbeddings is the model's own context ceiling, 0 when the Hub
+	// did not say. It is stored on the endpoint at provision so the runtime is
+	// started inside a window the model actually has — see llm_engines.go's
+	// Command, and hf.ServedContextTokens for what 0 instructs.
+	MaxPositionEmbeddings int
 }
 
-// ModelSizer answers "how much VRAM does this model reference need". It is the
-// store's whole view of huggingface.co.
+// ModelSizer answers "what does this model reference need, and can we serve it".
+// It is the store's whole view of huggingface.co.
 //
 // Injected rather than dialled directly, for the same reason InstallationTokenSource
 // is: the store owns transactions and must not own an HTTP client. cmd/sigmahub-cp
@@ -161,6 +191,45 @@ func (s *Store) sizeModelForFit(ctx context.Context, spec json.RawMessage) Model
 	return size
 }
 
+// checkModelServable refuses the two model shapes no runtime this control plane
+// renders can actually serve. nil means the create proceeds.
+//
+// Both were refused ONLY in the browser, and domain.go states why that is not
+// enough: "an API-direct create hits the wall the wizard draws" is the whole
+// reason the VRAM check was duplicated CP-side, and these two belong to the same
+// rule. Since EngineForModel returns "vllm" for every pick, an API-direct create
+// of TheBloke/phi-2-GGUF was accepted and vLLM started a container that reported
+// HEALTHY and 404'd every completion — the most expensive failure shape there
+// is, because nothing in the product watches for it and the host is billed at
+// GPU rates until somebody notices.
+//
+// It fails open on exactly the grounds checkModelFits does, and by the same
+// mechanism rather than a parallel one: an unresolvable model yields the zero
+// ModelSize, whose empty Quantization is not "gguf" and whose empty PipelineTag
+// is UNKNOWN. A Hub outage therefore refuses nothing here either.
+func checkModelServable(model string, size ModelSize) error {
+	if size.Quantization == "gguf" {
+		return ErrInvalid{Msg: fmt.Sprintf(
+			"%s is a GGUF repository, and the vLLM runtime SigmaHub renders cannot load one — "+
+				"the container starts, reports healthy, and answers 404 to every completion. "+
+				"Pick this model's safetensors repository instead, or an AWQ or GPTQ 4-bit build "+
+				"if you chose GGUF to save VRAM",
+			model)}
+	}
+	// Empty is UNKNOWN and stays permitted: a gated repository resolved without
+	// a token carries no metadata at all, so reading empty as "not a text model"
+	// would make a control plane with no Hub token refuse every gated repo —
+	// the one case where the operator can do least about it.
+	if size.PipelineTag != "" && size.PipelineTag != hf.TextGenerationTask {
+		return ErrInvalid{Msg: fmt.Sprintf(
+			"%s is a %s model on the Hub, and an `llm` resource serves %s over an "+
+				"OpenAI-compatible API — nothing here would answer /v1/completions for it. "+
+				"Pick a %s model, or deploy this one as an `app` with a runtime image of your own",
+			model, size.PipelineTag, hf.TextGenerationTask, hf.TextGenerationTask)}
+	}
+	return nil
+}
+
 // checkModelFits is the comparison itself: nil means the create proceeds.
 //
 // The capacity it compares against is VRAM PER CARD, not the host's total. That
@@ -172,9 +241,8 @@ func (s *Store) sizeModelForFit(ctx context.Context, spec json.RawMessage) Model
 // walls agreeing matters more than either being clever — an operator who was
 // told "this fits" by the dashboard must not then be refused by the API.
 //
-// target names the thing that has the memory, so the sentence works for both a
-// server ("gpu-hel-01 has 24 GB per GPU") and a cluster, where the scheduler
-// picks the node and the honest bound is its largest one.
+// target names the thing that has the memory, so the sentence reads as the
+// operator's own inventory: "gpu-hel-01 has 24 GB per GPU".
 func checkModelFits(model string, size ModelSize, vramBytesPerGPU uint64, target string) error {
 	// Fail open: an unsized model is a guess, and a guess never blocks a deploy.
 	if !size.ParametersKnown || size.VRAMBytesRequired == 0 {
@@ -204,52 +272,4 @@ func checkModelFits(model string, size ModelSize, vramBytesPerGPU uint64, target
 			"pick a quantized build of this one (an AWQ or GPTQ 4-bit repo needs roughly a quarter "+
 			"as much), or run it on a machine with a bigger card",
 		model, need, target, humanBytes(vramBytesPerGPU))}
-}
-
-// clusterNodeFactsTx reads the facts of every live node in a cluster, inside the
-// caller's transaction so the membership it sees is the membership the resource
-// is created against. A cluster with no nodes yet returns nothing, which sizes
-// as unknown and skips the check — the right answer for a cluster that has been
-// declared but not yet built out.
-func clusterNodeFactsTx(ctx context.Context, tx pgx.Tx, clusterID string) ([]json.RawMessage, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT sv.facts
-		  FROM cluster_nodes n JOIN servers sv ON sv.id = n.server_id
-		 WHERE n.cluster_id = $1 AND sv.deleted_at IS NULL`, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("read cluster node facts: %w", err)
-	}
-	defer rows.Close()
-	var out []json.RawMessage
-	for rows.Next() {
-		var facts json.RawMessage
-		if err := rows.Scan(&facts); err != nil {
-			return nil, err
-		}
-		out = append(out, facts)
-	}
-	return out, rows.Err()
-}
-
-// maxVRAMPerGPU returns the largest per-card VRAM among a cluster's nodes.
-//
-// The MAXIMUM, not the minimum or the sum, because Kubernetes schedules the
-// workload onto one node and it only has to fit somewhere: refusing a model
-// that the cluster's one big GPU node could run, because a small node exists
-// alongside it, would be a false refusal — and this check is allowed to be
-// wrong only in the permissive direction. Nodes with no GPU facts contribute
-// nothing, so a cluster nobody has reported hardware for sizes as unknown and
-// the check is skipped entirely.
-func maxVRAMPerGPU(nodeFacts []json.RawMessage) uint64 {
-	var best uint64
-	for _, raw := range nodeFacts {
-		gpu := ParseHostFacts(raw).GPU
-		if gpu == nil {
-			continue
-		}
-		if gpu.VRAMBytesPerGPU > best {
-			best = gpu.VRAMBytesPerGPU
-		}
-	}
-	return best
 }

@@ -59,6 +59,7 @@ type SearchResult = {
 
 export function ModelStep({
   orgId,
+  projectId,
   name,
   onNameChange,
   modelId,
@@ -68,6 +69,13 @@ export function ModelStep({
   onTokenConfiguredChange,
 }: {
   orgId: string;
+  /** The project this endpoint is being created in, when it is known this early
+   *  — the wizard was opened from a project page. It is what the search asks the
+   *  weights-token question ABOUT, so a project holding its own
+   *  HUGGING_FACE_HUB_TOKEN secret is not told that none is configured. Empty
+   *  from /dashboard/resources, where the project is picked two steps later:
+   *  there the control plane answers on its own token, which is all it can. */
+  projectId: string;
   name: string;
   onNameChange: (value: string) => void;
   /** The model reference that will be sent at create — a repo id, picked or
@@ -93,7 +101,10 @@ export function ModelStep({
    *  typed and skips the fit check. */
   const [unresolved, setUnresolved] = React.useState<string | null>(null);
 
-  const searchKey = `${reloads}:${query}`;
+  // The project is part of the key, not just of the request: it changes the
+  // ANSWER (whether a weights token was found), so a result recorded under one
+  // project must not be shown as the answer for another.
+  const searchKey = `${reloads}:${projectId}:${query}`;
   const loading = result?.key !== searchKey;
   const models = result?.models ?? [];
 
@@ -104,7 +115,7 @@ export function ModelStep({
     // the query moved on, which is what stops an older, slower search from
     // overwriting a newer one.
     const timer = setTimeout(() => {
-      void searchModels({ orgId, query })
+      void searchModels({ orgId, query, projectId: projectId || undefined })
         .then((res) => {
           if (cancelled) return;
           setResult({ key: searchKey, models: res.models, error: res.error ?? null });
@@ -126,7 +137,7 @@ export function ModelStep({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [orgId, query, searchKey, onTokenConfiguredChange]);
+  }, [orgId, projectId, query, searchKey, onTokenConfiguredChange]);
 
   const typed = query.trim();
   /** Offer the typed text as an id only when it could BE one and the search did
@@ -301,14 +312,18 @@ export function ModelStep({
           the Hub publishes their METADATA to anyone and gates only the weights —
           demo mode ships three of them and this notice used to claim, directly
           above their rows, that they were not listed. The token that matters is
-          the one the GPU host pulls with, so that is the one named here. */}
+          the one the GPU host pulls with, so that is the one named here, in both
+          of the places it can live: opened from a project, the search asked
+          about that project's secrets; opened from the resources list, no
+          project is known yet and only the control plane's own token counted. */}
       {!tokenConfigured && (
         <p className="text-xs text-muted-foreground">
           Gated repositories are listed here — Hugging Face describes them to
           anyone and gates only the download. Their weights need an account that
-          has accepted the model&rsquo;s licence, and a token from it in
-          HUGGING_FACE_HUB_TOKEN on this control plane; none is configured, so a
-          gated model may fail on its first pull.
+          has accepted the model&rsquo;s licence, and a token from it in a
+          HUGGING_FACE_HUB_TOKEN secret on the project you deploy into, or on the
+          control plane itself; none was found, so a gated model may fail on its
+          first pull.
         </p>
       )}
 

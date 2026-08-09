@@ -108,23 +108,66 @@ func TestAnEndpointStillCarriesItsOwnSecrets(t *testing.T) {
 	}
 }
 
-// The context window the fit check paid for has to reach the runtime, or the
-// estimate approved a deploy that cannot start: vLLM otherwise sizes its KV
-// cache from the model's own max_position_embeddings, which is many times the
-// window hf.SizedContextTokens budgets for.
-func TestTheStartCommandPinsTheContextTheFitCheckBudgeted(t *testing.T) {
-	cs := renderOneLLM(t, store.LLMTarget{Port: 21000}, nil)
-	got := ""
+// maxModelLen reads the rendered --max-model-len, or "" when the flag is absent.
+func maxModelLen(cs containerOpSpec) string {
 	for i, arg := range cs.Command {
 		if arg == "--max-model-len" && i+1 < len(cs.Command) {
-			got = cs.Command[i+1]
+			return cs.Command[i+1]
 		}
 	}
-	// Compared against the sizing package's own constant, not a literal: the
-	// number here and the number the VRAM estimate budgets are the same number,
-	// and a test that spelled it out again would keep passing while they drifted.
-	if want := strconv.Itoa(hf.SizedContextTokens); got != want {
-		t.Fatalf("--max-model-len = %q, want the sized context %q; a runtime allowed to size its "+
-			"KV cache from the model's own limit exits on a card the fit check approved", got, want)
+	return ""
+}
+
+// The window the endpoint was provisioned for is the window it is started at —
+// the document carries the ENDPOINT's number, not a package constant.
+//
+// Both ends of that range are fatal, which is why this cannot be a literal.
+// Unpinned, vLLM sizes its KV cache from the model's own
+// max_position_embeddings, many times what hf.SizedContextTokens budgets, and
+// the runtime exits demanding memory the fit check never estimated. Pinned to
+// hf.SizedContextTokens for every model — which is what this used to render —
+// vLLM refuses to start anything whose own ceiling is shorter, so TinyLlama at
+// 2048 crash-looped on a card it fits many times over.
+func TestTheStartCommandPinsTheWindowTheEndpointWasProvisionedFor(t *testing.T) {
+	sized := renderOneLLM(t, store.LLMTarget{Port: 21000, ContextTokens: hf.SizedContextTokens}, nil)
+	if got, want := maxModelLen(sized), strconv.Itoa(hf.SizedContextTokens); got != want {
+		t.Fatalf("--max-model-len = %q, want the endpoint's own %q; a runtime allowed to size its "+
+			"KV cache from the model's limit exits on a card the fit check approved", got, want)
+	}
+
+	// A model whose own ceiling is shorter than the sizing window is served at
+	// ITS ceiling. 2048 is TinyLlama-1.1B-Chat, the catalogue's "fits anything"
+	// pick and therefore the model this failure hit most often.
+	short := renderOneLLM(t, store.LLMTarget{Port: 21000, ContextTokens: 2048}, nil)
+	if got := maxModelLen(short); got != "2048" {
+		t.Fatalf("--max-model-len = %q for a 2048-token model, want 2048; vLLM raises rather than "+
+			"clamping when the flag exceeds the model's own maximum", got)
+	}
+}
+
+// A zero on the endpoint row renders no flag, and that case is now only
+// reachable for rows written before any of this existed.
+//
+// It is worth stating what changed, because omitting used to be the DESIGN and
+// it was wrong. hf.ServedContextTokens no longer returns zero: an unreadable
+// ceiling falls back to the window the VRAM estimate budgeted, because the
+// models whose ceiling cannot be read are the GATED ones — Llama and its kin,
+// whose real ceilings are far above that window — and leaving those unpinned is
+// the 131072-token KV-cache crash the flag exists to prevent, with a green fit
+// check in front of it. Migration 0056 backfills existing rows for the same
+// reason, so this guard should never fire in production.
+//
+// It stays anyway. A row that says zero is a row that says nothing, and
+// rendering "--max-model-len 0" against it would be a container that cannot
+// start for a reason nobody could read off the document.
+func TestAnEndpointRowWithNoWindowRendersNoFlagRatherThanAZeroOne(t *testing.T) {
+	cs := renderOneLLM(t, store.LLMTarget{Port: 21000}, nil)
+	if got := maxModelLen(cs); got != "" {
+		t.Fatalf("--max-model-len = %q for an endpoint row carrying no window, want the flag omitted", got)
+	}
+	// The rest of the command is untouched — this omits one flag, it does not
+	// stop serving the model.
+	if len(cs.Command) == 0 || cs.Command[0] != "--model" {
+		t.Fatalf("command = %v, want the model still passed to the runtime", cs.Command)
 	}
 }

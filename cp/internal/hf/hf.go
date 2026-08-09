@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -113,6 +114,18 @@ type ModelCard struct {
 	// Engine is the runtime the control plane would render for this model. The
 	// wizard used to ask; the metadata already knows (see EngineForModel).
 	Engine string `json:"engine"`
+	// MaxPositionEmbeddings is the model's OWN context ceiling, as the Hub's
+	// copy of its config.json states it. 0 means the Hub did not say, and that
+	// is a common answer rather than an error case — a gated repository read
+	// without a token carries no config at all.
+	//
+	// It rides on the card because the context window a runtime is started at is
+	// not ours alone to pick: vLLM REFUSES to start when --max-model-len is
+	// longer than this number, so the window is the smaller of what the sizing
+	// paid for and what the model has. ServedContextTokens is that decision, and
+	// a 0 here makes a 0 there — which is an instruction to render no flag at
+	// all, not a length. Read its comment before rendering anything from this.
+	MaxPositionEmbeddings int `json:"maxPositionEmbeddings"`
 	// Parameters is 0 and ParametersKnown false when nothing in the metadata or
 	// the repository name reveals a size. That pair is load-bearing: it is what
 	// switches the fit check OFF rather than guessing a number to gate on.
@@ -280,6 +293,12 @@ func (c *Client) Resolve(ctx context.Context, repoID string) (ModelCard, error) 
 			m.ID = id
 		}
 		card, _ := cardFromAPI(m)
+		// The context ceiling costs a second request, and it is taken HERE and
+		// not in Search on purpose: it is needed once, for the model actually
+		// being deployed, and a twenty-row search would otherwise fan out into
+		// twenty-one requests per keystroke. The card that reaches the store —
+		// and so the rendered --max-model-len — comes through this path.
+		card.MaxPositionEmbeddings = c.contextCeiling(ctx, id, segments)
 		c.remember(key, []ModelCard{card}, nil)
 		return card, nil
 
@@ -301,18 +320,50 @@ func (c *Client) Resolve(ctx context.Context, repoID string) (ModelCard, error) 
 	}
 }
 
+// contextCeiling reads the model's own context ceiling from its config.json.
+//
+// Every failure returns 0 — "the Hub did not tell us" — and 0 is not a short
+// window: ServedContextTokens turns it into the context the estimate was
+// actually paid for. That is why this cannot fail the Resolve it is called
+// from. A GGUF-only repository publishes no config.json at all (404), a gated
+// one answers 401 to a control plane with no token, and neither is a reason to
+// refuse a model the rest of the record described perfectly well.
+func (c *Client) contextCeiling(ctx context.Context, id string, segments []string) int {
+	body, status, err := c.do(ctx, "/"+strings.Join(segments, "/")+configJSONPath, "the model config for "+id)
+	if err != nil || status != http.StatusOK || len(body) > maxConfigBytes {
+		return 0
+	}
+	return configContextCeiling(body)
+}
+
 // gatedCard is everything that can be honestly said about a repository the Hub
-// will not describe to us: it exists, it is gated, and its NAME still sizes it
-// (see ParseParameterCount). The card's SizingBasis says "name" so a support
-// question can be answered later; nothing softens the fit check on the strength
-// of it, and nothing should — see the field's comment for why a third
-// confidence tier is a decision nobody asked for.
+// will not describe to us: it exists, it is gated, and the format spelled out in
+// its id decides which runtime would serve it. It is NOT sized.
+//
+// It used to be, from the name, and the name lies about mixture-of-experts
+// repositories: "mistralai/Mixtral-8x7B-Instruct-v0.1" multiplies out to 56e9
+// parameters and ~150 GB, where the real checkpoint is 46.7e9 and ~125 GB. On a
+// 141 GB H200 that gated card REFUSED a model that fits, by 25 GB — and
+// store.checkModelFits states the rule it broke: the fit check "is only allowed
+// to be wrong in the permissive direction". An unsized gated model is a KNOWN
+// unknown, and refusing on a guess is the one direction this code may not be
+// wrong in, so ParametersKnown stays false, VRAMBytesRequired stays 0, and every
+// consumer of the card fails open exactly as it does for a model nobody can
+// size.
+//
+// The name path is not gone; it still sizes repositories the Hub DID describe
+// but published no readable index for (see applySizing). What it no longer does
+// is stand in for metadata that a token would have produced — the fix for a
+// gated model is a token, and the product says so.
 //
 // PipelineTag is empty here and cannot be otherwise: a 401 carries no metadata.
 // Empty is unknown, and unknown is not a refusal.
 func gatedCard(id string) ModelCard {
 	card := ModelCard{ID: id, Name: displayName(id), Gated: true}
-	applySizing(&card, nil, "", 0)
+	// A 401 carries no tags and no dtype either, so the format is whatever the
+	// id itself spells out — "…-AWQ" is still AWQ when the Hub will not say so.
+	applyRuntime(&card, nil, "")
+	card.SizingBasis = "unknown"
 	return card
 }
 
@@ -338,6 +389,118 @@ type apiModel struct {
 	} `json:"safetensors"`
 }
 
+// configJSONPath is where a repository's ACTUAL config.json lives — the same
+// file transformers and vLLM read, served straight out of the git repo.
+//
+// It has to be fetched separately, and that is the correction to a wrong
+// assumption that cost a release. `/api/models/{id}` carries a field called
+// `config`, which reads like the answer and is not: the Hub returns a curated
+// three-key subset — architectures, model_type, tokenizer_config — and
+// max_position_embeddings is not among them, on either the search rows or the
+// single-model record. Reading the ceiling from there returned 0 for EVERY
+// model, which made ServedContextTokens' unknown branch the only branch and
+// restored the exact 131072-token crash --max-model-len exists to prevent, with
+// the fit check certifying it green. The stub in this package's own tests said
+// otherwise, because the stub was written from the same assumption as the code.
+//
+// Pinned to `main` rather than the record's sha: the sha names a commit whose
+// config a model card may not have been built from, and a context ceiling that
+// changes between revisions of the same repository is not a thing that happens.
+const configJSONPath = "/resolve/main/config.json"
+
+// maxConfigBytes caps the config.json read. A model config is a few kilobytes;
+// anything approaching this is not one, and an unbounded read of a third
+// party's file is how a control plane dies of someone else's mistake.
+const maxConfigBytes = 256 << 10
+
+// contextCeilingKeys are the config.json fields an architecture may declare its
+// context ceiling in, in the order vLLM's own _get_and_verify_max_len consults
+// them. There is more than one because the field is the ARCHITECTURE's, not a
+// standard: GPT-2 and its descendants say n_positions, the ChatGLM family says
+// seq_length, and reading only the transformers spelling means silently
+// treating those as unknown.
+var contextCeilingKeys = []string{
+	"max_position_embeddings",
+	"n_positions",
+	"max_seq_len",
+	"seq_length",
+	"model_max_length",
+	"n_ctx",
+}
+
+// configContextCeiling reads a model's own context ceiling out of the Hub's
+// config block. 0 means the Hub did not say — an ordinary answer, not a
+// failure — and it must never be read as a short window: see
+// ServedContextTokens for what a caller does with it.
+//
+// Two nestings are searched. The top level is where a plain decoder-only
+// repository states it; the nested pass is for the multimodal repositories that
+// state it inside the text half's own config ("text_config" on the Llama and
+// Qwen vision families, other spellings elsewhere), and it matches on the KEY so
+// that a list of architecture names is not something this file has to keep
+// current.
+//
+// A top-level value wins outright, and when only nested blocks answer the
+// SMALLEST does. That tie-break has to be deterministic — Go's map iteration is
+// not, and a card whose context differed between two identical requests would be
+// unexplainable — and small is the safe direction, because a window shorter than
+// the model allows serves fewer tokens while one longer than it allows is a
+// runtime that refuses to start at all.
+func configContextCeiling(raw json.RawMessage) int {
+	var config map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &config) != nil {
+		return 0
+	}
+	if n, ok := firstContextLength(config); ok {
+		return n
+	}
+	var best int
+	for _, value := range config {
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(value, &nested) != nil {
+			// Not an object: architectures, model_type and the rest of the file.
+			continue
+		}
+		if n, ok := firstContextLength(nested); ok && (best == 0 || n < best) {
+			best = n
+		}
+	}
+	return best
+}
+
+// firstContextLength returns the ceiling from the earliest key in
+// contextCeilingKeys this block answers. Order is the tie-break, not size,
+// because these are not competing estimates of one quantity — they are
+// different architectures' names for it, and a repository that carries two
+// carries the transformers spelling as the real one.
+func firstContextLength(block map[string]json.RawMessage) (int, bool) {
+	for _, key := range contextCeilingKeys {
+		if n, ok := contextLength(block[key]); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// contextLength decodes one config value as a token count.
+//
+// Anything that is not a positive number this platform can hold is reported
+// ABSENT rather than clamped into range: it is a field we misread, and the
+// honest answer for something we cannot read is "unknown", which downstream
+// leaves the runtime on its own ceiling instead of on ours.
+func contextLength(raw json.RawMessage) (int, bool) {
+	// float64, not int, because these arrive as JSON numbers and a config that
+	// writes 2048 as "2048.0" is not wrong about its context window.
+	var n float64
+	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil {
+		return 0, false
+	}
+	if n < 1 || n > math.MaxInt32 {
+		return 0, false
+	}
+	return int(n), true
+}
+
 func cardFromAPI(m apiModel) (ModelCard, bool) {
 	id := m.ID
 	if id == "" {
@@ -346,6 +509,9 @@ func cardFromAPI(m apiModel) (ModelCard, bool) {
 	if id == "" {
 		return ModelCard{}, false
 	}
+	// MaxPositionEmbeddings is deliberately absent here: nothing in the model
+	// record answers it (see configJSONPath), so it is filled by Resolve, which
+	// is the one path that spends a second request on the file that does.
 	card := ModelCard{
 		ID:          id,
 		Name:        displayName(id),

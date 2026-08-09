@@ -27,10 +27,14 @@ import type { TargetChoices, WizardProject } from "@/lib/wizard/availability";
  *
  * WHICH targets are offered is not decided here. This component renders a
  * TargetChoices and nothing else, because the defect it shipped with was an
- * argument that never got passed — the chosen model reached the server filter
- * and not the cluster one — and an argument list inside JSX is the one thing
- * this repository's suites cannot reach (they run in node, with no DOM). The
- * decision lives in availability.targetChoices, where a test can hold it.
+ * argument that never got passed, and an argument list inside JSX is the one
+ * thing this repository's suites cannot reach (they run in node, with no DOM).
+ * The decision lives in availability.targetChoices, where a test can hold it.
+ *
+ * A cluster row is never refused for the MODEL any more, only for the kind: a
+ * model endpoint cannot run inside a cluster on this control plane, so the row
+ * says that instead of comparing VRAM figures the cluster listing no longer
+ * publishes. Server rows still carry the fit refusal.
  */
 export function TargetStep({
   projects,

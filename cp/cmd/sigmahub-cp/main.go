@@ -185,11 +185,13 @@ func loadGitHubApp(ctx context.Context, st *store.Store, cfg config.Config) (*gi
 
 // hubSizer adapts the Hugging Face client to store.ModelSizer.
 //
-// The adapter exists so the store's dependency stays two fields wide. Handing
-// it the hf.Client directly would work and would be a mistake: the store would
-// then be one autocomplete away from making a provisioning decision out of
-// `gated` or `pipelineTag`, which are the picker's business, and it would carry
-// an HTTP client into a package whose job is transactions.
+// The adapter exists so the store never holds the card itself. Handing it the
+// hf.Client directly would work and would be a mistake: the store would then be
+// one autocomplete away from making a provisioning decision out of `gated`,
+// `likes` or `sizingBasis`, which are the picker's business, and it would carry
+// an HTTP client into a package whose job is transactions. What crosses this
+// line is exactly what a CREATE decides on, and every field below has a refusal
+// or a rendered flag behind it.
 type hubSizer struct{ hub *hf.Client }
 
 func (h hubSizer) SizeModel(ctx context.Context, repoID string) (store.ModelSize, error) {
@@ -203,6 +205,15 @@ func (h hubSizer) SizeModel(ctx context.Context, repoID string) (store.ModelSize
 		// Carried, not re-rendered: the refusal must quote the same string the
 		// picker put on screen for this model.
 		VRAMText: card.VRAMText,
+		// The two the wizard refuses at the model step, so an API-direct create
+		// hits the same wall: vLLM cannot open a GGUF repository, and an `llm`
+		// resource serves text generation and nothing else.
+		Quantization: card.Quantization,
+		PipelineTag:  card.PipelineTag,
+		// The model's own context ceiling, which the endpoint's --max-model-len
+		// is clamped to at provision. 0 is "the Hub did not say" and renders no
+		// flag at all.
+		MaxPositionEmbeddings: card.MaxPositionEmbeddings,
 	}, nil
 }
 
