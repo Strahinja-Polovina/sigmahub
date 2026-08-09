@@ -828,3 +828,85 @@ func TestDecommissionRefusesALiveBuildServer(t *testing.T) {
 		t.Fatalf("DeleteServer on a live build server returned %v; want a 409", err)
 	}
 }
+
+// SIGMA-233: a decommission that times out has to REACH somebody.
+//
+// The timeout path tombstones the row, revokes the agent token and writes one
+// audit entry, and that was the whole of it — the only runtime signal was a
+// log.Warn on the control plane's stdout. Nothing entered the alert outbox, so
+// nothing reached the operator's channels.
+//
+// That is the one ending of the three that means the machine is still out
+// there. On the ack the host tore itself down; on a force disconnect the
+// operator chose it with the cleanup script in front of them. On the timeout
+// nobody knows anything: sigmad is still installed, Docker restarts every
+// managed container (unless-stopped) the moment the box comes back, and the
+// only record the product keeps is a row nothing lists and a line in a log
+// nobody ships.
+func TestTimeoutStaleDecommissions_EnqueuesAlert(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_decom_alert"
+
+	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
+		Kind: "slack", Name: "ops", Secret: "https://hooks.example/T000/secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	serverID := connectServer(t, st, orgID, "powered-off")
+	if _, err := st.BeginDecommission(ctx, orgID, serverID, false, "operator"); err != nil {
+		t.Fatal(err)
+	}
+
+	timedOut, err := st.TimeoutStaleDecommissions(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(timedOut) != 1 {
+		t.Fatalf("timed out = %+v, want the one stale decommission", timedOut)
+	}
+
+	var event, title, body string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT event, title, body FROM alert_outbox`).Scan(&event, &title, &body); err != nil {
+		t.Fatalf("no alert reached the outbox for a host that still has our software on it: %v", err)
+	}
+	if event != store.AlertDecommissionTimedOut {
+		t.Fatalf("event = %q, want %q", event, store.AlertDecommissionTimedOut)
+	}
+	// The operator has to be able to act on it: which machine, who started the
+	// teardown, and what is now the only way to finish it.
+	if !strings.Contains(title+body, "powered-off") {
+		t.Errorf("the alert does not name the server: %q / %q", title, body)
+	}
+	if !strings.Contains(body, "operator") {
+		t.Errorf("the alert does not say who started the teardown: %q", body)
+	}
+	if !strings.Contains(body, "uninstall.sh") {
+		t.Errorf("the alert does not point at the manual cleanup that is now the only way to finish: %q", body)
+	}
+}
+
+// The alert is a fan-out over subscribed channels, so an org with no channels
+// must still time out cleanly — the sweeper runs across every org at once, and
+// one silent tenant must not stop the others' rows from being settled.
+func TestTimeoutStaleDecommissionsWithNoAlertChannels(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_decom_nochannel"
+
+	serverID := connectServer(t, st, orgID, "quiet")
+	if _, err := st.BeginDecommission(ctx, orgID, serverID, false, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	timedOut, err := st.TimeoutStaleDecommissions(ctx, 0)
+	if err != nil {
+		t.Fatalf("the sweep failed for an org with no alert channels: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ServerID != serverID {
+		t.Fatalf("timed out = %+v, want the one stale decommission", timedOut)
+	}
+	if _, err := st.GetServer(ctx, orgID, serverID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the row survived its timeout: err = %v", err)
+	}
+}

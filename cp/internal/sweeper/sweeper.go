@@ -74,10 +74,17 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 				} else {
 					for _, d := range timedOut {
 						// Per-server, at warn: the machine still has our binary,
-						// unit, tunnel and containers on it, and only the audit
-						// log and this line say so.
+						// unit, tunnel and containers on it. This line is no
+						// longer the only thing that says so — the store enqueues
+						// a decommission_timed_out alert in the same transaction
+						// as the tombstone (SIGMA-233), because stdout on the
+						// control plane is shipped nowhere and this is the one
+						// ending of a disconnect that leaves a live host behind
+						// without anybody choosing it. The actor is included so
+						// the log agrees with the notification the person who
+						// pressed Disconnect just received.
 						log.Warn("sweeper: decommission timed out; server removed without agent confirmation",
-							"server", d.ServerID, "org", d.OrgID, "name", d.Name)
+							"server", d.ServerID, "org", d.OrgID, "name", d.Name, "actor", d.Actor)
 					}
 				}
 			}
