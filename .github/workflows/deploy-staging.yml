@@ -8,7 +8,7 @@ name: Deploy staging
 #
 # Required repo secret:
 #   STAGING_SSH_KEY — private half of the dedicated CI deploy key installed
-#   for deploy@159.195.215.228 (see /home/deploy/.ssh/authorized_keys).
+#   for deploy@159.195.43.22 (see /home/deploy/.ssh/authorized_keys).
 
 on:
   push:
@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  STAGING_HOST: 159.195.215.228
+  STAGING_HOST: 159.195.43.22
   STAGING_USER: deploy
   STAGING_DIR: /home/deploy/sigmahub
   CP_IMAGE_REPO: ghcr.io/strahinja-polovina/sigmahub-cp
@@ -80,7 +80,7 @@ jobs:
           printf '%s\n' "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # Pinned host key — no TOFU on the runner.
-          echo "159.195.215.228 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHtZrueOK6f47D6QQ2tcHF5zyvJkcqHkwmw4mzOAOxjU" >> ~/.ssh/known_hosts
+          echo "159.195.43.22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDFwZ5hNqBhBCWZufp/H0J7G1nHpK5GQE/SqlwPLB9oA" >> ~/.ssh/known_hosts
 
       - name: Sync deploy files
         run: |
