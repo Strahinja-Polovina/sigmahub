@@ -20,6 +20,8 @@ import {
   type CpBranchMap,
 } from "@/server/cp";
 import { isInstallationId } from "@/lib/github-app";
+import { WIZARD_RESUME_PARAM, WIZARD_RESUME_VALUE } from "@/lib/wizard/resume";
+import { listClusters } from "@/server/actions/clusters";
 import { ProjectDetailView } from "@/components/dashboard/projects/project-detail-view";
 import type {
   GitAppInfo,
@@ -144,11 +146,14 @@ export default async function ProjectDetailPage({
   const rawInstallation = typeof query.installation_id === "string" ? query.installation_id : undefined;
   const pendingInstallationId = isInstallationId(rawInstallation) ? rawInstallation : undefined;
 
-  const [panels, servers, gitConnections, gitApp] = await Promise.all([
+  const [panels, servers, gitConnections, gitApp, clusterData] = await Promise.all([
     getEnvironmentPanels(projectId),
     getServers(orgId),
     loadGitConnections(orgId, projectId),
     loadGitApp(orgId),
+    // A cluster is a deploy TARGET, and the wizard could not offer one because
+    // nothing loaded them here (SIGMA-210).
+    cpEnabled() ? listClusters(orgId) : Promise.resolve({ clusters: [], excludedKinds: [] }),
   ]);
   // What recent pushes to this project's repositories actually produced. The
   // org-wide list is filtered to this project's connections; a CP failure just
@@ -175,6 +180,9 @@ export default async function ProjectDetailPage({
       projectMembers={projectMembers}
       canManageMembers={canManageMembers}
       cpMode={cpEnabled()}
+      clusters={clusterData.clusters}
+      clusterExcludedKinds={clusterData.excludedKinds}
+      resumeWizard={query[WIZARD_RESUME_PARAM] === WIZARD_RESUME_VALUE}
     />
   );
 }

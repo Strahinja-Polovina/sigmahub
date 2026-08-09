@@ -532,3 +532,291 @@ func TestClusterTargetIsScopedToItsEnvironmentAndOrg(t *testing.T) {
 		t.Fatalf("cross-org cluster id → %d: %v", code, body)
 	}
 }
+
+// A repository whose Dockerfile is not at the root, or which has no Dockerfile
+// at all, has to reach the agent as the build it actually is.
+//
+// The agent's image.build op has taken `dockerfile` and `contextSubdir` since
+// the Compose work, and the single-container path set NEITHER — it hardcoded a
+// Dockerfile at the clone root. So a monorepo app and a Dockerfile-less app
+// were both undeployable for want of two strings that every layer already
+// understood. That gap is invisible to unit tests on either side: gitdetect
+// finds apps/api/Dockerfile correctly and the agent honours contextSubdir
+// correctly; nothing carried the answer between them. This drives the real
+// handler into the real Postgres and reads the actually-rendered op.
+func TestBuildConfigReachesTheBuildOp(t *testing.T) {
+	cases := []struct {
+		name              string
+		build             map[string]any
+		wantBuilder       string
+		wantDockerfile    string
+		wantContextSubdir string
+	}{
+		{
+			name:              "monorepo: build where the app lives",
+			build:             map[string]any{"method": "dockerfile", "dockerfile": "Dockerfile", "contextSubdir": "apps/api"},
+			wantDockerfile:    "Dockerfile",
+			wantContextSubdir: "apps/api",
+		},
+		{
+			name:           "overridden dockerfile path at the root",
+			build:          map[string]any{"method": "dockerfile", "dockerfile": "docker/Dockerfile.prod"},
+			wantDockerfile: "docker/Dockerfile.prod",
+		},
+		{
+			// The auto-build fallback: no Dockerfile anywhere, so the op has to
+			// name a builder or the agent will look for one and blame the clone.
+			name:              "nixpacks auto-build",
+			build:             map[string]any{"method": "nixpacks", "contextSubdir": "services/api"},
+			wantBuilder:       "nixpacks",
+			wantContextSubdir: "services/api",
+		},
+		{
+			// Every resource created before the wizard could express any of this.
+			name:        "no build block keeps the historical default",
+			build:       nil,
+			wantBuilder: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, dsdKey := testStore(t)
+			ctx := context.Background()
+			ts, rec, token := wizardAPI(t, st, dsdKey)
+			orgID := "org_buildcfg_" + strings.ReplaceAll(strings.ReplaceAll(tc.name, " ", "_"), ":", "")
+
+			proj, err := st.CreateProject(ctx, orgID, "shop", "", "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			serverID := connectServer(t, st, orgID, "host-a")
+			if err := st.AttachServer(ctx, orgID, env.ID, serverID, "admin"); err != nil {
+				t.Fatal(err)
+			}
+
+			spec := map[string]any{
+				"repo":  "acme/shop",
+				"ports": []map[string]any{{"container": 8080, "host": 0, "protocol": "tcp"}},
+			}
+			if tc.build != nil {
+				spec["build"] = tc.build
+			}
+			code, body := postAs(t, ts, token, "/v1/orgs/"+orgID+"/resources", map[string]any{
+				"environmentId": env.ID, "serverId": serverID, "name": "shop", "kind": "app", "spec": spec,
+			})
+			if code != http.StatusCreated {
+				t.Fatalf("create → %d: %v", code, body)
+			}
+			resourceID, _ := body["id"].(string)
+
+			conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+				ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/shop",
+			}, "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+				ResourceID: resourceID, EnvironmentID: env.ID, ServerID: serverID,
+				ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+			}, "admin"); err != nil {
+				t.Fatal(err)
+			}
+
+			buildID := "build:" + resourceID
+			ops := renderedOps(t, st, rec, orgID, serverID, func(ops []dsd.Op) bool {
+				return opIDs(ops)[buildID] == dsd.KindImageBuild
+			})
+			var got struct {
+				Builder       string `json:"builder"`
+				Dockerfile    string `json:"dockerfile"`
+				ContextSubdir string `json:"contextSubdir"`
+			}
+			found := false
+			for _, op := range ops {
+				if op.ID != buildID {
+					continue
+				}
+				found = true
+				if err := json.Unmarshal(op.Spec, &got); err != nil {
+					t.Fatalf("build op spec is not decodable: %v", err)
+				}
+			}
+			if !found {
+				t.Fatalf("no image.build op rendered; ops = %v", opIDs(ops))
+			}
+			if got.Builder != tc.wantBuilder {
+				t.Errorf("builder = %q, want %q", got.Builder, tc.wantBuilder)
+			}
+			if got.Dockerfile != tc.wantDockerfile {
+				t.Errorf("dockerfile = %q, want %q", got.Dockerfile, tc.wantDockerfile)
+			}
+			if got.ContextSubdir != tc.wantContextSubdir {
+				t.Errorf("context subdir = %q, want %q", got.ContextSubdir, tc.wantContextSubdir)
+			}
+		})
+	}
+}
+
+// An unknown build method is refused at create, while the wizard is still open
+// and the operator can pick a different one. The agent refuses it too, which is
+// the right last line of defence and a terrible first one: by then the resource
+// exists and the failure is a red deployment nobody is watching.
+func TestUnknownBuildMethodRefusedAtCreate(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	ts, _, token := wizardAPI(t, st, dsdKey)
+	orgID := "org_badbuilder"
+
+	proj, err := st.CreateProject(ctx, orgID, "shop", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID := connectServer(t, st, orgID, "host-a")
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := postAs(t, ts, token, "/v1/orgs/"+orgID+"/resources", map[string]any{
+		"environmentId": env.ID, "serverId": serverID, "name": "shop", "kind": "app",
+		"spec": map[string]any{"build": map[string]any{"method": "buildpacks"}},
+	})
+	if code != http.StatusUnprocessableEntity && code != http.StatusBadRequest {
+		t.Fatalf("unknown build method → %d (%v), want a 4xx refusal", code, body)
+	}
+	msg, _ := body["message"].(string)
+	if msg == "" {
+		msg, _ = body["error"].(string)
+	}
+	if !strings.Contains(msg, "buildpacks") {
+		t.Errorf("refusal must name the method it refused, got %v", body)
+	}
+}
+
+// The build config has to reach a CLUSTER build too.
+//
+// The cluster build op was assembled without it, so every cluster app built as
+// "Dockerfile at the clone root": a monorepo built the wrong service, and an
+// auto-build app failed with "build context missing Dockerfile (clone did not
+// run?)" — the one error the auto-build path exists to make unreachable. It is
+// the intersection of the two things this change adds, the cluster picker and
+// the build methods, and it was tested at neither end.
+func TestBuildConfigReachesTheClusterBuildOp(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cluster_build_cfg"
+	ts, rec, token := wizardAPI(t, st, dsdKey)
+	_ = ts
+
+	envID, cpServer, _ := clusterFixture(t, st, orgID)
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := connectServer(t, st, orgID, "builder")
+	_ = token
+	// A cluster build pushes to a registry — without one configured, nothing
+	// renders and the test would pass by describing an empty document.
+	if _, err := st.SetImageRegistry(ctx, orgID, store.SetImageRegistryInput{
+		Host: "ghcr.io", Namespace: "acme", Username: "bot", Password: "s3cret",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: projectID, Provider: "github", RepoFullName: "acme/shop",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, resource                          string
+		spec                                    string
+		wantBuilder, wantDockerfile, wantSubdir string
+	}{
+		{
+			name: "auto-build onto a cluster", resource: "autobuilt",
+			spec:        `{"build":{"method":"nixpacks","contextSubdir":"services/api"}}`,
+			wantBuilder: "nixpacks", wantSubdir: "services/api",
+		},
+		{
+			name: "monorepo Dockerfile onto a cluster", resource: "monorepo",
+			spec:           `{"build":{"method":"dockerfile","dockerfile":"Dockerfile","contextSubdir":"apps/api"}}`,
+			wantDockerfile: "Dockerfile", wantSubdir: "apps/api",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+				EnvironmentID: envID, ClusterID: cluster.ID, Name: tc.resource,
+				Kind: "app", Spec: json.RawMessage(tc.spec),
+			}, "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+				ResourceID: app.ID, EnvironmentID: envID, ConnectionID: conn.ID,
+				Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+			}, "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Pool.Exec(ctx,
+				`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, builder); err != nil {
+				t.Fatal(err)
+			}
+			if err := rec.Reconcile(ctx, orgID, builder); err != nil {
+				t.Fatal(err)
+			}
+			signed, err := st.GetDSD(ctx, builder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found bool
+			for _, o := range signed.Document.Ops {
+				// Scoped to THIS resource: the build server accumulates a build
+				// op per cluster app, and asserting over all of them would read
+				// the previous subtest's spec.
+				if o.Kind != dsd.KindImageBuild || o.ID != "build:"+app.ID {
+					continue
+				}
+				var got struct {
+					Builder       string `json:"builder"`
+					Dockerfile    string `json:"dockerfile"`
+					ContextSubdir string `json:"contextSubdir"`
+				}
+				if err := json.Unmarshal(o.Spec, &got); err != nil {
+					t.Fatal(err)
+				}
+				found = true
+				if got.Builder != tc.wantBuilder {
+					t.Errorf("builder = %q, want %q", got.Builder, tc.wantBuilder)
+				}
+				if got.Dockerfile != tc.wantDockerfile {
+					t.Errorf("dockerfile = %q, want %q", got.Dockerfile, tc.wantDockerfile)
+				}
+				if got.ContextSubdir != tc.wantSubdir {
+					t.Errorf("contextSubdir = %q, want %q", got.ContextSubdir, tc.wantSubdir)
+				}
+			}
+			if !found {
+				t.Fatalf("no image.build op rendered for the build server: %+v", signed.Document.Ops)
+			}
+		})
+	}
+}

@@ -186,10 +186,23 @@ export type ResourceSpecInput = {
   domain?: string | null;
   detected?: {
     ports?: number[];
-    healthCheck?: { type?: string; path?: string; port?: number } | null;
+    healthCheck?: { type?: string; path?: string; port?: number; intervalSec?: number } | null;
     services?: DetectedComposeService[];
   } | null;
+  /** The wizard's port mappings, when it collected them. Overrides the detected
+   *  ports, because the whole point of showing them was to let the user change
+   *  them (SIGMA-210). */
+  ports?: { container: number; host: number; protocol?: string }[] | null;
+  /** How this repository gets built (SIGMA-209). The agent's image.build op has
+   *  taken a dockerfile path and a context subdirectory since the Compose work;
+   *  nothing on the single-container path ever set either, so a repo whose
+   *  Dockerfile is not at its root could not be deployed at all. */
+  build?: { method: string; dockerfile?: string; contextSubdir?: string } | null;
   llm?: { engine?: string; model?: string } | null;
+  /** Object-storage engine (minio | seaweedfs). Rides the SAME `engine` spec
+   *  field as the LLM runtime, because that is what the control plane reads for
+   *  both — see store.s3EngineFromSpec and store.provisionLLMTx. */
+  s3Engine?: string | null;
 };
 
 /**
@@ -209,14 +222,40 @@ export function buildResourceSpec(input: ResourceSpecInput): Record<string, unkn
   // `ports` drives the rollout's exposed ports AND the default TCP health
   // probe; host 0 means internal-only, which is the safe default — Traefik
   // fronts anything that needs to be reachable.
-  const ports = (input.detected?.ports ?? []).filter(
-    (p) => Number.isInteger(p) && p > 0 && p < 65536
+  //
+  // The wizard's mappings win over detection when it collected them: detection
+  // is a pre-fill the user is shown precisely so they can correct it, and
+  // re-deriving from the raw detected list here would silently discard the
+  // correction (and the published host port that came with it).
+  const explicit = (input.ports ?? []).filter(
+    (p) => Number.isInteger(p.container) && p.container > 0 && p.container < 65536
   );
-  if (ports.length > 0) {
-    spec.ports = ports.map((container) => ({ container, host: 0, protocol: "tcp" }));
+  if (explicit.length > 0) {
+    spec.ports = explicit.map((p) => ({
+      container: p.container,
+      host: Number.isInteger(p.host) && p.host > 0 && p.host < 65536 ? p.host : 0,
+      protocol: p.protocol ?? "tcp",
+    }));
+  } else {
+    const ports = (input.detected?.ports ?? []).filter(
+      (p) => Number.isInteger(p) && p > 0 && p < 65536
+    );
+    if (ports.length > 0) {
+      spec.ports = ports.map((container) => ({ container, host: 0, protocol: "tcp" }));
+    }
   }
   if (input.detected?.healthCheck?.type) {
     spec.healthCheck = input.detected.healthCheck;
+  }
+  // Where and how to build. Absent means the historical default — a Dockerfile
+  // at the clone root — which is what every pre-wizard resource carries and
+  // what the reconciler still assumes when the block is missing.
+  if (input.build?.method) {
+    spec.build = {
+      method: input.build.method,
+      ...(input.build.dockerfile ? { dockerfile: input.build.dockerfile } : {}),
+      ...(input.build.contextSubdir ? { contextSubdir: input.build.contextSubdir } : {}),
+    };
   }
   // A Compose repo is a graph, and `spec.compose` is the only thing that makes
   // the control plane treat it as one: without it the reconciler takes the
@@ -231,6 +270,11 @@ export function buildResourceSpec(input: ResourceSpecInput): Record<string, unkn
   if (input.llm?.engine) {
     spec.engine = input.llm.engine;
     spec.model = input.llm.model;
+  }
+  // Object storage picks an engine too, through the same field. The two never
+  // co-occur — a resource is one kind — so one key is not an ambiguity.
+  if (input.s3Engine) {
+    spec.engine = input.s3Engine;
   }
   return spec;
 }

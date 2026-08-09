@@ -24,6 +24,24 @@ func manualForce(target store.DeployTarget) bool {
 	}
 }
 
+// buildConfig unpacks the wizard's build decision into the three fields the
+// image.build op carries. A resource created before the wizard could express
+// any of this has no build block at all, and must keep building exactly as it
+// did: a Dockerfile at the clone root, no builder override.
+//
+// "nixpacks" is passed through verbatim rather than mapped, because the agent
+// refuses a builder it does not know — a typo has to fail loudly at the build
+// rather than silently fall back to looking for a Dockerfile that isn't there.
+func buildConfig(b *buildConfigSpec) (builder, dockerfile, contextSubdir string) {
+	if b == nil {
+		return "", "", ""
+	}
+	if b.Method != "" && b.Method != "dockerfile" {
+		builder = b.Method
+	}
+	return builder, b.Dockerfile, b.ContextSubdir
+}
+
 // crossHostRegistryHost is the registry to authenticate against, but only for a
 // build whose image actually leaves this machine. A same-host build pushes
 // nothing, so naming a registry there would make the agent fetch a credential
@@ -56,7 +74,11 @@ type buildImageOpSpec struct {
 	// Compose service's `build:` path (empty ⇒ repo root).
 	ContextSubdir string `json:"contextSubdir,omitempty"`
 	ImageTag      string `json:"imageTag"`
-	DeploymentID  string `json:"deploymentId,omitempty"`
+	// Builder selects HOW the image is produced: "" / "dockerfile" runs a docker
+	// build against ContextSubdir, "nixpacks" auto-builds a repo that ships no
+	// Dockerfile at all.
+	Builder      string `json:"builder,omitempty"`
+	DeploymentID string `json:"deploymentId,omitempty"`
 	// Force skips the build-dedup short-circuit so a manual redeploy rebuilds the
 	// same commit (e.g. to pick up base-image changes) instead of reusing the cached image.
 	Force bool `json:"force,omitempty"`
@@ -272,9 +294,13 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		ResourceID: rs.ResourceID, Provider: target.Provider, RepoFullName: target.RepoFullName,
 		Ref: target.Ref, SHA: target.SHA, CredentialRef: target.DeploymentID,
 	})
+	// Where and how to build. Absent (every pre-wizard resource) keeps the
+	// historical default: a Dockerfile at the clone root.
+	builder, dockerfile, contextSubdir := buildConfig(spec.Build)
 	build, _ := json.Marshal(buildImageOpSpec{
 		ResourceID: rs.ResourceID, SHA: target.SHA, DedupKey: target.ConfigHash + ":" + target.SHA,
 		ImageTag: imageTag, DeploymentID: target.DeploymentID,
+		Builder: builder, Dockerfile: dockerfile, ContextSubdir: contextSubdir,
 		// A manual redeploy forces a rebuild of the same commit; git-triggered
 		// deploys keep the warm-cache dedup.
 		Force: manualForce(target),

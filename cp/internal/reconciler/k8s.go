@@ -393,12 +393,23 @@ func renderClusterBuildOps(rs store.ResourceSpec, target store.DeployTarget, rep
 	})
 
 	if !isCompose {
+		// The build config the wizard collected — auto-build vs Dockerfile, the
+		// dockerfile path, the context subdirectory — travels here exactly as it
+		// does on the single-server path. Omitting it built every cluster app as
+		// "Dockerfile at the clone root", so a monorepo built the wrong service
+		// and a nixpacks app failed with "build context missing Dockerfile" —
+		// the one error the auto-build path exists to make unreachable. The
+		// per-service branch below already carried it; only this one was blind.
+		builder, dockerfile, contextSubdir := buildConfig(spec.Build)
 		build, _ := json.Marshal(buildImageOpSpec{
 			ResourceID: rs.ResourceID, SHA: target.SHA, DedupKey: target.ConfigHash + ":" + target.SHA,
-			ImageTag:     dsd.QualifyImage(repository, dsd.PinnedImageTag(rs.ResourceID, target.SHA, target.ImagePin)),
-			DeploymentID: target.DeploymentID,
-			Force:        manualForce(target),
-			PushImage:    true,
+			ImageTag:      dsd.QualifyImage(repository, dsd.PinnedImageTag(rs.ResourceID, target.SHA, target.ImagePin)),
+			DeploymentID:  target.DeploymentID,
+			Builder:       builder,
+			Dockerfile:    dockerfile,
+			ContextSubdir: contextSubdir,
+			Force:         manualForce(target),
+			PushImage:     true,
 		})
 		return []dsd.Op{
 			{ID: cloneID, Kind: dsd.KindGitClone, Spec: clone},

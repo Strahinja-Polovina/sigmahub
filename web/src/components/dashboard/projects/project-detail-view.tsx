@@ -25,6 +25,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { DeployWizard } from "@/components/dashboard/resources/deploy-wizard";
 import type { DeployTarget } from "@/components/dashboard/resources/resource-meta";
+import type { WizardCluster } from "@/lib/wizard/availability";
+import { WIZARD_RESUME_KEY, decodeWizardDraft } from "@/lib/wizard/resume";
 import {
   Card,
   CardContent,
@@ -475,6 +477,9 @@ export function ProjectDetailView({
   projectMembers,
   canManageMembers = false,
   cpMode = false,
+  clusters = [],
+  clusterExcludedKinds = [],
+  resumeWizard = false,
 }: {
   project: ProjectRow | null;
   panels: EnvPanel[];
@@ -493,11 +498,37 @@ export function ProjectDetailView({
   canManageMembers?: boolean;
   /** CP mode enables in-place resource creation from this page. */
   cpMode?: boolean;
+  /** Clusters in this project's environments — a deploy target the wizard had
+   *  no way to offer (SIGMA-210). */
+  clusters?: WizardCluster[];
+  clusterExcludedKinds?: string[];
+  /** Returning from the GitHub App install started inside the wizard. */
+  resumeWizard?: boolean;
 }) {
   // Deploy wizard scoped to one environment of this project, so a resource can
   // be added where you are already standing instead of navigating to Resources
   // and re-choosing the project you just came from.
+  //
+  // The id list is memoized because it is an effect dependency: `panels` is a
+  // fresh array on every render of the server component above.
+  const panelEnvIds = React.useMemo(() => panels.map((p) => p.env.id), [panels]);
   const [wizardEnvId, setWizardEnvId] = React.useState<string | null>(null);
+
+  // Coming back from the GitHub App install started inside the wizard: reopen
+  // it on the environment the draft named. Reading (not consuming) the draft
+  // here leaves it for the wizard itself, which restores the rest of it.
+  const resumed = React.useRef(false);
+  React.useEffect(() => {
+    if (!resumeWizard || resumed.current) return;
+    resumed.current = true;
+    let envId: string | null = null;
+    try {
+      envId = decodeWizardDraft(window.sessionStorage.getItem(WIZARD_RESUME_KEY))?.environmentId ?? null;
+    } catch {
+      envId = null;
+    }
+    setWizardEnvId(envId ?? panelEnvIds[0] ?? null);
+  }, [resumeWizard, panelEnvIds]);
 
   if (!project) return <NotFound />;
 
@@ -521,6 +552,7 @@ export function ProjectDetailView({
                 type: sv.type,
                 provider: sv.provider ?? "",
                 region: sv.region ?? "",
+                status: sv.status,
               })),
             })),
         },
@@ -614,6 +646,12 @@ export function ProjectDetailView({
           targets={wizardTargets}
           cpMode={cpMode}
           orgId={orgId ?? ""}
+          clusters={clusters.filter((c) => c.environmentId === wizardEnvId)}
+          clusterExcludedKinds={clusterExcludedKinds}
+          // So a GitHub install started here comes back HERE, not to the
+          // resources list the user was not on.
+          originProjectId={project.id}
+          resume={resumeWizard}
         />
       )}
 

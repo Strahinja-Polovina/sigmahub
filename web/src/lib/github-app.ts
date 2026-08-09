@@ -9,6 +9,13 @@ export type GitAppInstallTarget =
   // Org-level: the App is connected once for the whole organization and repos
   // are picked from it afterwards. This is the normal path.
   | { kind: "org" }
+  // Org-level too, but initiated from inside the New Resource wizard: the
+  // callback claims the installation exactly as "org" does and then returns to
+  // the page the wizard was opened from, so the flow the user was halfway
+  // through can pick itself back up (SIGMA-208). Only the PROJECT id travels —
+  // the rest of the draft is on the user's own machine, and a return path that
+  // came back from github.com would be an open redirect.
+  | { kind: "wizard"; projectId?: string }
   | { kind: "project"; projectId: string }
   | { kind: "connection"; projectId: string; connectionId: string };
 
@@ -19,6 +26,8 @@ export function encodeInstallState(target: GitAppInstallTarget): string {
   switch (target.kind) {
     case "org":
       return "org";
+    case "wizard":
+      return target.projectId ? `wiz:${target.projectId}` : "wiz";
     case "project":
       return `proj:${target.projectId}`;
     case "connection":
@@ -31,7 +40,11 @@ export function parseInstallState(
 ): GitAppInstallTarget | null {
   if (!state) return null;
   if (state === "org") return { kind: "org" };
+  if (state === "wiz") return { kind: "wizard" };
   const parts = state.split(":");
+  if (parts[0] === "wiz" && parts.length === 2 && ID.test(parts[1])) {
+    return { kind: "wizard", projectId: parts[1] };
+  }
   if (parts[0] === "proj" && parts.length === 2 && ID.test(parts[1])) {
     return { kind: "project", projectId: parts[1] };
   }

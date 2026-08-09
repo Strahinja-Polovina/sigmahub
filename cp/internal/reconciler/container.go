@@ -32,6 +32,25 @@ type appResourceSpec struct {
 	// Compose, when present, makes this a multi-service deploy: each service gets
 	// its own build + rollout/recreate op. Populated from gitdetect at connect.
 	Compose *composeDeploySpec `json:"compose,omitempty"`
+	// Build is HOW the single-container path builds this app. Absent means the
+	// historical default — a Dockerfile at the clone root — which is what every
+	// resource created before the wizard could express anything else carries.
+	Build *buildConfigSpec `json:"build,omitempty"`
+}
+
+// buildConfigSpec is the wizard's build decision, persisted. The agent's
+// image.build op has taken a dockerfile path and a context subdirectory since
+// the Compose work; nothing on the single-container path ever set either, so a
+// repo whose Dockerfile was not at the root simply could not be deployed even
+// though every layer below here supported it.
+type buildConfigSpec struct {
+	// Method: "dockerfile" (default) or "nixpacks" (auto-build, no Dockerfile).
+	// "compose" never appears here — a compose app is expressed by Compose above.
+	Method string `json:"method,omitempty"`
+	// Dockerfile is relative to the build context, matching BuildImageSpec.
+	Dockerfile string `json:"dockerfile,omitempty"`
+	// ContextSubdir is relative to the clone root; empty means the root.
+	ContextSubdir string `json:"contextSubdir,omitempty"`
 }
 
 // composeDeploySpec is the Compose service graph stored on a multi-service app
