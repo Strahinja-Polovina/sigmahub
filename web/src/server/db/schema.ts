@@ -175,6 +175,17 @@ export const servers = pgTable("servers", {
   // connect form stopped asking, so registration fills it from the reported
   // hostname while this is set (SIGMA-202).
   nameAuto: boolean("name_auto").notNull().default(false),
+  // A graceful decommission in flight (SIGMA-204). Set when the operator
+  // disconnects, cleared only by the row going away — the tombstone is written
+  // when the agent confirms it removed itself, or when the timeout gives up.
+  // The dashboard needs the TIMESTAMP and not just the status: "Force
+  // disconnect" is offered once the graceful path has had its chance, and that
+  // is a comparison against this, not a second flag.
+  decommissionStartedAt: timestamp("decommission_started_at"),
+  // Whether the operator opted into destroying named volumes too. Default off:
+  // a database's data directory is the customer's, and disconnecting the
+  // machine it sits on is not consent to delete it.
+  decommissionPurgeVolumes: boolean("decommission_purge_volumes").notNull().default(false),
 });
 
 export const envServers = pgTable(

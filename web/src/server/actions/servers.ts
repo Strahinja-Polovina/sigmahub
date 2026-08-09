@@ -7,6 +7,7 @@ import * as s from "../db/schema";
 import { requireMembership, requireProjectAdmin, getActiveOrgId } from "../active-org";
 import { writeAudit } from "../audit";
 import type { ServerType } from "@/lib/server-catalog.generated";
+import { DECOMMISSION_TIMEOUT_MS } from "@/lib/decommission";
 import {
   checkServerCompatibility,
   nextServerStatus,
@@ -22,8 +23,10 @@ import {
   cpSetHardening,
   cpSetProxyRole,
   cpPublicUrl,
+  cpDecommissionServer,
   cpDeleteServer,
   cpGetServer,
+  boundResourcesOf,
   cpReissueBootstrapToken,
   cpRenameServer,
   cpSetServerType,
@@ -682,28 +685,222 @@ export async function agentCheckIn(input: { serverId: string; shape?: DemoHostSh
   revalidatePath("/dashboard", "layout");
 }
 
-/** Disconnect (delete) a server. Hosted resources are detached (serverId → null). */
-export async function disconnectServer(input: { serverId: string }) {
-  const [server] = await db
-    .select()
-    .from(s.servers)
-    .where(eq(s.servers.id, input.serverId));
-  // In CP mode a connected-but-unattached server has NO local mirror row (only
-  // attached servers get one), so the decommission must not be gated on it —
-  // resolve the org from the row if present, else the active org.
+// ── Disconnecting a server (SIGMA-204, SIGMA-205) ───────────────────────────
+//
+// This used to be one action that deleted the row and showed a toast claiming
+// "the agent tears down its WireGuard tunnel". It did not: the binary, the
+// systemd unit, the tunnel, the containers and the volumes all stayed on the
+// machine, and the only thing that changed was that we stopped being able to
+// see them. It is now two actions, because there are genuinely two things an
+// operator can mean.
+
+/** The shape both disconnect actions answer with. `boundResources` is the 409's
+ *  data — the resources still on the host — so the dialog lists them by name
+ *  instead of printing a control-plane error string at the operator. */
+export type DisconnectResult =
+  | { ok: true; status: string }
+  | { ok: false; error: string; boundResources: string[] };
+
+/** Resolve the org for a server that may exist only in the control plane: a
+ *  connected-but-unattached server has no local mirror row, so a disconnect
+ *  must not be gated on one. */
+async function serverOrgId(serverId: string) {
+  const [server] = await db.select().from(s.servers).where(eq(s.servers.id, serverId));
   const orgId = server?.orgId ?? (await getActiveOrgId());
-  if (!orgId) return;
-  // Decommissioning is destructive — gate on Project Admin (P1-4), not bare
-  // membership. In CP mode the control plane tombstones the server and revokes
-  // its agent token (409 if resources are still bound — the thrown error aborts
-  // before the local row is touched); the local mirror is then removed if present.
+  return { server, orgId };
+}
+
+/** Resources still bound to a server — the first line of defence, in demo mode
+ *  as in CP mode. The control plane runs its own version of this check inside
+ *  the disconnect transaction (where it is race-free against a concurrent
+ *  create); this is the demo mirror of it, so the demo walks the same refusal
+ *  rather than silently orphaning resources. */
+async function boundResourceNames(serverId: string): Promise<string[]> {
+  const rows = await db
+    .select({ name: s.resources.name })
+    .from(s.resources)
+    .where(eq(s.resources.serverId, serverId));
+  return rows.map((r) => r.name).sort();
+}
+
+/** Graceful decommission: ask the agent to remove the workloads and then
+ *  itself, and tombstone the record only once it confirms (or the control
+ *  plane's timeout gives up).
+ *
+ *  purgeVolumes defaults OFF at every layer, this one included. Named volumes
+ *  are database data directories and uploaded files — the customer's, not the
+ *  machine's. */
+export async function decommissionServer(input: {
+  serverId: string;
+  purgeVolumes?: boolean;
+}): Promise<DisconnectResult> {
+  const { server, orgId } = await serverOrgId(input.serverId);
+  if (!orgId) return { ok: false, error: "No active organization.", boundResources: [] };
+  // Destructive — Project Admin (P1-4), not bare membership.
   const { user, role } = await requireProjectAdmin(orgId);
+  const purgeVolumes = input.purgeVolumes === true;
+
   if (cpEnabled()) {
-    await cpDeleteServer(orgId, input.serverId, { name: user.name, role });
+    try {
+      const res = await cpDecommissionServer(orgId, input.serverId, purgeVolumes, {
+        name: user.name,
+        role,
+      });
+      revalidatePath("/dashboard", "layout");
+      return { ok: true, status: res.status };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Please try again.",
+        boundResources: boundResourcesOf(err),
+      };
+    }
+  }
+
+  // Demo mode: no control plane and no agent, so the row carries the in-flight
+  // state and the dashboard offers the buttons that drive it forward.
+  if (!server) return { ok: false, error: "Server not found.", boundResources: [] };
+  const bound = await boundResourceNames(input.serverId);
+  if (bound.length > 0) {
+    return {
+      ok: false,
+      error: `Server has ${bound.length} bound resource(s): ${bound.join(", ")}`,
+      boundResources: bound,
+    };
+  }
+  await db
+    .update(s.servers)
+    .set({
+      status: SERVER_STATUS.decommissioning,
+      decommissionStartedAt: new Date(),
+      decommissionPurgeVolumes: purgeVolumes,
+    })
+    .where(eq(s.servers.id, input.serverId));
+  await writeAudit({
+    orgId,
+    actor: user.name,
+    action: purgeVolumes
+      ? "Server decommissioning (application data included)"
+      : "Server decommissioning",
+    target: server.name,
+  });
+  revalidatePath("/dashboard", "layout");
+  return { ok: true, status: SERVER_STATUS.decommissioning };
+}
+
+/** Force disconnect: remove the record here and revoke the agent's credential,
+ *  leaving the host untouched.
+ *
+ *  Offered only where a graceful teardown cannot land — an unreachable machine,
+ *  or one whose decommission timed out — and always alongside the manual
+ *  cleanup script, because everything SigmaHub installed is still on that box.
+ *  It is deliberately NOT the default: it is one click and it "works", and
+ *  every use of it recreates the defect this feature exists to fix. */
+export async function forceDisconnectServer(input: { serverId: string }): Promise<DisconnectResult> {
+  const { server, orgId } = await serverOrgId(input.serverId);
+  if (!orgId) return { ok: false, error: "No active organization.", boundResources: [] };
+  const { user, role } = await requireProjectAdmin(orgId);
+
+  if (cpEnabled()) {
+    try {
+      await cpDeleteServer(orgId, input.serverId, { name: user.name, role });
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Please try again.",
+        boundResources: boundResourcesOf(err),
+      };
+    }
+  } else {
+    if (!server) return { ok: false, error: "Server not found.", boundResources: [] };
+    const bound = await boundResourceNames(input.serverId);
+    if (bound.length > 0) {
+      return {
+        ok: false,
+        error: `Server has ${bound.length} bound resource(s): ${bound.join(", ")}`,
+        boundResources: bound,
+      };
+    }
   }
   if (server) {
     await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
   }
-  await writeAudit({ orgId, actor: user.name, action: "Disconnected server", target: server?.name ?? input.serverId });
+  await writeAudit({
+    orgId,
+    actor: user.name,
+    action: "Server force-disconnected — the host was not cleaned up",
+    target: server?.name ?? input.serverId,
+  });
+  revalidatePath("/dashboard", "layout");
+  return { ok: true, status: "deleted" };
+}
+
+/** Demo-mode only: drive a decommission forward without a real agent.
+ *
+ *  Demo mode is where a prospective user learns what these states MEAN, so it
+ *  has to walk the whole flow and not just the happy half — including the two
+ *  ways a graceful teardown does not land (SIGMA-215).
+ *
+ *   - "ack"     the agent finished and reported: the record is removed;
+ *   - "failed"  the agent reported a teardown it could not complete: the record
+ *               is still removed (the machine has already gone), and the audit
+ *               says so — this is what the cleanup script exists for;
+ *   - "timeout" the agent never answered: the decommission ages past the
+ *               control plane's window, so the dialog starts offering Force
+ *               disconnect;
+ *   - "silence" the host stops heartbeating entirely, which is the OTHER route
+ *               to the force path — nothing is listening to be asked. */
+export async function simulateDecommission(input: {
+  serverId: string;
+  event: "ack" | "failed" | "timeout" | "silence";
+}) {
+  if (cpEnabled()) return;
+  const [server] = await db.select().from(s.servers).where(eq(s.servers.id, input.serverId));
+  if (!server) throw new Error("Server not found.");
+  // Project Admin, matching decommissionServer and forceDisconnectServer. The
+  // "ack"/"failed" branches DELETE the server row, and a demo where a Viewer
+  // can remove a server teaches the wrong permission model to the person
+  // evaluating the product — the one audience demo mode exists for.
+  const { user } = await requireProjectAdmin(server.orgId);
+
+  switch (input.event) {
+    case "ack":
+    case "failed": {
+      await db.delete(s.servers).where(eq(s.servers.id, input.serverId));
+      await writeAudit({
+        orgId: server.orgId,
+        actor: user.name,
+        action:
+          input.event === "ack"
+            ? "Server decommissioned"
+            : "Server decommissioned with errors — containers: docker daemon not reachable",
+        target: server.name,
+      });
+      break;
+    }
+    case "timeout": {
+      // Age the request past the control plane's window. The dialog decides
+      // what to offer by comparing this against DECOMMISSION_TIMEOUT_MS, so
+      // moving the clock is the whole simulation.
+      await db
+        .update(s.servers)
+        .set({ decommissionStartedAt: new Date(Date.now() - DECOMMISSION_TIMEOUT_MS - 60_000) })
+        .where(eq(s.servers.id, input.serverId));
+      break;
+    }
+    case "silence": {
+      await db
+        .update(s.servers)
+        .set({ status: SERVER_STATUS.unreachable })
+        .where(eq(s.servers.id, input.serverId));
+      await writeAudit({
+        orgId: server.orgId,
+        actor: "sweeper",
+        action: "Server unreachable",
+        target: server.name,
+      });
+      break;
+    }
+  }
   revalidatePath("/dashboard", "layout");
 }

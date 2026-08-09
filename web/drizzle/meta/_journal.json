@@ -50,6 +50,13 @@
       "when": 1786231188225,
       "tag": "0006_server_compatibility",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786235002990,
+      "tag": "0007_server_decommission",
+      "breakpoints": true
     }
   ]
 }

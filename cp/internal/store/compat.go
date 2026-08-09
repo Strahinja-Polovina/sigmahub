@@ -53,11 +53,17 @@ import (
 // exits are changing that type or disconnecting. Leaving it in `provisioning`
 // would have shown a spinner forever for a state that will never resolve on
 // its own, and marking it `running` would bill it and schedule work onto it.
+//
+// `decommissioning` (SIGMA-204) is the fifth, and the only one that is
+// TERMINAL: every other status can be re-derived from what the host reports,
+// this one is a decision the operator made about the machine's future and no
+// fact the agent sends can revise it.
 const (
-	ServerStatusProvisioning = "provisioning"
-	ServerStatusRunning      = "running"
-	ServerStatusUnreachable  = "unreachable"
-	ServerStatusIncompatible = "incompatible"
+	ServerStatusProvisioning    = "provisioning"
+	ServerStatusRunning         = "running"
+	ServerStatusUnreachable     = "unreachable"
+	ServerStatusIncompatible    = "incompatible"
+	ServerStatusDecommissioning = "decommissioning"
 )
 
 // FailedRequirement is one precondition the host did not meet, in the shape the
@@ -184,6 +190,17 @@ func CheckServerCompatibility(serverType string, f HostFacts) []FailedRequiremen
 // claim liveness it does not have in order to express "no longer
 // incompatible".
 func compatibilityStatus(prev string, fails []FailedRequirement, agentCheckedIn bool) string {
+	// A decommissioning server outranks the gate, and this guard is load-bearing
+	// rather than tidy. The teardown takes minutes, the agent keeps heartbeating
+	// throughout it, and one of the two documented exits from `incompatible` IS
+	// disconnecting — so the very host most likely to be decommissioned is one
+	// whose facts fail its type. Letting the gate write `incompatible` back over
+	// `decommissioning` would take the row out of the sweeper's timeout scan
+	// (which keys on the status) and off the dashboard's in-flight list, and the
+	// operator's disconnect would silently never complete.
+	if prev == ServerStatusDecommissioning {
+		return prev
+	}
 	if len(fails) > 0 {
 		return ServerStatusIncompatible
 	}
@@ -303,6 +320,12 @@ const DefaultStaleAfter = 90 * time.Second
 // liveness. Clearing it restores the liveness the row actually has, which is
 // what last_seen_at says — never seen, seen too long ago, or seen recently.
 func statusAfterTypeChange(prev string, fails []FailedRequirement, lastSeenAt *time.Time, staleAfter time.Duration) string {
+	// Same terminal rule as compatibilityStatus: a machine on its way out is not
+	// re-graded. (The type endpoint refuses outright while a decommission is in
+	// flight; this is the belt to that braces.)
+	if prev == ServerStatusDecommissioning {
+		return prev
+	}
 	if len(fails) > 0 {
 		return ServerStatusIncompatible
 	}

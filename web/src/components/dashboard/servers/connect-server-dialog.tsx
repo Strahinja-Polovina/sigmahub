@@ -36,7 +36,7 @@ import {
   agentCheckIn,
   changeServerType,
   connectServer,
-  disconnectServer,
+  decommissionServer,
   provisionServer,
   serverConnectionState,
   type ServerConnectionState,
@@ -161,17 +161,22 @@ export function IncompatiblePanel({
     });
   }
 
+  // The graceful path (SIGMA-204), even here. This host was misfiled, not
+  // broken: its agent is installed, authenticated and heartbeating, and the
+  // operator ran our installer on it minutes ago. Tombstoning the row would
+  // leave that installer's work — the binary, the unit, the tunnel — on a
+  // machine we then claim to know nothing about.
   function disconnect() {
     startTransition(async () => {
-      try {
-        await disconnectServer({ serverId: state.id });
-        toast.success(`Disconnected ${state.name}`);
-        onDisconnected?.();
-      } catch (err) {
-        toast.error("Couldn’t disconnect", {
-          description: err instanceof Error ? err.message : "Please try again.",
-        });
+      const res = await decommissionServer({ serverId: state.id });
+      if (!res.ok) {
+        toast.error("Couldn’t disconnect", { description: res.error });
+        return;
       }
+      toast.success(`Decommissioning ${state.name}…`, {
+        description: "The agent removes what SigmaHub installed and then removes itself.",
+      });
+      onDisconnected?.();
     });
   }
 

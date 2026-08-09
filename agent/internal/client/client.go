@@ -291,6 +291,21 @@ func (c *Client) PostClusterStatus(ctx context.Context, agentToken string, st Cl
 	return c.post(ctx, "/v1/agent/cluster-status", agentToken, st, nil)
 }
 
+// PostUninstallAck is the final word of a graceful decommission (SIGMA-204):
+// the workloads are gone and this agent is about to remove itself. The control
+// plane answers by tombstoning the server and revoking this very token, so
+// nothing may be sent on this channel afterwards — and, critically, nothing the
+// uninstall handler does before this call may break the channel. See
+// internal/uninstall for the ordering.
+//
+// ok=false still completes the decommission; detail says what did not tear
+// down, so the operator is told to finish by hand instead of being left with a
+// row that looks clean.
+func (c *Client) PostUninstallAck(ctx context.Context, agentToken string, ok bool, detail string) error {
+	return c.post(ctx, "/v1/agent/uninstall-ack", agentToken,
+		map[string]any{"ok": ok, "detail": detail}, nil)
+}
+
 // RegistryCredentialResponse authenticates a push (on a build server) or a pull
 // (on a cluster node) against the org's registry. In-memory only; the CP audits
 // every release.

@@ -99,6 +99,14 @@ type registryRender struct {
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
 func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender, registry registryRender) ([]dsd.Op, string) {
+	// A server being decommissioned renders ONE op and nothing else — see
+	// renderUninstallOps for why the teardown cannot share a document with the
+	// state it is tearing down. Checked before anything is rendered so no other
+	// branch can add to it.
+	if hardening.Decommissioning {
+		ops := renderUninstallOps(serverID, hardening)
+		return ops, dsd.SpecHash(ops)
+	}
 	networks := map[string]string{} // net op id -> network name (deduped per project)
 	var resourceOps []dsd.Op
 

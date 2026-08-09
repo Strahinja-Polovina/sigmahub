@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
 import type { Status } from "@/lib/mock";
-import { normalizeStatus } from "@/lib/status";
+import { RAW_STATUS_LABELS, normalizeStatus } from "@/lib/status";
 
 // Maps a resource/server Status to a small colored dot + label.
 // running=emerald, degraded=amber, error/stopped=red, provisioning=blue.
@@ -13,19 +13,6 @@ const STATUS_META: Record<Status, { label: string; dot: string; text: string }> 
 };
 
 const FALLBACK_META = { label: "Unknown", dot: "bg-muted-foreground", text: "text-muted-foreground" };
-
-// Some CP states share a UI Status but deserve their own wording: an
-// unreachable server is red like `stopped`, but "Stopped" implies someone
-// stopped it, while this means the agent went silent (SIGMA-184). A `skipped`
-// op means the deploy never ran because a prerequisite failed (SIGMA-189).
-const RAW_LABELS: Record<string, string> = {
-  unreachable: "Unreachable",
-  skipped: "Not deployed",
-  // The host installed and is heartbeating; what is wrong is the TYPE it was
-  // enrolled as (SIGMA-203). "Error" would send the operator hunting for a
-  // crash instead of reading the sentence next to this badge.
-  incompatible: "Incompatible",
-};
 
 function rawKey(status: unknown): string {
   if (typeof status === "string") return status;
@@ -41,7 +28,7 @@ function resolveMeta(status: unknown) {
   const norm = normalizeStatus(status);
   if (!norm) return FALLBACK_META;
   const meta = STATUS_META[norm];
-  const override = RAW_LABELS[rawKey(status)];
+  const override = RAW_STATUS_LABELS[rawKey(status)];
   return override ? { ...meta, label: override } : meta;
 }
 

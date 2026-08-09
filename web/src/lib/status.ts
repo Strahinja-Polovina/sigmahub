@@ -29,6 +29,14 @@ export const STATE_ALIASES: Record<string, Status> = {
   // A server the CP's staleness sweep flipped after 90s of silence. Without
   // this it rendered as a grey "Unknown" pill (SIGMA-184).
   unreachable: "stopped",
+  // A server whose agent is tearing the host down (SIGMA-204). It maps to
+  // `provisioning` — the in-flight bucket — because that is what it is: a
+  // transition with a known end, and the only one of these states where a
+  // spinner is honest. It keeps its own LABEL (see RAW_LABELS): "Provisioning"
+  // on a machine being removed would read as the exact opposite of what is
+  // happening. Every aggregate that counts running servers excludes it, which
+  // is what stops a decommissioning host being counted as fleet capacity.
+  decommissioning: "provisioning",
   // A host whose facts do not satisfy the type it was enrolled as (SIGMA-203).
   // It maps to `error` because it needs the operator to act — the two exits are
   // changing the type or disconnecting — and it keeps its own LABEL in the
@@ -56,3 +64,28 @@ export function normalizeStatus(status: unknown): Status | null {
   }
   return null;
 }
+
+/** Raw CP/agent states that share a UI Status but deserve their own wording.
+ *
+ *  It lives here, next to STATE_ALIASES, because the two decisions are halves
+ *  of one translation: the alias says which bucket a state falls in (and so how
+ *  every aggregate counts it), the label says what the operator reads. Keeping
+ *  the label in the badge component made the second half untestable and let it
+ *  drift — a state could be aliased into a bucket and then rendered with that
+ *  bucket's word, which is how "Decommissioning" would have shown up as
+ *  "Provisioning" on a machine being removed. */
+export const RAW_STATUS_LABELS: Record<string, string> = {
+  // Red like `stopped`, but "Stopped" implies someone stopped it; this means
+  // the agent went silent (SIGMA-184).
+  unreachable: "Unreachable",
+  // The deploy never ran because a prerequisite failed (SIGMA-189).
+  skipped: "Not deployed",
+  // The host installed and is heartbeating; what is wrong is the TYPE it was
+  // enrolled as (SIGMA-203). "Error" would send the operator hunting for a
+  // crash instead of reading the sentence next to this badge.
+  incompatible: "Incompatible",
+  // The agent is removing the workloads and then itself (SIGMA-204). In the
+  // in-flight bucket, because that is what it is — but "Provisioning" on a
+  // machine being decommissioned reads as the exact opposite of the truth.
+  decommissioning: "Decommissioning",
+};

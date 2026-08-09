@@ -153,6 +153,11 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
           // the host looked like the first time it was synced.
           facts: row.facts,
           incompatibleReasons: row.incompatibleReasons,
+          // A decommission starts and ends on the control plane's clock, so a
+          // mirror that froze this would show a stale "Decommissioning" pill —
+          // or miss one entirely — on every page that reads the mirror.
+          decommissionStartedAt: row.decommissionStartedAt,
+          decommissionPurgeVolumes: row.decommissionPurgeVolumes,
         },
       });
   }

@@ -67,6 +67,7 @@ export default async function ServerDetailPage({
         metricsPoints={points}
         orgId={orgId}
         canManage={role === "Org Admin" || role === "Project Admin"}
+        lastSeenAt={cpServer.lastSeenAt}
         hardening={{
           ready: Boolean(cpServer.ready),
           score: cpServer.hardeningScore ?? null,

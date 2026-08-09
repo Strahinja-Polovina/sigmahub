@@ -286,11 +286,17 @@ func run() error {
 	// 3× the agent's default 30s heartbeat. DeployTimeout sits above the agent's
 	// own per-op ceilings (a build plus a 120s health gate) so only a genuinely
 	// dead apply is failed (SIGMA-182).
+	// DecommissionTimeout is the other half of "the CP completes on ack OR a
+	// timeout" (SIGMA-204): ten minutes is long enough for a real teardown
+	// (container stop grace periods, a long-poll cycle, an apt-busy host) and
+	// short enough that an operator watching the row does not conclude the
+	// product hung.
 	go sweeper.Run(ctx, log, st, sweeper.Config{
-		Interval:      30 * time.Second,
-		StaleAfter:    90 * time.Second,
-		Retention:     24 * time.Hour,
-		DeployTimeout: 45 * time.Minute,
+		Interval:            30 * time.Second,
+		StaleAfter:          90 * time.Second,
+		Retention:           24 * time.Hour,
+		DeployTimeout:       45 * time.Minute,
+		DecommissionTimeout: 10 * time.Minute,
 	})
 
 	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates

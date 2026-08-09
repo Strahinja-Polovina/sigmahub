@@ -167,11 +167,16 @@ export function checkServerCompatibility(
 /** Server status vocabulary, including the one SIGMA-203 adds. `incompatible`
  *  is deliberately not a flavour of provisioning: the host is installed and
  *  heartbeating, and only changing its type or disconnecting it will move it. */
+/** `decommissioning` (SIGMA-204) is the fifth, and the only TERMINAL one: every
+ *  other status is re-derived from what the host reports, this one is a
+ *  decision the operator made about the machine's future that no fact can
+ *  revise. */
 export const SERVER_STATUS = {
   provisioning: "provisioning",
   running: "running",
   unreachable: "unreachable",
   incompatible: "incompatible",
+  decommissioning: "decommissioning",
 } as const;
 
 /** Whether a server needs the operator to choose between the two exits. */
@@ -193,6 +198,14 @@ export function nextServerStatus(
   reasons: FailedRequirement[],
   agentCheckedIn: boolean
 ): string {
+  // A decommissioning server outranks the gate — the same terminal rule as
+  // store.compatibilityStatus, and load-bearing for the same reason: one of the
+  // two documented exits from `incompatible` IS disconnecting, so the host most
+  // likely to be torn down is one whose facts fail its type, and it keeps
+  // checking in throughout the teardown. Letting the gate write `incompatible`
+  // back over `decommissioning` loses the in-flight state the whole flow hangs
+  // off.
+  if (prev === SERVER_STATUS.decommissioning) return prev;
   if (reasons.length > 0) return SERVER_STATUS.incompatible;
   if (
     agentCheckedIn &&
@@ -225,6 +238,8 @@ export function statusAfterTypeChange(
   lastSeenAt: Date | string | null | undefined,
   staleAfterMs = 90_000
 ): string {
+  // Terminal, as in nextServerStatus: a machine on its way out is not re-graded.
+  if (prev === SERVER_STATUS.decommissioning) return prev;
   if (reasons.length > 0) return SERVER_STATUS.incompatible;
   // Nothing to clear, so nothing to decide: a re-file neither promotes a
   // provisioning host nor revives an unreachable one.

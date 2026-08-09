@@ -156,6 +156,7 @@ func (f *fakeStore) RecordStorageBytes(context.Context, string, string, int64, t
 	return nil
 }
 func (f *fakeStore) FailS3OpFromOpStatus(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) CompleteDecommission(context.Context, string, bool, string) error   { return nil }
 
 // fakeDomain implements DomainAPI in-memory for handler tests.
 type fakeDomain struct {
@@ -293,6 +294,9 @@ func (f *fakeDomain) IssueConfirmToken(_ context.Context, _, _, _, _, _ string, 
 }
 func (f *fakeDomain) ConfirmDestructiveOp(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	return "pdo_1", nil
+}
+func (f *fakeDomain) BeginDecommission(_ context.Context, _, serverID string, purge bool, _ string) (store.DecommissionState, error) {
+	return store.DecommissionState{ServerID: serverID, Status: store.ServerStatusDecommissioning, PurgeVolumes: purge}, nil
 }
 func (f *fakeDomain) DeleteServer(_ context.Context, _, _, _ string) error     { return nil }
 func (f *fakeDomain) RevokeAgentToken(_ context.Context, _, _, _ string) error { return nil }
