@@ -629,6 +629,10 @@ func TestCertStatusAcceptedFromTheHostThatRendersTheDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The owning server has to carry the proxy role before a domain may attach.
+	if err := st.SetProxyRole(ctx, orgID, owner, true, "admin"); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := st.AttachDomain(ctx, orgID, res.ID, "app.example.com", "http", "admin"); err != nil {
 		t.Fatal(err)
 	}

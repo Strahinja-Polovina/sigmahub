@@ -85,6 +85,17 @@ func deployStatusRank(s string) int {
 	return -1
 }
 
+// deployInFlight reports whether a deployment is still on its way. It is the
+// same set the SQL in this file spells as IN ('queued','building','deploying'),
+// named once so a caller in Go and a caller in SQL cannot drift apart.
+func deployInFlight(status string) bool {
+	switch status {
+	case "queued", "building", "deploying":
+		return true
+	}
+	return false
+}
+
 // supersedeInFlightTx freezes any still-in-flight deployment for a (server,
 // resource) as 'superseded' — called in the same tx that creates a newer
 // deployment, so there is at most ONE in-flight deployment per (server,resource).
@@ -703,8 +714,28 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 // source release's image pin so the render re-ships the running release's
 // exact image with no clone and no build.
 //
-// Resources that were never deployed, or whose latest deployment is in flight
-// or failed, are skipped: the next real deploy renders the new config anyway.
+// Two states are skipped, both because something else will carry the change: a
+// resource that has NEVER been deployed (the first deploy renders the new config
+// anyway) and one with a deployment still IN FLIGHT (it resolves secret values
+// at rollout time, and superseding it could discard a commit mid-build).
+//
+// Every other state mints a row. A successful latest deployment lends its pin,
+// so the change re-ships the exact running image with no clone and no build. A
+// SETTLED-BUT-UNSUCCESSFUL one — failed, superseded, rolled back — falls back to
+// the last successful release, because that is what is actually serving: a
+// rollout that fails its health gate keeps its predecessor up. Only when nothing
+// has ever succeeded does the render rebuild, from the failed attempt's commit
+// and never its image.
+//
+// That fallback is the whole point. This used to read
+// `if status != "success" { continue }`, on the assumption that "the next real
+// deploy renders the new config anyway" — and for a config-only fix there is no
+// next real deploy. The user edited an env var or attached a domain, the
+// dashboard reported success, and nothing happened, for good, unless somebody
+// pushed a commit or found the Deploy button. It failed hardest exactly where it
+// hurt most: the latest deployment is `failed` precisely when the user is trying
+// to fix what broke it.
+//
 // Returns the distinct servers to re-render. Audited per resource.
 func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resourceIDs []string, actor, reason string) ([]ServerRef, error) {
 	if len(resourceIDs) == 0 {
@@ -732,7 +763,10 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 		if err != nil {
 			return nil, err
 		}
-		if status != "success" {
+		// Something is already on its way to this resource. Let it land: it will
+		// resolve secret values at rollout time, and superseding it could throw
+		// away a commit that is mid-build.
+		if deployInFlight(status) {
 			continue
 		}
 		svcCount, err := resourceServiceCountTx(ctx, tx, orgID, resID)
@@ -740,10 +774,33 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 			return nil, err
 		}
 		depID := newID("dep")
-		// The source's pin comes along so the render ships the exact running
-		// image. A legacy source without a pin still gets a config row: the
-		// render falls back to the full clone→build→rollout pipeline, which is
-		// slower but equally un-wedges the generation.
+		// The latest deployment is settled but not successful — failed, superseded
+		// or rolled back. What is actually SERVING is the last successful release,
+		// because a rollout that fails its health gate keeps its predecessor up. So
+		// re-ship that one with the new config rather than skipping: this is the
+		// case where the user is trying to fix what broke, and it is the one that
+		// used to swallow the change whole.
+		if status != "success" {
+			var okRef, okSHA, okDigest *string
+			var okPin string
+			err := tx.QueryRow(ctx, `
+				SELECT git_ref, git_sha, image_digest, COALESCE(image_pin,'')
+				  FROM deployments
+				 WHERE org_id = $1 AND resource_id = $2 AND status = 'success'
+				 ORDER BY created_at DESC LIMIT 1`, orgID, resID).
+				Scan(&okRef, &okSHA, &okDigest, &okPin)
+			switch {
+			case err == nil:
+				ref, sha, digest, pin = okRef, okSHA, okDigest, okPin
+			case errors.Is(err, pgx.ErrNoRows):
+				// Nothing has ever served. Keep the failed attempt's commit but not
+				// its image: that image never passed a health gate. The rebuild takes
+				// its OWN pin (SIGMA-173) so it cannot overwrite another release's tag.
+				digest, pin = nil, deployPin(depID)
+			default:
+				return nil, err
+			}
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
 			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by)
