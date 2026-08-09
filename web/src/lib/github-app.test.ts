@@ -26,6 +26,22 @@ describe("install state round-trip", () => {
     });
   });
 
+  // Started from inside the New Resource wizard: the callback claims the
+  // installation for the org exactly as "org" does, then returns to the page
+  // the wizard was opened from so the flow can pick itself back up (SIGMA-208).
+  it("encodes and parses a wizard target, with and without a project", () => {
+    expect(encodeInstallState({ kind: "wizard" })).toBe("wiz");
+    expect(parseInstallState("wiz")).toEqual({ kind: "wizard" });
+    expect(encodeInstallState({ kind: "wizard", projectId: "prj_1" })).toBe("wiz:prj_1");
+    expect(parseInstallState("wiz:prj_1")).toEqual({ kind: "wizard", projectId: "prj_1" });
+  });
+
+  it("rejects a wizard state whose project id is not one", () => {
+    for (const bad of ["wiz:", "wiz:../etc", "wiz:a:b", "wiz:" + "x".repeat(65)]) {
+      expect(parseInstallState(bad), bad).toBeNull();
+    }
+  });
+
   it("rejects forged or garbled state instead of guessing", () => {
     for (const bad of [
       undefined,

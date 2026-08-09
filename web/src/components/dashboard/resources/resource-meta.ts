@@ -5,6 +5,11 @@ export type DeployTargetServer = {
   type: string;
   provider: string;
   region: string;
+  /** The enrollment gate's verdict. A host it refused matches the availability
+   *  matrix on paper and not in fact, and the control plane refuses to schedule
+   *  onto it — so the wizard has to stop offering it as a target rather than
+   *  let the operator find out at create (SIGMA-203). */
+  status?: string;
 };
 export type DeployTarget = {
   id: string;

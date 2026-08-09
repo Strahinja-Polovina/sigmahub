@@ -1060,9 +1060,26 @@ export type CpDetected = {
   services?: CpDetectedComposeService[];
   healthCheck: CpHealthCheck;
   deployable: boolean;
+  /** Set by the web layer, never by the control plane: the repository could not
+   *  be READ (transport failure, rate limit, expired token) as opposed to
+   *  having nothing to build. The wizard must not answer the first with advice
+   *  meant for the second. */
+  unreadable?: boolean;
   reason?: string;
   /** The provider-reported default branch — the wizard's auto-mapping target. */
   defaultBranch?: string;
+  /** HOW this repository gets built, decided by the CP's detector:
+   *  "dockerfile" | "compose" | "nixpacks" | "" (nothing here can be built).
+   *  Absent from a control plane older than SIGMA-209, which is why the
+   *  dashboard still derives a fallback from hasDockerfile/hasCompose. */
+  buildMethod?: string;
+  /** The directory the build runs in, relative to the repo root. Set when the
+   *  build was found BELOW the root — a monorepo, which used to be reported as
+   *  undeployable (SIGMA-209). */
+  contextSubdir?: string;
+  /** The language behind a nixpacks auto-build, and its display label. */
+  language?: string;
+  languageLabel?: string;
 };
 
 export type CpGitConnection = {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -34,14 +35,16 @@ func NewInspector() *Inspector {
 	}
 }
 
-// candidateFiles are the root files the detector understands; each is fetched
-// independently so a repo with only some of them still resolves. Env templates
-// (.env.example & co) contribute variable KEYS to the wizard pre-fill and never
-// affect deployability.
-var candidateFiles = append([]string{
-	"Dockerfile", "dockerfile",
-	"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml",
-}, gitdetect.EnvExampleNames...)
+// maxDetectDepth caps how deep a build may be found. Two levels covers the
+// shapes people actually have (apps/api, services/web, src) without turning the
+// inspection of a large monorepo into hundreds of Contents calls.
+const maxDetectDepth = 2
+
+// maxDetectFiles caps how many files one inspection fetches. A repository that
+// legitimately contains fifty package.json files is a workspace, not fifty
+// deployables, and reading all of them would spend the installation's rate
+// limit on a pre-fill.
+const maxDetectFiles = 40
 
 // Inspect fetches the candidate root files and runs detection. Missing files are
 // skipped (a 404 is normal); a transport or unexpected-status error aborts. The
@@ -75,10 +78,37 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 		}, nil
 	}
 
+	// ONE listing call decides what is worth reading, instead of guessing paths.
+	// Guessing is what limited detection to the repository root: probing
+	// "apps/api/Dockerfile" for every plausible directory would have cost dozens
+	// of Contents calls per inspection, so nobody did, so a monorepo was
+	// undeployable. The tree endpoint answers the same question once.
+	wanted, listed := i.wantedPaths(ctx, base, repo, defaultBranch, token)
+	if !listed {
+		// No listing (an empty repo, a 409 on an unborn branch, a permission
+		// shape that allows contents but not trees): fall back to probing the
+		// conventional paths. Worse, but never worse than root-only was.
+		//
+		// Capped like the listing path is. The candidate set is ~260 paths and
+		// each is a separate sequential request inside the call the user is
+		// watching a spinner on — uncapped, the fallback for a repo we cannot
+		// list turns a slow screen into a multi-minute hang. The set is ordered
+		// root-first, so the cap keeps the paths most likely to matter.
+		wanted = gitdetect.CandidatePaths()
+		if len(wanted) > maxDetectFiles {
+			wanted = wanted[:maxDetectFiles]
+		}
+	}
+
 	files := map[string][]byte{}
-	for _, name := range candidateFiles {
+	for _, name := range wanted {
 		content, found, err := i.fetchFile(ctx, base, repo, name, token)
 		if err != nil {
+			// A missing path in the FALLBACK set is expected; only a real
+			// listing promises the file exists, so only that aborts.
+			if !listed {
+				continue
+			}
 			return gitdetect.Detected{}, err
 		}
 		if found {
@@ -88,6 +118,67 @@ func (i *Inspector) Inspect(ctx context.Context, repoFullName, token string) (gi
 	d := gitdetect.Detect(files)
 	d.DefaultBranch = defaultBranch
 	return d, nil
+}
+
+// wantedPaths lists the repo tree once and returns the detection-relevant
+// subset. ok=false means the tree could not be read and the caller should probe
+// conventional paths instead — never an error, because a pre-fill that can
+// still be produced must not be turned into a failed inspection.
+func (i *Inspector) wantedPaths(ctx context.Context, base, repo, ref, token string) (paths []string, ok bool) {
+	if ref == "" {
+		ref = "HEAD"
+	}
+	u := fmt.Sprintf("%s/repos/%s/git/trees/%s?recursive=1", base, repo, url.PathEscape(ref))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := i.Client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, false
+	}
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		} `json:"tree"`
+	}
+	// A 200 that carries no tree array is not a listing — decode succeeds on any
+	// JSON object, so without this an unexpected-but-successful response would
+	// read as "this repository contains no files" and detect nothing at all,
+	// instead of falling through to probing.
+	if err := json.Unmarshal(body, &tree); err != nil || tree.Tree == nil {
+		return nil, false
+	}
+	all := make([]string, 0, len(tree.Tree))
+	for _, e := range tree.Tree {
+		if e.Type != "blob" {
+			continue
+		}
+		all = append(all, e.Path)
+	}
+	// A truncated tree is still a tree: GitHub truncates the TAIL, and every
+	// path we care about is shallow, so the head of the listing is exactly the
+	// part that survives. Using it beats falling back to guessing.
+	wanted := gitdetect.WantedPaths(all, maxDetectDepth)
+	if len(wanted) > maxDetectFiles {
+		wanted = wanted[:maxDetectFiles]
+	}
+	return wanted, true
 }
 
 // BranchHead returns the branch's head commit sha (GET /repos/{r}/branches/{b})

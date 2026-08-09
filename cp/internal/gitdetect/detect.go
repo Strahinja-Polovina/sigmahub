@@ -1,12 +1,22 @@
-// Package gitdetect inspects a repository's root files and derives the deploy
+// Package gitdetect inspects a repository's files and derives the deploy
 // configuration the connect wizard pre-fills: whether it ships a Dockerfile or a
 // Compose file, which ports it exposes, which env vars it references, and any
 // declared health check. The parsing is deliberately dependency-light (targeted
 // line scans, not a full YAML/Dockerfile grammar) because the result is a
 // best-effort pre-fill a human confirms in the UI, not an authoritative build.
+//
+// Detection is not limited to the repository ROOT. It used to be, and the
+// consequence was that a monorepo — a root holding nothing but a README, a
+// workspace file and apps/ — was reported as undeployable, which is both false
+// and the least actionable thing we could have said about it. The search now
+// runs over whatever file set it is handed, prefers the root when the root
+// describes a build, and otherwise picks the best-ranked subdirectory that
+// does; the chosen directory travels on as ContextSubdir so the build actually
+// runs where the Dockerfile is.
 package gitdetect
 
 import (
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -15,12 +25,18 @@ import (
 
 // Detected is the derived deploy configuration for a connected repo.
 type Detected struct {
-	HasDockerfile bool     `json:"hasDockerfile"`
-	HasCompose    bool     `json:"hasCompose"`
-	DockerfileT   string   `json:"dockerfilePath,omitempty"`
-	ComposePath   string   `json:"composePath,omitempty"`
-	Ports         []int    `json:"ports"`
-	Env           []string `json:"env"`
+	HasDockerfile bool `json:"hasDockerfile"`
+	HasCompose    bool `json:"hasCompose"`
+	// DockerfileT is the Dockerfile path RELATIVE TO ContextSubdir, because that
+	// is what the agent's image.build op means by "dockerfile" — the two fields
+	// are read together and a repo-absolute path here would send the build
+	// looking for apps/api/apps/api/Dockerfile.
+	DockerfileT string `json:"dockerfilePath,omitempty"`
+	// ComposePath is repo-relative, because nothing builds "from" it — it is
+	// shown to a human and used to resolve service build contexts.
+	ComposePath string   `json:"composePath,omitempty"`
+	Ports       []int    `json:"ports"`
+	Env         []string `json:"env"`
 	// Services is the Compose service graph (empty for a plain Dockerfile app) —
 	// the input to a per-service multi-service deploy.
 	Services []ComposeService `json:"services,omitempty"`
@@ -28,14 +44,28 @@ type Detected struct {
 	// nothing is declared — a default TCP probe on the primary declared port. It
 	// is the spec field the P1-9 zero-downtime gate consumes.
 	HealthCheck HealthCheck `json:"healthCheck"`
-	// Deployable is false when the repo ships neither a Dockerfile nor a Compose
-	// file; Reason then carries an actionable message for the UI.
+	// Deployable is false only when nothing here can be built AT ALL — not even
+	// by the nixpacks fallback. Reason then carries an actionable message.
 	Deployable bool   `json:"deployable"`
 	Reason     string `json:"reason,omitempty"`
 	// DefaultBranch is the repo's default branch as reported by the provider
 	// (set by the inspector, not by file detection) — the wizard's auto
 	// branch-mapping target.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
+	// BuildMethod is HOW this repository gets built: BuildDockerfile,
+	// BuildCompose, BuildNixpacks, or "" when nothing can. It is a decision,
+	// made once, here — the dashboard presents it and lets the user override it,
+	// but it never re-derives it, because two implementations of "what is this
+	// repo" is how the UI comes to disagree with the thing that builds.
+	BuildMethod string `json:"buildMethod"`
+	// ContextSubdir is the directory the build runs in, relative to the repo
+	// root. Empty means the root, which is the overwhelmingly common case.
+	ContextSubdir string `json:"contextSubdir,omitempty"`
+	// Language / LanguageLabel are set when BuildMethod is BuildNixpacks: the
+	// evidence for the auto-build, so the offer reads "we found a go.mod" and
+	// not "trust us".
+	Language      string `json:"language,omitempty"`
+	LanguageLabel string `json:"languageLabel,omitempty"`
 }
 
 // HealthCheck is the resource's readiness probe. Type is "http" when a path was
@@ -69,29 +99,122 @@ var (
 	EnvExampleNames = []string{".env.example", ".env.sample", ".env.template"}
 )
 
-// Detect derives the deploy configuration from a repo's root file set, keyed by
-// path. Unknown files are ignored. It never errors — an empty/unrecognized repo
-// yields a non-Deployable result with an actionable Reason.
-func Detect(files map[string][]byte) Detected {
-	d := Detected{Ports: []int{}, Env: []string{}}
+// dirIndex groups a path-keyed file set by directory, recording which base
+// names each directory holds. Detection is a question about a DIRECTORY ("does
+// this place describe a build?"), so asking it directory-first is what lets the
+// same rules run at the root and three levels down without a second code path.
+type dirIndex map[string]map[string]bool
 
-	var dockerfile []byte
-	for _, name := range dockerfileNames {
-		if b, ok := files[name]; ok {
-			d.HasDockerfile = true
-			d.DockerfileT = name
-			dockerfile = b
+func indexDirs(files map[string][]byte) dirIndex {
+	idx := dirIndex{}
+	for p := range files {
+		clean := path.Clean(strings.TrimPrefix(p, "./"))
+		dir, base := path.Split(clean)
+		dir = strings.TrimSuffix(dir, "/")
+		if dir == "." {
+			dir = ""
+		}
+		if idx[dir] == nil {
+			idx[dir] = map[string]bool{}
+		}
+		idx[dir][base] = true
+	}
+	return idx
+}
+
+// preferredDirs ranks candidate subdirectories when the ROOT describes no
+// build. A monorepo usually holds several buildable directories and we have to
+// pick one to pre-fill; picking by name (the service-ish one) beats picking by
+// map iteration order, which is what "pick any" would actually mean in Go.
+var preferredDirs = []string{
+	"app", "api", "backend", "server", "service", "src", "web", "frontend", "cmd", "docker",
+}
+
+// dirScore orders candidate directories: shallower always wins, then a
+// recognized service-ish leaf name, then lexicographic so the answer is stable
+// across runs. Lower is better.
+func dirScore(dir string) (int, string) {
+	depth := 0
+	if dir != "" {
+		depth = strings.Count(dir, "/") + 1
+	}
+	leaf := dir
+	if i := strings.LastIndex(dir, "/"); i >= 0 {
+		leaf = dir[i+1:]
+	}
+	rank := len(preferredDirs)
+	for i, name := range preferredDirs {
+		if leaf == name {
+			rank = i
 			break
 		}
 	}
-	var compose []byte
-	for _, name := range composeNames {
-		if b, ok := files[name]; ok {
-			d.HasCompose = true
-			d.ComposePath = name
-			compose = b
-			break
+	return depth*1000 + rank, dir
+}
+
+// bestDir picks the lowest-scoring directory for which match reports true, or
+// ok=false when none does. The root is a candidate like any other and wins by
+// construction: its depth is 0.
+func bestDir(idx dirIndex, match func(names map[string]bool) bool) (string, bool) {
+	best, bestScore, found := "", 0, false
+	for dir, names := range idx {
+		if !match(names) {
+			continue
 		}
+		score, _ := dirScore(dir)
+		if !found || score < bestScore || (score == bestScore && dir < best) {
+			best, bestScore, found = dir, score, true
+		}
+	}
+	return best, found
+}
+
+// firstPresent returns the first candidate name the directory holds.
+func firstPresent(names map[string]bool, candidates []string) (string, bool) {
+	for _, c := range candidates {
+		if names[c] {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+func hasBuildFile(names map[string]bool) bool {
+	if _, ok := firstPresent(names, dockerfileNames); ok {
+		return true
+	}
+	_, ok := firstPresent(names, composeNames)
+	return ok
+}
+
+// Detect derives the deploy configuration from a repo's file set, keyed by
+// repo-relative path. Unknown files are ignored. It never errors — a repository
+// nothing can be built from yields a non-Deployable result with an actionable
+// Reason.
+func Detect(files map[string][]byte) Detected {
+	d := Detected{Ports: []int{}, Env: []string{}}
+	idx := indexDirs(files)
+
+	// The build directory: the root when the root says how to build, otherwise
+	// the best-ranked subdirectory that does. A root README and an apps/ tree is
+	// a repository that can be deployed, and used to be told it could not.
+	dir, foundBuild := bestDir(idx, hasBuildFile)
+	names := idx[dir]
+
+	var dockerfile, compose []byte
+	if foundBuild {
+		if name, ok := firstPresent(names, dockerfileNames); ok {
+			d.HasDockerfile = true
+			// Relative to the context, not to the repo — see the field comment.
+			d.DockerfileT = name
+			dockerfile = files[path.Join(dir, name)]
+		}
+		if name, ok := firstPresent(names, composeNames); ok {
+			d.HasCompose = true
+			d.ComposePath = path.Join(dir, name)
+			compose = files[d.ComposePath]
+		}
+		d.ContextSubdir = dir
 	}
 
 	portSet := map[int]bool{}
@@ -103,13 +226,54 @@ func Detect(files map[string][]byte) Detected {
 	}
 	if d.HasCompose {
 		parseCompose(compose, portSet, envSet, &hc)
-		d.Services = ParseComposeServices(compose)
+		// A Compose service's build context is relative to the COMPOSE FILE, so
+		// a compose file found in a subdirectory has to have that subdirectory
+		// folded into every service before the graph leaves here — the renderer
+		// resolves these against the clone root and would otherwise build the
+		// wrong tree (or nothing).
+		d.Services = rebaseServices(ParseComposeServices(compose), dir)
 	}
+	// Env templates live beside the build they configure.
 	for _, name := range EnvExampleNames {
-		if b, ok := files[name]; ok {
+		if b, ok := files[path.Join(dir, name)]; ok {
 			parseEnvExample(b, envSet)
 			break
 		}
+	}
+
+	// Nothing describes a build: fall back to nixpacks if a language is
+	// recognizable. "Not deployable, go away" was the worst dead end in the
+	// product and it was reached by the most ordinary repository shape there is.
+	if !foundBuild {
+		langDir, ok := bestDir(idx, func(names map[string]bool) bool {
+			_, found := DetectLanguage(names)
+			return found
+		})
+		if ok {
+			lang, _ := DetectLanguage(idx[langDir])
+			d.BuildMethod = BuildNixpacks
+			d.ContextSubdir = langDir
+			d.Language = lang.ID
+			d.LanguageLabel = lang.Label
+			// No Dockerfile means no EXPOSE, so the language's conventional port
+			// is the only port there is. Without it the rollout declares none and
+			// its probe targets nothing.
+			portSet[lang.DefaultPort] = true
+			for _, name := range EnvExampleNames {
+				if b, ok := files[path.Join(langDir, name)]; ok {
+					parseEnvExample(b, envSet)
+					break
+				}
+			}
+		}
+	} else if d.HasCompose {
+		// Compose wins over a sibling Dockerfile: the compose file describes the
+		// WHOLE application (including the service that Dockerfile builds), and
+		// building only that one service is how a four-service repo came to
+		// deploy as one container.
+		d.BuildMethod = BuildCompose
+	} else {
+		d.BuildMethod = BuildDockerfile
 	}
 
 	for p := range portSet {
@@ -123,11 +287,103 @@ func Detect(files map[string][]byte) Detected {
 
 	d.HealthCheck = finalizeHealth(hc, d.Ports)
 
-	d.Deployable = d.HasDockerfile || d.HasCompose
+	d.Deployable = d.BuildMethod != ""
 	if !d.Deployable {
-		d.Reason = "no Dockerfile or Compose file found at the repository root — sigmahub needs one to build and run this app"
+		d.Reason = "no Dockerfile, Compose file or recognizable project manifest found — " +
+			"add a Dockerfile (the wizard can write you a starter one) or point sigmahub at the subdirectory that holds your app"
 	}
 	return d
+}
+
+// rebaseServices folds the compose file's own directory into each service's
+// build context, so every path in the graph is relative to the REPO ROOT — the
+// one place the clone exists.
+func rebaseServices(services []ComposeService, dir string) []ComposeService {
+	if dir == "" || len(services) == 0 {
+		return services
+	}
+	out := make([]ComposeService, len(services))
+	copy(out, services)
+	for i := range out {
+		if out[i].Build == "" {
+			continue
+		}
+		out[i].Build = path.Join(dir, out[i].Build)
+	}
+	return out
+}
+
+// CandidatePaths lists the paths worth fetching when the provider cannot give
+// us a file listing (the inspector's fallback). It is the root candidates plus
+// the same names under a short list of conventional subdirectories — a poor
+// substitute for a real tree listing, but better than root-only.
+func CandidatePaths() []string {
+	names := buildFileNames()
+	out := make([]string, 0, len(names)*(len(preferredDirs)+1))
+	out = append(out, names...)
+	for _, dir := range preferredDirs {
+		for _, name := range names {
+			out = append(out, dir+"/"+name)
+		}
+	}
+	return out
+}
+
+// WantedPaths filters a repository's full path listing down to the files
+// detection actually reads. Depth is capped because a build described eight
+// directories deep is not what the wizard should pre-fill, and because the
+// listing of a large monorepo is long enough that fetching every match would be
+// its own outage.
+func WantedPaths(all []string, maxDepth int) []string {
+	want := map[string]bool{}
+	for _, n := range buildFileNames() {
+		want[n] = true
+	}
+	out := []string{}
+	for _, p := range all {
+		clean := path.Clean(strings.TrimPrefix(p, "./"))
+		if clean == "." || strings.HasPrefix(clean, "../") {
+			continue
+		}
+		depth := strings.Count(clean, "/")
+		if depth > maxDepth {
+			continue
+		}
+		if want[path.Base(clean)] {
+			out = append(out, clean)
+		}
+	}
+	// Shallowest first, because the caller truncates: a repository with fifty
+	// workspace package.json files must not push its own root Dockerfile out of
+	// the fetch list. Lexicographic within a depth keeps the result stable.
+	sort.Slice(out, func(a, b int) bool {
+		da, db := strings.Count(out[a], "/"), strings.Count(out[b], "/")
+		if da != db {
+			return da < db
+		}
+		return out[a] < out[b]
+	})
+	return out
+}
+
+// buildFileNames is every base name detection reads: the build files, the env
+// templates and the language markers behind the nixpacks fallback.
+func buildFileNames() []string {
+	out := make([]string, 0, 32)
+	out = append(out, dockerfileNames...)
+	out = append(out, composeNames...)
+	out = append(out, EnvExampleNames...)
+	out = append(out, LanguageMarkerNames()...)
+	seen := map[string]bool{}
+	uniq := out[:0]
+	for _, n := range out {
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		uniq = append(uniq, n)
+	}
+	return uniq
 }
 
 // finalizeHealth turns collected hints into a probe. A declared HTTP path wins

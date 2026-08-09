@@ -47,6 +47,7 @@ import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator"
 import type { ResourceKind, Status } from "@/lib/mock";
 import { KIND_LABELS, formatDate, type DeployTarget } from "./resource-meta";
 import { DeployWizard } from "./deploy-wizard";
+import type { WizardCluster } from "@/lib/wizard/availability";
 
 const ALL = "__all__";
 
@@ -97,14 +98,22 @@ export function ResourcesView({
   targets,
   cpMode = false,
   orgId = "",
+  clusters = [],
+  clusterExcludedKinds = [],
+  /** The GitHub install round trip lands back here with ?wizard=resume, and the
+   *  wizard picks the draft it left in sessionStorage back up (SIGMA-208). */
+  resumeWizard = false,
 }: {
   orgName: string;
   resources: ResourceItem[];
   targets: DeployTarget[];
   cpMode?: boolean;
   orgId?: string;
+  clusters?: WizardCluster[];
+  clusterExcludedKinds?: string[];
+  resumeWizard?: boolean;
 }) {
-  const [wizardOpen, setWizardOpen] = React.useState(false);
+  const [wizardOpen, setWizardOpen] = React.useState(resumeWizard);
   const [kindFilter, setKindFilter] = React.useState<string>(ALL);
   const [envFilter, setEnvFilter] = React.useState<string>(ALL);
 
@@ -263,7 +272,16 @@ export function ResourcesView({
         </CardContent>
       </Card>
 
-      <DeployWizard open={wizardOpen} onOpenChange={setWizardOpen} targets={targets} cpMode={cpMode} orgId={orgId} />
+      <DeployWizard
+        open={wizardOpen}
+        onOpenChange={setWizardOpen}
+        targets={targets}
+        cpMode={cpMode}
+        orgId={orgId}
+        clusters={clusters}
+        clusterExcludedKinds={clusterExcludedKinds}
+        resume={resumeWizard}
+      />
     </div>
   );
 }

@@ -306,3 +306,76 @@ describe("the create-resource request carries its target", () => {
     expect(body.clusterId).toBe("");
   });
 });
+
+// The build block is the SIGMA-209 wiring, and it has exactly the shape that
+// went wrong four times before: a couple of fields that every layer below
+// already understood and nothing above ever set. The agent's image.build op has
+// taken `dockerfile` and `contextSubdir` since the Compose work; because the
+// single-container path never wrote them, a repo whose Dockerfile is not at its
+// root simply could not be deployed. Deleting any assertion below makes the
+// feature disappear while the pure helpers on either side stay green.
+describe("the persisted spec carries the build decision", () => {
+  it("writes the method, the Dockerfile path and the build context", () => {
+    const spec = buildResourceSpec({
+      repo: "acme/platform",
+      build: { method: "dockerfile", dockerfile: "Dockerfile", contextSubdir: "apps/api" },
+    });
+    expect(
+      spec.build,
+      "without spec.build a monorepo builds at the repo root and finds nothing"
+    ).toEqual({ method: "dockerfile", dockerfile: "Dockerfile", contextSubdir: "apps/api" });
+  });
+
+  it("writes the auto-build method for a repo with no Dockerfile", () => {
+    const spec = buildResourceSpec({
+      repo: "acme/reporting",
+      build: { method: "nixpacks", contextSubdir: "services/api" },
+    });
+    expect(spec.build).toEqual({ method: "nixpacks", contextSubdir: "services/api" });
+  });
+
+  // Every resource created before the wizard could express any of this.
+  it("writes no build block when nothing was decided", () => {
+    expect(buildResourceSpec({ repo: "acme/shop" }).build).toBeUndefined();
+  });
+});
+
+// Detection is a PRE-FILL the user is shown precisely so they can correct it.
+// Re-deriving the ports from the raw detected list at create time would
+// silently discard the correction — and the published host port that came with
+// it (SIGMA-210).
+describe("the wizard's port mappings beat the detected ones", () => {
+  it("uses the mappings the user left the networking step with", () => {
+    const spec = buildResourceSpec({
+      repo: "acme/shop",
+      detected: { ports: [3000] },
+      ports: [{ container: 8080, host: 8080 }],
+    });
+    expect(spec.ports).toEqual([{ container: 8080, host: 8080, protocol: "tcp" }]);
+  });
+
+  it("still falls back to detection when the flow collected none", () => {
+    const spec = buildResourceSpec({ repo: "acme/shop", detected: { ports: [3000] } });
+    expect(spec.ports).toEqual([{ container: 3000, host: 0, protocol: "tcp" }]);
+  });
+
+  it("clamps a nonsense host port to internal-only rather than sending it", () => {
+    const spec = buildResourceSpec({
+      repo: "acme/shop",
+      ports: [{ container: 3000, host: 99999 }],
+    });
+    expect(spec.ports).toEqual([{ container: 3000, host: 0, protocol: "tcp" }]);
+  });
+});
+
+// Object storage picks an engine through the SAME `engine` spec field the LLM
+// runtime uses, because that is what the control plane reads for both.
+describe("the object-storage engine reaches the spec", () => {
+  it("writes the chosen engine", () => {
+    expect(buildResourceSpec({ s3Engine: "seaweedfs" }).engine).toBe("seaweedfs");
+  });
+
+  it("leaves it unset when the flow did not ask", () => {
+    expect(buildResourceSpec({ repo: "acme/shop" }).engine).toBeUndefined();
+  });
+});

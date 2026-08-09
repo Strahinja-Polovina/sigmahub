@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { getActiveOrgId } from "@/server/active-org";
 import { linkInstallation, connectGitIntegration } from "@/server/actions/git";
 import { isInstallationId, parseInstallState } from "@/lib/github-app";
+import { wizardResumePath } from "@/lib/wizard/resume";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // GitHub App post-install callback (SIGMA-55). The App's Setup URL points
@@ -28,16 +29,22 @@ export default async function GitHubSetupPage({
     error = "GitHub did not send a valid installation id.";
   } else if (!target) {
     error = "The install link's state is missing or malformed, so the installation can't be routed to a project.";
-  } else if (target.kind === "org") {
-    // Org-level install: claim it for the organization, then land on the
-    // integrations tab where the connected account is now listed.
+  } else if (target.kind === "org" || target.kind === "wizard") {
+    // Org-level install: claim it for the organization, then land where the
+    // install was started from. A wizard install returns to the page that
+    // opened the wizard, which reopens it from the draft it left behind —
+    // otherwise the reward for connecting GitHub is starting over (SIGMA-208).
     try {
       await connectGitIntegration({ orgId, installationId });
     } catch (err) {
       error = err instanceof Error ? err.message : "Connecting the integration failed.";
       return <SetupError message={error} />;
     }
-    redirect("/dashboard/settings?tab=integrations");
+    redirect(
+      target.kind === "wizard"
+        ? wizardResumePath(target.projectId)
+        : "/dashboard/settings?tab=integrations"
+    );
   } else if (target.kind === "project") {
     redirect(
       `/dashboard/projects/${target.projectId}?installation_id=${installationId}`

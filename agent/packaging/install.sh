@@ -75,6 +75,17 @@ need wg-quick || { echo "installing wireguard-tools..."; apt-get update -qq && a
 apt-get install -y -qq auditd >/dev/null 2>&1 || echo "warning: could not install auditd; the CIS auditd control will score as unmet"
 # restic executes the P1-11 backup/verify ops (client-side encrypted backups).
 ensure_tool restic restic
+# nixpacks builds a repo that carries no Dockerfile — the wizard's answer to
+# "this repository does not say how to build itself". Without it the auto-build
+# method the dashboard offers fails on the host with "executable file not
+# found", which is the dead end that path exists to remove. Not fatal: a fleet
+# that only ever builds Dockerfiles is unaffected, and the agent says plainly
+# what is missing rather than reporting a broken repository.
+if ! need nixpacks; then
+  echo "installing nixpacks..."
+  curl -fsSL https://nixpacks.com/install.sh | bash \
+    || echo "warning: could not install nixpacks; repositories with no Dockerfile cannot be auto-built on this host"
+fi
 # cosign is required to verify the release before we run it.
 if ! need cosign; then
   echo "installing cosign..."

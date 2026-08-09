@@ -13,6 +13,14 @@ const (
 	KindImageBuild = "image.build"
 )
 
+// Builders this agent can execute. The strings are the control plane's
+// gitdetect build methods, so the value the wizard showed the user is the value
+// that runs here.
+const (
+	BuilderDockerfile = "dockerfile"
+	BuilderNixpacks   = "nixpacks"
+)
+
 // GitCloneSpec is the payload of a git.clone op. CredentialRef, when set, names a
 // short-lived clone credential the agent fetches into memory from the control
 // plane (never persisted). A public repo needs no credential.
@@ -33,10 +41,20 @@ type BuildImageSpec struct {
 	SHA        string `json:"sha"`
 	DedupKey   string `json:"dedupKey"`
 	Dockerfile string `json:"dockerfile,omitempty"`
-	// ContextSubdir is a Compose service's build context relative to the cloned
-	// repo root (empty ⇒ repo root). Validated to stay within the clone.
+	// ContextSubdir is the build context relative to the cloned repo root
+	// (empty ⇒ repo root): a Compose service's `build:` path, or the
+	// subdirectory a monorepo's app lives in. Validated to stay within the clone.
 	ContextSubdir string `json:"contextSubdir,omitempty"`
-	ImageTag      string `json:"imageTag"` // e.g. sigmahub/<resourceId>:<sha>
+	// Builder selects how the image is produced. Empty (and "dockerfile") means
+	// a docker build of Dockerfile in the context. "nixpacks" auto-builds a repo
+	// that ships no Dockerfile at all, from its language manifest.
+	//
+	// An UNKNOWN value is refused rather than defaulted: falling back to a
+	// docker build would look for a Dockerfile the repository does not have and
+	// report the resulting failure as "clone did not run?", which is a lie about
+	// which step went wrong.
+	Builder  string `json:"builder,omitempty"`
+	ImageTag string `json:"imageTag"` // e.g. sigmahub/<resourceId>:<sha>
 	// DeploymentID scopes the streamed build logs on the control plane.
 	DeploymentID string `json:"deploymentId,omitempty"`
 	// Force skips the ImageExists dedup short-circuit so a manual redeploy rebuilds

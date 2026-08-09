@@ -79,6 +79,11 @@ export async function detectRepo(input: {
       { name: user.name, role }
     );
   } catch (err) {
+    // `unreadable`, not `deployable: false`. The two are different facts and
+    // the wizard acts on them differently: "this repo says nothing about how to
+    // build itself" invites the user to commit a Dockerfile, which is exactly
+    // the wrong advice when what actually happened is a 500, a rate limit or an
+    // expired token — the repo may already have one we simply could not read.
     return {
       hasDockerfile: false,
       hasCompose: false,
@@ -86,6 +91,7 @@ export async function detectRepo(input: {
       env: [],
       healthCheck: { type: "tcp", intervalSec: 10, source: "default" },
       deployable: false,
+      unreadable: true,
       reason: err instanceof Error ? err.message : "Could not read the repository. Please try again.",
     };
   }

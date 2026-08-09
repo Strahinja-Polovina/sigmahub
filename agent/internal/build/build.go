@@ -62,6 +62,9 @@ type Builder struct {
 	workRoot string
 	log      *slog.Logger
 	sink     LogSink
+	// lookPath resolves an external builder on PATH. A field so a test can say
+	// "this host has no nixpacks" without depending on the build machine.
+	lookPath func(string) (string, error)
 }
 
 // NewBuilder wires the default os/exec runner. workRoot is the base directory for
@@ -69,6 +72,7 @@ type Builder struct {
 // nil on a host that never builds for another machine.
 func NewBuilder(docker ImageBuilder, cred CredentialFetcher, registry RegistryFetcher, workRoot string, log *slog.Logger, sink LogSink) *Builder {
 	return &Builder{
+		lookPath: exec.LookPath,
 		runner: func(ctx context.Context, dir string, extraEnv []string, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
 			cmd.Dir = dir
@@ -229,13 +233,38 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 			return fmt.Errorf("build context %q escapes the clone root", spec.ContextSubdir)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, dockerfile)); err != nil {
-		return fmt.Errorf("build context missing %s (clone did not run?): %w", dockerfile, err)
-	}
-
 	logs := &lineWriter{ctx: ctx, sink: b.sink, deploymentID: spec.DeploymentID}
-	if err := b.docker.ImageBuild(ctx, dir, dockerfile, spec.ImageTag, logs); err != nil {
-		return fmt.Errorf("build image: %w", err)
+	switch spec.Builder {
+	case "", BuilderDockerfile:
+		if _, err := os.Stat(filepath.Join(dir, dockerfile)); err != nil {
+			return fmt.Errorf("build context missing %s (clone did not run?): %w", dockerfile, err)
+		}
+		if err := b.docker.ImageBuild(ctx, dir, dockerfile, spec.ImageTag, logs); err != nil {
+			return fmt.Errorf("build image: %w", err)
+		}
+	case BuilderNixpacks:
+		// nixpacks reads the source tree, derives a build plan from its language
+		// manifest and drives docker build itself — which is exactly why it is
+		// the fallback we chose: it needs no new op kind and no privileged
+		// surface beyond the docker access this path already has.
+		// Say what is missing rather than letting exec fail with "executable
+		// file not found": an operator reading a deploy log should not have to
+		// know that the auto-build method is a separate binary the installer
+		// puts on the host.
+		if _, err := b.lookPath("nixpacks"); err != nil {
+			return fmt.Errorf("this host has no nixpacks, so a repository with no Dockerfile cannot be auto-built here — " +
+				"re-run the agent installer to add it, or switch the app to the Dockerfile build method")
+		}
+		b.stream(ctx, spec.DeploymentID, "build", "no Dockerfile — building "+spec.ImageTag+" with nixpacks")
+		out, err := b.runner(ctx, dir, nil, "nixpacks", "build", ".", "--name", spec.ImageTag)
+		// nixpacks streams the underlying docker build on its own stdout, so its
+		// output is the build log whether it succeeded or not.
+		_, _ = logs.Write(out)
+		if err != nil {
+			return fmt.Errorf("nixpacks build: %w: %s", err, strings.TrimSpace(lastLines(string(out), 20)))
+		}
+	default:
+		return fmt.Errorf("unknown builder %q — this agent knows %q and %q", spec.Builder, BuilderDockerfile, BuilderNixpacks)
 	}
 	// Dedicated build server: the deploy target pulls this image, and it cannot
 	// read this machine's Docker daemon. A push failure has to fail the op — a
@@ -308,6 +337,17 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		w.buf = nil
 	}
 	return len(p), nil
+}
+
+// lastLines is the TAIL of a build's output, for the error message. A failed
+// build's cause is at the end; leading the error with the first 20 lines of
+// "installing nix packages" would bury it.
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func indexByte(b []byte, c byte) int {

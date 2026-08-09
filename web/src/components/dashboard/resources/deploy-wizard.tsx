@@ -4,23 +4,20 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
-  GitBranch,
-  FileCode2,
-  Boxes,
-  Server as ServerIcon,
+  Rocket,
   Check,
   ChevronRight,
   ChevronLeft,
-  Plus,
-  Trash2,
   Loader2,
   CircleCheck,
   CircleAlert,
   ArrowRight,
-  Search,
   Database,
   Cpu,
   HardDrive,
+  GitBranch,
+  Lock,
+  ExternalLink,
 } from "lucide-react";
 
 import {
@@ -33,6 +30,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -40,173 +38,93 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { canHost, HOSTS_NOTHING_REASON } from "@/lib/server-catalog.generated";
-import {
-  ROLLOUT_BLUE_GREEN,
-  ROLLOUT_RECREATE,
-  recreateSummary,
-  ignoredHostPorts,
-  type DetectedComposeService,
-} from "@/lib/deploy-spec";
-import type { ResourceKind, ServerType } from "@/lib/mock";
 import Link from "next/link";
-import { RepoPicker } from "./repo-picker";
+import {
+  RESOURCE_KIND_LABELS,
+  RESOURCE_KINDS,
+  type ResourceKind,
+} from "@/lib/server-catalog.generated";
+import {
+  buildInventory,
+  kindAvailability,
+  type WizardCluster,
+  type WizardProject,
+} from "@/lib/wizard/availability";
+import {
+  nextStepId,
+  prevStepId,
+  resolveStep,
+  stepsForKind,
+  type WizardStepId,
+} from "@/lib/wizard/steps";
+import {
+  BUILD_COMPOSE,
+  decideBuildMethod,
+  subdirError,
+  type BuildMethod,
+  type DetectedRepo,
+} from "@/lib/wizard/build";
+import {
+  createResourceInput,
+  createSecretsFor,
+  shouldWireRepo,
+  type WizardDraftState,
+} from "@/lib/wizard/create";
+import {
+  defaultHealthPath,
+  defaultPortMappings,
+  domainError,
+  portMappingsError,
+  type PortMapping,
+} from "@/lib/wizard/networking";
+import {
+  blankEnvDraft,
+  envVarCount,
+  envVarsValid,
+  seedEnvVars,
+  type EnvDraft,
+} from "@/lib/wizard/env";
+import { blockingGaps, type ReviewInput } from "@/lib/wizard/review";
+import {
+  DEFAULT_LLM_ENGINE,
+  DEFAULT_S3_ENGINE,
+  LLM_ENGINES,
+  S3_ENGINES,
+  defaultManagedName,
+  isDatabaseKind,
+  isManagedKind,
+  managedSummary,
+  resourceNameError,
+} from "@/lib/wizard/managed";
+import {
+  WIZARD_RESUME_KEY,
+  decodeWizardDraft,
+  encodeWizardDraft,
+  type WizardDraft,
+} from "@/lib/wizard/resume";
+import { findMockRepo, type MockRepo } from "@/lib/mock/repos";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
-import { detectRepo, wireRepoToEnvironment } from "@/server/actions/git";
-import {
-  KIND_LABELS,
-  SERVER_TYPE_LABELS,
-  type DeployTarget,
-} from "./resource-meta";
+import { detectRepo, getGitAppInfo, wireRepoToEnvironment } from "@/server/actions/git";
+import { revealDatabaseConnection } from "@/server/actions/databases";
+import { revealS3Connection } from "@/server/actions/s3";
+import type { DeployTarget } from "./resource-meta";
+import { SourceStep } from "./wizard/source-step";
+import { BuildStep } from "./wizard/build-step";
+import { NetworkStep } from "./wizard/network-step";
+import { TargetStep } from "./wizard/target-step";
+import { EnvStep } from "./wizard/env-step";
+import { ReviewStep } from "./wizard/review-step";
 
-// ---- Demo-mode Git surface (CP mode uses real detection below) --------------
-
-type Repo = {
-  fullName: string;
-  description: string;
-  private: boolean;
-  defaultBranch: string;
-  // The kind the detected build produces — drives the availability matrix.
-  detectedKind: ResourceKind;
-  build: "Dockerfile" | "docker-compose.yml";
-  buildDetail: string;
-  port: number;
-  /** Full inspector output, carried so the create call can persist it into the
-   *  resource spec — otherwise the rollout has no ports and its health probe
-   *  targets a port the app doesn't listen on (SIGMA-160), and a Compose repo
-   *  is created as a single container (SIGMA-199). */
-  detected?: {
-    ports?: number[];
-    healthCheck?: { type: string; path?: string; port?: number };
-    services?: DetectedComposeService[];
-  };
-  /** Variable KEYS detected from the repo (.env.example, Dockerfile ENV/ARG,
-   *  compose environment) — seeds the Variables step. */
-  envKeys?: string[];
-};
-
-// Demo mode has no control plane to inspect a repository, so these stand in for
-// the inspector's output. `acme/api` carries a real multi-service graph —
-// including one service that can only be recreated — because a demo where every
-// repo is a single container is a demo of the bug this flow was built around
-// (SIGMA-199): the multi-service path would never be exercised offline.
-const MOCK_REPOS: Repo[] = [
-  {
-    fullName: "acme/storefront",
-    description: "Next.js customer-facing storefront",
-    private: true,
-    defaultBranch: "main",
-    detectedKind: "app",
-    build: "Dockerfile",
-    buildDetail: "node:20-alpine · 3 stages",
-    port: 3000,
-    detected: { ports: [3000], healthCheck: { type: "http", path: "/healthz", port: 3000 } },
-  },
-  {
-    fullName: "acme/api",
-    description: "Core REST + gRPC services",
-    private: true,
-    defaultBranch: "main",
-    detectedKind: "app",
-    build: "docker-compose.yml",
-    buildDetail: "4 services: api, worker, cache, db",
-    port: 8080,
-    detected: {
-      ports: [8080],
-      healthCheck: { type: "http", path: "/health", port: 8080 },
-      services: [
-        {
-          name: "api",
-          build: ".",
-          dockerfile: "Dockerfile",
-          ports: [8080],
-          dependsOn: ["db", "cache"],
-          rollout: ROLLOUT_BLUE_GREEN,
-        },
-        { name: "worker", build: "./worker", rollout: ROLLOUT_BLUE_GREEN },
-        { name: "cache", image: "redis:7.4", ports: [6379], rollout: ROLLOUT_BLUE_GREEN },
-        {
-          name: "db",
-          image: "postgres:16",
-          ports: [5432],
-          namedVolumes: ["pgdata"],
-          rollout: ROLLOUT_RECREATE,
-        },
-      ],
-    },
-  },
-  {
-    fullName: "acme/ml-inference",
-    description: "vLLM inference server",
-    private: true,
-    defaultBranch: "main",
-    detectedKind: "llm",
-    build: "Dockerfile",
-    buildDetail: "nvidia/cuda:12.4 base",
-    port: 8000,
-  },
-  {
-    fullName: "acme/edge-cache",
-    description: "Redis-backed edge cache",
-    private: false,
-    defaultBranch: "main",
-    detectedKind: "redis",
-    build: "docker-compose.yml",
-    buildDetail: "redis:7.4",
-    port: 6379,
-    // A repo the demo presents as Compose has to CARRY a graph, or demo mode
-    // shows the one shape SIGMA-199 exists to prevent: a compose repo that
-    // renders no services and creates a single container. This one also carries
-    // a published host port, which is the only way the ignored-binding notice
-    // is reachable offline.
-    detected: {
-      ports: [6379],
-      services: [
-        {
-          name: "cache",
-          image: "redis:7.4",
-          ports: [6379],
-          publishedPorts: [6379],
-          namedVolumes: ["cachedata"],
-          rollout: ROLLOUT_RECREATE,
-        },
-        {
-          name: "warmer",
-          build: "./warmer",
-          dependsOn: ["cache"],
-          rollout: ROLLOUT_BLUE_GREEN,
-        },
-      ],
-    },
-  },
-];
-
-type EnvVar = { id: string; key: string; value: string };
-
-// Must match createSecretAction's server-side validation (secrets.ts): a
-// rejected key would otherwise throw mid-create and surface as a misleading
-// "Create failed" after the resource already exists (SIGMA-151).
-const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const envKeyValid = (key: string) => {
-  const k = key.trim();
-  return k === "" || ENV_KEY_RE.test(k);
-};
-
-const STEPS = [
-  { id: 1, label: "Source" },
-  { id: 2, label: "Build" },
-  { id: 3, label: "Target" },
-  { id: 4, label: "Variables" },
-  { id: 5, label: "Deploy" },
-] as const;
-
-// Managed services created straight from an engine image — no git repo, no
-// build step.
-const SERVICE_KINDS: { kind: ResourceKind; icon: React.ElementType; detail: string }[] = [
+/** The step-1 card grid. Ordered as the product talks about itself: the app
+ *  first, then the data it needs, then the specialist. */
+const KIND_CARDS: {
+  kind: ResourceKind;
+  icon: React.ElementType;
+  detail: string;
+}[] = [
+  { kind: "app", icon: GitBranch, detail: "Build and deploy a repository" },
   { kind: "postgres", icon: Database, detail: "Managed PostgreSQL" },
   { kind: "mysql", icon: Database, detail: "Managed MySQL" },
   { kind: "mongodb", icon: Database, detail: "Managed MongoDB" },
@@ -215,26 +133,15 @@ const SERVICE_KINDS: { kind: ResourceKind; icon: React.ElementType; detail: stri
   { kind: "llm", icon: Cpu, detail: "Model endpoint on a GPU server" },
 ];
 
-/** Inference runtimes the control plane knows how to render. An unknown one is
- *  refused at create, so this list is the contract rather than free text. */
-const LLM_ENGINES = [
-  { id: "vllm", label: "vLLM", detail: "High-throughput serving for most open models" },
-  { id: "ollama", label: "Ollama", detail: "Simple single-model serving" },
-] as const;
+type PickedRepo = {
+  fullName: string;
+  defaultBranch: string;
+  installationId?: string;
+  branches?: string[];
+};
 
-const DEPLOY_PHASES = [
-  "Cloning repository",
-  "Building image",
-  "Pushing to registry",
-  "Provisioning on server",
-  "Running health checks",
-] as const;
-
-let seq = 0;
-function newId() {
-  seq += 1;
-  return `envvar_${seq}`;
-}
+/** Credentials a managed resource generated, shown once. */
+type RevealedCredentials = { label: string; value: string; secret?: boolean }[];
 
 export function DeployWizard({
   open,
@@ -242,432 +149,556 @@ export function DeployWizard({
   targets,
   cpMode = false,
   orgId = "",
+  clusters = [],
+  clusterExcludedKinds = [],
+  /** The project this wizard was opened from, when it was opened from one. Used
+   *  to bring the GitHub install round trip back to the right page. */
+  originProjectId,
+  /** Reopened after a GitHub install — restore the draft the user left. */
+  resume = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   targets: DeployTarget[];
-  /** CP mode replaces the demo repo picker with real repo detection and the
-   *  timed deploy animation with the actual (single) create call. */
   cpMode?: boolean;
   orgId?: string;
+  clusters?: WizardCluster[];
+  clusterExcludedKinds?: string[];
+  originProjectId?: string;
+  resume?: boolean;
 }) {
   const router = useRouter();
-  const [step, setStep] = React.useState(1);
-  const [repoQuery, setRepoQuery] = React.useState("");
-  const [repo, setRepo] = React.useState<Repo | null>(null);
-  // Optional token for private repos (CP mode): used for detection here and
-  // stored by auto-connecting the repo to the project on create.
-  const [repoToken, setRepoToken] = React.useState("");
-  // Org-level GitHub integration: when repos can be listed the wizard SELECTS
-  // one; `pickerEmpty` flips to the manual owner/repo + token form so an org
-  // without the App (or with the App unable to see a repo) is never stuck.
-  const [pickerEmpty, setPickerEmpty] = React.useState(false);
-  const [pickedInstallation, setPickedInstallation] = React.useState<string | undefined>();
-  // Managed-service mode: a picked engine kind replaces the git repo as the
-  // source (databases/object storage never had a repo to detect).
-  const [serviceKind, setServiceKind] = React.useState<ResourceKind | null>(null);
-  const [serviceName, setServiceName] = React.useState("");
-  // CP mode: real repo detection state.
-  const [detecting, setDetecting] = React.useState(false);
-  // CP mode: honest create outcome for step 5 (no simulated pipeline).
-  const [createState, setCreateState] = React.useState<"idle" | "creating" | "done" | "error">("idle");
-  const [createdId, setCreatedId] = React.useState<string | null>(null);
-  const createStartedRef = React.useRef(false);
-  // An inference endpoint needs a runtime and a model; the control plane refuses
-  // a create without them rather than guessing.
-  const [llmEngine, setLlmEngine] = React.useState<string>(LLM_ENGINES[0].id);
-  const [llmModel, setLlmModel] = React.useState("");
-  const [projectId, setProjectId] = React.useState<string>("");
-  const [environmentId, setEnvironmentId] = React.useState<string>("");
-  const [serverId, setServerId] = React.useState<string>("");
-  const [envVars, setEnvVars] = React.useState<EnvVar[]>([]);
-  const [deployPhase, setDeployPhase] = React.useState(0);
-  const [deploying, setDeploying] = React.useState(false);
 
-  const projects = targets;
-  const kind = serviceKind ?? repo?.detectedKind;
-  // What lands in the resource record + step-5 copy.
-  const resourceName = serviceKind
-    ? serviceName.trim()
-    : (repo?.fullName.split("/").pop() ?? "resource");
-  const sourceLabel = serviceKind ? serviceName.trim() || KIND_LABELS[serviceKind] : repo?.fullName;
+  const [kind, setKind] = React.useState<ResourceKind | null>(null);
+  const [step, setStep] = React.useState<WizardStepId>("kind");
+  const [name, setName] = React.useState("");
+
+  // Source
+  const [repo, setRepo] = React.useState<PickedRepo | null>(null);
+  const [branch, setBranch] = React.useState("");
+  const [manualRepo, setManualRepo] = React.useState("");
+  const [token, setToken] = React.useState("");
+  const [detecting, setDetecting] = React.useState(false);
+  const [detected, setDetected] = React.useState<DetectedRepo | null>(null);
+  const [detectError, setDetectError] = React.useState<string | null>(null);
+  const [gitAppSlug, setGitAppSlug] = React.useState<string | null>(null);
+
+  // Build
+  const [method, setMethod] = React.useState<BuildMethod | null>(null);
+  const [dockerfile, setDockerfile] = React.useState("");
+  const [contextSubdir, setContextSubdir] = React.useState("");
+
+  // Networking
+  const [ports, setPorts] = React.useState<PortMapping[]>([]);
+  const [domain, setDomain] = React.useState("");
+  const [healthPath, setHealthPath] = React.useState("/");
+
+  // Target
+  const [projectId, setProjectId] = React.useState("");
+  const [environmentId, setEnvironmentId] = React.useState("");
+  const [serverId, setServerId] = React.useState("");
+  const [clusterId, setClusterId] = React.useState("");
+
+  // Variables
+  const [envVars, setEnvVars] = React.useState<EnvDraft[]>([blankEnvDraft()]);
+
+  // Managed
+  const [s3Engine, setS3Engine] = React.useState<string>(DEFAULT_S3_ENGINE);
+  const [llmEngine, setLlmEngine] = React.useState<string>(DEFAULT_LLM_ENGINE);
+  const [llmModel, setLlmModel] = React.useState("");
+
+  // Create
+  const [createState, setCreateState] = React.useState<
+    "idle" | "creating" | "done" | "error"
+  >("idle");
+  const [createdId, setCreatedId] = React.useState<string | null>(null);
+  const [createError, setCreateError] = React.useState<string | null>(null);
+  const [credentials, setCredentials] = React.useState<RevealedCredentials | null>(null);
+  const createStartedRef = React.useRef(false);
+
+  const projects = targets as WizardProject[];
+  const inventory = React.useMemo(
+    () => buildInventory(projects, clusters, clusterExcludedKinds),
+    [projects, clusters, clusterExcludedKinds]
+  );
+  const steps = stepsForKind(kind);
+  const decision = React.useMemo(() => decideBuildMethod(detected), [detected]);
 
   const environments = React.useMemo(
     () => projects.find((p) => p.id === projectId)?.environments ?? [],
     [projects, projectId]
   );
+  const environment = environments.find((e) => e.id === environmentId);
+  const server = environments.flatMap((e) => e.servers).find((s) => s.id === serverId);
+  const cluster = clusters.find((c) => c.id === clusterId);
+  const project = projects.find((p) => p.id === projectId);
 
-  // Candidate servers for the chosen environment, annotated with matrix compatibility.
-  const candidateServers = React.useMemo(() => {
-    const env = environments.find((e) => e.id === environmentId);
-    if (!env || !kind) return [];
-    return env.servers.map((server) => ({
+  // Memoized because the step guard below depends on it: a fresh object on
+  // every render would recompute (and re-render) on every keystroke.
+  const reviewInput: ReviewInput = React.useMemo(
+    () => ({
+      kind: kind ?? "app",
+      name,
+      repo: repo?.fullName,
+      branch,
+      buildMethod: kind === "app" ? method : null,
+      dockerfile,
+      contextSubdir,
+      composeServiceCount: detected?.services?.length,
+      ports: kind === "app" && method !== BUILD_COMPOSE ? ports : undefined,
+      domain,
+      healthPath: kind === "app" && method !== BUILD_COMPOSE ? healthPath : undefined,
+      envVarCount: kind === "app" ? envVarCount(envVars) : undefined,
+      llmEngine: kind === "llm" ? llmEngine : undefined,
+      llmModel: kind === "llm" ? llmModel : undefined,
+      engineVersion: kind === "s3" ? s3Engine : undefined,
+      projectName: project?.name,
+      environmentName: environment?.name,
+      serverName: server?.name,
+      clusterName: cluster?.name,
+    }),
+    [
+      kind,
+      name,
+      repo,
+      branch,
+      method,
+      dockerfile,
+      contextSubdir,
+      detected,
+      ports,
+      domain,
+      healthPath,
+      envVars,
+      llmEngine,
+      llmModel,
+      s3Engine,
+      project,
+      environment,
       server,
-      compatible: canHost(server.type as ServerType, kind),
-    }));
-  }, [environments, environmentId, kind]);
-
-  const selectedServer = React.useMemo(
-    () => environments.flatMap((e) => e.servers).find((s) => s.id === serverId),
-    [environments, serverId]
+      cluster,
+    ]
   );
 
-  // A typed "422-style" incompatibility error, shown inline in step 3.
-  // Two cases: an explicitly-picked server that can't host the kind, or an
-  // environment whose servers are all incompatible with the detected kind.
-  const incompatibility = React.useMemo(() => {
-    if (!kind) return null;
-    if (selectedServer && !canHost(selectedServer.type as ServerType, kind)) {
-      // Types that host NOTHING get the catalog's reason appended: "a Build
-      // server cannot host an App" is true but reads like a bug, and the
-      // operator's next move is to pick a different server, not to retry.
-      const why = HOSTS_NOTHING_REASON[selectedServer.type as ServerType];
-      return {
-        code: 422,
-        type: "resource_kind_unsupported",
-        message: `A ${SERVER_TYPE_LABELS[selectedServer.type as ServerType]} server cannot host a ${KIND_LABELS[kind]} resource.${why ? ` ${why}` : ""}`,
-      };
-    }
-    if (
-      environmentId &&
-      candidateServers.length > 0 &&
-      candidateServers.every((c) => !c.compatible)
-    ) {
-      return {
-        code: 422,
-        type: "no_eligible_server",
-        message: `No server in this environment can host a ${KIND_LABELS[kind]} resource. Attach a compatible server first.`,
-      };
-    }
-    return null;
-  }, [selectedServer, kind, environmentId, candidateServers]);
+  // ── Draft persistence across the GitHub install round trip ────────────────
 
-  const filteredRepos = React.useMemo(() => {
-    const q = repoQuery.trim().toLowerCase();
-    if (!q) return MOCK_REPOS;
-    return MOCK_REPOS.filter(
-      (r) =>
-        r.fullName.toLowerCase().includes(q) ||
-        r.description.toLowerCase().includes(q)
-    );
-  }, [repoQuery]);
+  const stashDraft = React.useCallback(() => {
+    if (!kind) return;
+    const draft: WizardDraft = {
+      kind,
+      ...(name.trim() ? { name: name.trim() } : {}),
+      ...(projectId ? { projectId } : {}),
+      ...(environmentId ? { environmentId } : {}),
+      ...(serverId ? { serverId } : {}),
+      ...(clusterId ? { clusterId } : {}),
+      ...(repo?.fullName ? { repo: repo.fullName } : {}),
+      ...(branch ? { branch } : {}),
+    };
+    try {
+      window.sessionStorage.setItem(WIZARD_RESUME_KEY, encodeWizardDraft(draft));
+    } catch {
+      // A blocked sessionStorage costs the user their draft, not the flow.
+    }
+  }, [kind, name, projectId, environmentId, serverId, clusterId, repo, branch]);
 
-  // Reset all state whenever the dialog is (re)opened. Adjusting during the
-  // render that flips `open` avoids a setState-in-effect and the extra
-  // committed render it would cause.
-  const [prevOpen, setPrevOpen] = React.useState(open);
+  // Reset (or restore) whenever the dialog opens. Adjusting during the render
+  // that flips `open` avoids a setState-in-effect and the extra committed
+  // render it would cause.
+  //
+  // Seeded FALSE, not from `open`. Both resume call sites mount this component
+  // already open — the whole point is to come back from github.com straight
+  // into the wizard — and `useState(open)` made prevOpen match on the very
+  // first render, so the restore below could not fire on the one render that
+  // matters. The user returned to an empty wizard on step 1, which is exactly
+  // the failure the draft exists to prevent; worse, the draft was never
+  // cleared, so closing and reopening later resurrected it.
+  const [prevOpen, setPrevOpen] = React.useState(false);
   if (open !== prevOpen) {
     setPrevOpen(open);
     if (open) {
-      setStep(1);
-      setRepoQuery("");
+      let draft: WizardDraft | null = null;
+      if (resume) {
+        try {
+          draft = decodeWizardDraft(window.sessionStorage.getItem(WIZARD_RESUME_KEY));
+          window.sessionStorage.removeItem(WIZARD_RESUME_KEY);
+        } catch {
+          draft = null;
+        }
+      }
+      setKind(draft?.kind ?? null);
+      // A restored draft lands on Source, which is where the user was when they
+      // left for github.com — dropping them back on step 1 would technically
+      // preserve their state and still feel like starting over.
+      setStep(draft ? resolveStep(draft.kind, "source") : "kind");
+      setName(draft?.name ?? "");
       setRepo(null);
-      setRepoToken("");
-      setServiceKind(null);
-      setServiceName("");
+      setBranch(draft?.branch ?? "");
+      setManualRepo(draft?.repo ?? "");
+      setToken("");
+      setDetected(null);
+      setDetectError(null);
       setDetecting(false);
+      setMethod(null);
+      setDockerfile("");
+      setContextSubdir("");
+      setPorts([]);
+      setDomain("");
+      setHealthPath("/");
+      setProjectId(draft?.projectId ?? "");
+      setEnvironmentId(draft?.environmentId ?? "");
+      setServerId(draft?.serverId ?? "");
+      setClusterId(draft?.clusterId ?? "");
+      setEnvVars([blankEnvDraft()]);
+      setS3Engine(DEFAULT_S3_ENGINE);
+      setLlmEngine(DEFAULT_LLM_ENGINE);
+      setLlmModel("");
       setCreateState("idle");
       setCreatedId(null);
-      setProjectId("");
-      setEnvironmentId("");
-      setServerId("");
-      setEnvVars([
-        { id: newId(), key: "NODE_ENV", value: "production" },
-        { id: newId(), key: "", value: "" },
-      ]);
-      setDeployPhase(0);
-      setDeploying(false);
+      setCreateError(null);
+      setCredentials(null);
     }
   }
 
-  // CP mode: real repo detection for step 1 (the CP inspects the repo's
-  // Dockerfile/compose over the provider API; no mock list).
-  function runDetect(explicitRepo?: string, installationId?: string) {
-    const fullName = (explicitRepo ?? repoQuery).trim();
-    if (!fullName.includes("/")) {
-      toast.error("Enter the repository as owner/name.");
-      return;
-    }
-    setDetecting(true);
-    setRepo(null);
-    detectRepo({
-      orgId,
-      repoFullName: fullName,
-      installationId: installationId ?? pickedInstallation,
-      token: repoToken.trim() || undefined,
-    })
-      .then((d) => {
-        if (!d.deployable) {
-          toast.error("Repository is not deployable", {
-            description: d.reason ?? "No Dockerfile or compose file detected.",
-          });
-          return;
-        }
-        const services = d.services ?? [];
-        setRepo({
-          fullName,
-          description: d.hasCompose ? `compose: ${d.composePath ?? "docker-compose.yml"}` : `dockerfile: ${d.dockerfilePath ?? "Dockerfile"}`,
-          private: false,
-          defaultBranch: d.defaultBranch || "main",
-          detectedKind: "app",
-          build: d.hasCompose ? "docker-compose.yml" : "Dockerfile",
-          // Service COUNT is the headline for a Compose repo: it is the number
-          // the operator can check against their own compose file, and the one
-          // that used to be silently wrong (always 1).
-          buildDetail: services.length
-            ? `${services.length} services: ${services.map((s) => s.name).join(", ")}`
-            : d.ports.length
-              ? `ports ${d.ports.join(", ")}`
-              : "no ports detected",
-          port: d.ports[0] ?? 0,
-          detected: {
-            ports: d.ports,
-            healthCheck: d.healthCheck?.type
-              ? { type: d.healthCheck.type, path: d.healthCheck.path, port: d.healthCheck.port }
-              : undefined,
-            services,
-          },
-          envKeys: d.env,
-        });
-        // Pre-fill the Variables step with the repo's own variable names
-        // (.env.example / Dockerfile ENV / compose environment) — the operator
-        // fills in values instead of retyping keys.
-        if (d.env?.length) {
-          setEnvVars([
-            ...d.env.map((key) => ({ id: newId(), key, value: "" })),
-            { id: newId(), key: "", value: "" },
-          ]);
-        }
-      })
-      .catch((err) => {
-        toast.error("Detection failed", {
-          description: err instanceof Error ? err.message : "Please try again.",
-        });
-      })
-      .finally(() => setDetecting(false));
-  }
-
-  // Step 5. CP mode: ONE honest create call — the resource lands as
-  // `provisioning` and the real pipeline (P1-9) drives it from the git panel;
-  // nothing is animated or fabricated. Demo mode keeps the simulated pipeline.
-  // Re-arm the one-shot create guard on every dialog open (refs are mutated
-  // only inside effects, per the hooks rules).
   React.useEffect(() => {
     if (open) createStartedRef.current = false;
   }, [open]);
 
+  // The App slug drives the inline Connect GitHub link. Loaded once per open,
+  // and a failure simply means the offer is not shown.
   React.useEffect(() => {
-    if (step !== 5) return;
-    if (cpMode) {
-      if (createStartedRef.current) return;
-      createStartedRef.current = true;
-      (async () => {
-        try {
-          const { id } = await createResource({
-            projectId,
-            environmentId,
-            serverId,
-            name: resourceName || "resource",
-            kind: kind ?? "app",
-            repo: serviceKind ? undefined : repo?.fullName,
-            installationId: serviceKind ? undefined : pickedInstallation,
-            detected: serviceKind ? undefined : repo?.detected,
-            llm: serviceKind === "llm" ? { engine: llmEngine, model: llmModel.trim() } : undefined,
-          });
-          // Wire push-to-deploy for the golden path in ONE resilient call:
-          // connect the repo (reusing an existing org connection instead of
-          // failing on the conflict), map the default branch to the chosen
-          // environment, (re)register the push webhook and enqueue the
-          // initial deploy of the branch head. Failures never undo the
-          // created resource — they surface as actionable toasts.
-          if (!serviceKind && repo) {
-            const wired = await wireRepoToEnvironment({
-              orgId,
-              projectId,
-              repoFullName: repo.fullName,
-              token: repoToken.trim() || undefined,
-              installationId: pickedInstallation,
-              branch: repo.defaultBranch,
-              environmentId,
-            });
-            if (!wired.ok) {
-              toast.warning("Repository not fully wired", {
-                description: `${wired.error} — finish the setup in the project's Git panel.`,
-              });
-            } else {
-              if (wired.initialDeploy) {
-                toast.success("First build started", {
-                  description: `Deploying ${repo.defaultBranch}@HEAD — watch the Deployments tab.`,
-                });
-              }
-              if (!wired.webhookRegistered) {
-                toast.info("Push webhook not registered", {
-                  description:
-                    "Pushes won't auto-deploy yet — the token may lack webhook permission. Add the webhook on GitHub or reconnect with a token that can manage webhooks.",
-                });
-              }
-            }
-          }
-          // The resource now exists. Persist env vars as secrets separately: a
-          // secret failure must NOT be reported as a failed create (SIGMA-151),
-          // so collect per-key failures and keep going instead of aborting.
-          const failedKeys: string[] = [];
-          for (const ev of envVars) {
-            if (!ev.key.trim() || !ev.value) continue;
-            try {
-              await createSecretAction({
-                resourceId: id,
-                name: ev.key.trim(),
-                value: ev.value,
-                scope: "environment",
-                envVar: true,
-              });
-            } catch {
-              failedKeys.push(ev.key.trim());
-            }
-          }
-          setCreatedId(id);
-          setCreateState("done");
-          setDeploying(false);
-          router.refresh();
-          if (failedKeys.length > 0) {
-            toast.warning(`${sourceLabel ?? "Resource"} created — some variables need attention`, {
-              description: `Couldn't save ${failedKeys.length} variable(s): ${failedKeys.join(", ")}. Add them from the resource's Secrets panel.`,
-            });
-          } else {
-            toast.success(`${sourceLabel ?? "Resource"} created`, {
-              description: serviceKind
-                ? "The agent pulls the engine image and starts it on the target server."
-                : "Connect the repository in the project's Git panel to enable push-to-deploy.",
-            });
-          }
-        } catch (err) {
-          setCreateState("error");
-          setDeploying(false);
-          toast.error("Create failed", {
-            description: err instanceof Error ? err.message : "Please try again.",
-          });
+    if (!open || !cpMode || !orgId) return;
+    let cancelled = false;
+    getGitAppInfo(orgId)
+      .then((info) => {
+        if (!cancelled) setGitAppSlug(info.enabled && info.slug ? info.slug : null);
+      })
+      .catch(() => {
+        if (!cancelled) setGitAppSlug(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, cpMode, orgId]);
+
+  // ── Detection ─────────────────────────────────────────────────────────────
+
+  /** Apply a detection result to the build/network/variable defaults. */
+  const applyDetection = React.useCallback((d: DetectedRepo) => {
+    setDetected(d);
+    const decided = decideBuildMethod(d);
+    setMethod(decided.method);
+    setDockerfile(d.dockerfilePath ?? "");
+    setContextSubdir(d.contextSubdir ?? "");
+    const mappings = defaultPortMappings(d.ports);
+    setPorts(mappings);
+    setHealthPath(defaultHealthPath(d.healthCheck));
+    // Keys the repository itself names — the operator fills in values instead
+    // of retyping names, and a missed one is a container that dies on start.
+    setEnvVars(seedEnvVars(d.env));
+  }, []);
+
+  const runDetect = React.useCallback(
+    async (fullName: string, installationId?: string) => {
+      if (!fullName.includes("/")) {
+        setDetectError("Enter the repository as owner/name.");
+        return;
+      }
+      setDetecting(true);
+      setDetectError(null);
+      try {
+        const d = await detectRepo({
+          orgId,
+          repoFullName: fullName,
+          installationId,
+          token: token.trim() || undefined,
+        });
+        if (!d.deployable && !d.hasDockerfile && !d.hasCompose && !d.buildMethod) {
+          // NOT a dead end any more: the build step offers a starter Dockerfile
+          // and the auto-build fallback, so the repo is still selected.
+          setDetectError(d.reason ?? "Couldn't work out how to build this repository.");
         }
-      })();
+        setRepo({
+          fullName,
+          defaultBranch: d.defaultBranch || "main",
+          installationId,
+        });
+        setBranch((b) => b || d.defaultBranch || "main");
+        applyDetection(d as DetectedRepo);
+      } catch (err) {
+        setDetectError(
+          err instanceof Error ? err.message : "Couldn't read the repository."
+        );
+      } finally {
+        setDetecting(false);
+      }
+    },
+    [orgId, token, applyDetection]
+  );
+
+  function pickRepo(picked: PickedRepo & { mock?: MockRepo }) {
+    setRepo(picked);
+    setBranch(picked.defaultBranch);
+    setDetectError(null);
+    if (!cpMode) {
+      // Demo mode has no control plane to read a repository; the fixture IS the
+      // inspector's output, so every path stays walkable offline.
+      const mock = picked.mock ?? findMockRepo(picked.fullName);
+      if (mock) applyDetection(mock.detected);
       return;
     }
-    let phase = 0;
-    const timer = setInterval(() => {
-      phase += 1;
-      if (phase >= DEPLOY_PHASES.length) {
-        clearInterval(timer);
-        setDeployPhase(DEPLOY_PHASES.length);
-        // The animation is the simulated pipeline; persist the result now.
-        createResource({
-          projectId,
-          environmentId,
-          serverId,
-          name: resourceName || "resource",
-          kind: kind ?? "app",
-          repo: serviceKind ? undefined : repo?.fullName,
-          // Demo mode takes the same create path, detection and all, so the
-          // compose branch is exercised offline instead of only against a CP.
-          detected: serviceKind ? undefined : repo?.detected,
-          llm: serviceKind === "llm" ? { engine: llmEngine, model: llmModel.trim() } : undefined,
-        })
-          .then(() => {
-            setDeploying(false);
-            router.refresh();
-            toast.success(`${sourceLabel ?? "Resource"} deployed`, {
-              description: "Health checks passed · now serving traffic.",
-            });
-          })
-          .catch((err) => {
-            setDeploying(false);
-            toast.error("Deploy failed", {
-              description: err instanceof Error ? err.message : "Please try again.",
-            });
+    void runDetect(picked.fullName, picked.installationId);
+  }
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+
+  const stepBlocked = React.useMemo((): string | null => {
+    switch (step) {
+      case "kind":
+        if (!kind) return "Pick what you're deploying.";
+        if (!kindAvailability(kind, inventory).available) {
+          return "Nothing in this organization can host that yet.";
+        }
+        return resourceNameError(name);
+      case "source":
+        if (!repo) return "Pick a repository.";
+        if (!branch.trim()) return "Pick a branch.";
+        return null;
+      case "build":
+        if (!method) return "Choose how this repository gets built.";
+        if (subdirError(contextSubdir)) return subdirError(contextSubdir);
+        return null;
+      case "networking":
+        // Both, not just the ports. domainError was rendered in destructive red
+        // next to an ENABLED Continue button — a validator with no gate, which
+        // let a malformed hostname through to a create that then refused it.
+        return portMappingsError(ports) ?? domainError(domain);
+      case "engine":
+      case "storage":
+        return resourceNameError(name);
+      case "model":
+        if (resourceNameError(name)) return resourceNameError(name);
+        return llmModel.trim() ? null : "Name the model this endpoint serves.";
+      case "target":
+        if (!projectId) return "Pick a project.";
+        if (!environmentId) return "Pick an environment.";
+        if (!serverId && !clusterId) return "Pick a server or a cluster.";
+        return null;
+      case "env":
+        return envVarsValid(envVars) ? null : "Fix the variable names first.";
+      case "review":
+        return blockingGaps(reviewInput)[0] ?? null;
+      default:
+        return null;
+    }
+  }, [
+    step,
+    kind,
+    name,
+    inventory,
+    repo,
+    branch,
+    method,
+    contextSubdir,
+    ports,
+    domain,
+    llmModel,
+    projectId,
+    environmentId,
+    serverId,
+    clusterId,
+    envVars,
+    reviewInput,
+  ]);
+
+  function goNext() {
+    if (stepBlocked) return;
+    const next = nextStepId(kind, step);
+    if (next) setStep(next);
+  }
+  function goBack() {
+    const prev = prevStepId(kind, step);
+    if (prev) setStep(prev);
+  }
+
+  function pickKind(next: ResourceKind) {
+    setKind(next);
+    // Any step the new kind does not have resolves back to the picker, so a
+    // Redis can never be standing on the application flow's Build screen.
+    setStep((s) => resolveStep(next, s));
+    setName((current) => {
+      if (current.trim()) return current;
+      return next === "app" ? "" : defaultManagedName(next, environment?.name);
+    });
+    if (next !== "app") {
+      setRepo(null);
+      setDetected(null);
+      setMethod(null);
+    }
+    // A kind change can invalidate the chosen server (the matrix differs), so
+    // drop it rather than carry an impossible target into the create call.
+    setServerId("");
+    setClusterId("");
+  }
+
+  // ── Create ────────────────────────────────────────────────────────────────
+
+  React.useEffect(() => {
+    if (step !== "create" || !kind) return;
+    if (createStartedRef.current) return;
+    createStartedRef.current = true;
+    setCreateState("creating");
+
+    // The whole request, decided in one testable place. Assembling it inline
+    // here is what let the Compose graph, the cluster id and the detected ports
+    // each be dropped by a single statement with every suite still green.
+    const draft: WizardDraftState = {
+      kind,
+      name,
+      projectId,
+      environmentId,
+      serverId,
+      clusterId,
+      domain,
+      repo,
+      branch,
+      detected,
+      method,
+      dockerfile,
+      contextSubdir,
+      ports,
+      healthPath,
+      s3Engine,
+      llmEngine,
+      llmModel,
+      envVars,
+    };
+
+    (async () => {
+      try {
+        const { id } = await createResource(createResourceInput(draft));
+
+        // Push-to-deploy for the golden path, in one resilient call. Failures
+        // never undo the created resource — they surface as warnings.
+        if (shouldWireRepo(draft, cpMode) && repo) {
+          const wired = await wireRepoToEnvironment({
+            orgId,
+            projectId,
+            repoFullName: repo.fullName,
+            token: token.trim() || undefined,
+            installationId: repo.installationId,
+            branch: branch.trim() || repo.defaultBranch,
+            environmentId,
           });
-      } else {
-        setDeployPhase(phase);
+          if (!wired.ok) {
+            toast.warning("Repository not fully wired", {
+              description: `${wired.error} — finish the setup in the project's Git panel.`,
+            });
+          } else if (!wired.webhookRegistered) {
+            toast.info("Push webhook not registered", {
+              description:
+                "Pushes won't auto-deploy yet — add the webhook on GitHub, or reconnect with a token that can manage webhooks.",
+            });
+          }
+        }
+
+        // Variables become secrets AFTER the resource exists. A secret failure
+        // must not be reported as a failed create (SIGMA-151), so collect
+        // per-key failures and keep going.
+        const failed: string[] = [];
+        for (const ev of createSecretsFor(draft)) {
+          try {
+            await createSecretAction({
+              resourceId: id,
+              name: ev.key,
+              value: ev.value,
+              scope: "environment",
+              envVar: true,
+            });
+          } catch {
+            failed.push(ev.key);
+          }
+        }
+
+        setCreatedId(id);
+        setCreateState("done");
+        router.refresh();
+
+        if (failed.length > 0) {
+          toast.warning(`${name} created — some variables need attention`, {
+            description: `Couldn't save ${failed.length} variable(s): ${failed.join(", ")}. Add them from the resource's Secrets panel.`,
+          });
+        }
+
+        // Generated credentials, shown once (SIGMA-212). The reveal is audited
+        // on both sides; showing them here is the difference between "your
+        // database exists" and "your database is usable".
+        if (cpMode && isManagedKind(kind)) {
+          try {
+            const creds = isDatabaseKind(kind)
+              ? await revealDatabaseConnection({ orgId, resourceId: id }).then((c) => [
+                  { label: "Host", value: `${c.host}:${c.port}` },
+                  { label: "Database", value: c.database ?? "" },
+                  { label: "User", value: c.username ?? "" },
+                  {
+                    label: "Password",
+                    value: c.password ?? "",
+                    secret: true,
+                  },
+                  { label: "URL", value: c.url ?? "", secret: true },
+                ])
+              : await revealS3Connection({ orgId, resourceId: id }).then((c) => [
+                  { label: "Endpoint", value: c.endpoint ?? "" },
+                  { label: "Access key", value: c.accessKey ?? "" },
+                  {
+                    label: "Secret key",
+                    value: c.secretKey ?? "",
+                    secret: true,
+                  },
+                ]);
+            setCredentials(creds.filter((c) => c.value));
+          } catch {
+            // The engine may still be provisioning. The panel on the resource
+            // page can reveal them whenever it is up — that is not an error.
+            setCredentials(null);
+          }
+        }
+      } catch (err) {
+        setCreateState("error");
+        setCreateError(err instanceof Error ? err.message : "Please try again.");
       }
-    }, 850);
-    return () => clearInterval(timer);
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
-  const canNext = React.useMemo(() => {
-    switch (step) {
-      case 1:
-        return serviceKind ? Boolean(serviceName.trim()) : Boolean(repo);
-      case 2:
-        return Boolean(repo);
-      case 3:
-        return (
-          Boolean(projectId) &&
-          Boolean(environmentId) &&
-          Boolean(serverId) &&
-          !incompatibility
-        );
-      case 4:
-        // Block Deploy while any env-var key is malformed — the server rejects
-        // it, and by then the resource is already created (SIGMA-151).
-        return envVars.every((ev) => envKeyValid(ev.key));
-      default:
-        return false;
-    }
-  }, [step, repo, serviceKind, serviceName, projectId, environmentId, serverId, incompatibility, envVars]);
-
-  function next() {
-    if (step < 5 && canNext) {
-      // Managed services have no build step — jump straight to the target.
-      const target = serviceKind && step === 1 ? 3 : step + 1;
-      setStep(target);
-      if (target === 5) {
-        // Prime the deploy animation state here (an event handler) so the
-        // step-5 effect only has to start the timer.
-        setDeploying(true);
-        setDeployPhase(0);
-      }
-    }
-  }
-  function back() {
-    if (step > 1 && step < 5) setStep((s) => (serviceKind && s === 3 ? 1 : s - 1));
-  }
-
-  function addEnvVar() {
-    setEnvVars((v) => [...v, { id: newId(), key: "", value: "" }]);
-  }
-  function removeEnvVar(id: string) {
-    setEnvVars((v) => v.filter((e) => e.id !== id));
-  }
-  function updateEnvVar(id: string, patch: Partial<EnvVar>) {
-    setEnvVars((v) => v.map((e) => (e.id === id ? { ...e, ...patch } : e)));
-  }
-
-  const deployDone =
-    step === 5 &&
-    (cpMode
-      ? createState === "done" || createState === "error"
-      : !deploying && deployPhase >= DEPLOY_PHASES.length);
+  const done = createState === "done" || createState === "error";
+  const isLast = step === "create";
+  const nextLabel = nextStepId(kind, step) === "create" ? "Deploy" : "Continue";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="flex max-h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-lg"
-        showCloseButton={step !== 5}
+        className="flex max-h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-xl"
+        showCloseButton={!isLast || done}
       >
         <DialogHeader className="gap-1 border-b p-4">
           <DialogTitle className="flex items-center gap-2">
-            <GitBranch className="size-4" />
+            <Rocket className="size-4" />
             New resource
           </DialogTitle>
           <DialogDescription>
-            Deploy an app from Git, or provision a managed database / object
-            storage on one of your servers.
+            {kind
+              ? `Deploying ${RESOURCE_KIND_LABELS[kind]}.`
+              : "Pick what you're deploying — the rest of this wizard follows from it."}
           </DialogDescription>
         </DialogHeader>
 
-        {/* Stepper */}
+        {/* Stepper. The sequence is the KIND's, so a managed engine never shows
+            chips for screens it will not walk. */}
         <div className="flex items-center gap-1 border-b bg-muted/40 px-4 py-2.5">
-          {STEPS.map((s, i) => {
+          {steps.map((s, i) => {
+            const at = steps.findIndex((x) => x.id === step);
             const active = s.id === step;
-            const done = s.id < step;
+            const complete = i < at;
             return (
               <React.Fragment key={s.id}>
                 <div className="flex items-center gap-1.5">
@@ -675,11 +706,13 @@ export function DeployWizard({
                     className={cn(
                       "grid size-5 shrink-0 place-items-center rounded-full border text-[10px] font-semibold tabular-nums",
                       active && "border-primary bg-primary text-primary-foreground",
-                      done && "border-primary/30 bg-primary/10 text-primary",
-                      !active && !done && "border-border bg-background text-muted-foreground"
+                      complete && "border-primary/30 bg-primary/10 text-primary",
+                      !active &&
+                        !complete &&
+                        "border-border bg-background text-muted-foreground"
                     )}
                   >
-                    {done ? <Check className="size-3" /> : s.id}
+                    {complete ? <Check className="size-3" /> : i + 1}
                   </span>
                   <span
                     className={cn(
@@ -690,7 +723,7 @@ export function DeployWizard({
                     {s.label}
                   </span>
                 </div>
-                {i < STEPS.length - 1 && (
+                {i < steps.length - 1 && (
                   <span className="mx-0.5 h-px flex-1 bg-border" aria-hidden />
                 )}
               </React.Fragment>
@@ -699,786 +732,171 @@ export function DeployWizard({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {/* Step 1 — pick the source: an app built from a git repo, or a
-              managed service provisioned from its engine image (no repo). */}
-          {step === 1 && (
-            <div className="mb-4 flex flex-col gap-1.5">
-              <Label className="text-xs text-muted-foreground">What are you deploying?</Label>
-              <div className="grid gap-1.5 sm:grid-cols-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setServiceKind(null);
-                    setEnvVars([
-                      { id: newId(), key: "NODE_ENV", value: "production" },
-                      { id: newId(), key: "", value: "" },
-                    ]);
-                  }}
-                  className={cn(
-                    "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                    serviceKind === null
-                      ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                      : "border-border bg-card hover:bg-muted/50"
-                  )}
-                >
-                  <GitBranch className="size-4 shrink-0 text-muted-foreground" />
-                  <div className="min-w-0 flex-1">
-                    <span className="text-sm font-medium text-foreground">App from Git</span>
-                    <p className="truncate text-xs text-muted-foreground">
-                      Build and deploy a repository
-                    </p>
-                  </div>
-                  {serviceKind === null && <Check className="size-4 shrink-0 text-primary" />}
-                </button>
-                {SERVICE_KINDS.map(({ kind: k, icon: Icon, detail }) => {
-                  const selected = serviceKind === k;
-                  return (
-                    <button
-                      key={k}
-                      type="button"
-                      onClick={() => {
-                        setServiceKind(k);
-                        setRepo(null);
-                        if (!serviceName.trim()) setServiceName(k);
-                        // Engine credentials (user/password/db) are generated
-                        // by the control plane — no fake defaults here.
-                        setEnvVars([{ id: newId(), key: "", value: "" }]);
-                      }}
-                      className={cn(
-                        "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                        selected
-                          ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                          : "border-border bg-card hover:bg-muted/50"
-                      )}
-                    >
-                      <Icon className="size-4 shrink-0 text-muted-foreground" />
-                      <div className="min-w-0 flex-1">
-                        <span className="text-sm font-medium text-foreground">{KIND_LABELS[k]}</span>
-                        <p className="truncate text-xs text-muted-foreground">{detail}</p>
-                      </div>
-                      {selected && <Check className="size-4 shrink-0 text-primary" />}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-          {step === 1 && serviceKind && (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="wizard-service-name" className="text-xs text-muted-foreground">
-                Resource name
-              </Label>
-              <Input
-                id="wizard-service-name"
-                value={serviceName}
-                onChange={(e) => setServiceName(e.target.value)}
-                placeholder={serviceKind}
-                className="font-mono"
-              />
-              <p className="text-xs text-muted-foreground">
-                Provisioned from the official {KIND_LABELS[serviceKind]} image on
-                a compatible server — no repository or build needed.
-              </p>
-            </div>
-          )}
-          {/* Step 1 (app) — pick repository. CP mode: real detection; demo: mock list. */}
-          {step === 1 && !serviceKind && cpMode && (
-            <div className="flex flex-col gap-3">
-              {/* Org-level GitHub integration: pick a repo the App already
-                  grants. Falls back to the manual form when the org hasn't
-                  connected GitHub (or the App can't see the repo). */}
-              {!pickerEmpty && (
-                <RepoPicker
-                  orgId={orgId}
-                  value={repo?.fullName ?? null}
-                  onUnavailable={() => setPickerEmpty(true)}
-                  onSelect={(picked) => {
-                    setRepoQuery(picked.fullName);
-                    setPickedInstallation(picked.installationId);
-                    runDetect(picked.fullName, picked.installationId);
-                  }}
-                />
-              )}
-
-              {pickerEmpty && (
-                <>
-                  <div className="flex gap-2">
-                    <Input
-                      value={repoQuery}
-                      onChange={(e) => setRepoQuery(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && runDetect()}
-                      placeholder="owner/repository"
-                      className="font-mono"
-                    />
-                    <Button size="sm" className="h-9" onClick={() => runDetect()} disabled={detecting}>
-                      {detecting ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
-                      Detect
-                    </Button>
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="wizard-repo-token" className="text-xs text-muted-foreground">
-                      Access token <span className="opacity-70">(only for private repositories)</span>
-                    </Label>
-                    <Input
-                      id="wizard-repo-token"
-                      type="password"
-                      value={repoToken}
-                      onChange={(e) => setRepoToken(e.target.value)}
-                      placeholder="github_pat_… / ghp_…"
-                      className="font-mono"
-                      autoComplete="off"
-                    />
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Connect GitHub once in{" "}
-                    <Link
-                      href="/dashboard/settings?tab=integrations"
-                      className="underline underline-offset-2 hover:text-foreground"
-                    >
-                      Settings › Integrations
-                    </Link>{" "}
-                    and your repositories appear here to pick from. Until then, enter a
-                    public repository, or paste a token with read access (Contents) for a
-                    private one — it is stored encrypted.
-                  </p>
-                </>
-              )}
-
-              {detecting && !pickerEmpty && (
-                <p className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Loader2 className="size-3.5 animate-spin" />
-                  Reading the repository…
-                </p>
-              )}
-              {repo && (
-                <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
-                  <CircleCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-foreground">
-                      Detected <span className="font-mono">{repo.build}</span>
-                    </p>
-                    <p className="text-xs text-muted-foreground">{repo.buildDetail}</p>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-          {step === 1 && !serviceKind && !cpMode && (
-            <div className="flex flex-col gap-3">
-              <div className="relative">
-                <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={repoQuery}
-                  onChange={(e) => setRepoQuery(e.target.value)}
-                  placeholder="Search connected repositories…"
-                  className="pl-8"
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                {filteredRepos.map((r) => {
-                  const selected = repo?.fullName === r.fullName;
-                  return (
-                    <button
-                      key={r.fullName}
-                      type="button"
-                      onClick={() => setRepo(r)}
-                      className={cn(
-                        "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                        selected
-                          ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                          : "border-border bg-card hover:bg-muted/50"
-                      )}
-                    >
-                      <GitBranch className="size-4 shrink-0 text-muted-foreground" />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate font-mono text-sm font-medium text-foreground">
-                            {r.fullName}
-                          </span>
-                          <Badge variant="outline" className="font-mono text-[10px]">
-                            {r.private ? "private" : "public"}
-                          </Badge>
-                        </div>
-                        <p className="truncate text-xs text-muted-foreground">
-                          {r.description}
-                        </p>
-                      </div>
-                      {selected && <Check className="size-4 shrink-0 text-primary" />}
-                    </button>
-                  );
-                })}
-                {filteredRepos.length === 0 && (
-                  <p className="py-6 text-center text-sm text-muted-foreground">
-                    No repositories match “{repoQuery}”.
-                  </p>
-                )}
-              </div>
-            </div>
+          {step === "kind" && (
+            <KindStep
+              kind={kind}
+              onPick={pickKind}
+              inventory={inventory}
+              name={name}
+              onNameChange={setName}
+            />
           )}
 
-          {/* Step 2 — detected build */}
-          {step === 2 && repo && (
-            <div className="flex flex-col gap-3">
-              <div className="rounded-lg border border-border bg-card p-3">
-                <div className="flex items-center gap-2">
-                  <GitBranch className="size-4 text-muted-foreground" />
-                  <span className="font-mono text-sm font-medium text-foreground">
-                    {repo.fullName}
-                  </span>
-                  <Badge variant="outline" className="font-mono text-[10px]">
-                    {repo.defaultBranch}
-                  </Badge>
-                </div>
-              </div>
-
-              <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
-                <CircleCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-foreground">
-                    Detected{" "}
-                    <span className="font-mono">{repo.build}</span>
-                  </p>
-                  <p className="text-xs text-muted-foreground">{repo.buildDetail}</p>
-                </div>
-              </div>
-
-              {/* The Compose graph. Showing it is the point: the operator has to
-                  be able to see that every service was understood, and
-                  which of them cannot swap without going down — the product
-                  makes a zero-downtime promise that a named volume or a fixed
-                  host port quietly exempts a service from. */}
-              {(repo.detected?.services?.length ?? 0) > 0 && (
-                <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
-                  <p className="text-xs text-muted-foreground">
-                    {repo.detected!.services!.length} services will be deployed, each as its own
-                    container.
-                  </p>
-                  <ul className="flex flex-col gap-1.5">
-                    {repo.detected!.services!.map((svc) => (
-                      <li key={svc.name} className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-mono text-sm text-foreground">{svc.name}</span>
-                        <Badge variant="outline" className="font-mono text-[10px]">
-                          {svc.build ? `build ${svc.build === "." ? "." : svc.build}` : svc.image}
-                        </Badge>
-                        {(svc.ports?.length ?? 0) > 0 && (
-                          <span className="text-xs text-muted-foreground tabular-nums">
-                            :{svc.ports!.join(", :")}
-                          </span>
-                        )}
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "text-[10px]",
-                            svc.rollout === ROLLOUT_RECREATE && "border-amber-500/40 text-amber-600"
-                          )}
-                        >
-                          {svc.rollout === ROLLOUT_RECREATE ? ROLLOUT_RECREATE : ROLLOUT_BLUE_GREEN}
-                        </Badge>
-                      </li>
-                    ))}
-                  </ul>
-                  {recreateSummary(repo.detected?.services).length > 0 && (
-                    <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2.5">
-                      <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
-                      <div className="min-w-0 text-xs text-muted-foreground">
-                        <p className="font-medium text-foreground">
-                          Not every service deploys with zero downtime.
-                        </p>
-                        <ul className="mt-1 flex flex-col gap-0.5">
-                          {recreateSummary(repo.detected?.services).map((svc) => (
-                            <li key={svc.name}>
-                              <span className="font-mono text-foreground">{svc.name}</span> is
-                              stopped before its replacement starts, because {svc.reason}.
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  )}
-                  {ignoredHostPorts(repo.detected?.services).length > 0 && (
-                    <div className="flex items-start gap-2 rounded-md border border-border bg-muted/40 p-2.5">
-                      <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                      <div className="min-w-0 text-xs text-muted-foreground">
-                        <p className="font-medium text-foreground">
-                          Host port bindings are not used.
-                        </p>
-                        <ul className="mt-1 flex flex-col gap-0.5">
-                          {ignoredHostPorts(repo.detected?.services).map((svc) => (
-                            <li key={svc.name}>
-                              <span className="font-mono text-foreground">{svc.name}</span> asks for
-                              host port{svc.ports.length > 1 ? "s" : ""} {svc.ports.join(", ")}.
-                              Traefik routes to the container instead, so nothing binds the host —
-                              attach a domain to reach it from outside.
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border border-border bg-card p-3 text-sm">
-                <div className="flex flex-col gap-0.5">
-                  <dt className="text-xs text-muted-foreground">Build method</dt>
-                  <dd className="flex items-center gap-1.5 text-foreground">
-                    <FileCode2 className="size-3.5 text-muted-foreground" />
-                    {repo.build === "Dockerfile" ? "Dockerfile" : "Compose"}
-                  </dd>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <dt className="text-xs text-muted-foreground">Resource kind</dt>
-                  <dd>
-                    <Badge variant="outline" className="font-mono">
-                      {KIND_LABELS[repo.detectedKind]}
-                    </Badge>
-                  </dd>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <dt className="text-xs text-muted-foreground">Exposed port</dt>
-                  <dd className="font-mono text-foreground tabular-nums">{repo.port}</dd>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <dt className="text-xs text-muted-foreground">Branch</dt>
-                  <dd className="font-mono text-foreground">{repo.defaultBranch}</dd>
-                </div>
-              </dl>
-            </div>
+          {step === "source" && (
+            <SourceStep
+              cpMode={cpMode}
+              orgId={orgId}
+              repo={repo}
+              branch={branch}
+              onPickRepo={pickRepo}
+              onBranchChange={setBranch}
+              detecting={detecting}
+              gitAppSlug={gitAppSlug}
+              installUrlTarget={{ kind: "wizard", projectId: originProjectId }}
+              onBeforeLeaveForGitHub={stashDraft}
+              manualRepo={manualRepo}
+              onManualRepoChange={setManualRepo}
+              token={token}
+              onTokenChange={setToken}
+              onDetectManual={() => void runDetect(manualRepo.trim())}
+              detectError={detectError}
+            />
           )}
 
-          {/* Step 3 — target environment + server (availability matrix) */}
-          {step === 3 && (repo || serviceKind) && (
-            <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="wizard-project">
-                  <Boxes className="size-3.5 text-muted-foreground" />
-                  Project
-                </Label>
-                <Select
-                  value={projectId}
-                  onValueChange={(v) => {
-                    setProjectId(v as string);
-                    setEnvironmentId("");
-                    setServerId("");
-                  }}
-                >
-                  <SelectTrigger id="wizard-project" className="w-full">
-                    <SelectValue placeholder="Select a project">
-                      {(v) =>
-                        projects.find((p) => p.id === v)?.name ??
-                        "Select a project"
-                      }
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {projects.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="wizard-env">Environment</Label>
-                <Select
-                  value={environmentId}
-                  onValueChange={(v) => {
-                    setEnvironmentId(v as string);
-                    setServerId("");
-                  }}
-                  disabled={!projectId}
-                >
-                  <SelectTrigger id="wizard-env" className="w-full">
-                    <SelectValue placeholder="Select an environment">
-                      {(v) =>
-                        environments.find((e) => e.id === v)?.name ??
-                        "Select an environment"
-                      }
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {environments.map((e) => (
-                      <SelectItem key={e.id} value={e.id}>
-                        {e.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <Label>
-                  <ServerIcon className="size-3.5 text-muted-foreground" />
-                  Target server
-                </Label>
-                {!environmentId ? (
-                  <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-                    Choose an environment to see eligible servers.
-                  </p>
-                ) : candidateServers.length === 0 ? (
-                  <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-                    No servers attached to this environment.
-                  </p>
-                ) : (
-                  <div className="flex flex-col gap-1.5">
-                    {candidateServers.map(({ server, compatible }) => {
-                      const selected = serverId === server.id;
-                      return (
-                        <button
-                          key={server.id}
-                          type="button"
-                          disabled={!compatible}
-                          onClick={() => compatible && setServerId(server.id)}
-                          className={cn(
-                            "flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                            !compatible &&
-                              "cursor-not-allowed border-border bg-muted/40 opacity-60",
-                            compatible &&
-                              (selected
-                                ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                                : "border-border bg-card hover:bg-muted/50")
-                          )}
-                        >
-                          <ServerIcon className="size-4 shrink-0 text-muted-foreground" />
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-2">
-                              <span className="truncate font-mono text-sm text-foreground">
-                                {server.name}
-                              </span>
-                              <Badge variant="outline" className="text-[10px]">
-                                {SERVER_TYPE_LABELS[server.type as ServerType]}
-                              </Badge>
-                            </div>
-                            <p className="truncate text-xs text-muted-foreground">
-                              {server.provider} · {server.region}
-                            </p>
-                          </div>
-                          {!compatible ? (
-                            <span className="shrink-0 text-[10px] font-medium text-destructive">
-                              incompatible
-                            </span>
-                          ) : (
-                            selected && (
-                              <Check className="size-4 shrink-0 text-primary" />
-                            )
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {kind && (
-                  <p className="text-xs text-muted-foreground">
-                    Only servers that can host a{" "}
-                    <span className="font-medium text-foreground">
-                      {KIND_LABELS[kind]}
-                    </span>{" "}
-                    resource are selectable.
-                  </p>
-                )}
-
-                {incompatibility && (
-                  <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
-                    <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-                    <div className="min-w-0 text-xs">
-                      <p className="font-medium text-destructive">
-                        {incompatibility.code} ·{" "}
-                        <span className="font-mono">{incompatibility.type}</span>
-                      </p>
-                      <p className="text-destructive/90">{incompatibility.message}</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
+          {step === "build" && (
+            <BuildStep
+              detected={detected}
+              decision={decision}
+              method={method}
+              onMethodChange={setMethod}
+              dockerfile={dockerfile}
+              onDockerfileChange={setDockerfile}
+              contextSubdir={contextSubdir}
+              onContextSubdirChange={setContextSubdir}
+            />
           )}
 
-          {/* Step 4 — environment variables */}
-          {step === 4 && (
-            <div className="flex flex-col gap-3">
-              {serviceKind === "llm" && (
-                <div className="flex flex-col gap-3 rounded-lg border border-border p-3">
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="llm-engine">Runtime</Label>
-                    <Select value={llmEngine} onValueChange={(v) => setLlmEngine(v ?? "")}>
-                      <SelectTrigger id="llm-engine">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {LLM_ENGINES.map((e) => (
-                          <SelectItem key={e.id} value={e.id}>
-                            {e.label} · {e.detail}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor="llm-model">Model</Label>
-                    <Input
-                      id="llm-model"
-                      value={llmModel}
-                      onChange={(e) => setLlmModel(e.target.value)}
-                      placeholder="meta-llama/Llama-3.1-8B-Instruct"
-                      className="font-mono"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Pulled on first start, so the endpoint takes a few minutes to
-                      become ready. It listens on the private mesh only — never a
-                      public interface.
-                    </p>
-                  </div>
-                </div>
-              )}
-              {serviceKind && serviceKind !== "llm" ? (
-                <div className="flex items-start gap-2.5 rounded-lg border border-border bg-muted/40 p-3">
-                  <CircleCheck className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {serviceKind === "s3"
-                      ? "Access keys are generated automatically and shown on the resource's Storage panel."
-                      : "The user, password and database name are generated automatically and shown on the resource's Database panel."}{" "}
-                    Add variables below only if this service needs something extra.
-                  </p>
-                </div>
-              ) : serviceKind === "llm" ? null : (
-                <p className="text-sm text-muted-foreground">
-                  Injected into the container at runtime. Values are encrypted at rest.
-                  {repo?.envKeys?.length
-                    ? " Keys were pre-filled from the repository (.env.example / Dockerfile / compose) — fill in the values."
-                    : ""}
-                </p>
-              )}
-              <div className="flex flex-col gap-2">
-                {envVars.map((ev) => (
-                  <div key={ev.id} className="flex items-center gap-2">
-                    <Input
-                      value={ev.key}
-                      onChange={(e) =>
-                        updateEnvVar(ev.id, { key: e.target.value.toUpperCase() })
-                      }
-                      placeholder="KEY"
-                      className="font-mono"
-                      aria-invalid={!envKeyValid(ev.key) || undefined}
-                    />
-                    <Input
-                      value={ev.value}
-                      onChange={(e) => updateEnvVar(ev.id, { value: e.target.value })}
-                      placeholder="value"
-                      className="font-mono"
-                    />
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Remove variable"
-                      onClick={() => removeEnvVar(ev.id)}
-                    >
-                      <Trash2 className="size-4 text-muted-foreground" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-              {envVars.some((ev) => !envKeyValid(ev.key)) && (
-                <p className="text-xs text-destructive">
-                  Keys must start with a letter or underscore and contain only
-                  letters, digits, and underscores (e.g. API_KEY).
-                </p>
-              )}
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-fit"
-                onClick={addEnvVar}
-              >
-                <Plus className="size-3.5" />
-                Add variable
-              </Button>
-            </div>
+          {step === "networking" && (
+            <NetworkStep
+              ports={ports}
+              onPortsChange={setPorts}
+              domain={domain}
+              onDomainChange={setDomain}
+              healthPath={healthPath}
+              onHealthPathChange={setHealthPath}
+              composeMode={method === BUILD_COMPOSE}
+            />
           )}
 
-          {/* Step 5 (CP mode) — one honest create; the pipeline runs on the CP. */}
-          {step === 5 && (repo || serviceKind) && cpMode && (
-            <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-3">
-                <span
-                  className={cn(
-                    "grid size-9 shrink-0 place-items-center rounded-lg",
-                    createState === "done"
-                      ? "bg-emerald-500/10 text-emerald-600"
-                      : createState === "error"
-                        ? "bg-destructive/10 text-destructive"
-                        : "bg-primary/10 text-primary"
-                  )}
-                >
-                  {createState === "done" ? (
-                    <CircleCheck className="size-5" />
-                  ) : createState === "error" ? (
-                    <CircleAlert className="size-5" />
-                  ) : (
-                    <Loader2 className="size-5 animate-spin" />
-                  )}
-                </span>
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-foreground">
-                    {createState === "done"
-                      ? "Resource created"
-                      : createState === "error"
-                        ? "Create failed"
-                        : "Creating resource…"}
-                  </p>
-                  <p className="truncate font-mono text-xs text-muted-foreground">
-                    {sourceLabel} → {selectedServer?.name}
-                  </p>
-                </div>
-              </div>
-              {createState === "done" && (
-                <p className="rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
-                  {serviceKind ? (
-                    <>
-                      The resource starts as <span className="font-medium">provisioning</span>.
-                      The server’s agent pulls the {KIND_LABELS[serviceKind]} image,
-                      starts it, and reports it as running — credentials appear on
-                      the resource page.
-                    </>
-                  ) : (
-                    <>
-                      The resource starts as <span className="font-medium">provisioning</span> until
-                      its first build. The repository is connected and{" "}
-                      <span className="font-mono">{repo?.defaultBranch}</span> is mapped to this
-                      environment — push to it and the build rolls out with zero
-                      downtime (adjust the mapping in the project’s Git panel).
-                    </>
-                  )}
-                </p>
-              )}
-              {createState === "done" && createdId && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="w-fit"
-                  onClick={() => {
-                    onOpenChange(false);
-                    router.push(`/dashboard/resources/${createdId}`);
-                  }}
-                >
-                  Open resource
-                  <ArrowRight className="size-4" />
-                </Button>
-              )}
-            </div>
+          {(step === "engine" || step === "storage" || step === "model") && kind && (
+            <ManagedStep
+              kind={kind}
+              name={name}
+              onNameChange={setName}
+              s3Engine={s3Engine}
+              onS3EngineChange={setS3Engine}
+              llmEngine={llmEngine}
+              onLlmEngineChange={setLlmEngine}
+              llmModel={llmModel}
+              onLlmModelChange={setLlmModel}
+            />
           )}
 
-          {/* Step 5 (demo) — simulated deploy progress */}
-          {step === 5 && (repo || serviceKind) && !cpMode && (
-            <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-3">
-                <span
-                  className={cn(
-                    "grid size-9 shrink-0 place-items-center rounded-lg",
-                    deployDone
-                      ? "bg-emerald-500/10 text-emerald-600"
-                      : "bg-primary/10 text-primary"
-                  )}
-                >
-                  {deployDone ? (
-                    <CircleCheck className="size-5" />
-                  ) : (
-                    <Loader2 className="size-5 animate-spin" />
-                  )}
-                </span>
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-foreground">
-                    {deployDone ? "Deployment complete" : "Deploying…"}
-                  </p>
-                  <p className="truncate font-mono text-xs text-muted-foreground">
-                    {sourceLabel} → {selectedServer?.name}
-                  </p>
-                </div>
-              </div>
+          {step === "target" && kind && (
+            <TargetStep
+              kind={kind}
+              projects={projects}
+              clusters={clusters}
+              inventory={inventory}
+              projectId={projectId}
+              environmentId={environmentId}
+              serverId={serverId}
+              clusterId={clusterId}
+              onProjectChange={(id) => {
+                setProjectId(id);
+                setEnvironmentId("");
+                setServerId("");
+                setClusterId("");
+              }}
+              onEnvironmentChange={(id) => {
+                setEnvironmentId(id);
+                setServerId("");
+                setClusterId("");
+              }}
+              onServerChange={(id) => {
+                setServerId(id);
+                setClusterId("");
+              }}
+              onClusterChange={(id) => {
+                setClusterId(id);
+                setServerId("");
+              }}
+            />
+          )}
 
-              <Progress
-                value={(deployPhase / DEPLOY_PHASES.length) * 100}
-                className="w-full"
-              />
+          {step === "env" && (
+            <EnvStep
+              vars={envVars}
+              onChange={setEnvVars}
+              seededFromRepo={Boolean(detected?.env?.length)}
+            />
+          )}
 
-              <ol className="flex flex-col gap-2">
-                {DEPLOY_PHASES.map((phase, i) => {
-                  const state =
-                    i < deployPhase ? "done" : i === deployPhase ? "active" : "pending";
-                  return (
-                    <li key={phase} className="flex items-center gap-2.5 text-sm">
-                      <span className="grid size-5 shrink-0 place-items-center">
-                        {state === "done" && (
-                          <CircleCheck className="size-4 text-emerald-600" />
-                        )}
-                        {state === "active" && (
-                          <Loader2 className="size-4 animate-spin text-primary" />
-                        )}
-                        {state === "pending" && (
-                          <span className="size-1.5 rounded-full bg-muted-foreground/30" />
-                        )}
-                      </span>
-                      <span
-                        className={cn(
-                          state === "pending"
-                            ? "text-muted-foreground"
-                            : "text-foreground"
-                        )}
-                      >
-                        {phase}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ol>
-            </div>
+          {step === "review" && <ReviewStep input={reviewInput} onJump={setStep} />}
+
+          {step === "create" && (
+            <CreateStep
+              state={createState}
+              error={createError}
+              kind={kind}
+              name={name}
+              targetName={cluster?.name ?? server?.name ?? ""}
+              credentials={credentials}
+              createdId={createdId}
+              onOpenResource={(id) => {
+                onOpenChange(false);
+                router.push(`/dashboard/resources/${id}`);
+              }}
+            />
           )}
         </div>
 
-        {/* Footer / navigation */}
-        <div className="flex items-center justify-between gap-2 border-t bg-muted/50 p-4">
-          {step < 5 ? (
+        <div className="flex items-center justify-between gap-3 border-t bg-muted/50 p-4">
+          {!isLast ? (
             <>
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={back}
-                disabled={step === 1}
+                onClick={goBack}
+                disabled={!prevStepId(kind, step)}
               >
                 <ChevronLeft className="size-4" />
                 Back
               </Button>
-              {step === 4 ? (
-                <Button
-                  size="sm"
-                  onClick={next}
-                  // An endpoint with no model has nothing to serve, and the
-                  // control plane refuses the create — better to say so here
-                  // than to fail after the wizard has closed.
-                  disabled={serviceKind === "llm" && llmModel.trim() === ""}
-                >
-                  Deploy
-                  <ArrowRight className="size-4" />
+              <div className="flex min-w-0 items-center gap-3">
+                {/* Disabled-with-reason, consistently: a greyed-out button whose
+                    cause is invisible is the pattern this rebuild removes. */}
+                {stepBlocked && (
+                  <span className="truncate text-right text-xs text-muted-foreground">
+                    {stepBlocked}
+                  </span>
+                )}
+                <Button size="sm" onClick={goNext} disabled={Boolean(stepBlocked)}>
+                  {nextLabel}
+                  {nextLabel === "Deploy" ? (
+                    <ArrowRight className="size-4" />
+                  ) : (
+                    <ChevronRight className="size-4" />
+                  )}
                 </Button>
-              ) : (
-                <Button size="sm" onClick={next} disabled={!canNext}>
-                  Continue
-                  <ChevronRight className="size-4" />
-                </Button>
-              )}
+              </div>
             </>
           ) : (
             <>
               <span className="text-xs text-muted-foreground">
-                {deployDone ? "You're all set." : "Please wait…"}
+                {done ? "You're all set." : "Creating…"}
               </span>
-              <Button
-                size="sm"
-                onClick={() => onOpenChange(false)}
-                disabled={!deployDone}
-              >
+              <Button size="sm" onClick={() => onOpenChange(false)} disabled={!done}>
                 <Check className="size-4" />
                 Done
               </Button>
@@ -1487,5 +905,361 @@ export function DeployWizard({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Step 1: the type grid, with availability decided here rather than at step 4. */
+function KindStep({
+  kind,
+  onPick,
+  inventory,
+  name,
+  onNameChange,
+}: {
+  kind: ResourceKind | null;
+  onPick: (k: ResourceKind) => void;
+  inventory: ReturnType<typeof buildInventory>;
+  name: string;
+  onNameChange: (v: string) => void;
+}) {
+  const nameProblem = kind ? resourceNameError(name) : null;
+  const availability = kind ? kindAvailability(kind, inventory) : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1.5">
+        <Label className="text-xs text-muted-foreground">What are you deploying?</Label>
+        <div className="grid gap-1.5 sm:grid-cols-2">
+          {KIND_CARDS.filter((c) => (RESOURCE_KINDS as string[]).includes(c.kind)).map(
+            ({ kind: k, icon: Icon, detail }) => {
+              const avail = kindAvailability(k, inventory);
+              const selected = kind === k;
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  disabled={!avail.available}
+                  aria-pressed={selected}
+                  onClick={() => avail.available && onPick(k)}
+                  className={cn(
+                    "flex items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
+                    !avail.available && "cursor-not-allowed border-border bg-muted/40",
+                    avail.available &&
+                      (selected
+                        ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                        : "border-border bg-card hover:bg-muted/50")
+                  )}
+                >
+                  <Icon
+                    className={cn(
+                      "mt-0.5 size-4 shrink-0",
+                      avail.available ? "text-muted-foreground" : "text-muted-foreground/50"
+                    )}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className={cn(
+                        "block text-sm font-medium",
+                        avail.available ? "text-foreground" : "text-muted-foreground"
+                      )}
+                    >
+                      {RESOURCE_KIND_LABELS[k]}
+                    </span>
+                    <span className="block text-xs leading-snug text-muted-foreground">
+                      {avail.available ? detail : avail.reason}
+                    </span>
+                    {!avail.available && avail.action && (
+                      <Link
+                        href={avail.action.href}
+                        className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-2 hover:underline"
+                      >
+                        {avail.action.label}
+                        <ExternalLink className="size-3" />
+                      </Link>
+                    )}
+                  </span>
+                  {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
+                </button>
+              );
+            }
+          )}
+        </div>
+      </div>
+
+      {/* An application names itself from its repository, so its name field
+          lives on the Source step. Everything else needs one now. */}
+      {kind === "app" && (
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="wizard-name">Name</Label>
+          <Input
+            id="wizard-name"
+            value={name}
+            onChange={(e) => onNameChange(e.target.value)}
+            placeholder="storefront"
+            className="font-mono"
+            spellCheck={false}
+            aria-invalid={nameProblem ? true : undefined}
+          />
+          <p
+            className={cn(
+              "text-xs",
+              nameProblem ? "text-destructive" : "text-muted-foreground"
+            )}
+          >
+            {nameProblem ?? "Used for the container, its private DNS name and its volumes."}
+          </p>
+        </div>
+      )}
+
+      {availability && !availability.available && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <p className="min-w-0 text-xs text-muted-foreground">{availability.reason}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The managed path's single configuration step (SIGMA-212). */
+function ManagedStep({
+  kind,
+  name,
+  onNameChange,
+  s3Engine,
+  onS3EngineChange,
+  llmEngine,
+  onLlmEngineChange,
+  llmModel,
+  onLlmModelChange,
+}: {
+  kind: ResourceKind;
+  name: string;
+  onNameChange: (v: string) => void;
+  s3Engine: string;
+  onS3EngineChange: (v: string) => void;
+  llmEngine: string;
+  onLlmEngineChange: (v: string) => void;
+  llmModel: string;
+  onLlmModelChange: (v: string) => void;
+}) {
+  const nameProblem = resourceNameError(name);
+  const summary = managedSummary(kind);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor="wizard-managed-name">Name</Label>
+        <Input
+          id="wizard-managed-name"
+          value={name}
+          onChange={(e) => onNameChange(e.target.value)}
+          placeholder={kind}
+          className="font-mono"
+          spellCheck={false}
+          aria-invalid={nameProblem ? true : undefined}
+        />
+        <p
+          className={cn(
+            "text-xs",
+            nameProblem ? "text-destructive" : "text-muted-foreground"
+          )}
+        >
+          {nameProblem ?? "Other resources reach it by this name on the private network."}
+        </p>
+      </div>
+
+      {kind === "s3" && (
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="wizard-s3-engine">Engine</Label>
+          <Select
+            value={s3Engine}
+            onValueChange={(v) => onS3EngineChange((v as string) ?? "")}
+          >
+            <SelectTrigger id="wizard-s3-engine" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {S3_ENGINES.map((e) => (
+                <SelectItem key={e.id} value={e.id}>
+                  {e.label} · {e.detail}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {kind === "llm" && (
+        <>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="wizard-llm-engine">Runtime</Label>
+            <Select
+              value={llmEngine}
+              onValueChange={(v) => onLlmEngineChange((v as string) ?? "")}
+            >
+              <SelectTrigger id="wizard-llm-engine" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LLM_ENGINES.map((e) => (
+                  <SelectItem key={e.id} value={e.id}>
+                    {e.label} · {e.detail}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="wizard-llm-model">Model</Label>
+            <Input
+              id="wizard-llm-model"
+              value={llmModel}
+              onChange={(e) => onLlmModelChange(e.target.value)}
+              placeholder="meta-llama/Llama-3.1-8B-Instruct"
+              className="font-mono"
+              spellCheck={false}
+            />
+            <p className="text-xs text-muted-foreground">
+              Pulled on first start, so the endpoint takes a few minutes to become ready. It
+              listens on the private mesh only — never a public interface.
+            </p>
+          </div>
+        </>
+      )}
+
+      {kind !== "llm" && (
+        <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/40 p-3">
+          <p className="text-xs text-muted-foreground">{summary.line}</p>
+          <p className="flex items-start gap-2 text-xs text-muted-foreground">
+            <Lock className="mt-0.5 size-3.5 shrink-0" />
+            {summary.credentials}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The terminal screen: the create call, its outcome, and — for a managed
+ *  engine — the credentials it generated, shown once. */
+function CreateStep({
+  state,
+  error,
+  kind,
+  name,
+  targetName,
+  credentials,
+  createdId,
+  onOpenResource,
+}: {
+  state: "idle" | "creating" | "done" | "error";
+  error: string | null;
+  kind: ResourceKind | null;
+  name: string;
+  targetName: string;
+  credentials: RevealedCredentials | null;
+  createdId: string | null;
+  onOpenResource: (id: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-3">
+        <span
+          className={cn(
+            "grid size-9 shrink-0 place-items-center rounded-lg",
+            state === "done"
+              ? "bg-emerald-500/10 text-emerald-600"
+              : state === "error"
+                ? "bg-destructive/10 text-destructive"
+                : "bg-primary/10 text-primary"
+          )}
+        >
+          {state === "done" ? (
+            <CircleCheck className="size-5" />
+          ) : state === "error" ? (
+            <CircleAlert className="size-5" />
+          ) : (
+            <Loader2 className="size-5 animate-spin" />
+          )}
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-foreground">
+            {state === "done"
+              ? "Resource created"
+              : state === "error"
+                ? "Create failed"
+                : "Creating resource…"}
+          </p>
+          <p className="truncate font-mono text-xs text-muted-foreground">
+            {name}
+            {targetName ? ` → ${targetName}` : ""}
+          </p>
+        </div>
+      </div>
+
+      {state === "error" && error && (
+        <p className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive/90">
+          {error}
+        </p>
+      )}
+
+      {state === "done" && (
+        <p className="rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+          {kind === "app" ? (
+            <>
+              It starts as <span className="font-medium">provisioning</span> until its first
+              build finishes. The branch you picked is mapped to this environment, so
+              pushing to it rolls out a new version.
+            </>
+          ) : (
+            <>
+              It starts as <span className="font-medium">provisioning</span>. The
+              server&apos;s agent pulls the image, starts it, and reports it running.
+            </>
+          )}
+        </p>
+      )}
+
+      {credentials && credentials.length > 0 && (
+        <div className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Lock className="size-3.5" />
+            Generated credentials
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Copy what you need now. After this screen they are behind an audited reveal on
+            the resource page.
+          </p>
+          <dl className="flex flex-col gap-1.5">
+            {credentials.map((c) => (
+              <div key={c.label} className="flex items-baseline gap-2">
+                <dt className="w-24 shrink-0 text-xs text-muted-foreground">{c.label}</dt>
+                <dd className="min-w-0 flex-1 font-mono text-xs break-all text-foreground">
+                  {c.value}
+                </dd>
+                {c.secret && (
+                  <Badge variant="outline" className="shrink-0 text-[10px]">
+                    secret
+                  </Badge>
+                )}
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+
+      {state === "done" && createdId && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-fit"
+          onClick={() => onOpenResource(createdId)}
+        >
+          Open resource
+          <ArrowRight className="size-4" />
+        </Button>
+      )}
+    </div>
   );
 }

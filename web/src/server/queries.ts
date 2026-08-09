@@ -426,6 +426,10 @@ export async function getDeployTargets(orgId: string, visible?: Set<string> | nu
                 type: sv.type,
                 provider: sv.provider,
                 region: sv.region,
+                // Carried so the wizard can refuse a host the enrollment gate
+                // already refused, instead of offering it and letting the
+                // create call be the first thing that says no (SIGMA-203).
+                status: sv.status,
               })),
           };
         })

@@ -57,6 +57,10 @@ func newTestBuilder(t *testing.T, docker ImageBuilder, cred CredentialFetcher) (
 		docker:   docker,
 		workRoot: t.TempDir(),
 		log:      slog.Default(),
+		// The build host has nixpacks; a test that needs the opposite overrides
+		// this. Resolving against the REAL PATH would make these tests pass or
+		// fail depending on what happens to be installed on the machine.
+		lookPath: func(name string) (string, error) { return "/usr/local/bin/" + name, nil },
 	}
 	return b, &cmds
 }
@@ -352,5 +356,184 @@ func TestBuildDoesNotPushForLocalDeploy(t *testing.T) {
 	}
 	if fb.pushed {
 		t.Fatal("a local build must not push")
+	}
+}
+
+// ── The nixpacks builder (the auto-build fallback) ──────────────────────────
+
+// A repository that ships no Dockerfile is built by nixpacks from its language
+// manifest. The old path stat'd for a Dockerfile before doing anything, so this
+// spec would have failed with "build context missing Dockerfile (clone did not
+// run?)" — an error about the wrong step entirely.
+func TestBuildImageNixpacksBuildsWithoutADockerfile(t *testing.T) {
+	docker := &fakeImageBuilder{}
+	b, cmds := newTestBuilder(t, docker, nil)
+	dir := b.ContextDir("res_nix")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A Go service: a go.mod and no Dockerfile anywhere.
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module acme/x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_nix", SHA: "abc1234", ImageTag: "sigmahub/res_nix:abc1234",
+		Builder: BuilderNixpacks,
+	})); err != nil {
+		t.Fatalf("nixpacks build: %v", err)
+	}
+	if docker.built {
+		t.Error("a nixpacks build must not also run a docker build of a Dockerfile that does not exist")
+	}
+	var nix *capturedCmd
+	for i := range *cmds {
+		if (*cmds)[i].name == "nixpacks" {
+			nix = &(*cmds)[i]
+		}
+	}
+	if nix == nil {
+		t.Fatalf("nixpacks was never invoked; commands = %+v", *cmds)
+	}
+	if nix.dir != dir {
+		t.Errorf("nixpacks ran in %q, want the clone at %q", nix.dir, dir)
+	}
+	if strings.Join(nix.args, " ") != "build . --name sigmahub/res_nix:abc1234" {
+		t.Errorf("nixpacks args = %v, want the image tag it must produce", nix.args)
+	}
+}
+
+// The context subdirectory is honoured by the nixpacks path too: a monorepo's
+// app is built where it lives, not at the clone root.
+func TestBuildImageNixpacksHonoursContextSubdir(t *testing.T) {
+	b, cmds := newTestBuilder(t, &fakeImageBuilder{}, nil)
+	sub := filepath.Join(b.ContextDir("res_mono"), "apps", "api")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_mono", ImageTag: "sigmahub/res_mono:x",
+		Builder: BuilderNixpacks, ContextSubdir: "apps/api",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range *cmds {
+		if c.name == "nixpacks" && c.dir != sub {
+			t.Errorf("nixpacks ran in %q, want %q", c.dir, sub)
+		}
+	}
+}
+
+// A context subdirectory cannot escape the clone, whichever builder runs — the
+// nixpacks path must not become a way around the confinement the docker path
+// has, because it hands the directory to a subprocess rather than to the
+// daemon.
+func TestBuildImageNixpacksContextStaysInsideTheClone(t *testing.T) {
+	b, cmds := newTestBuilder(t, &fakeImageBuilder{}, nil)
+	root := b.ContextDir("res_esc")
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_esc", ImageTag: "t", Builder: BuilderNixpacks, ContextSubdir: "../../etc",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range *cmds {
+		if c.name != "nixpacks" {
+			continue
+		}
+		if !strings.HasPrefix(c.dir, root+string(filepath.Separator)) && c.dir != root {
+			t.Errorf("nixpacks ran in %q, outside the clone at %q", c.dir, root)
+		}
+	}
+}
+
+// An unknown builder fails the op instead of quietly falling back to looking
+// for a Dockerfile: the resulting "build context missing Dockerfile" would blame
+// the clone for a control-plane typo.
+func TestBuildImageUnknownBuilderRefused(t *testing.T) {
+	docker := &fakeImageBuilder{}
+	b, _ := newTestBuilder(t, docker, nil)
+	dir := b.ContextDir("res_bad")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_bad", ImageTag: "t", Builder: "buildpacks",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "unknown builder") {
+		t.Fatalf("unknown builder must fail loudly, got %v", err)
+	}
+	if docker.built {
+		t.Error("an unknown builder must not silently run a docker build")
+	}
+}
+
+// The default (empty) builder is unchanged: a docker build of the Dockerfile.
+func TestBuildImageDefaultBuilderStillDockerfile(t *testing.T) {
+	docker := &fakeImageBuilder{}
+	b, cmds := newTestBuilder(t, docker, nil)
+	dir := b.ContextDir("res_df")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_df", ImageTag: "t",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if !docker.built {
+		t.Error("the default path must still docker build")
+	}
+	for _, c := range *cmds {
+		if c.name == "nixpacks" {
+			t.Error("the default path must not shell out to nixpacks")
+		}
+	}
+}
+
+// A host without nixpacks must say so, not fail with "executable file not
+// found in $PATH".
+//
+// The auto-build method exists to answer "this repository does not say how to
+// build itself" — the worst dead end in the wizard. Answering it with a
+// low-level exec error, on a fleet installed before nixpacks was part of the
+// install script, moves the dead end rather than removing it: the operator sees
+// a broken build for a repository that is fine.
+func TestBuildImageNixpacksSaysWhatIsMissing(t *testing.T) {
+	b, cmds := newTestBuilder(t, &fakeImageBuilder{}, nil)
+	b.lookPath = func(string) (string, error) { return "", errors.New("not found") }
+
+	dir := b.ContextDir("res_nonix")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module acme/x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_nonix", SHA: "abc1234", ImageTag: "sigmahub/res_nonix:abc1234",
+		Builder: BuilderNixpacks,
+	}))
+	if err == nil {
+		t.Fatal("a host with no nixpacks must refuse the build")
+	}
+	// The message has to name the missing thing AND both ways out, because the
+	// operator reading it has no reason to know the auto-build method is a
+	// separate binary.
+	for _, want := range []string{"nixpacks", "installer", "Dockerfile build method"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	for _, c := range *cmds {
+		if c.name == "nixpacks" {
+			t.Fatal("nixpacks was executed despite not being on the host")
+		}
 	}
 }

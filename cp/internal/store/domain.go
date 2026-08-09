@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/gitdetect"
 )
 
 // ErrConflict marks uniqueness violations (duplicate names, key reuse).
@@ -475,6 +477,25 @@ type CreateResourceInput struct {
 	Spec      json.RawMessage
 }
 
+// buildMethodFromSpec reads spec.build.method — how the wizard decided this app
+// gets built. Empty (every resource created before the wizard could express it,
+// and every non-app kind) means the historical default: a Dockerfile at the
+// clone root.
+func buildMethodFromSpec(spec json.RawMessage) string {
+	if len(bytes.TrimSpace(spec)) == 0 {
+		return ""
+	}
+	var s struct {
+		Build *struct {
+			Method string `json:"method"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal(spec, &s); err != nil || s.Build == nil {
+		return ""
+	}
+	return s.Build.Method
+}
+
 // CreateResource enforces the domain rules the UI can't be trusted with:
 // known kind, availability matrix against the server's type, and the server
 // actually being attached to the target environment.
@@ -500,6 +521,14 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 		if !s.s3EngineEnabled(s3Engine) {
 			return Resource{}, ErrInvalid{Msg: fmt.Sprintf("s3 engine %q is not enabled on this control plane", s3Engine)}
 		}
+	}
+	// The wizard's build decision rides the spec (SIGMA-209). The agent refuses
+	// a builder it does not know, which is the right last line of defence but a
+	// terrible first one: by then the resource exists, the operator has closed
+	// the wizard, and the failure surfaces as a red deployment. Refuse it here,
+	// symmetric with the engine gates above.
+	if method := buildMethodFromSpec(in.Spec); method != "" && !gitdetect.ValidBuildMethod(method) {
+		return Resource{}, ErrInvalid{Msg: fmt.Sprintf("unknown build method %q", method)}
 	}
 
 	tx, err := s.Pool.Begin(ctx)

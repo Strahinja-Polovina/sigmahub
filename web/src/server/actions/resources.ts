@@ -8,6 +8,7 @@ import { requireProjectAdminForResource, requireProjectRole } from "../active-or
 import { getProject, getResource } from "../queries";
 import { writeAudit } from "../audit";
 import { isIncompatible } from "@/lib/server-compat";
+import { attachDomain } from "./domains";
 import {
   buildResourceSpec,
   resolveDeployTarget,
@@ -53,16 +54,26 @@ export async function createResource(input: {
    *  guaranteed to fail the gate (SIGMA-160). */
   detected?: {
     ports?: number[];
-    healthCheck?: { type: string; path?: string; port?: number };
+    healthCheck?: { type: string; path?: string; port?: number; intervalSec?: number };
     /** The repo's Compose service graph. Dropping it made a repo that
      *  describes five services deploy as a single container: `spec.compose`
      *  was never written, so the reconciler's per-service branch had nothing
      *  to render from and could not be reached at all (SIGMA-199). */
     services?: DetectedComposeService[];
   };
+  /** Port mappings as the wizard's networking step left them — host 0 is
+   *  internal-only. Overrides `detected.ports` (SIGMA-210). */
+  ports?: { container: number; host: number; protocol?: string }[];
+  /** The build decision: method, Dockerfile path and build context. Without it
+   *  a repo whose Dockerfile is not at the root cannot be deployed, even though
+   *  the agent's build op has taken both fields all along (SIGMA-209). */
+  build?: { method: string; dockerfile?: string; contextSubdir?: string };
   /** Inference runtime + model, for kind "llm". The control plane refuses an
    *  unknown runtime, so this is passed through rather than defaulted. */
   llm?: { engine: string; model: string };
+  /** Object-storage engine, for kind "s3". Also refused by the CP when unknown,
+   *  and defaulted there when absent. */
+  s3Engine?: string;
 }) {
   const project = await getProject(input.projectId);
   if (!project) throw new Error("Project not found.");
@@ -189,9 +200,26 @@ export async function createResource(input: {
       startedAt: now,
     });
   }
+  // A domain is a first-class record on the control plane, not a field on the
+  // spec: the reconciler routes from the `domains` rows, and nothing reads
+  // spec.domain. The wizard collected one and wrote it only to the spec and the
+  // local mirror, so in DEMO mode the dashboard showed the app reachable at it
+  // while in CP mode it was silently discarded — the one direction of demo/CP
+  // divergence that matters, on the screen that promises "Reachable at https://…".
+  let domainError: string | undefined;
+  if (cpEnabled() && input.domain?.trim()) {
+    try {
+      await attachDomain({ orgId: project.orgId, resourceId: id, domain: input.domain });
+    } catch (err) {
+      // The resource exists and deploys; only the hostname is missing. Say so
+      // rather than failing a create the user would then have to redo — they
+      // can attach it from the resource page.
+      domainError = err instanceof Error ? err.message : "Could not attach the domain.";
+    }
+  }
   await writeAudit({ orgId: project.orgId, actor: user.name, action: "Created resource", target: `${name} · ${input.kind}` });
   revalidatePath("/dashboard", "layout");
-  return { id };
+  return { id, domainError };
 }
 
 /** Kick off a redeploy: a new deployment enters the pipeline as `queued`. */
