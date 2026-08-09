@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { RESOURCE_KINDS } from "@/lib/server-catalog.generated";
-import { formatDuration, KIND_LABELS, DEPLOY_STATUS_META } from "./resource-meta";
+import {
+  formatDuration,
+  KIND_LABELS,
+  DEPLOY_STATUS_META,
+  DEPLOY_IN_FLIGHT,
+  isDeployInFlight,
+} from "./resource-meta";
 
 describe("formatDuration", () => {
   it("renders seconds under a minute", () => {
@@ -30,6 +36,33 @@ describe("deploy status meta", () => {
   it("covers the CP pipeline states", () => {
     for (const status of ["queued", "running", "success", "failed"]) {
       expect(DEPLOY_STATUS_META[status]).toBeTruthy();
+    }
+  });
+});
+
+describe("in-flight deploy statuses", () => {
+  it("counts every state the pipeline passes through before it settles", () => {
+    // queued is the one that mattered: a deployment sits there for the whole
+    // build (the agent reports clone/build/rollout in a single terminal POST),
+    // and treating it as "nothing is happening" is what left the resource page
+    // showing the PREVIOUS run's error while a fix was already building.
+    for (const status of ["queued", "building", "deploying"]) {
+      expect(isDeployInFlight(status), status).toBe(true);
+    }
+  });
+
+  it("excludes the settled states, so a finished deploy stops the polling", () => {
+    for (const status of ["success", "failed", "superseded", "rolled_back"]) {
+      expect(isDeployInFlight(status), status).toBe(false);
+    }
+  });
+
+  it("only claims statuses the badge can render", () => {
+    // An in-flight status with no DEPLOY_STATUS_META entry would render the
+    // banner's phase label as "undefined" while the page polled correctly —
+    // the failure would be cosmetic and therefore easy to ship.
+    for (const status of DEPLOY_IN_FLIGHT) {
+      expect(DEPLOY_STATUS_META[status], status).toBeTruthy();
     }
   });
 });

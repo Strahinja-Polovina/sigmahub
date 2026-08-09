@@ -64,10 +64,12 @@ import {
   deployResource,
 } from "@/server/actions/resources";
 import {
+  DEPLOY_STATUS_META,
   KIND_LABELS,
   SERVER_TYPE_LABELS,
   formatDateTime,
   formatDuration,
+  isDeployInFlight,
 } from "./resource-meta";
 import { MetricsChart } from "./metrics-chart";
 import { LogsViewer } from "./logs-viewer";
@@ -372,6 +374,29 @@ export function ResourceDetail({
 }) {
   const { resource, projectName, envName, server, cluster, deployments, secrets, canManage } =
     detail;
+  const router = useRouter();
+
+  // A deployment the control plane is still working on. Everything this page
+  // says about "now" — the banner, the logs, the deployment list — is a server
+  // render, so while one of these exists the page has to go back and ask.
+  const inFlight = deployments.find((d) => isDeployInFlight(d.status)) ?? null;
+
+  // Poll while a deploy is in flight. This page had no refresh path at all: the
+  // clone→build→rollout pipeline can run for minutes, and the only way to see
+  // that it had moved was a full navigation. Five seconds is well under the
+  // shortest phase and the refresh is a server re-render of data the page
+  // already fetches, not a new endpoint.
+  //
+  // The dependency is the BOOLEAN, not the deployment: `inFlight` is a fresh
+  // object every render, and router.refresh() causes a render, so depending on
+  // it would tear down and re-arm the interval before it ever fired.
+  const deployInFlight = inFlight !== null;
+  React.useEffect(() => {
+    if (!deployInFlight) return;
+    const id = setInterval(() => router.refresh(), 5000);
+    return () => clearInterval(id);
+  }, [deployInFlight, router]);
+
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
 
@@ -498,20 +523,44 @@ export function ResourceDetail({
         </div>
       )}
 
-      {statusError && (
-        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+      {/* An in-flight deploy outranks the last one's error. statusError is the
+          last APPLIED state, so it keeps describing a failure the running
+          pipeline may already be fixing — and it told the user to "press
+          Deploy" while their deploy was three minutes into its build. */}
+      {inFlight ? (
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/40 p-3">
+          <Rocket className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0 text-sm">
-            <p className="font-medium text-destructive">This resource is failing</p>
-            <p className="mt-0.5 break-words font-mono text-xs text-destructive/90">
-              {statusError}
+            <p className="font-medium">Deployment in progress</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {DEPLOY_STATUS_META[inFlight.status]?.label ?? inFlight.status} — this
+              page refreshes itself until it finishes. Build output is in the
+              Deployments tab; the Logs tab keeps showing the version that is
+              serving traffic until the new one passes its health check.
             </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Fix the cause, then press Deploy to re-apply. Logs and metrics
-              stay empty until the container starts.
-            </p>
+            {statusError && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Previous failure: <span className="font-mono">{statusError}</span>
+              </p>
+            )}
           </div>
         </div>
+      ) : (
+        statusError && (
+          <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+            <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+            <div className="min-w-0 text-sm">
+              <p className="font-medium text-destructive">This resource is failing</p>
+              <p className="mt-0.5 break-words font-mono text-xs text-destructive/90">
+                {statusError}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Fix the cause, then press Deploy to re-apply. Logs and metrics
+                stay empty until the container starts.
+              </p>
+            </div>
+          </div>
+        )
       )}
 
       <Tabs defaultValue="overview">
@@ -690,9 +739,26 @@ export function ResourceDetail({
               <div className="flex items-center justify-between gap-4">
                 <div className="flex flex-col gap-1">
                   <CardTitle>Logs</CardTitle>
-                  <CardDescription>Live tail from {resource.name}</CardDescription>
+                  <CardDescription>
+                    {/* Not "Live tail": this is a snapshot of the newest lines,
+                        taken when the page rendered. Calling it live is what
+                        made a stale tail look like a stuck container. */}
+                    Newest output from {resource.name}
+                    {inFlight ? " — refreshing while the deployment runs" : ""}
+                  </CardDescription>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => toast("Refreshed log tail")}>
+                {/* This used to be `onClick={() => toast("Refreshed log tail")}`
+                    — a button that reported success and fetched nothing, on a
+                    card headed "Live tail". The tail is a server render, so
+                    refreshing it is refreshing the route. */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    router.refresh();
+                    toast("Refreshing log tail…");
+                  }}
+                >
                   <ScrollText className="size-4" />
                   Refresh
                 </Button>
