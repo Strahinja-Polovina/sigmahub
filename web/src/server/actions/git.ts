@@ -34,7 +34,7 @@ import {
   type CpPreviewEnvironment,
   type CpGitIntegration,
   type CpGitHubInstallation,
-  type CpRepoList,
+  type CpRepoListResult,
 } from "../cp";
 
 /** Git integration is a control-plane feature; the demo path has no webhook
@@ -425,17 +425,31 @@ export async function disconnectGitIntegration(input: {
 
 /** Repos the org's installations can reach — the picker's options.
  *
- *  A CP/GitHub failure returns an empty, explicitly-not-connected list rather
- *  than throwing: Next.js redacts thrown server-action messages in production,
- *  so a throw would surface as an opaque digest instead of "GitHub isn't
- *  connected yet". */
-export async function listGitRepos(orgId: string): Promise<CpRepoList> {
+ *  A CP/GitHub failure returns rather than throwing: Next.js redacts thrown
+ *  server-action messages in production, so a throw would surface as an opaque
+ *  digest instead of something the picker can act on.
+ *
+ *  It returns the failure DISTINCTLY, in `error` (SIGMA-237). It used to answer
+ *  `{ repos: [], connected: false }`, which is the same answer as "this org has
+ *  never installed the GitHub App" — and the picker reads that as "offer the
+ *  install". So a control plane that was merely restarting told a user whose App
+ *  had been installed org-wide for months to go to github.com and re-run the
+ *  installation, which is a chance to narrow their org's repository access to
+ *  fix a ninety-second outage. `connected` stays false because we did not
+ *  confirm a connection; `error` is what says we never got to ask. */
+export async function listGitRepos(orgId: string): Promise<CpRepoListResult> {
   ensureCp();
   await requireMembership(orgId);
   try {
     return await cpListGitRepos(orgId);
-  } catch {
-    return { repos: [], connected: false };
+  } catch (err) {
+    return {
+      repos: [],
+      connected: false,
+      error: `Couldn't reach the control plane to list your repositories: ${
+        err instanceof Error ? err.message : "unknown error"
+      }.`,
+    };
   }
 }
 

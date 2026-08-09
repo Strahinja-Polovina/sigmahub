@@ -1867,6 +1867,16 @@ export type CpRepoList = {
   unavailable?: string[];
 };
 
+/** What `listGitRepos` hands the picker: the control plane's answer, or — when
+ *  we never got one — the reason, in `error` (SIGMA-237).
+ *
+ *  The distinction matters because "connected: false" is a real answer from a
+ *  healthy control plane ("this org has not installed the App"), and the picker
+ *  responds to it by offering to install one. A CP that did not answer must not
+ *  be able to produce that offer, so the failure gets its own field rather than
+ *  borrowing `connected: false`. Never set by the CP itself. */
+export type CpRepoListResult = CpRepoList & { error?: string };
+
 export async function cpGetGitIntegration(orgId: string): Promise<CpGitIntegration> {
   return cpFetch(`${org(orgId)}/git/integration`, undefined, { orgId });
 }
