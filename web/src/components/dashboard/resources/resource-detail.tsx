@@ -83,6 +83,7 @@ import { ComposeServicesPanel, type PlacementServer } from "./compose-services-p
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type {
+  CpHealthCheck,
   CpDatabaseInfo,
   CpS3Info,
   CpComposeServices,
@@ -319,6 +320,22 @@ function DeleteResourceButton({
   );
 }
 
+/** The branch mapping that decides whether a push deploys this resource's
+ *  environment. `null` means the control plane has no mapping for it. */
+export type AutoDeployPolicy = { branch: string; policy: "auto" | "manual" };
+
+/** One line describing the probe the control plane actually runs, e.g.
+ *  "HTTP GET /healthz on :3000" or "TCP probe on :3000". Returns null when
+ *  there is no probe to describe — the caller renders "None", which is a
+ *  different statement from a badge reading "Enabled". */
+function describeHealthCheck(hc: CpHealthCheck | null | undefined): string | null {
+  if (!hc || !hc.type) return null;
+  const on = hc.port ? ` on :${hc.port}` : "";
+  if (hc.type === "http") return `HTTP GET ${hc.path || "/"}${on}`;
+  if (hc.type === "tcp") return `TCP probe${on}`;
+  return `${hc.type}${on}`;
+}
+
 /** "a, b and c" — the failed reads read as prose rather than a bare array. */
 function formatList(items: string[]): string {
   if (items.length === 1) return items[0];
@@ -343,6 +360,8 @@ export function ResourceDetail({
   cpTelemetry = null,
   statusError = null,
   loadFailures = [],
+  autoDeploy = null,
+  healthCheck = null,
 }: {
   detail: Detail;
   orgId?: string;
@@ -380,6 +399,11 @@ export function ResourceDetail({
   /** P1-13 telemetry (CP mode): real pipeline data or the explicit
    *  not-configured state. null = demo mode (labeled synthetic data). */
   cpTelemetry?: CpTelemetry | null;
+  /** The branch→environment mapping governing this resource's deploys, from the
+   *  control plane's git connection. null = no mapping (or nothing to ask). */
+  autoDeploy?: AutoDeployPolicy | null;
+  /** The health probe stored on the resource's spec. null = none. */
+  healthCheck?: CpHealthCheck | null;
 }) {
   const { resource, projectName, envName, server, cluster, deployments, secrets, canManage } =
     detail;
@@ -932,11 +956,39 @@ export function ResourceDetail({
                 <FactRow icon={Boxes} label="Name">
                   <span className="font-mono">{resource.name}</span>
                 </FactRow>
+                {/* Both of these used to be the literal
+                    `<Badge variant="secondary">Enabled</Badge>` with no data
+                    behind them. A user who mapped their branch as "Manual
+                    promote" in the Git panel read "Auto-deploy on push:
+                    Enabled" here, pushed, and waited for a rollout that was
+                    never going to happen — and the project panel's "Recent
+                    pushes" correctly saying the push deployed nothing then read
+                    as the lagging one. The same badge claimed auto-deploy and
+                    health checks for a database, which has no repository at all
+                    (SIGMA-240).
+
+                    Both now render what the control plane actually holds: the
+                    branch mapping's policy, and the probe on the resource's
+                    spec. */}
                 <FactRow icon={GitBranch} label="Auto-deploy on push">
-                  <Badge variant="secondary">Enabled</Badge>
+                  {!resource.repo ? (
+                    <span className="text-muted-foreground">Not connected to a repository</span>
+                  ) : autoDeploy ? (
+                    autoDeploy.policy === "auto" ? (
+                      <Badge variant="secondary">
+                        On push to <span className="font-mono">{autoDeploy.branch}</span>
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">Manual promote</Badge>
+                    )
+                  ) : (
+                    <span className="text-muted-foreground">No branch mapped</span>
+                  )}
                 </FactRow>
                 <FactRow icon={Activity} label="Health checks">
-                  <Badge variant="secondary">Enabled</Badge>
+                  {describeHealthCheck(healthCheck) ?? (
+                    <span className="text-muted-foreground">None</span>
+                  )}
                 </FactRow>
               </CardContent>
             </Card>

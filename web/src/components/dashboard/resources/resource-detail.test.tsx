@@ -102,6 +102,13 @@ function openTab(name: string) {
   fireEvent.click(screen.getByRole("tab", { name }));
 }
 
+/** The value cell of a FactRow, found by its label. */
+function factRow(label: string): HTMLElement {
+  const cell = screen.getByText(label).parentElement;
+  if (!cell) throw new Error(`no fact row for ${label}`);
+  return cell;
+}
+
 function dangerZone(): HTMLElement {
   const card = screen.getByText("Danger zone").closest('[data-slot="card"]');
   if (!card) throw new Error("danger zone card not found");
@@ -154,6 +161,46 @@ describe("ResourceDetail links to the running app", () => {
   it("a resource with no domain offers no Open control at all", () => {
     renderCp({ detail: makeDetail({ domain: null }) });
     expect(screen.queryByRole("link", { name: /^Open$/ })).toBeNull();
+  });
+});
+
+describe("ResourceDetail settings facts", () => {
+  it("the Settings tab reflects a manual branch policy", () => {
+    renderCp({ autoDeploy: { branch: "main", policy: "manual" } });
+    openTab("Settings");
+
+    const row = factRow("Auto-deploy on push");
+    // The badge used to be the literal string "Enabled", with no data behind
+    // it: a user who mapped their branch as "Manual promote" read this, pushed,
+    // and waited for a rollout that never came (SIGMA-240).
+    expect(row.textContent).toMatch(/Manual promote/);
+    expect(row.textContent).not.toMatch(/Enabled/);
+  });
+
+  it("an auto-deploying branch names the branch it deploys from", () => {
+    renderCp({ autoDeploy: { branch: "release", policy: "auto" } });
+    openTab("Settings");
+    expect(factRow("Auto-deploy on push").textContent).toMatch(/On push to.*release/);
+  });
+
+  it("a resource with no repository says so rather than claiming auto-deploy", () => {
+    renderCp({ detail: makeDetail({ kind: "postgres", repo: null, domain: null }) });
+    openTab("Settings");
+    expect(factRow("Auto-deploy on push").textContent).toMatch(/Not connected to a repository/);
+  });
+
+  it("the health-check row describes the detected probe, or says there is none", () => {
+    const { unmount } = renderCp({
+      healthCheck: { type: "tcp", port: 3000, intervalSec: 10, source: "default" },
+    });
+    openTab("Settings");
+    expect(factRow("Health checks").textContent).toMatch(/TCP probe on :3000/);
+    unmount();
+
+    renderCp();
+    openTab("Settings");
+    expect(factRow("Health checks").textContent).toMatch(/None/);
+    expect(factRow("Health checks").textContent).not.toMatch(/Enabled/);
   });
 });
 
