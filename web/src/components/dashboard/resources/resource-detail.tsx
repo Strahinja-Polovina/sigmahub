@@ -17,7 +17,6 @@ import {
   MemoryStick,
   Activity,
   Trash2,
-  Power,
   ScrollText,
   Loader2,
   CircleAlert,
@@ -935,22 +934,22 @@ export function ResourceDetail({
                 <CardTitle className="text-destructive">Danger zone</CardTitle>
                 <CardDescription>These actions are irreversible.</CardDescription>
               </CardHeader>
-              <CardContent className="flex flex-col gap-4 pt-0">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Stop resource</p>
-                    <p className="text-sm text-muted-foreground">
-                      Take {resource.name} offline. It can be restarted later.
-                    </p>
-                  </div>
-                  <Button variant="outline" size="sm" onClick={() => toast(`${resource.name} stopped`)}>
-                    <Power className="size-4" />
-                    Stop
-                  </Button>
-                </div>
+              {/* "Stop resource" used to live here, and its entire handler was
+                  `toast(`${resource.name} stopped`)` — a control in a card
+                  headed "These actions are irreversible" that reported an
+                  irreversible action it never performed. There is no CP stop
+                  endpoint and no desired-state change behind it: the container
+                  kept serving traffic, kept its database connections and kept
+                  being billed, while the status badge (correctly) still read
+                  Running, which an operator mid-incident reads as stale UI
+                  rather than as the truth. Removed until a real scale-to-zero /
+                  container.stop op exists that the reconciler renders and the
+                  status badge reflects — the same treatment the Overview
+                  dropdown's fake Deploy/Restart items already got (SIGMA-234,
+                  SIGMA-162). */}
+              <CardContent className="flex flex-col gap-4 pt-4">
                 {resource.kind === "app" && resource.serverId && (
                   <>
-                    <Separator />
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="text-sm font-medium text-foreground">Delete a data volume</p>
@@ -960,9 +959,9 @@ export function ResourceDetail({
                       </div>
                       <VolumeDeleteDialog resourceId={resource.id} resourceName={resource.name} />
                     </div>
+                    <Separator />
                   </>
                 )}
-                <Separator />
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="text-sm font-medium text-foreground">Delete resource</p>
