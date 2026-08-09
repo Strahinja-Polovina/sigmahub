@@ -4,7 +4,9 @@
 // server-type availability matrix, the billing weights and the per-type
 // enrollment requirements — is RENDERED from the control plane's canonical
 // catalog at cp/internal/store/server_catalog.go, together with the kinds a
-// cluster refuses, which come from cp/internal/store/clusters.go.
+// cluster refuses (cp/internal/store/clusters.go) and the engine catalogs the
+// managed-data panels describe themselves from (cp/internal/store/db_engines.go
+// and cp/internal/store/s3_engines.go).
 //
 // Editing this file by hand re-creates the defect SIGMA-198 removed: a
 // dashboard offering server types the API rejects. Change the Go catalog and
@@ -19,7 +21,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "9cc7a938194c617b46b02ef1b41e10811b7c07cb30ddc72bcc1d6ac30a772cfc";
+export const CATALOG_SOURCE_SHA256 = "9ab407bdb7af50d42922395d3155bf84688b6158e37bf19efe03bd80704e645d";
 
 export type ServerType =
   | "general"
@@ -50,6 +52,20 @@ export type RequirementId =
   | "arch"
   | "disk"
   | "gpu";
+
+/** A resource kind provisioned as a managed database engine: for these the
+ *  kind IS the engine, so this union is a subset of ResourceKind. */
+export type DatabaseEngine =
+  | "postgres"
+  | "mysql"
+  | "mongodb"
+  | "redis";
+
+/** An object-storage engine. Unlike a database engine it is NOT a resource
+ *  kind: `s3` is the kind, and which engine serves it is a choice under it. */
+export type S3Engine =
+  | "minio"
+  | "seaweedfs";
 
 /** One precondition a host must meet to enroll as a type. The fact field names
  *  the agent-reported datum it is checked against, so a host that never
@@ -84,6 +100,31 @@ export type ServerTypeSpec = {
   connectable: boolean;
   unitWeight: number;
   requires: ServerRequirements;
+};
+
+/** What the control plane provisions a managed database as.
+ *
+ *  There is no port here, deliberately. A managed engine is published on the
+ *  mesh port its server ALLOCATED (MESH_PORT_BASE and up), never on the
+ *  engine's container port — demo mode printed 5432 for a product that hands
+ *  out 15000+, and publishing the container port here would be inviting that
+ *  back. The port travels with the resource, not with the engine. */
+export type DatabaseEngineSpec = {
+  engine: DatabaseEngine;
+  /** The image this control plane pins. Never a floating tag: the agent's
+   *  policy refuses "latest" outright, so an image shown here is one the
+   *  product would actually run. */
+  image: string;
+  /** The connection string's shape — {username}, {password}, {host}, {port} and
+   *  {database}, filled once each by databaseConnectionUrl. */
+  urlTemplate: string;
+};
+
+export type S3EngineSpec = {
+  engine: S3Engine;
+  image: string;
+  /** {host} and {port}, filled by s3EndpointUrl. */
+  endpointTemplate: string;
 };
 
 /** One bucket of the New Resource wizard's first screen. */
@@ -385,6 +426,68 @@ export const SUPPORTED_DISTROS: { id: string; label: string }[] = [
   { id: "debian-12", label: "Debian 12" },
 ];
 
+/** What each managed database kind is provisioned as.
+ *
+ *  Rendered from store.dbEngines rather than restated, because demo mode kept a
+ *  second copy and every value in it had drifted: postgres:17-alpine against a
+ *  control plane pinned to 16.6 — a MAJOR version someone plans around — plus
+ *  mysql:8.4 for 8.4.4, mongo:8 for 7.0.16 and redis:7-alpine for 7.4.2. Both
+ *  panels print the value verbatim under a label reading "Engine", so the demo
+ *  was not illustrating the product, it was describing a different one. */
+export const DB_ENGINE_CATALOG: Record<DatabaseEngine, DatabaseEngineSpec> = {
+  postgres: {
+    engine: "postgres",
+    image: "postgres:16.6",
+    urlTemplate: "postgresql://{username}:{password}@{host}:{port}/{database}",
+  },
+  mysql: {
+    engine: "mysql",
+    image: "mysql:8.4.4",
+    urlTemplate: "mysql://{username}:{password}@{host}:{port}/{database}",
+  },
+  mongodb: {
+    engine: "mongodb",
+    image: "mongo:7.0.16",
+    urlTemplate: "mongodb://{username}:{password}@{host}:{port}/?authSource=admin",
+  },
+  redis: {
+    engine: "redis",
+    image: "redis:7.4.2",
+    urlTemplate: "redis://:{password}@{host}:{port}/0",
+  },
+};
+
+/** The database kinds, in catalog order. */
+export const DB_ENGINE_KINDS: DatabaseEngine[] = ["postgres", "mysql", "mongodb", "redis"];
+
+/** The object-storage engines, same story: the demo advertised
+ *  minio/minio:latest and chrislusf/seaweedfs:latest, and the agent's image
+ *  policy REFUSES a floating tag ("the floating 'latest' tag is not permitted"),
+ *  so the demo was advertising images the product would decline to run. */
+export const S3_ENGINE_CATALOG: Record<S3Engine, S3EngineSpec> = {
+  minio: {
+    engine: "minio",
+    image: "minio/minio:RELEASE.2025-04-22T22-12-26Z",
+    endpointTemplate: "http://{host}:{port}",
+  },
+  seaweedfs: {
+    engine: "seaweedfs",
+    image: "chrislusf/seaweedfs:3.94@sha256:d8ab8284bf4fd221e3cbf25f114f2f317c5bc942b1df032c43cc9d7bfe9bb1c6",
+    endpointTemplate: "http://{host}:{port}",
+  },
+};
+
+export const S3_ENGINE_NAMES: S3Engine[] = ["minio", "seaweedfs"];
+/** What an s3 resource provisions when its spec names no engine. */
+export const DEFAULT_S3_ENGINE: S3Engine = "minio";
+
+/** The first mesh-bound host port the control plane's per-server allocator
+ *  hands out (store.MeshPortBase). A managed engine is reachable on an
+ *  ALLOCATED port from here up — never on the engine's container port, which is
+ *  what demo mode used to print. "Your Postgres is on 5432" is the one sentence
+ *  a connection panel must not teach about a product that hands out 15000+. */
+export const MESH_PORT_BASE = 15000;
+
 /** Whether a server type may host a resource kind. */
 export function canHost(server: ServerType, kind: ResourceKind): boolean {
   return (SERVER_TYPE_HOSTS[server] ?? []).includes(kind);
@@ -433,4 +536,53 @@ export function isServerType(value: string): value is ServerType {
 
 export function isResourceKind(value: string): value is ResourceKind {
   return value in RESOURCE_KIND_LABELS;
+}
+
+/** Whether a resource kind is provisioned as a managed database engine. Takes a
+ *  plain string: CP rows and restored drafts carry one, and a kind that is not
+ *  an engine is simply not a database. */
+export function isDatabaseEngine(kind: string): kind is DatabaseEngine {
+  return kind in DB_ENGINE_CATALOG;
+}
+
+/** Whether a name is an object-storage engine this control plane provisions. */
+export function isS3Engine(engine: string): engine is S3Engine {
+  return engine in S3_ENGINE_CATALOG;
+}
+
+/** Fills a connection template in ONE pass, so a credential that happens to
+ *  contain "{host}" is never re-read as a placeholder. The Go half
+ *  (DBEngineDef.ConnectionURL) substitutes the same way, which is what makes
+ *  one template render one string on both sides. */
+function fillTemplate(template: string, parts: Record<string, string | number>): string {
+  return template.replace(/\{(\w+)\}/g, (whole, key: string) =>
+    key in parts ? String(parts[key]) : whole
+  );
+}
+
+/** The engine's canonical connection string.
+ *
+ *  The port belongs to the RESOURCE, not to the engine: a managed database is
+ *  published on the mesh port its server allocated (MESH_PORT_BASE and up), and
+ *  the container port never appears in a URL anyone dials. */
+export function databaseConnectionUrl(
+  engine: DatabaseEngine,
+  parts: {
+    username: string;
+    password: string;
+    host: string;
+    port: number;
+    database: string;
+  }
+): string {
+  return fillTemplate(DB_ENGINE_CATALOG[engine].urlTemplate, parts);
+}
+
+/** The S3 API endpoint a client dials, on the same allocated mesh port. An
+ *  empty host means the server has not finished mesh enrollment, and there is
+ *  no endpoint to show yet — the control plane answers with nothing there too,
+ *  rather than a URL pointing at no address. */
+export function s3EndpointUrl(engine: S3Engine, host: string, port: number): string {
+  if (!host) return "";
+  return fillTemplate(S3_ENGINE_CATALOG[engine].endpointTemplate, { host, port });
 }

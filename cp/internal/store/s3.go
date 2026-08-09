@@ -21,83 +21,9 @@ import (
 // S3Kind is the single object-storage resource kind. The concrete engine
 // (MinIO or SeaweedFS) is a per-resource selection under it, not a distinct
 // kind — mirroring how a database "kind" already names its engine, but S3 needs
-// engine choice under one semantic category (P2-2).
+// engine choice under one semantic category (P2-2). The engines themselves are
+// catalogued in s3_engines.go.
 const S3Kind = "s3"
-
-// DefaultS3Engine is what an s3 resource provisions when its spec names no
-// engine. MinIO stays the default; SeaweedFS is opt-in (the Apache-2.0 hedge
-// against MinIO's AGPL license, per P2-2).
-const DefaultS3Engine = "minio"
-
-// S3EngineDef pins one object-storage engine the CP can provision. Both engines
-// take their root credentials purely through environment variables so the agent
-// stays engine-agnostic: the access key rides plain env, the secret rides an
-// env-mode secret reference. (SeaweedFS also supports a JSON config file, but
-// that reloads only on SIGHUP — which would need engine-specific agent code —
-// so env-var admin credentials are the deliberate choice, pinned by digest to
-// freeze the behavior against upstream env-cred regressions.)
-type S3EngineDef struct {
-	Engine string
-	// Image is the pinned release; the agent's image policy refuses floating
-	// tags. A digest (@sha256:) is the ideal, immutable form.
-	Image string
-	// APIPort is the in-container S3 API port.
-	APIPort int
-	// DataMount is where the data volume mounts.
-	DataMount string
-	// AccessKeyEnv is the plain (non-secret) env var carrying the access key.
-	AccessKeyEnv string
-	// StaticEnv is the non-credential engine environment (console toggles etc).
-	StaticEnv map[string]string
-	// SecretEnvNames are env vars carrying the generated secret key; the DSD
-	// renders them as secret REFERENCES only.
-	SecretEnvNames []string
-	// Cmd is the container command that starts the S3 API.
-	Cmd []string
-}
-
-var s3Engines = map[string]S3EngineDef{
-	// MinIO: the P2-1 engine. Console disabled — the dashboard is the UI, and
-	// one less exposed surface is one less thing to harden.
-	"minio": {
-		Engine:         "minio",
-		Image:          "minio/minio:RELEASE.2025-04-22T22-12-26Z",
-		APIPort:        9000,
-		DataMount:      "/data",
-		AccessKeyEnv:   "MINIO_ROOT_USER",
-		StaticEnv:      map[string]string{"MINIO_BROWSER": "off"},
-		SecretEnvNames: []string{"MINIO_ROOT_PASSWORD"},
-		Cmd:            []string{"server", "/data", "--address", ":9000"},
-	},
-	// SeaweedFS: all-in-one `weed server -s3`, S3 gateway on 8333. Pinned to 3.94
-	// by digest — the release where AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY seed
-	// the admin S3 identity (regressed in 3.97, upstream #7311); the digest
-	// freezes that behavior. Only the S3 port is published on the mesh; the
-	// master/volume/filer ports stay container-internal.
-	"seaweedfs": {
-		Engine:         "seaweedfs",
-		Image:          "chrislusf/seaweedfs:3.94@sha256:d8ab8284bf4fd221e3cbf25f114f2f317c5bc942b1df032c43cc9d7bfe9bb1c6",
-		APIPort:        8333,
-		DataMount:      "/data",
-		AccessKeyEnv:   "AWS_ACCESS_KEY_ID",
-		StaticEnv:      map[string]string{},
-		SecretEnvNames: []string{"AWS_SECRET_ACCESS_KEY"},
-		Cmd:            []string{"server", "-dir=/data", "-s3", "-s3.port=8333"},
-	},
-}
-
-// S3EngineByName returns the engine definition for an engine name (minio,
-// seaweedfs). ok=false for an unknown engine.
-func S3EngineByName(engine string) (S3EngineDef, bool) {
-	def, ok := s3Engines[engine]
-	return def, ok
-}
-
-// IsS3Engine reports whether the name is a known object-storage engine.
-func IsS3Engine(engine string) bool {
-	_, ok := s3Engines[engine]
-	return ok
-}
 
 // IsS3Kind reports whether the kind is CP-provisioned object storage.
 func IsS3Kind(kind string) bool { return kind == S3Kind }
@@ -116,27 +42,6 @@ func s3EngineFromSpec(spec json.RawMessage) string {
 		return DefaultS3Engine
 	}
 	return s.Engine
-}
-
-// PlainEnv is the non-secret engine environment: the access key under the
-// engine's access-key env var, plus any static engine env.
-func (d S3EngineDef) PlainEnv(accessKey string) map[string]string {
-	env := map[string]string{d.AccessKeyEnv: accessKey}
-	for k, v := range d.StaticEnv {
-		env[k] = v
-	}
-	return env
-}
-
-// Command starts the S3 API on the fixed in-container port.
-func (d S3EngineDef) Command() []string { return d.Cmd }
-
-// EndpointURL renders the mesh endpoint S3 clients dial.
-func (d S3EngineDef) EndpointURL(host string, port int) string {
-	if host == "" {
-		return ""
-	}
-	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
 // SetEnabledS3Engines installs the S3 engine allowlist (CP_S3_ENGINES),
@@ -182,7 +87,7 @@ func allocateS3Port(ctx context.Context, tx pgx.Tx, serverID string) (int, error
 			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
 			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1),
 			COALESCE((SELECT MAX(port) FROM llm_endpoints WHERE server_id = $1), $2 - 1)
-		) + 1`, serverID, dbPortBase).Scan(&port)
+		) + 1`, serverID, MeshPortBase).Scan(&port)
 	if err != nil {
 		return 0, fmt.Errorf("s3 port max: %w", err)
 	}

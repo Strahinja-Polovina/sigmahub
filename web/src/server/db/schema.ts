@@ -283,6 +283,17 @@ export const resources = pgTable("resources", {
   repo: text("repo"),
   domain: text("domain"),
   version: text("version"),
+  // Which engine serves this resource — the local mirror of the control
+  // plane's `spec.engine`, which carries an object-storage engine (minio |
+  // seaweedfs) and an inference runtime through the same field.
+  //
+  // Demo mode had nowhere to put it, so the wizard's engine choice reached
+  // createResource and stopped there: every demo S3 resource described itself
+  // with the default engine's image and endpoint, and a user who picked
+  // SeaweedFS on the storage step opened the resource and was told MinIO
+  // (SIGMA-215). Null for the kinds that have no engine to choose — an app —
+  // and for a managed database, where the KIND is the engine.
+  engine: text("engine"),
   // SIGMA-194: PR-preview resources, torn down with their PR. Badged in the
   // UI and their Delete carries an explicit preview-breaking warning.
   ephemeral: boolean("ephemeral").notNull().default(false),

@@ -7,16 +7,27 @@ import {
   CATALOG_SOURCE_SHA256,
   CLUSTER_EXCLUDED_KINDS,
   CONNECTABLE_SERVER_TYPES,
+  DB_ENGINE_CATALOG,
+  DB_ENGINE_KINDS,
+  DEFAULT_S3_ENGINE,
   HOSTS_NOTHING_REASON,
+  MESH_PORT_BASE,
   RESOURCE_KINDS,
   RESOURCE_KIND_LABELS,
+  S3_ENGINE_CATALOG,
+  S3_ENGINE_NAMES,
   SERVER_CATALOG,
   SERVER_TYPES,
   SERVER_TYPE_HOSTS,
   SERVER_TYPE_LABELS,
   SERVER_UNIT_WEIGHTS,
   canHost,
+  categoryForKind,
   clusterCanHost,
+  databaseConnectionUrl,
+  isDatabaseEngine,
+  isS3Engine,
+  s3EndpointUrl,
 } from "./server-catalog.generated";
 import type { ResourceKind, ServerType } from "./server-catalog.generated";
 
@@ -42,18 +53,26 @@ const STORE_GO = join(REPO, "cp", "internal", "store");
 const GENERATED = join("src", "lib", "server-catalog.generated.ts");
 
 // Every input the generated module is rendered from, in the order the Go side
-// hashes them (store.CatalogSourceFiles). All four, because the output embeds
+// hashes them (store.CatalogSourceFiles). All six, because the output embeds
 // more than the catalog: hashing only server_catalog.go let a currency change
 // in billing.go ship a dashboard that still said EUR, with the whole web suite
 // green. clusters.go joined the list when CLUSTER_EXCLUDED_KINDS started being
 // rendered from it — an exclusion the web cannot see change is the same failure
 // wearing a different hat, and demo mode reads that list with no control plane
 // to correct it.
+//
+// db_engines.go and s3_engines.go joined when the engine table stopped being
+// restated in demo-connection.ts. Every value in that copy disagreed with the
+// control plane — postgres:17-alpine against a pin of 16.6, minio/minio:latest
+// against an agent that refuses floating tags — and a version bump on the Go
+// side is exactly the edit this list has to make visible here.
 const CATALOG_SOURCES = [
   "server_catalog.go",
   "server_catalog_ts.go",
   "billing.go",
   "clusters.go",
+  "db_engines.go",
+  "s3_engines.go",
 ];
 
 describe("the generated catalog tracks the control plane", () => {
@@ -145,8 +164,15 @@ describe("nothing keeps a second copy of the vocabulary", () => {
       // docker image tags in one file failed a guard about something else
       // entirely. A key is what this is looking for; an image reference is not
       // a key, and no real offender writes one without balanced quotes.
+      //
+      // A URL SCHEME is not a key either, for the same reason and with the same
+      // consequence: three connection strings in one test — `mysql://…`,
+      // `mongodb://…`, `redis://…` — read as a table keyed by resource kind the
+      // day the demo's connection URLs started being asserted in full. Hence the
+      // backtick among the excluded prefixes and the `//` lookahead; nothing
+      // that is really a key is followed by two slashes.
       const named = vocabulary.filter((v) =>
-        new RegExp(`(^|[^\\w\\-"'])(${v}|"${v}"|'${v}')\\s*:`, "m").test(src)
+        new RegExp(`(^|[^\\w\\-"'\`])(${v}|"${v}"|'${v}')\\s*:(?!//)`, "m").test(src)
       );
       if (named.length < 3) continue;
       if (new RegExp(`Record<\\s*${typeName}\\s*,`).test(src)) continue;
@@ -250,6 +276,100 @@ describe("the kinds a cluster refuses", () => {
       expect(clusterCanHost(kind)).toBe(false);
     }
     expect(clusterCanHost("app")).toBe(true);
+  });
+});
+
+// What a managed engine IS — the image, the connection-URL shape and the port
+// range — arrives here compiled in for the same reason the cluster exclusions
+// do: demo mode has no control plane to ask, and it answered from a table of
+// its own where postgres:17-alpine stood against a control plane pinned to
+// 16.6. Both panels print the value verbatim under a label reading "Engine", so
+// the copy was not a stale detail, it described a different product.
+describe("the engine catalog is the control plane's", () => {
+  it("pins every image to a version tag or a digest, never latest", () => {
+    // The agent's own policy: "the floating 'latest' tag is not permitted; pin
+    // a version tag or digest" (agent/internal/container/policy.go). The demo
+    // advertised minio/minio:latest and chrislusf/seaweedfs:latest — images
+    // this product would have refused to run.
+    const images = [
+      ...DB_ENGINE_KINDS.map((kind) => DB_ENGINE_CATALOG[kind].image),
+      ...S3_ENGINE_NAMES.map((engine) => S3_ENGINE_CATALOG[engine].image),
+    ];
+    expect(images.length).toBeGreaterThan(0);
+    for (const image of images) {
+      if (image.includes("@sha256:")) continue; // digest-pinned: immutable
+      const tag = image.slice(image.lastIndexOf(":") + 1);
+      expect(tag, `${image} carries no version tag`).not.toBe(image);
+      expect(tag, `${image} carries a tag the agent policy refuses`).not.toBe("latest");
+    }
+  });
+
+  it("describes every database kind, and only database kinds", () => {
+    for (const kind of DB_ENGINE_KINDS) {
+      expect(RESOURCE_KINDS).toContain(kind);
+      expect(categoryForKind(kind)).toBe("database");
+      expect(DB_ENGINE_CATALOG[kind].engine).toBe(kind);
+    }
+    for (const kind of RESOURCE_KINDS) {
+      expect(isDatabaseEngine(kind)).toBe(categoryForKind(kind) === "database");
+    }
+  });
+
+  it("renders each engine's URL from its own template, filling every placeholder", () => {
+    for (const kind of DB_ENGINE_KINDS) {
+      const url = databaseConnectionUrl(kind, {
+        username: "sigma",
+        password: "s3cret",
+        host: "10.8.0.21",
+        port: MESH_PORT_BASE,
+        database: "orders",
+      });
+      // A leftover {placeholder} is a template the renderer does not know how
+      // to fill — a connection string nobody can paste anywhere.
+      expect(url, kind).not.toMatch(/[{}]/);
+      expect(url, kind).toContain(`10.8.0.21:${MESH_PORT_BASE}`);
+      expect(url, kind).toContain("s3cret");
+    }
+  });
+
+  it("fills a template once, so a credential is never re-read as a placeholder", () => {
+    // Single-pass substitution is what makes the Go and TypeScript renderers
+    // one renderer; a second pass would also let a password rewrite the host.
+    const url = databaseConnectionUrl("postgres", {
+      username: "sigma",
+      password: "{host}",
+      host: "10.8.0.21",
+      port: MESH_PORT_BASE,
+      database: "orders",
+    });
+    expect(url).toBe(`postgresql://sigma:{host}@10.8.0.21:${MESH_PORT_BASE}/orders`);
+  });
+
+  it("has no endpoint for a host that has not finished mesh enrollment", () => {
+    // The control plane answers with an empty endpoint until the server has a
+    // mesh IP; a URL pointing at no address would be worse than none.
+    expect(s3EndpointUrl(DEFAULT_S3_ENGINE, "", MESH_PORT_BASE)).toBe("");
+    expect(s3EndpointUrl(DEFAULT_S3_ENGINE, "10.8.0.9", MESH_PORT_BASE)).toBe(
+      `http://10.8.0.9:${MESH_PORT_BASE}`
+    );
+  });
+
+  it("names a mesh port base that is none of the engines' own ports", () => {
+    // The allocator's range starts here, and the numbers it must not start on
+    // are the ports the engines listen on inside their containers — 5432, 3306,
+    // 27017, 6379 for the databases, 9000 and 8333 for the object stores. A
+    // panel printing one of those is printing a port nothing outside the
+    // container ever answers on, which is what demo mode used to do.
+    for (const containerPort of [5432, 3306, 27017, 6379, 9000, 8333]) {
+      expect(MESH_PORT_BASE).not.toBe(containerPort);
+    }
+    expect(MESH_PORT_BASE).toBeGreaterThan(1024);
+  });
+
+  it("knows the default object-storage engine, and it is a real one", () => {
+    expect(isS3Engine(DEFAULT_S3_ENGINE)).toBe(true);
+    expect(S3_ENGINE_NAMES).toContain(DEFAULT_S3_ENGINE);
+    expect(isS3Engine("ceph")).toBe(false);
   });
 });
 

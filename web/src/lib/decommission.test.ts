@@ -7,6 +7,7 @@ import {
   DEMO_TEARDOWN_STEP_MS,
   boundResourcesMessage,
   demoTeardownPhase,
+  demoTeardownSpanMs,
   forceReason,
   isDecommissioning,
   msUntilNextTeardownStep,
@@ -274,13 +275,42 @@ describe("the demo teardown", () => {
   });
 
   it("finishes, which is the whole reason it exists", () => {
-    expect(demoTeardownPhase(at(4 * DEMO_TEARDOWN_STEP_MS)).done).toBe(true);
+    expect(demoTeardownPhase(at(demoTeardownSpanMs(false))).done).toBe(true);
+  });
+
+  // The boundary anything meant to sit outside the demo teardown is derived
+  // from — the seeded in-flight fixture above all. It has to land on the last
+  // step's end and not a step short: a row placed just past a span that
+  // understated itself is still mid-teardown, and the page that loads it acks a
+  // server nobody asked about.
+  it("spans the sequence it is about to walk, to its last step and no further", () => {
+    for (const purgeVolumes of [false, true]) {
+      const span = demoTeardownSpanMs(purgeVolumes);
+      const phaseAt = (now: number) =>
+        demoTeardownPhase({ startedAt: new Date(START), purgeVolumes, now });
+      expect(phaseAt(START + span - 1).done, `purgeVolumes=${purgeVolumes}`).toBe(false);
+      expect(phaseAt(START + span).done, `purgeVolumes=${purgeVolumes}`).toBe(true);
+    }
+    // The opted-in volume step is a step like any other, and it lengthens the
+    // teardown a watcher has to be present for.
+    expect(demoTeardownSpanMs(true)).toBe(demoTeardownSpanMs(false) + DEMO_TEARDOWN_STEP_MS);
+  });
+
+  // `done` is this clock reporting that its seconds are spent, and nothing
+  // more: it answers identically for a teardown that finished under a watching
+  // page and for one seeded a week ago that nobody ever saw. Reading it as "the
+  // agent reported in" is what deleted a server on first paint, so the ack is
+  // the servers page's decision — made only for a teardown it watched start —
+  // and never this function's.
+  it("says the same thing about a teardown nobody watched as about one that just finished", () => {
+    expect(demoTeardownPhase(at(demoTeardownSpanMs(false))).done).toBe(true);
+    expect(demoTeardownPhase(at(7 * 86_400_000)).done).toBe(true);
   });
 
   // Ten seconds, not ten minutes. The timeout is what the "never answers"
   // simulation reaches, and nobody watching a demo can sit through it.
   it("completes far inside the control plane's patience", () => {
-    expect(4 * DEMO_TEARDOWN_STEP_MS).toBeLessThan(DECOMMISSION_TIMEOUT_MS / 10);
+    expect(demoTeardownSpanMs(true)).toBeLessThan(DECOMMISSION_TIMEOUT_MS / 10);
   });
 
   it("treats a row with no start time as already finished, never as stuck", () => {
@@ -290,6 +320,6 @@ describe("the demo teardown", () => {
 
   it("asks to be looked at again exactly when the next step lands", () => {
     expect(msUntilNextTeardownStep(at(1_000))).toBe(DEMO_TEARDOWN_STEP_MS - 1_000);
-    expect(msUntilNextTeardownStep(at(4 * DEMO_TEARDOWN_STEP_MS))).toBeNull();
+    expect(msUntilNextTeardownStep(at(demoTeardownSpanMs(false)))).toBeNull();
   });
 });

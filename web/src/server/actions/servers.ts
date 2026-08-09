@@ -862,6 +862,19 @@ export async function simulateDecommission(input: {
   // can remove a server teaches the wrong permission model to the person
   // evaluating the product — the one audience demo mode exists for.
   const { user } = await requireProjectAdmin(server.orgId);
+  // Every event but "silence" is a report ABOUT a teardown, and two of them
+  // delete the row. A report on a teardown that was never requested is not a
+  // simulation of anything the product does, and the caller that sends one is
+  // wrong about the server's state — so say so instead of removing a server on
+  // the strength of it. The servers page used to fire "ack" at a row it had
+  // simply arrived late to, and this is the second line of defence against that
+  // class of caller: a demo fleet must not shrink by one because a page loaded.
+  if (input.event !== "silence" && server.status !== SERVER_STATUS.decommissioning) {
+    throw new Error(
+      `${server.name} is not being decommissioned, so there is no teardown to report on. ` +
+        "Open the server and press Disconnect first."
+    );
+  }
 
   switch (input.event) {
     case "ack":

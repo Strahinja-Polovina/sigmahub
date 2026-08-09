@@ -158,11 +158,21 @@ export function isDecommissioning(status: string): boolean {
 
 /** How long each teardown step takes in demo mode.
  *
- *  2.5 seconds: four steps is ten seconds, which is long enough to read each
- *  line as it happens and short enough that nobody concludes it has hung. It is
- *  deliberately unrelated to DECOMMISSION_TIMEOUT_MS — that is the control
- *  plane's ten-MINUTE patience, and the whole point of the "never answers"
- *  simulation is that nobody can sit through it. */
+ *  2.5 seconds: the whole sequence is then seven and a half to ten seconds
+ *  (demoTeardownSpanMs), long enough to read each line as it happens and short
+ *  enough that nobody concludes it has hung. It is deliberately unrelated to
+ *  DECOMMISSION_TIMEOUT_MS — that is the control plane's ten-MINUTE patience,
+ *  and the whole point of the "never answers" simulation is that nobody can sit
+ *  through it.
+ *
+ *  Two clocks three orders of magnitude apart, in one feature, is how the demo
+ *  came to delete a server nobody had touched: a fixture stated its age in
+ *  minutes and justified it against the ten-minute one, and the servers page
+ *  measured the same row against this one, found it long finished, and wrote
+ *  the agent's ack. Nothing that has to fall on one side of either boundary may
+ *  be written as a number that happens to fit — derive it from
+ *  demoTeardownSpanMs for this clock, from DECOMMISSION_TIMEOUT_MS for the
+ *  other, and it cannot be made wrong by editing the other file. */
 export const DEMO_TEARDOWN_STEP_MS = 2_500;
 
 export type TeardownPhase = {
@@ -186,6 +196,20 @@ function teardownSteps(purgeVolumes: boolean): string[] {
     "Bringing down the WireGuard tunnel",
     "Removing the agent, its unit and its config",
   ];
+}
+
+/** The whole demo teardown, from the request to the ack, for the sequence the
+ *  operator's volume choice produces.
+ *
+ *  It is ABSOLUTE wall time and there is nothing to pause it: no agent reports,
+ *  no job runs between requests, and a page that was not open while these
+ *  seconds passed missed the entire teardown. So a row older than this span
+ *  says only that the span is over — never that anything happened — and code
+ *  that reads "finished" as "the agent confirmed" is inventing a report. That
+ *  is the boundary a watcher has to be present for, and the number anything
+ *  sitting deliberately outside it must be derived from. */
+export function demoTeardownSpanMs(purgeVolumes: boolean): number {
+  return teardownSteps(purgeVolumes).length * DEMO_TEARDOWN_STEP_MS;
 }
 
 /** Where a demo teardown has got to, from the timestamp the decommission was

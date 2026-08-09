@@ -1,11 +1,16 @@
 package store
 
-import "fmt"
+import (
+	"slices"
+	"strconv"
+	"strings"
+)
 
 // DBEngineDef is the single source of truth for one supported database engine:
-// its pinned image, container port, data mount, credential env-var contract and
-// server-type tuning profile. The reconciler renders from it and the credential
-// resolve path injects from it, so the two sides cannot drift.
+// its pinned image, container port, data mount, credential env-var contract,
+// connection-URL shape and server-type tuning profile. The reconciler renders
+// from it, the credential resolve path injects from it, and the dashboard's
+// generated catalog is rendered from it, so no side can drift from another.
 //
 // Tuning is deliberately container-level knobs only (engine config args) —
 // host-level tuning (IO scheduler, dedicated volumes) is out of the typed op
@@ -15,11 +20,36 @@ type DBEngineDef struct {
 	Image         string // pinned version tag; the agent policy refuses floating tags
 	ContainerPort int
 	DataMount     string // where the named "data" volume mounts
+	// URLTemplate is the connection string's SHAPE: {username}, {password},
+	// {host}, {port} and {database}, each substituted once (ConnectionURL).
+	//
+	// A template rather than a switch statement because the dashboard has to
+	// render the same string in demo mode, where there is no control plane to
+	// ask. Demo mode kept its own switch, and that copy appended
+	// ?sslmode=disable to the Postgres URL and put the database in the MongoDB
+	// path — two connection strings this product never hands out, printed under
+	// a panel headed "your connection details".
+	URLTemplate string
 	// SecretEnvNames are the env vars carrying generated credentials. They are
 	// rendered into the DSD as secret REFERENCES and resolved agent-side at
 	// container create, so a captured DSD leaks nothing.
 	SecretEnvNames []string
 }
+
+// MeshPortBase is the first mesh-bound host port the allocator hands out, and
+// therefore the first number a connection panel can print. The range is
+// per-server (a unique index on (server_id, port) is the backstop) and never
+// collides with the engines' well-known container ports — which is the whole
+// point of it: a managed engine answers on an ALLOCATED mesh port, never on
+// 5432, and every panel that says otherwise is teaching a port that will not
+// connect.
+//
+// It lives beside the engine catalog rather than beside allocateDBPort because
+// it is RENDERED into the dashboard (server_catalog_ts.go). Every file that
+// reaches the generated output is hashed into the catalog digest, and hashing
+// databases.go would make each unrelated query edit there demand a regenerate
+// that changes no byte.
+const MeshPortBase = 15000
 
 // DB engine catalog (P1-10). Version pins are deliberate: a floating tag would
 // let a database change out from under the pinned DSD (and the agent policy
@@ -28,23 +58,55 @@ var dbEngines = map[string]DBEngineDef{
 	"postgres": {
 		Engine: "postgres", Image: "postgres:16.6", ContainerPort: 5432,
 		DataMount:      "/var/lib/postgresql/data",
+		URLTemplate:    "postgresql://{username}:{password}@{host}:{port}/{database}",
 		SecretEnvNames: []string{"POSTGRES_PASSWORD"},
 	},
 	"mysql": {
 		Engine: "mysql", Image: "mysql:8.4.4", ContainerPort: 3306,
 		DataMount:      "/var/lib/mysql",
+		URLTemplate:    "mysql://{username}:{password}@{host}:{port}/{database}",
 		SecretEnvNames: []string{"MYSQL_PASSWORD", "MYSQL_ROOT_PASSWORD"},
 	},
 	"redis": {
 		Engine: "redis", Image: "redis:7.4.2", ContainerPort: 6379,
-		DataMount:      "/data",
+		DataMount: "/data",
+		// No username and no database name: Redis authenticates with the
+		// password alone, and a URL that invented a database would not connect.
+		URLTemplate:    "redis://:{password}@{host}:{port}/0",
 		SecretEnvNames: []string{"REDIS_PASSWORD"},
 	},
 	"mongodb": {
 		Engine: "mongodb", Image: "mongo:7.0.16", ContainerPort: 27017,
-		DataMount:      "/data/db",
+		DataMount: "/data/db",
+		// The database is deliberately absent from the path: credentials are
+		// created on the admin database, so authSource=admin is what makes the
+		// URL authenticate at all.
+		URLTemplate:    "mongodb://{username}:{password}@{host}:{port}/?authSource=admin",
 		SecretEnvNames: []string{"MONGO_INITDB_ROOT_PASSWORD"},
 	},
+}
+
+// The catalog is rendered into a checked-in file and read by name everywhere
+// else, so the two ways it can be quietly wrong are worth failing at package
+// load rather than at the first CreateResource of the week: an engine whose
+// name is not a resource kind never reaches DBEngineCatalog (the dashboard
+// would simply never hear of it), and an engine with no URL template renders an
+// empty connection string on both sides.
+func init() {
+	for kind, def := range dbEngines {
+		if def.Engine != kind {
+			panic("store: db engine keyed " + kind + " calls itself " + def.Engine)
+		}
+		if !slices.Contains(ResourceKinds(), kind) {
+			panic("store: db engine " + kind + " is not a resource kind, so nothing renders it")
+		}
+		if def.URLTemplate == "" {
+			panic("store: db engine " + kind + " has no connection-URL template")
+		}
+		if def.Image == "" {
+			panic("store: db engine " + kind + " has no image")
+		}
+	}
 }
 
 // DBEngine returns the engine definition for a resource kind (ok=false for
@@ -56,6 +118,31 @@ func DBEngine(kind string) (DBEngineDef, bool) {
 
 // IsDBKind reports whether a resource kind is a database engine.
 func IsDBKind(kind string) bool { _, ok := dbEngines[kind]; return ok }
+
+// DBEngineCatalog returns every engine definition in resource-kind order.
+//
+// The order is the catalog's, not the map's: this is what the TypeScript
+// generator renders, the rendered file is checked in, and a map range would
+// reshuffle it on most runs — making `go generate` produce a different file
+// each time and failing the staleness test on commits that changed nothing.
+func DBEngineCatalog() []DBEngineDef {
+	out := make([]DBEngineDef, 0, len(dbEngines))
+	for _, kind := range ResourceKinds() {
+		if def, ok := dbEngines[kind]; ok {
+			out = append(out, def)
+		}
+	}
+	return out
+}
+
+// DBEngineKinds lists the database kinds in the same order.
+func DBEngineKinds() []string {
+	out := make([]string, 0, len(dbEngines))
+	for _, def := range DBEngineCatalog() {
+		out = append(out, def.Engine)
+	}
+	return out
+}
 
 // PlainEnv is the engine's NON-secret environment (usernames and database
 // names are identifiers, not secrets — the password never appears here).
@@ -107,18 +194,19 @@ func (d DBEngineDef) TunedCommand(serverType string) []string {
 }
 
 // ConnectionURL renders the engine's canonical connection string for the
-// mesh-internal address. Password is the caller's responsibility (audited
-// reveal only).
+// mesh-internal address — port is the ALLOCATED mesh port, never the container
+// port. Password is the caller's responsibility (audited reveal only). An
+// engine this catalog does not know renders nothing rather than a URL shaped
+// like a guess.
 func (d DBEngineDef) ConnectionURL(username, password, host string, port int, dbname string) string {
-	switch d.Engine {
-	case "postgres":
-		return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s", username, password, host, port, dbname)
-	case "mysql":
-		return fmt.Sprintf("mysql://%s:%s@%s:%d/%s", username, password, host, port, dbname)
-	case "redis":
-		return fmt.Sprintf("redis://:%s@%s:%d/0", password, host, port)
-	case "mongodb":
-		return fmt.Sprintf("mongodb://%s:%s@%s:%d/?authSource=admin", username, password, host, port)
+	if d.URLTemplate == "" {
+		return ""
 	}
-	return ""
+	return strings.NewReplacer(
+		"{username}", username,
+		"{password}", password,
+		"{host}", host,
+		"{port}", strconv.Itoa(port),
+		"{database}", dbname,
+	).Replace(d.URLTemplate)
 }

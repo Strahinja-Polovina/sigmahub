@@ -218,6 +218,15 @@ export async function createResource(input: {
     name,
     kind: input.kind,
     status: cp ? "provisioning" : "running",
+    // Read off the SPEC rather than off the input, so the mirror cannot
+    // disagree with what the control plane was sent about the same resource:
+    // an object-storage engine and an inference runtime ride the one
+    // `spec.engine` field, and buildResourceSpec is where that is decided.
+    //
+    // Demo mode wrote nothing here, and the S3 panel derives its image, port
+    // and endpoint from the engine — so a user who picked SeaweedFS in the
+    // wizard opened the resource and was told MinIO, the default (SIGMA-215).
+    engine: typeof spec.engine === "string" ? spec.engine : null,
     repo: input.repo ?? null,
     domain: input.domain ?? null,
     version: "v1",

@@ -5,6 +5,7 @@ package store
 // boundary that quietly disagrees with the domain model.
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -250,6 +251,145 @@ func TestBothPublishedClusterExclusionListsAreOneStatement(t *testing.T) {
 	for _, kind := range []string{"postgres", "mysql", "mongodb", "redis", "s3", "llm"} {
 		if ClusterKindAllowed(kind) {
 			t.Errorf("%q must not run inside a cluster", kind)
+		}
+	}
+}
+
+// What a managed engine IS — its pinned image and the shape of the connection
+// string it hands out — is published twice for the same reason the cluster
+// exclusions are: the API answers with it at runtime, and the dashboard
+// compiles it in for demo mode, where there is no control plane to ask. Demo
+// mode used to answer from a table of its own, and every single value in it had
+// drifted: postgres:17-alpine against this package's 16.6 (a MAJOR version a
+// customer plans around), mysql:8.4 for 8.4.4, mongo:8 for 7.0.16,
+// redis:7-alpine for 7.4.2, and two floating "latest" tags the agent's image
+// policy refuses outright. Both panels print the value under a label reading
+// "Engine", so this asserts the rendered module carries THIS catalog.
+func TestGeneratedTypeScriptCarriesTheEngineCatalogs(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := string(RenderTypeScript(sha))
+
+	for _, def := range DBEngineCatalog() {
+		for _, fragment := range []string{
+			`  | "` + def.Engine + `"`, // the DatabaseEngine union
+			`    image: ` + tsString(def.Image) + `,`,
+			`    urlTemplate: ` + tsString(def.URLTemplate) + `,`,
+		} {
+			if !strings.Contains(ts, fragment) {
+				t.Errorf("db engine %q: generated TS is missing %q", def.Engine, fragment)
+			}
+		}
+	}
+	for _, def := range S3EngineCatalog() {
+		for _, fragment := range []string{
+			`  | "` + def.Engine + `"`,
+			`    image: ` + tsString(def.Image) + `,`,
+			`    endpointTemplate: ` + tsString(def.EndpointTemplate) + `,`,
+		} {
+			if !strings.Contains(ts, fragment) {
+				t.Errorf("s3 engine %q: generated TS is missing %q", def.Engine, fragment)
+			}
+		}
+	}
+	// The port is the other half of the disagreement: demo mode printed the
+	// engines' CONTAINER ports, and this product publishes a managed engine on
+	// a port allocated per server from here up.
+	if fragment := fmt.Sprintf("export const MESH_PORT_BASE = %d;", MeshPortBase); !strings.Contains(ts, fragment) {
+		t.Errorf("the generated catalog does not carry the allocator's port base;\nexpected: %s", fragment)
+	}
+	if strings.Contains(ts, "containerPort") {
+		t.Error("the generated catalog publishes a container port; nothing outside the container dials one, and publishing it is how a panel comes to print 5432 for a database reachable on 15000+")
+	}
+}
+
+// Every image this control plane pins must be one the AGENT will accept:
+// agent/internal/container/policy.go refuses a bare repository and refuses the
+// floating "latest" tag ("pin a version tag or digest"), so an unpinned image
+// here is a resource that provisions and then fails at container create — and,
+// once the catalog reaches the dashboard, an image the demo advertises that the
+// product would decline to run.
+func TestEveryEngineImageIsPinnedTheWayTheAgentDemands(t *testing.T) {
+	images := map[string]string{}
+	for _, def := range DBEngineCatalog() {
+		images[def.Engine] = def.Image
+	}
+	for _, def := range S3EngineCatalog() {
+		images[def.Engine] = def.Image
+	}
+	if len(images) == 0 {
+		t.Fatal("no engines in the catalog")
+	}
+	for engine, image := range images {
+		if strings.Contains(image, "@sha256:") {
+			continue // digest-pinned: immutable, the ideal form
+		}
+		i := strings.LastIndex(image, ":")
+		if i < 0 || strings.Contains(image[i+1:], "/") {
+			t.Errorf("%s: image %q carries no tag; the agent refuses it", engine, image)
+			continue
+		}
+		if tag := image[i+1:]; tag == "latest" {
+			t.Errorf("%s: image %q floats; the agent refuses the latest tag", engine, image)
+		}
+	}
+}
+
+// The connection URL is the one thing here that is a FUNCTION rather than a
+// table, and it is the reason the shapes are templates: the dashboard renders
+// the same string in demo mode, and its own switch statement had grown an
+// ?sslmode=disable Postgres never gets from us and a MongoDB URL with the
+// database in the path — where this catalog authenticates on admin and puts no
+// database there at all. One template, filled on both sides.
+func TestConnectionURLRendersFromTheEngineTemplate(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want string
+	}{
+		{"postgres", "postgresql://sigma:pw@10.8.0.21:15003/orders"},
+		{"mysql", "mysql://sigma:pw@10.8.0.21:15003/orders"},
+		{"redis", "redis://:pw@10.8.0.21:15003/0"},
+		{"mongodb", "mongodb://sigma:pw@10.8.0.21:15003/?authSource=admin"},
+	} {
+		def, ok := DBEngine(tc.kind)
+		if !ok {
+			t.Fatalf("%s is not a database engine", tc.kind)
+		}
+		if got := def.ConnectionURL("sigma", "pw", "10.8.0.21", 15003, "orders"); got != tc.want {
+			t.Errorf("%s URL = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+	// One pass: a credential that happens to contain a placeholder must be
+	// carried through as itself, never re-read. The TypeScript half does the
+	// same, which is what keeps one template one string.
+	def, _ := DBEngine("postgres")
+	if got := def.ConnectionURL("sigma", "{host}", "10.8.0.21", 15003, "orders"); got != "postgresql://sigma:{host}@10.8.0.21:15003/orders" {
+		t.Errorf("a password containing a placeholder was re-substituted: %q", got)
+	}
+	// An engine nothing in the catalog describes renders nothing, rather than a
+	// URL shaped like a guess at what it might have been.
+	if got := (DBEngineDef{Engine: "cassandra"}).ConnectionURL("u", "p", "h", 1, "d"); got != "" {
+		t.Errorf("an unknown engine rendered %q", got)
+	}
+}
+
+// The S3 endpoint is the same story one layer along: the port in it is the
+// ALLOCATED mesh port, not the engine's API port, and demo mode printed 9000 —
+// MinIO's in-container port, and not SeaweedFS's at all.
+func TestS3EndpointRendersOnTheAllocatedPort(t *testing.T) {
+	for _, def := range S3EngineCatalog() {
+		if got, want := def.EndpointURL("10.8.0.9", 15007), "http://10.8.0.9:15007"; got != want {
+			t.Errorf("%s endpoint = %q, want %q", def.Engine, got, want)
+		}
+		if def.APIPort == 0 {
+			t.Errorf("%s has no API port; the container render needs one", def.Engine)
+		}
+		// A host with no mesh address yet has no endpoint at all — the panel
+		// says "not enrolled yet" rather than offering a URL to nowhere.
+		if got := def.EndpointURL("", 15007); got != "" {
+			t.Errorf("%s rendered an endpoint for a host with no mesh address: %q", def.Engine, got)
 		}
 	}
 }

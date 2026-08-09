@@ -20,7 +20,12 @@ import { clusters, environments, projects, resources, servers } from "./data";
 import { findMockModel, MOCK_MODELS } from "./models";
 import { checkServerCompatibility, SERVER_STATUS } from "@/lib/server-compat";
 import { clusterCanHost } from "@/lib/server-catalog.generated";
-import { DECOMMISSION_TIMEOUT_MS, forceReason } from "@/lib/decommission";
+import {
+  DECOMMISSION_TIMEOUT_MS,
+  demoTeardownPhase,
+  demoTeardownSpanMs,
+  forceReason,
+} from "@/lib/decommission";
 import {
   controlPlaneRefusal,
   demoApiEndpoint,
@@ -101,8 +106,18 @@ describe("a host the compatibility gate refuses", () => {
   });
 });
 
+// Two clocks read the same seeded timestamp, and this fixture used to be
+// checked against one of them: the control plane's ten-minute patience said
+// "still working" at two minutes, so the test passed, while the servers page
+// measured the same row against the demo teardown's ten SECONDS, read it as
+// finished, wrote the agent's ack and deleted the server on first paint. Every
+// assertion here therefore names WHICH clock it is asking.
 describe("a decommission in flight", () => {
   const teardowns = servers.filter((sv) => sv.decommission);
+  const seeded = () => {
+    const { startedMsAgo, purgeVolumes } = teardowns[0].decommission!;
+    return { startedAt: new Date(Date.now() - startedMsAgo), purgeVolumes };
+  };
 
   it("is in the fleet, on a host with nothing left running on it", () => {
     expect(teardowns).toHaveLength(1);
@@ -111,18 +126,61 @@ describe("a decommission in flight", () => {
     expect(resources.filter((r) => r.serverId === teardowns[0].id)).toEqual([]);
   });
 
-  it("opens on a teardown still working, and ages into the force path rather than starting there", () => {
-    const started = new Date(Date.now() - teardowns[0].decommission!.startedMinutesAgo * 60_000);
-    const input = { status: SERVER_STATUS.decommissioning, decommissioningSince: started };
+  it("opens on a teardown the control plane is still waiting on, and ages into the force path rather than starting there", () => {
+    const input = {
+      status: SERVER_STATUS.decommissioning,
+      decommissioningSince: seeded().startedAt,
+    };
     // Freshly seeded: the graceful path has time left, so Force disconnect is
     // deliberately not offered — it is one click, it "works", and every press
     // leaves an agent and a tunnel behind on a machine we stop showing.
     expect(forceReason(input)).toBeNull();
     // Past the control plane's window — reached in the demo by pressing
-    // "Simulate: timeout", and reached on its own by a database left for a week.
+    // "…never answers", and reached on its own by a database left for a week.
     expect(forceReason({ ...input, now: Date.now() + DECOMMISSION_TIMEOUT_MS })?.kind).toBe(
       "timedOut"
     );
+  });
+
+  // The clock the old test never asked, and the answer it has to give. A seeded
+  // database is opened minutes or days after it was written, so the ten seconds
+  // of absolute wall time this fixture would have to be inside are long gone —
+  // no offset can put a visitor there, and one small enough to try would only
+  // make it a race, where whoever loads the page quickly enough watches an
+  // unrequested server vanish. The demo's ticking step counter belongs to the
+  // teardown the visitor starts and the page therefore watches from step zero;
+  // this row's job is the durable half, and the page reads it as what it is —
+  // asked for, unconfirmed, still inside the window.
+  it("is past the demo teardown's own clock, which is why the page must not read it as acked", () => {
+    expect(demoTeardownPhase(seeded()).done).toBe(true);
+  });
+
+  it("sits between the two clocks by construction, not by a number that fits today", () => {
+    const { startedMsAgo } = teardowns[0].decommission!;
+    // The longest sequence, so the bound holds whichever volume choice a
+    // fixture makes.
+    expect(startedMsAgo, "a visitor could arrive mid-teardown and ack a server nobody touched")
+      .toBeGreaterThan(demoTeardownSpanMs(true));
+    expect(startedMsAgo, "a fresh demo would open on Force disconnect, skipping the graceful path")
+      .toBeLessThan(DECOMMISSION_TIMEOUT_MS);
+  });
+
+  // The route SIGMA-205 exists for: timeout → Force disconnect → cleanup
+  // script. The button that starts it backdates the row past the control
+  // plane's window, at which point the demo clock also reads finished — and a
+  // page that treats "finished" as "the agent reported" acks it and DELETES the
+  // server, which is the one outcome this path must not have. The button's own
+  // toast promises the operator the dialog will offer Force disconnect.
+  it("lands in the force path when the agent never answers, never in deletion", () => {
+    // What simulateDecommission's "timeout" branch writes (actions/servers.ts).
+    const backdated = new Date(Date.now() - DECOMMISSION_TIMEOUT_MS - 60_000);
+    expect(
+      forceReason({
+        status: SERVER_STATUS.decommissioning,
+        decommissioningSince: backdated,
+      })?.kind
+    ).toBe("timedOut");
+    expect(demoTeardownPhase({ startedAt: backdated, purgeVolumes: false }).done).toBe(true);
   });
 
   // Named volumes are the customer's database directories and uploaded files.

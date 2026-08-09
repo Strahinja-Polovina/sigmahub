@@ -42,6 +42,7 @@ async function demoResource(resourceId: string) {
       id: schema.resources.id,
       name: schema.resources.name,
       kind: schema.resources.kind,
+      engine: schema.resources.engine,
       meshIp: schema.servers.meshIp,
     })
     .from(schema.resources)
@@ -63,7 +64,15 @@ export async function getS3Info(input: {
   if (cpEnabled()) return cpGetS3(input.orgId, input.resourceId);
   const row = await demoResource(input.resourceId);
   if (!row || row.kind !== "s3") return null;
-  return demoS3Info({ resourceId: row.id, resourceName: row.name, meshIp: row.meshIp });
+  // The engine the resource was CREATED with, not the catalog default: this
+  // panel is where a demo user finds out what their SeaweedFS pick got them,
+  // and it used to answer MinIO for every one of them (SIGMA-215).
+  return demoS3Info({
+    resourceId: row.id,
+    resourceName: row.name,
+    engine: row.engine ?? undefined,
+    meshIp: row.meshIp,
+  });
 }
 
 export async function revealS3Connection(input: {
@@ -80,7 +89,12 @@ export async function revealS3Connection(input: {
   } else {
     const row = await demoResource(input.resourceId);
     if (!row || row.kind !== "s3") throw new Error("This resource is not object storage.");
-    conn = demoS3Connection({ resourceId: row.id, resourceName: row.name, meshIp: row.meshIp });
+    conn = demoS3Connection({
+      resourceId: row.id,
+      resourceName: row.name,
+      engine: row.engine ?? undefined,
+      meshIp: row.meshIp,
+    });
   }
   // Audited in both modes: the reveal is a privileged read, and a demo that
   // did not write the row would leave the audit log looking like nobody had

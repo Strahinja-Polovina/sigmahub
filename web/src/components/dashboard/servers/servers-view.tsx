@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Server as ServerIcon, ShieldCheck, Boxes, Loader2, Radio } from "lucide-react";
+import { Server as ServerIcon, ShieldCheck, Boxes, Clock, Loader2, Radio } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -34,6 +34,7 @@ import {
 } from "@/server/actions/servers";
 import {
   demoTeardownPhase,
+  forceReason,
   isDecommissioning,
   msUntilNextTeardownStep,
 } from "@/lib/decommission";
@@ -159,13 +160,28 @@ function DecommissionSimButton({
  *  at the end: nothing runs between requests, so if the page is not watching,
  *  nothing finishes it. The other endings stay as buttons next to it — a
  *  teardown that fails, or an agent that never answers, are not things a timer
- *  can produce, and they are the two that lead to the force path. */
+ *  can produce, and they are the two that lead to the force path.
+ *
+ *  It acks ONLY a teardown it watched start. Writing the ack claims the agent
+ *  reported in, and a component that writes it on arrival is asserting
+ *  something it never observed: the demo clock is seven to ten seconds of
+ *  absolute wall time, so any row already past it at mount — the seeded
+ *  fixture, a tab opened a minute late, a row the "…never answers" button has
+ *  just backdated — is a teardown nobody saw finish. Acking those deleted a
+ *  server the visitor had not touched, on first paint, dropped the fleet by one
+ *  and popped a green toast for it; on the timeout button it deleted the very
+ *  server whose force
+ *  path that button exists to demonstrate. Those rows render as what they
+ *  honestly are — in flight, unconfirmed — with both simulate buttons beside
+ *  them and the dialog's force path a click away. */
 function TeardownProgress({
   serverId,
+  status,
   startedAt,
   purgeVolumes,
 }: {
   serverId: string;
+  status: string;
   startedAt: Date | string | null;
   purgeVolumes: boolean;
 }) {
@@ -176,9 +192,28 @@ function TeardownProgress({
   // for one frame every time a step landed.
   const [, retick] = React.useState(0);
   const phase = demoTeardownPhase({ startedAt, purgeVolumes });
+  // Whether this teardown was still running the first time this component laid
+  // eyes on it — the one thing that entitles it to write the ack later.
+  //
+  // Keyed on the timestamp, because a decommissionStartedAt that CHANGES is a
+  // different request: "…never answers" rewrites the row to eleven minutes ago,
+  // and a component holding its earlier answer would read the backdated row as
+  // finished and ack it. Answered during render rather than in an effect, so no
+  // frame ever exists in which an already-finished teardown looks watched.
+  const key = startedAt instanceof Date ? startedAt.getTime() : (startedAt ?? "unset");
+  const [watched, setWatched] = React.useState(() => ({ key, fromStart: !phase.done }));
+  if (watched.key !== key) setWatched({ key, fromStart: !phase.done });
+  const fromStart = watched.key === key ? watched.fromStart : !phase.done;
+  // And past the control plane's window, the graceful path has had its chance:
+  // whatever the step clock says, what is true about that row is that nothing
+  // answered. Force disconnect and the cleanup script are the next honest move,
+  // not a tombstone written on the agent's behalf.
+  const timedOut = forceReason({ status, decommissioningSince: startedAt }) !== null;
+  const watching = fromStart && !timedOut;
   const ackedRef = React.useRef(false);
 
   React.useEffect(() => {
+    if (!watching) return;
     if (phase.done) {
       // Once, even if this effect re-runs: the ack DELETES the server row, and
       // a second call would fail with "Server not found" against a row the
@@ -202,7 +237,18 @@ function TeardownProgress({
     if (wait === null) return;
     const timer = setTimeout(() => retick((n) => n + 1), wait + 100);
     return () => clearTimeout(timer);
-  }, [serverId, startedAt, purgeVolumes, phase.done, phase.step, router]);
+  }, [serverId, startedAt, purgeVolumes, watching, phase.done, phase.step, router]);
+
+  // No spinner: nothing is turning. The request is out and the record is
+  // waiting, which is the true state of every teardown this page arrived after.
+  if (!watching) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Clock className="size-3.5" />
+        <span>The agent has not confirmed the teardown</span>
+      </span>
+    );
+  }
 
   return (
     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -255,10 +301,15 @@ function ServerRow({ server, cpMode }: { server: ServerWithCount; cpMode?: boole
               for (SIGMA-204/205). */}
           {!cpMode && isDecommissioning(server.status) && (
             <>
-              {/* The default ending, happening. It finishes by itself; the
-                  buttons beside it are the two that a clock cannot produce. */}
+              {/* The default ending, happening — for a teardown this page
+                  watched begin, which is the one the visitor just asked for. It
+                  finishes by itself; the buttons beside it are the two that a
+                  clock cannot produce, and they are also the way out of a
+                  teardown whose seconds were already spent when the page
+                  arrived. */}
               <TeardownProgress
                 serverId={server.id}
+                status={server.status}
                 startedAt={server.decommissionStartedAt}
                 purgeVolumes={server.decommissionPurgeVolumes}
               />

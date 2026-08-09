@@ -123,10 +123,16 @@ export interface Server {
   /** A graceful decommission in flight (SIGMA-204), as an OFFSET rather than a
    *  date: the dialog, its "Force disconnect" affordance and its timeout are all
    *  comparisons against the clock, so a calendar date in a fixture would decide
-   *  which of those the demo shows by the accident of when it is opened. The
-   *  seed turns this into `now − startedMinutesAgo`; see the fixture for the
-   *  offset chosen and why. */
-  decommission?: { startedMinutesAgo: number; purgeVolumes: boolean };
+   *  which of those the demo shows by the accident of when it is opened.
+   *
+   *  In MILLISECONDS, and not minutes as it was: the offset is read by two
+   *  clocks — the control plane's ten-minute patience and the demo teardown's
+   *  ten seconds — and a field that can only say "minutes" cannot be placed
+   *  against the second of them at all. It was placed against the first and
+   *  measured by the second, which is how the seeded teardown came to be over
+   *  before it was ever drawn. The seed turns this into `now − startedMsAgo`;
+   *  see the fixture for how the offset is derived. */
+  decommission?: { startedMsAgo: number; purgeVolumes: boolean };
 }
 
 export interface Resource {

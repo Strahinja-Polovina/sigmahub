@@ -12,11 +12,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// dbPortBase is the first mesh-bound host port the allocator hands out. The
-// range is per-server (unique index backstop) and never collides with the
-// engines' well-known container ports.
-const dbPortBase = 15000
-
 // ErrNotDatabase marks a database-only endpoint called on a non-database
 // resource; the API maps it to 404.
 var ErrNotDatabase = errors.New("resource is not a database")
@@ -110,7 +105,7 @@ func allocateDBPort(ctx context.Context, tx pgx.Tx, serverID string) (int, error
 			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
 			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1),
 			COALESCE((SELECT MAX(port) FROM llm_endpoints WHERE server_id = $1), $2 - 1)
-		) + 1`, serverID, dbPortBase).Scan(&port)
+		) + 1`, serverID, MeshPortBase).Scan(&port)
 	if err != nil {
 		return 0, fmt.Errorf("db port max: %w", err)
 	}

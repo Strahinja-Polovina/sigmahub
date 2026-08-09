@@ -13,14 +13,7 @@ import * as s from "./schema";
 import { user, session, account, verification, twoFactor } from "./auth-schema";
 import { auth } from "../../lib/auth";
 import { checkServerCompatibility, SERVER_STATUS } from "../../lib/server-compat";
-import { clusterCanHost } from "../../lib/server-catalog.generated";
-import {
-  CLUSTER_STATUS,
-  demoApiEndpoint,
-  demoClusterStatus,
-  demoKubernetesVersion,
-  demoNodeReport,
-} from "../../lib/demo-cluster";
+import { assertResourceTargetsAreLegal, deriveSeededClusters } from "./seed-rows";
 import {
   orgs as mockOrgs,
   projects as mockProjects,
@@ -40,30 +33,6 @@ function sha7(x: string) {
   return h.toString(16).padStart(8, "0").slice(0, 7);
 }
 
-/** Refuse to seed a fixture the product itself would not have accepted.
- *
- *  Demo data is the first thing a prospective user sees, so a row the wizard
- *  could never have produced is worse than a missing one: it teaches a rule and
- *  then breaks it on the next screen. Both checks below are the control plane's
- *  own — one target per resource (its migration 0050's CHECK constraint), and
- *  the kinds a cluster refuses, read from the generated catalog rather than
- *  listed here so a change on the Go side lands in this guard for free. */
-function assertResourceTargetsAreLegal() {
-  for (const r of mockResources) {
-    const targets = [r.serverId, r.clusterId].filter(Boolean).length;
-    if (targets !== 1) {
-      throw new Error(
-        `Demo resource ${r.name} has ${targets} deploy targets. Set exactly one of serverId or clusterId on it in web/src/lib/mock/data.ts.`
-      );
-    }
-    if (r.clusterId && !clusterCanHost(r.kind)) {
-      throw new Error(
-        `Demo resource ${r.name} is seeded into a cluster, but the control plane will not schedule a ${r.kind} inside one. Give it a serverId instead in web/src/lib/mock/data.ts.`
-      );
-    }
-  }
-}
-
 async function main() {
   // Before the migrator, never after: it reads a high-water mark that one
   // journal entry poisoned, and the demo's PGlite directory persists across
@@ -75,7 +44,7 @@ async function main() {
   // Before a single row is written, so a bad fixture fails at the top with a
   // sentence naming the file to fix rather than as a foreign-key error two
   // hundred inserts later.
-  assertResourceTargetsAreLegal();
+  assertResourceTargetsAreLegal(mockResources);
 
   // Idempotent: clear (child → parent) then identity tables.
   await db.delete(s.deployments);
@@ -163,12 +132,12 @@ async function main() {
     // somebody remembered to update (SIGMA-203).
     const facts = sv.facts ?? {};
     const incompatibleReasons = checkServerCompatibility(sv.type, facts);
-    // The teardown clock, likewise derived — the fixture states an OFFSET and
-    // this is where it becomes a date, so "how far into the ten-minute window is
-    // this demo" is answered from when the database was seeded rather than from
-    // a calendar date somebody typed (SIGMA-204).
+    // The teardown clock, likewise derived — the fixture states an OFFSET in
+    // milliseconds and this is where it becomes a date, so "where in each of the
+    // two teardown clocks is this demo" is answered from when the database was
+    // seeded rather than from a calendar date somebody typed (SIGMA-204).
     const decommissionStartedAt = sv.decommission
-      ? new Date(seededAt - sv.decommission.startedMinutesAgo * 60_000)
+      ? new Date(seededAt - sv.decommission.startedMsAgo)
       : null;
     return {
       id: sv.id,
@@ -208,69 +177,18 @@ async function main() {
     )
   );
 
-  // A cluster's rows are DERIVED from its nodes' hosts, by the demo's own
-  // functions rather than by a second copy of the rule here.
-  //
-  // The listing re-derives all of this on every read — a node's report comes
-  // from the HOST's status and how long ago it joined (demoNodeReport), and the
-  // cluster's status from the reports (demoClusterStatus, the TypeScript half of
-  // store.rederiveClusterStatusTx). So these columns are not what the dashboard
-  // will show; they are what it will show, written down. A seeded `error` node
-  // over a running host would be corrected on the first render, and a stored
-  // status that disagreed with the panel would send whoever next opened this
-  // database looking for a bug that is not there.
-  const seededServer = new Map(serverRows.map((row) => [row.id, row]));
-  const seededClusters = mockClusters.map((c) => {
-    const nodes = c.nodes.map((n) => {
-      const joinedAt = new Date(seededAt - n.joinedDaysAgo * DAY);
-      const report = demoNodeReport({
-        joinedAt,
-        serverStatus: seededServer.get(n.serverId)?.status ?? SERVER_STATUS.provisioning,
-        now: seededAt,
-      });
-      return { node: n, joinedAt, report };
-    });
-    const status = demoClusterStatus(
-      nodes.map(({ node, report }) => ({ role: node.role, status: report.status }))
-    );
-    const controlPlane = nodes.find(({ node }) => node.role === "control-plane");
-    return { cluster: c, nodes, status, controlPlaneId: controlPlane?.node.serverId };
+  // A cluster's rows are DERIVED from its nodes' hosts — from the status each
+  // one LANDED in above, which is not the status its fixture states — by the
+  // demo's own functions rather than by a second copy of the rule. See
+  // deriveSeededClusters for why the columns are written at all when every read
+  // re-derives them.
+  const seededClusters = deriveSeededClusters({
+    clusters: mockClusters,
+    hosts: serverRows,
+    seededAt,
   });
-
-  await db.insert(s.clusters).values(
-    seededClusters.map(({ cluster, status, controlPlaneId }) => ({
-      id: cluster.id,
-      orgId: cluster.orgId,
-      environmentId: cluster.environmentId,
-      name: cluster.name,
-      status,
-      // Empty while provisioning: the API server is not answering yet, and a
-      // placeholder URL there is an address someone can try to curl.
-      apiEndpoint:
-        status === CLUSTER_STATUS.provisioning
-          ? ""
-          : demoApiEndpoint(controlPlaneId ? seededServer.get(controlPlaneId)?.meshIp : ""),
-      kubernetesVersion: demoKubernetesVersion(status),
-      createdBy: cluster.createdBy,
-      createdAt: new Date(seededAt - cluster.createdDaysAgo * DAY),
-    }))
-  );
-
-  await db.insert(s.clusterNodes).values(
-    seededClusters.flatMap(({ cluster, nodes }) =>
-      nodes.map(({ node, joinedAt, report }) => ({
-        clusterId: cluster.id,
-        serverId: node.serverId,
-        role: node.role,
-        nodeStatus: report.status,
-        nodeMessage: report.message,
-        joinedAt,
-        // A node still `pending` has said nothing about Kubernetes yet, and a
-        // timestamp there would date a report that does not exist.
-        reportedAt: report.status === "pending" ? null : new Date(seededAt),
-      }))
-    )
-  );
+  await db.insert(s.clusters).values(seededClusters.clusters);
+  await db.insert(s.clusterNodes).values(seededClusters.nodes);
 
   // Deploy dates are relative to "now" (recent past) so that live deploys
   // created in-app sort as the newest — the mock's fixed 2027 dates would

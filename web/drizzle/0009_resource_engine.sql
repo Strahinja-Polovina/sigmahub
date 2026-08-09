@@ -1,0 +1,12 @@
+-- SIGMA-215, demo side: the mirror learns which engine serves a resource.
+--
+-- The control plane keeps this in `spec.engine`, where an object-storage engine
+-- (minio | seaweedfs) and an inference runtime both ride. The local mirror had
+-- no column for it, so on the demo branch the wizard's engine choice reached
+-- createResource and stopped there: every demo S3 resource was described with
+-- the default engine's image, port and endpoint shape, and a user who picked
+-- SeaweedFS on the storage step opened the resource page and was told MinIO.
+--
+-- Nullable, because most kinds have no engine to choose: an app brings its own
+-- image, and for a managed database the KIND is the engine.
+ALTER TABLE "resources" ADD COLUMN "engine" text;

@@ -8,6 +8,7 @@ import type {
   Member,
 } from "./types";
 import type { HostFacts } from "@/lib/server-compat";
+import { DECOMMISSION_TIMEOUT_MS, demoTeardownSpanMs } from "@/lib/decommission";
 
 export const orgs: Org[] = [
   { id: "org_acme", name: "Acme Cloud", slug: "acme", plan: "cloud", memberCount: 4, serverCount: 13 },
@@ -64,6 +65,37 @@ const DEBIAN_12 = {
   dockerAvailable: true,
   dockerVersion: "27.3.1",
 } satisfies HostFacts;
+
+// How far into its teardown the seeded in-flight decommission is (fsn-general-04
+// below), as an offset from the seed run. It is DERIVED rather than chosen,
+// because it has to fall on the right side of two boundaries that live in
+// another file and are three orders of magnitude apart, and a number that
+// satisfied both on the day it was typed is exactly the defect this replaces:
+// "two minutes" was written against the control plane's ten-minute window and
+// then measured by the servers page against the demo teardown's ten SECONDS, so
+// every fresh demo opened on a teardown that read finished, acked itself, and
+// deleted a server the visitor had never touched.
+//
+// Past demoTeardownSpanMs, and not narrowly: that clock is absolute wall time
+// spent long before anyone opens a seeded database, so no offset can hand a
+// visitor a ticking step counter — and a small one only converts the old bug
+// into a race, where a visitor who happens to load the page inside the span
+// still watches an unrequested server disappear. The ticking counter is
+// reached the way the product reaches it: press Disconnect and watch the
+// teardown you asked for.
+//
+// Inside DECOMMISSION_TIMEOUT_MS, because what this fixture is for is the state
+// a freshly-clicked Disconnect leaves behind — the control plane still waiting,
+// Force disconnect deliberately withheld — so that "Simulate: the agent never
+// answers" has somewhere to move the row TO.
+//
+// The midpoint is not a compromise between the two: it is the value furthest
+// from both mistakes, and it stays on the correct side of each for as long as a
+// teardown is quicker than the patience it is given, however either constant is
+// edited.
+const SEEDED_TEARDOWN_AGE_MS = Math.round(
+  (demoTeardownSpanMs(true) + DECOMMISSION_TIMEOUT_MS) / 2
+);
 
 // Disk and VRAM figures are ENUMERATED sizes — what the kernel and nvidia-smi
 // actually report — never the number on the invoice. A "2 TB" NVMe is
@@ -255,18 +287,21 @@ export const servers: Server[] = [
   // reason the gate overrides a misfiled host's status: the machine is fine, and
   // what is true about it is a decision the operator made.
   //
-  // TWO MINUTES, and relative to the seed run rather than a calendar date. The
-  // dialog decides what to offer by comparing this against the control plane's
-  // ten-minute window, so a fixed date would pick that answer for us: any date in
+  // Relative to the seed run rather than a calendar date, because the dialog
+  // decides what to offer by comparing this against the clock: any fixed date in
   // the past makes every demo, forever, show a teardown that has already timed
-  // out, and the graceful half — the state a freshly-clicked Disconnect actually
-  // produces — could never be seen. Two minutes in leaves eight of the ten, so a
-  // fresh demo opens on a teardown that is still working and the operator can
-  // drive it either way from there ("Simulate: agent acknowledged" finishes it,
-  // "Simulate: timeout" ages it into the Force disconnect path). A database
-  // seeded and then left for a week crosses the window on its own, which is not a
-  // drift: it is the row reaching the state the product would have put it in, and
-  // the dialog says exactly that.
+  // out, and the state a freshly-clicked Disconnect actually produces could
+  // never be seen. What that state IS, in a seeded database, is a decommission
+  // the control plane is still waiting on and whose agent has not reported —
+  // nothing was watching while the demo teardown's three steps went by (seven
+  // and a half seconds — this row keeps its volumes), and nothing runs between
+  // requests that could have finished it. That is the honest
+  // reading of a row this old, it is the one the servers page renders, and both
+  // exits are live from it: "…never answers" ages it into Force disconnect and
+  // the cleanup script, "…with errors" ends it the way a failed teardown does.
+  // Left alone for the rest of the window it crosses into the force path on its
+  // own, which is not drift — it is the row reaching the state the product would
+  // have put it in, and the dialog says exactly that.
   {
     id: "srv_gen_4", orgId: "org_acme", name: "fsn-general-04", type: "general",
     provider: "Hetzner", region: "eu-central · FSN1", status: "running",
@@ -276,7 +311,7 @@ export const servers: Server[] = [
       ...UBUNTU_24_04, hostname: "fsn-general-04", numCpu: 4, memTotalMb: 16_384,
       diskTotalBytes: 512_110_190_592, diskFreeBytes: 495_838_461_952,
     },
-    decommission: { startedMinutesAgo: 2, purgeVolumes: false },
+    decommission: { startedMsAgo: SEEDED_TEARDOWN_AGE_MS, purgeVolumes: false },
   },
   {
     id: "srv_nw_1", orgId: "org_northwind", name: "ams-general-01", type: "general",
