@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -818,5 +819,105 @@ func TestBuildConfigReachesTheClusterBuildOp(t *testing.T) {
 				t.Fatalf("no image.build op rendered for the build server: %+v", signed.Document.Ops)
 			}
 		})
+	}
+}
+
+// A Compose app IS its service graph, and an app that says it builds from
+// Compose while carrying none is a resource the reconciler cannot render as the
+// operator asked for.
+//
+// Reported from staging: three servers, a project, "app" plus Docker Compose
+// picked in the wizard, and the app simply never came up. The create was
+// accepted, the render took the single-container path, and nothing anywhere
+// said the resource was missing the one field its build method depends on.
+func TestAComposeAppWithNoServiceGraphIsRefusedAtCreate(t *testing.T) {
+	st, key := testStore(t)
+	ctx := context.Background()
+	ts, token := decommissionAPI(t, st, key)
+	orgID := "org_compose_gate"
+
+	serverID, _ := connectAgent(t, ts, token, orgID, "web-1", "general", noGPUHostFacts)
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "shop", Kind: "app",
+		Spec: json.RawMessage(`{"build":{"method":"compose"}}`),
+	}, "test")
+	if err == nil {
+		t.Fatal("a compose app with no service graph was accepted; the reconciler then " +
+			"builds one image from a Dockerfile the repo may not have and starts nothing else")
+	}
+	// The message has to name the way out, because the operator reading it is
+	// standing in the wizard with a repository they believe is a Compose repo.
+	if !strings.Contains(err.Error(), "detection") {
+		t.Errorf("refusal does not say how to fix it: %v", err)
+	}
+
+	// And the same app WITH a graph is created, so the gate refuses the missing
+	// field rather than the build method.
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "shop2", Kind: "app",
+		Spec: json.RawMessage(`{"build":{"method":"compose"},"compose":{"services":[{"name":"web"}]}}`),
+	}, "test"); err != nil {
+		t.Fatalf("a compose app carrying its graph was refused: %v", err)
+	}
+}
+
+// "This app has no compose services" is an ANSWER, not a failure to answer.
+//
+// The dashboard loads the service graph for every app, so returning ErrNotFound
+// for a plain Dockerfile app — which is most of them — painted "Some of this
+// page couldn't be loaded: the control plane didn't answer for the service
+// graph" across a control plane that had answered immediately and correctly.
+func TestAPlainAppReportsAnEmptyServiceGraphRatherThanNotFound(t *testing.T) {
+	st, key := testStore(t)
+	ctx := context.Background()
+	ts, token := decommissionAPI(t, st, key)
+	orgID := "org_plain_app"
+
+	serverID, _ := connectAgent(t, ts, token, orgID, "web-1", "general", noGPUHostFacts)
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "plain", Kind: "app",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	services, home, err := st.ComposeServicesForResource(ctx, orgID, res.ID)
+	if err != nil {
+		t.Fatalf("a plain app's service graph errored instead of coming back empty: %v", err)
+	}
+	if len(services) != 0 {
+		t.Errorf("got %d services for an app with no compose block", len(services))
+	}
+	if home != serverID {
+		t.Errorf("homeServerId = %q, want %q", home, serverID)
+	}
+
+	// A resource that genuinely does not exist still 404s — that is the only
+	// thing ErrNotFound should mean here.
+	if _, _, err := st.ComposeServicesForResource(ctx, orgID, "res_nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a missing resource returned %v, want ErrNotFound", err)
 	}
 }

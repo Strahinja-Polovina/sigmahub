@@ -77,7 +77,17 @@ func (s *Store) ComposeServicesForResource(ctx context.Context, orgID, resourceI
 	}
 	var shape composeSpecShape
 	if err := json.Unmarshal(raw, &shape); err != nil || shape.Compose == nil {
-		return nil, homeServer, ErrNotFound
+		// An app with no compose graph is not a missing resource — it is a
+		// resource whose answer to "what are your compose services" is "none".
+		// Returning ErrNotFound here made the two indistinguishable, and the
+		// dashboard loads this graph for EVERY app: a plain Dockerfile app, which
+		// is most of them, therefore rendered "Some of this page couldn't be
+		// loaded — the control plane didn't answer for the service graph" on a
+		// control plane that had answered immediately and correctly.
+		//
+		// A genuinely missing resource still 404s: that is the ErrNoRows branch
+		// above, and it is the only thing that should.
+		return nil, homeServer, nil
 	}
 	return shape.Compose.Services, homeServer, nil
 }
