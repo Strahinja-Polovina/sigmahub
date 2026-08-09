@@ -581,13 +581,14 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 
 	var t Deployment
 	var env, srv, conn, ref, sha, digest, cfg *string
-	var srcPin string
+	var srcPin, srcBuild string
 	var srcSvcCount int
 	err = tx.QueryRow(ctx, `
 		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
-		       COALESCE(image_pin,''), COALESCE(service_count,0), config_hash, status
+		       COALESCE(image_pin,''), COALESCE(service_count,0), config_hash, status,
+		       COALESCE(build_server_id,'')
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
-		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &srcPin, &srcSvcCount, &cfg, &t.Status)
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &srcPin, &srcSvcCount, &cfg, &t.Status, &srcBuild)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrNotFound
 	}
@@ -620,15 +621,26 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// Where this resource builds travels with the row (SIGMA-231). A rollback
+	// re-ships a retained image and renders no build of its own, but it becomes
+	// the resource's newest deployment — and the next redeploy copies from the
+	// newest deployment, so dropping the column here silently loses the build
+	// server for every deploy after it.
+	buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, d.ConnectionID, d.EnvironmentID)
+	if err != nil {
+		return Deployment{}, "", err
+	}
 	// COPY the source's pin — a rollback of a rollback keeps pointing at the
 	// original build's images, however long the chain (SIGMA-173).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,$13,'queued',$14)
+		                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, rollback_of, status, created_by,
+		                         build_server_id)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,$13,'queued',$14,NULLIF($15,''))
 		RETURNING created_at`,
 		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID,
-		d.GitRef, d.GitSHA, d.ImageDigest, srcPin, d.ConfigHash, svcCount, targetDeploymentID, actor).Scan(&d.CreatedAt)
+		d.GitRef, d.GitSHA, d.ImageDigest, srcPin, d.ConfigHash, svcCount, targetDeploymentID, actor,
+		buildServer).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -655,10 +667,12 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var env, srv, conn, ref, sha, cfg *string
+	var srcBuild string
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash,
+		       COALESCE(build_server_id,'')
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2
-		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg)
+		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg, &srcBuild)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
 	}
@@ -680,15 +694,26 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// A redeploy is a REBUILD, so where it builds is not optional (SIGMA-231).
+	// For a cluster app this column is the only thing that renders its clone and
+	// build ops anywhere, so a redeploy that drops it produces a deployment no
+	// machine can advance — queued with an empty build log until the stale-deploy
+	// sweeper fails it 45 minutes later and blames the agent.
+	buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, d.ConnectionID, d.EnvironmentID)
+	if err != nil {
+		return Deployment{}, "", err
+	}
 	// Its own pin: the forced rebuild lands on fresh per-deployment tags instead
 	// of overwriting the prior release's (SIGMA-173 — the overwrite is what made
 	// rollback silently re-ship the current image).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,''),$11,'queued',$12)
+		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by,
+		                         build_server_id)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,''),$11,'queued',$12,NULLIF($13,''))
 		RETURNING created_at`,
-		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, deployPin(d.ID), d.ConfigHash, svcCount, actor).Scan(&d.CreatedAt)
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, deployPin(d.ID), d.ConfigHash, svcCount, actor,
+		buildServer).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -750,13 +775,13 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 	seen := map[string]ServerRef{}
 	for _, resID := range resourceIDs {
 		var env, srv, conn, ref, sha, digest, cfg *string
-		var pin, status string
+		var pin, status, srcBuild string
 		err := tx.QueryRow(ctx, `
 			SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
-			       COALESCE(image_pin,''), config_hash, status
+			       COALESCE(image_pin,''), config_hash, status, COALESCE(build_server_id,'')
 			  FROM deployments WHERE org_id = $1 AND resource_id = $2
 			 ORDER BY created_at DESC LIMIT 1`, orgID, resID).
-			Scan(&env, &srv, &conn, &ref, &sha, &digest, &pin, &cfg, &status)
+			Scan(&env, &srv, &conn, &ref, &sha, &digest, &pin, &cfg, &status, &srcBuild)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
@@ -801,12 +826,28 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 				return nil, err
 			}
 		}
+		// Where this resource BUILDS travels with the row (SIGMA-231). A pinned
+		// config deploy re-ships and renders no build — but a pinless one falls
+		// back to the full clone→build→rollout below, and for a cluster app that
+		// pipeline exists only in the build server's document. Carrying it also
+		// keeps the column alive for the next redeploy, which copies from this row.
+		//
+		// Resolved AFTER the fallback above, deliberately: when the latest attempt
+		// failed and we re-ship the last successful release instead, the build
+		// server that matters is still the one configured for this resource today,
+		// not whichever host built a release months ago.
+		buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, deref(conn), deref(env))
+		if err != nil {
+			return nil, err
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by)
-			VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'config',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,'queued',$13)`,
+			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by,
+			                         build_server_id)
+			VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'config',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,'queued',$13,NULLIF($14,''))`,
 			depID, orgID, resID, deref(env), deref(srv), deref(conn),
-			deref(ref), deref(sha), deref(digest), pin, deref(cfg), svcCount, actor); err != nil {
+			deref(ref), deref(sha), deref(digest), pin, deref(cfg), svcCount, actor,
+			buildServer); err != nil {
 			return nil, err
 		}
 		if err := auditTx(ctx, tx, orgID, actor, "Config deploy queued ("+reason+")", resID); err != nil {
@@ -1416,6 +1457,40 @@ func composeServiceCount(spec []byte) int {
 // resourceServiceCountTx computes the CURRENT compose service count for a
 // resource — used by rollback/redeploy so the per-service denominator reflects
 // the spec that will actually be rendered, not a stale copy from a prior row.
+// resolveBuildServerTx answers "where does this deployment build?" for the
+// creators that mint a deployment from an EARLIER one instead of from a push:
+// manual redeploy, rollback and config deploy (SIGMA-231).
+//
+// Only the push path (DrainDeployRequests) and CreateHeadDeployment ever wrote
+// build_server_id, so those three minted rows with the column NULL. That is not
+// cosmetic: ClusterBuildSpecsForServer keys on it, and it is the ONLY thing that
+// puts a cluster workload's clone+build ops into any document at all — a cluster
+// app whose redeploy lost the column can be built by nobody, so it sits 'queued'
+// with an empty log until TimeoutStaleDeployments fails it 45 minutes later with
+// a message blaming the agent. clusterImageReady keys on it too. And because
+// each of these creators copies from the resource's MOST RECENT deployment, one
+// dropped column poisons every deploy after it.
+//
+// Prefer the source row (a deploy's history should explain itself), and fall
+// back to the branch map the way DrainDeployRequests resolves it — that covers a
+// release created before the operator picked a build server.
+func resolveBuildServerTx(ctx context.Context, tx pgx.Tx, srcBuildServer, connID, envID string) (string, error) {
+	if srcBuildServer != "" {
+		return srcBuildServer, nil
+	}
+	if connID == "" || envID == "" {
+		return "", nil
+	}
+	var out string
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(build_server_id,'') FROM git_branch_map
+		 WHERE connection_id = $1 AND environment_id = $2 LIMIT 1`, connID, envID).Scan(&out)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return out, err
+}
+
 func resourceServiceCountTx(ctx context.Context, tx pgx.Tx, orgID, resourceID string) (int, error) {
 	var spec []byte
 	err := tx.QueryRow(ctx, `SELECT spec FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&spec)
