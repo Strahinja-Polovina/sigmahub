@@ -698,3 +698,133 @@ func TestAServerWhoseAgentNeverRegisteredIsRemovedImmediately(t *testing.T) {
 		t.Errorf("%d agent token(s) still live for a removed server", live)
 	}
 }
+
+// SIGMA-229: the bound-resources guard has to ask the SAME question the
+// renderer asks — "what does this server run?" — and the renderer's answer
+// (ResourceHostedHere) counts three things, of which the guard historically
+// knew only one.
+//
+// The hole that matters in practice is per-service Compose placement. A
+// Compose app owned by one server can have individual services dragged onto
+// another host; the spec, not the resources row, records where they went. So
+// the receiving host's `resources` rows are empty, the disconnect dialog
+// reports zero blockers, and the graceful teardown proceeds: the agent removes
+// the containers and the row is tombstoned, while the app's spec still names a
+// server that no longer exists. No other document renders those services, and
+// nothing anywhere reports an error.
+func TestDecommissionRefusesAHostOfPlacedComposeServices(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_placed_compose"
+
+	appServer := connectServer(t, st, orgID, "srv_app")
+	dataServer := connectServer(t, st, orgID, "srv_data")
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{appServer, dataServer} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: appServer, Name: "shop", Kind: "app",
+		Spec: json.RawMessage(`{"compose":{"services":[{"name":"web"},{"name":"worker"},{"name":"redis"}]}}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetComposePlacements(ctx, orgID, app.ID, []store.ComposePlacement{
+		{Service: "worker", ServerID: dataServer},
+		{Service: "redis", ServerID: dataServer},
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// srv_data has no `resources` row of its own, but it runs two containers.
+	_, err = st.BeginDecommission(ctx, orgID, dataServer, false, "operator")
+	var bound store.ErrBoundResources
+	if !errors.As(err, &bound) {
+		t.Fatalf("BeginDecommission on a host of placed Compose services returned %v; "+
+			"want a 409 naming the app whose services run here", err)
+	}
+	if len(bound.Names) != 1 || bound.Names[0] != "shop" {
+		t.Fatalf("boundResources = %v, want [shop]", bound.Names)
+	}
+	// The force path answers from the same guard.
+	if err := st.DeleteServer(ctx, orgID, dataServer, "operator"); !errors.As(err, &bound) {
+		t.Fatalf("DeleteServer on a host of placed Compose services returned %v; want the same 409", err)
+	}
+
+	// And once the services move back home, the disconnect goes through.
+	if _, err := st.SetComposePlacements(ctx, orgID, app.ID, []store.ComposePlacement{
+		{Service: "worker", ServerID: appServer},
+		{Service: "redis", ServerID: appServer},
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.BeginDecommission(ctx, orgID, dataServer, false, "operator"); err != nil {
+		t.Fatalf("BeginDecommission after re-homing the services: %v", err)
+	}
+}
+
+// SIGMA-229, the other half: a dedicated build server holds no `resources` row
+// either — the clone+build ops live in ITS document because a deployment (or a
+// branch map) names it as build_server_id. Disconnecting it mid-build tears
+// down the builder under a pipeline that then hangs with nothing to report it.
+func TestDecommissionRefusesALiveBuildServer(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_live_builder"
+
+	runServer := connectServer(t, st, orgID, "run")
+	buildServer := connectServer(t, st, orgID, "build")
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{runServer, buildServer} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: runServer, Name: "api", Kind: "app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: runServer,
+		ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, buildServer); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.BeginDecommission(ctx, orgID, buildServer, false, "operator"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("BeginDecommission on a live build server returned %v; want a 409", err)
+	}
+	if err := st.DeleteServer(ctx, orgID, buildServer, "operator"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("DeleteServer on a live build server returned %v; want a 409", err)
+	}
+}

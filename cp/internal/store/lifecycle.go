@@ -81,9 +81,33 @@ func lockServerForDecommission(ctx context.Context, tx pgx.Tx, orgID, serverID s
 }
 
 // boundResourcesTx lists the resources still bound to a server, in name order.
+//
+// "Bound" is ResourceHostedHere's question, asked with ResourceHostedHere's
+// answer, and that is the whole point (SIGMA-229): the guard that decides
+// whether a host may be torn down has to count the same workloads the renderer
+// would put in that host's document. It used to ask only `resources.server_id`,
+// which misses two of the three ways a resource lands on a machine.
+//
+// The one that bit was per-service Compose placement. A Compose app owned by
+// srv_app can have its worker and redis services dragged onto srv_data; the
+// placement lives in the app's SPEC, not in a resources row, so srv_data's
+// Resources tab was empty and the disconnect dialog reported zero blockers. The
+// graceful teardown then ran to completion — containers force-removed, managed
+// network gone, row tombstoned — while the spec still named srv_data as those
+// services' serverId, so no other document ever rendered them again. The app
+// stayed permanently half-running and nothing anywhere reported an error.
+//
+// Cluster membership is the third case. The graceful path refuses a cluster
+// member earlier and with a better sentence (clusterMembershipTx), so this only
+// changes the FORCE path, where a node carrying cluster workloads now has to be
+// removed from its cluster first — RemoveClusterNode works on an unreachable
+// host, so the escape hatch is still reachable, it just no longer leaves k3s
+// workloads pointing at a server the product has forgotten.
 func boundResourcesTx(ctx context.Context, tx pgx.Tx, orgID, serverID string) ([]string, error) {
 	rows, err := tx.Query(ctx,
-		`SELECT name FROM resources WHERE org_id = $1 AND server_id = $2 ORDER BY name`, orgID, serverID)
+		`SELECT r.name FROM resources r
+		  WHERE r.org_id = $1 AND`+ResourceHostedHere("$2")+`
+		  ORDER BY r.name`, orgID, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("list bound resources: %w", err)
 	}
@@ -97,6 +121,64 @@ func boundResourcesTx(ctx context.Context, tx pgx.Tx, orgID, serverID string) ([
 		bound = append(bound, rn)
 	}
 	return bound, rows.Err()
+}
+
+// buildServerUseTx reports whether a server is still named as somebody's
+// dedicated BUILD server, and by what, or "" when nothing names it.
+//
+// A build server hosts no resource of its own — that is the entire idea — so
+// the bound-resources guard, however widened, cannot see it: what puts the
+// clone+build ops in its document is a deployment or a branch map naming it as
+// build_server_id (see deploymentReporterClause, which counts it as one of the
+// four ways a server owns part of a deployment). Disconnecting it therefore
+// looked completely clean and left two different wounds:
+//
+//   - an in-flight deployment whose build ops were rendered into a machine that
+//     is being torn down under them. Nothing else can run or report those ops,
+//     so the pipeline sits in 'building' until it times out, if it ever does;
+//   - a branch map still pointing at a tombstoned server, which is silent until
+//     the next push to that branch and then breaks every auto-deploy on it.
+//
+// Only LIVE deployments count — the same statuses ClusterBuildSpecsForServer
+// renders for. A finished build is history, and blocking on history would wedge
+// the force path forever. A branch map counts unconditionally: it is standing
+// configuration, and the operator clears it by picking another builder.
+func buildServerUseTx(ctx context.Context, tx pgx.Tx, orgID, serverID string) (string, error) {
+	var deployments, branches int
+	if err := tx.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM deployments
+		         WHERE org_id = $1 AND build_server_id = $2
+		           AND status IN ('queued','building','deploying')),
+		       (SELECT count(*) FROM git_branch_map m
+		          JOIN git_connections c ON c.id = m.connection_id
+		         WHERE c.org_id = $1 AND m.build_server_id = $2)`,
+		orgID, serverID).Scan(&deployments, &branches); err != nil {
+		return "", fmt.Errorf("check build server use: %w", err)
+	}
+	switch {
+	case deployments > 0 && branches > 0:
+		return fmt.Sprintf("%d deployment(s) are building on it and %d branch(es) are configured to build on it",
+			deployments, branches), nil
+	case deployments > 0:
+		return fmt.Sprintf("%d deployment(s) are building on it", deployments), nil
+	case branches > 0:
+		return fmt.Sprintf("%d branch(es) are configured to build on it", branches), nil
+	}
+	return "", nil
+}
+
+// refuseIfBuildServerTx turns buildServerUseTx into the 409 both disconnect
+// paths answer with.
+func refuseIfBuildServerTx(ctx context.Context, tx pgx.Tx, orgID, serverID string) error {
+	use, err := buildServerUseTx(ctx, tx, orgID, serverID)
+	if err != nil {
+		return err
+	}
+	if use != "" {
+		return fmt.Errorf("%w: this server is a build server — %s; point them at another server first",
+			ErrConflict, use)
+	}
+	return nil
 }
 
 // tombstoneServerTx is the terminal half of a disconnect: the soft-delete
@@ -162,6 +244,10 @@ func (s *Store) DeleteServer(ctx context.Context, orgID, serverID, actor string)
 	}
 	if len(bound) > 0 {
 		return ErrBoundResources{Names: bound}
+	}
+	// A build server owns no resource, so the check above cannot see it.
+	if err := refuseIfBuildServerTx(ctx, tx, orgID, serverID); err != nil {
+		return err
 	}
 	if err := tombstoneServerTx(ctx, tx, orgID, serverID, name, actor, "Server deleted"); err != nil {
 		return err

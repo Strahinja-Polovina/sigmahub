@@ -89,6 +89,14 @@ func (s *Store) BeginDecommission(ctx context.Context, orgID, serverID string, p
 	if len(bound) > 0 {
 		return DecommissionState{}, ErrBoundResources{Names: bound}
 	}
+	// A dedicated build server hosts nothing of its own — the clone+build ops
+	// are in its document because a deployment or a branch map names it — so the
+	// bound-resources check above cannot see it, however widely it looks
+	// (SIGMA-229). Tearing it down mid-build leaves the pipeline with no machine
+	// that can run or report the step it is waiting on.
+	if err := refuseIfBuildServerTx(ctx, tx, orgID, serverID); err != nil {
+		return DecommissionState{}, err
+	}
 
 	// A host whose agent never registered has nothing to tear down, and nothing
 	// that could ever tell us it did.
