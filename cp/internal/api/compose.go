@@ -27,6 +27,20 @@ func (s *Server) handleGetComposeServices(w http.ResponseWriter, r *http.Request
 		s.writeStoreErr(w, err, "compose services")
 		return
 	}
+	if services == nil {
+		// A nil Go slice marshals to JSON `null`, not `[]`, and "this app has no
+		// compose graph" is the COMMON case here — the dashboard loads this for
+		// every app, and most are plain Dockerfile apps.
+		//
+		// This is the second half of the bug that made a plain app render "the
+		// control plane didn't answer for the service graph". Fixing the store
+		// to return no services instead of ErrNotFound removed the 404 and put
+		// `"services": null` on the wire in its place, so the page went from a
+		// banner to `Cannot read properties of null (reading 'length')` — a
+		// worse outcome, and one the store-level test could not see because the
+		// store was already right. Empty list in, empty list out.
+		services = []store.ComposeServiceView{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"services": services,
 		// Services with no explicit placement run here.
