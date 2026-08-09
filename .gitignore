@@ -27,6 +27,7 @@ out/
 Thumbs.db
 *.log
 .codex/
+.idea/
 
 # Go build artifacts
 cp/bin/
