@@ -306,9 +306,12 @@ func TestTheServedContextIsClampedToTheModelsOwnCeilingAtCreate(t *testing.T) {
 		// model exits at startup on a card it fits three times over.
 		{"a model shorter than the window we sized", 2048, 2048},
 		{"a model longer than the window we sized", 131072, 8192},
-		// Unknown stays 0, which renders no flag at all rather than inventing a
-		// ceiling for a model whose ceiling nobody could read.
-		{"a model the Hub described no ceiling for", 0, 0},
+		// Unknown gets the window the VRAM estimate was paid for, so the flag
+		// and the arithmetic agree. Rendering nothing here was the OTHER way of
+		// getting this wrong: a ceiling is unreadable when config.json is gated,
+		// gated repositories are the long-context ones, and an unpinned Llama
+		// takes 131072 and exits on a KV cache the fit check never estimated.
+		{"a model whose ceiling nobody could read", 0, hf.SizedContextTokens},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, _ := testStore(t)
