@@ -61,7 +61,11 @@ type fakeGitHub struct {
 	mu          sync.Mutex
 	assets      []fakeAsset // index+1 is the asset id, mirroring GitHub's numeric ids
 	forceStatus int         // when set, every request answers this instead
-	requests    []recordedRequest
+	// forceRateLimitHeader adds `X-RateLimit-Remaining: 0` to the forced
+	// response, which is how GitHub's REST API actually reports an exhausted
+	// PRIMARY rate limit: 403 plus that header, not 429.
+	forceRateLimitHeader bool
+	requests             []recordedRequest
 }
 
 func (g *fakeGitHub) add(a fakeAsset) { g.assets = append(g.assets, a) }
@@ -81,12 +85,16 @@ func (g *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		auth: r.Header.Get("Authorization"), accept: r.Header.Get("Accept"),
 	})
 	forced := g.forceStatus
+	rateLimited := g.forceRateLimitHeader
 	g.mu.Unlock()
 
 	if forced != 0 {
 		// GitHub's own error bodies are JSON; serving one here is what proves
 		// the proxy never forwards an upstream body into a root shell.
 		w.Header().Set("Content-Type", "application/json")
+		if rateLimited {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+		}
 		w.WriteHeader(forced)
 		_, _ = w.Write([]byte(`{"message":"Not Found","documentation_url":"https://docs.github.com"}`))
 		return
@@ -524,6 +532,67 @@ func TestAGitHubRateLimitIsReportedAsTemporaryAndNamesTheTokenAsTheFix(t *testin
 	}
 	if !strings.Contains(rec.Body.String(), "CP_RELEASE_TOKEN") {
 		t.Errorf("rate-limit message does not mention that a token raises the limit:\n%s", rec.Body.String())
+	}
+}
+
+// GitHub's REST API reports an exhausted PRIMARY rate limit as 403 with
+// X-RateLimit-Remaining: 0. Only the newer secondary limits answer 429, so
+// switching on the status alone routes the COMMON exhaustion path — an
+// anonymous control plane spending its 60 requests an hour, which is ten
+// onboardings — into the credential branch.
+//
+// The operator then reads "Set CP_RELEASE_TOKEN to a token with read access",
+// revokes a perfectly good PAT, re-issues it, redeploys the control plane, and
+// gets the identical message, because the limit has not reset. A rotation and a
+// restart burned mid-onboarding on a condition that clears itself in minutes.
+//
+// cp/internal/githubapp/inspect.go has known this for two call sites; this is
+// the third.
+func TestUpstreamError_RateLimited403(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		// The anonymous 60/hr budget is the one that actually runs out.
+		{"public path", ""},
+		{"authenticated path", testReleaseToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			gh.forceStatus = http.StatusForbidden
+			gh.forceRateLimitHeader = true
+			s, _ := installerServer(t, gh, ReleaseSource{Token: tc.token})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+			body := rec.Body.String()
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("rate-limited 403 answered %d, want 503 (retryable, like the 429 path): %s", rec.Code, body)
+			}
+			if !strings.Contains(body, "rate-limited") || !strings.Contains(body, "Retry in a few minutes") {
+				t.Errorf("an exhausted rate limit is not reported as one:\n%s", body)
+			}
+			if strings.Contains(body, "GitHub refused this control plane's release credential") {
+				t.Errorf("a spent rate limit is reported as a bad credential, which sends the operator "+
+					"to rotate a token that is fine:\n%s", body)
+			}
+		})
+	}
+}
+
+// And the header must not turn every refusal into a rate limit: a genuinely
+// bad credential still answers with X-RateLimit-Remaining above zero (or no
+// header at all), and must still name CP_RELEASE_TOKEN.
+func TestARefusedCredentialWithBudgetLeftStillNamesTheToken(t *testing.T) {
+	gh := releaseWithInstaller()
+	gh.forceStatus = http.StatusForbidden
+	s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("upstream 403 with budget left answered %d, want 502: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CP_RELEASE_TOKEN") {
+		t.Errorf("credential refusal no longer names the setting that fixes it:\n%s", rec.Body.String())
 	}
 }
 

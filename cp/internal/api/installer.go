@@ -572,7 +572,7 @@ func (rs ReleaseSource) openPublic(ctx context.Context, version, asset string) (
 	}
 	if resp.StatusCode != http.StatusOK {
 		drain(resp)
-		return nil, 0, upstreamError(resp.StatusCode, version, asset)
+		return nil, 0, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	if resp.ContentLength > rs.MaxBytes {
 		drain(resp)
@@ -608,7 +608,8 @@ func (rs ReleaseSource) openAuthenticated(ctx context.Context, version, asset st
 	if want == nil {
 		// The release exists and does not publish this asset. That is the same
 		// answer as "no such release" to the caller, and the same fixes apply.
-		return nil, 0, upstreamError(http.StatusNotFound, version, asset)
+		// Synthesized here, so there are no upstream headers to read.
+		return nil, 0, upstreamError(http.StatusNotFound, nil, version, asset)
 	}
 	// Refuse on the DECLARED size, before a byte is transferred. This is the
 	// cheap half of the cap; the stream is capped again in proxyReleaseAsset
@@ -637,7 +638,7 @@ func (rs ReleaseSource) openAuthenticated(ctx context.Context, version, asset st
 	}
 	if resp.StatusCode != http.StatusOK {
 		drain(resp)
-		return nil, 0, upstreamError(resp.StatusCode, version, asset)
+		return nil, 0, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	size := resp.ContentLength
 	if size <= 0 {
@@ -671,7 +672,7 @@ func (rs ReleaseSource) releaseAssets(ctx context.Context, version, asset string
 	}
 	defer drain(resp)
 	if resp.StatusCode != http.StatusOK {
-		return nil, upstreamError(resp.StatusCode, version, asset)
+		return nil, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	var payload struct {
 		Assets []releaseAsset `json:"assets"`
@@ -698,7 +699,26 @@ func (rs ReleaseSource) authenticate(req *http.Request) {
 // and never a value: the token must not appear in a body, an error or a log,
 // and the repository slug is withheld from anonymous callers on purpose (see
 // proxyReleaseAsset).
-func upstreamError(status int, version, asset string) *releaseError {
+// hdr is the upstream response's headers, and it is not optional decoration:
+// GitHub's REST API answers an exhausted PRIMARY rate limit with 403 and
+// X-RateLimit-Remaining: 0 — 429 covers only the newer secondary limits — so
+// without the header a spent budget is indistinguishable from a bad credential
+// and gets reported as one. Pass nil only for a status this package
+// SYNTHESIZED (see openAuthenticated's asset-not-in-release 404), where there
+// is no upstream response to read.
+func upstreamError(status int, hdr http.Header, version, asset string) *releaseError {
+	// One rate-limit answer, whichever status is carrying it — and the real
+	// upstream status is kept, so the log line still says 403 when GitHub said
+	// 403. Mirrors cp/internal/githubapp/inspect.go, which has made this same
+	// header check at two call sites since before this file existed.
+	rateLimit := func() *releaseError {
+		return &releaseError{status: http.StatusServiceUnavailable, upstream: status, msg: fmt.Sprintf(
+			"GitHub rate-limited this control plane while fetching %s. Retry in a few minutes; setting CP_RELEASE_TOKEN raises the limit from 60 requests an hour to 5000.",
+			asset)}
+	}
+	if isRateLimited(status, hdr) {
+		return rateLimit()
+	}
 	switch status {
 	case http.StatusNotFound:
 		// Answered honestly as a 404: GitHub has no such asset, and neither do
@@ -715,15 +735,35 @@ func upstreamError(status int, version, asset string) *releaseError {
 		return &releaseError{status: http.StatusBadGateway, upstream: status, msg: fmt.Sprintf(
 			"GitHub refused this control plane's release credential while fetching %s. Set CP_RELEASE_TOKEN to a token with read access to the release repository's contents (a fine-grained token needs the Contents permission; a classic token needs the repo scope).",
 			asset)}
-	case http.StatusTooManyRequests:
-		return &releaseError{status: http.StatusServiceUnavailable, upstream: status, msg: fmt.Sprintf(
-			"GitHub rate-limited this control plane while fetching %s. Retry in a few minutes; setting CP_RELEASE_TOKEN raises the limit from 60 requests an hour to 5000.",
-			asset)}
 	default:
 		return &releaseError{status: http.StatusBadGateway, upstream: status, msg: fmt.Sprintf(
 			"GitHub answered %d while fetching %s. This is an upstream failure, not a configuration error; retry, and check https://www.githubstatus.com if it persists.",
 			status, asset)}
 	}
+}
+
+// isRateLimited reports whether an upstream refusal is a spent GitHub budget
+// rather than a credential problem.
+//
+// 429 is the easy half: it is what GitHub's newer SECONDARY rate limits answer
+// with. The PRIMARY limit — the one an anonymous control plane actually runs
+// out of, at 60 requests an hour against six per onboarding — answers 403 with
+// X-RateLimit-Remaining: 0. Switching on the status alone therefore lands the
+// common exhaustion in the credential branch, which tells an operator mid-
+// rollout to rotate a token that is fine; they revoke it, re-issue it, redeploy
+// the control plane, and read the identical sentence, because the limit has not
+// reset.
+//
+// A nil header is treated as "not rate-limited", which is right for the one
+// caller that synthesizes a status with no upstream response behind it.
+func isRateLimited(status int, hdr http.Header) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	return hdr.Get("X-RateLimit-Remaining") == "0"
 }
 
 func oversizedMessage(asset string, maxBytes int64) string {
