@@ -394,6 +394,9 @@ func run() error {
 	// /dl proxy, so a fleet on a private release repo can be upgraded.
 	rec.SetPublicURL(cfg.PublicURL)
 	rec.SetObservers(metrics.Loop(cpmetrics.LoopReconcilerResync).Report, metrics.ObserveDSDRender)
+	// SIGMA-320: how long a whole fleet pass takes, so the 60s drift-repair SLO
+	// degrading as the fleet grows is visible before a customer reports it.
+	rec.SetResyncPassObserver(metrics.ObserveResyncPass)
 	// Cross-replica long-poll wake-ups over Postgres LISTEN/NOTIFY (SIGMA-291):
 	// without this the waiter map is per-process, so an agent long-polling one
 	// replica sleeps out its whole window when another replica renders its

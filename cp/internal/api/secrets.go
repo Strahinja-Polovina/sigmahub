@@ -89,7 +89,7 @@ func (s *Server) handleListSecrets(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list secrets")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"secrets": secrets})
+	writeJSON(w, http.StatusOK, map[string]any{"secrets": jsonList(secrets)})
 }
 
 // handleRevealSecret returns a secret's decrypted value, audited. Gated at

@@ -530,7 +530,7 @@ func TestPushWithNoTargetsSaysSo(t *testing.T) {
 	if _, err := st.DrainDeployRequests(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reqs, err := st.ListDeployRequests(ctx, orgID, 10)
+	reqs, err := st.ListDeployRequests(ctx, orgID, "", 10)
 	if err != nil || len(reqs) != 1 {
 		t.Fatalf("deploy requests = %+v err=%v", reqs, err)
 	}
@@ -553,7 +553,7 @@ func TestPushWithNoTargetsSaysSo(t *testing.T) {
 	if _, err := st.DrainDeployRequests(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reqs, _ = st.ListDeployRequests(ctx, orgID, 10)
+	reqs, _ = st.ListDeployRequests(ctx, orgID, "", 10)
 	var latest store.DeployRequest
 	for _, r := range reqs {
 		if r.SHA == "def7654321" {
@@ -600,7 +600,7 @@ func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
 		map[string]json.RawMessage{app.ID: reported}, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	list, err := st.ListResources(ctx, orgID, envID)
+	list, err := st.ListResources(ctx, orgID, envID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -630,7 +630,7 @@ func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
 		map[string]json.RawMessage{app.ID: json.RawMessage(`{"state":"running"}`)}, true, nil); err != nil {
 		t.Fatal(err)
 	}
-	list, _ = st.ListResources(ctx, orgID, envID)
+	list, _ = st.ListResources(ctx, orgID, envID, "")
 	for _, r := range list {
 		if r.ID == app.ID && !strings.Contains(string(r.Status), "ImagePullBackOff") {
 			t.Fatalf("an unrelated server overwrote the resource's status: %s", r.Status)

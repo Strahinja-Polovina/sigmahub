@@ -71,18 +71,38 @@ func e2eKubectl(t *testing.T) func(stdin string, args ...string) (string, error)
 // The single-container workload: namespace, secrets (env and file mode), a
 // private-registry pull secret, ports, and an ingress. Every object we know how
 // to emit, in one document.
+//
+// The spec is the CONTROL PLANE's (SIGMA-338): it is decoded from the fixture
+// cp/internal/reconciler writes, not written down here. A literal proves only
+// that the renderer handles what the test author typed; what the API server
+// has to accept is what the control plane actually sends, and the two structs
+// are hand-mirrored across a module boundary with no import to keep them
+// honest. Anything the control plane stops sending — a lost replica count, a
+// renamed hosts field that silently drops every ingress — now fails here.
 func TestK8sE2EManifestAcceptedByAPIServer(t *testing.T) {
 	kubectl := e2eKubectl(t)
 
-	spec := ApplySpec{
-		ResourceID: "res_0a1b2c3d4e5f6071",
-		Name:       "sigmahub-res-0a1b2c3d4e5f6071",
-		Namespace:  e2eNamespace("sigmahub-prj"),
-		Image:      "ghcr.io/acme/app:abc1234567-pin1",
-		Replicas:   2,
-		Ports:      []int{8080},
-		Env:        map[string]string{"LOG_LEVEL": "info", "WITH_COLON": "a:b", "WITH_NEWLINE": "a\nb"},
-		Hosts:      []string{"app.example.com"},
+	spec := cpApplySpec(t, "git-deployed-app", "")
+	// Two overrides, both about the test environment rather than the workload:
+	// a namespace unique to this run (deleting one is asynchronous, so a fixed
+	// name makes the SECOND run fail on the first one's cleanup), and env values
+	// containing a colon and a newline. The control plane would never send those
+	// — but the renderer's quoting is what stops a secret from rewriting the
+	// document, and this is the only place a real parser checks it.
+	spec.Namespace = e2eNamespace("sigmahub-prj")
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	spec.Env["WITH_COLON"] = "a:b"
+	spec.Env["WITH_NEWLINE"] = "a\nb"
+	// A workload the control plane asked for must be able to have a pod. The
+	// API server accepts replicas: 0 without complaint and runs nothing, which
+	// is exactly the class of failure a green-everywhere suite misses.
+	if spec.Replicas < 1 {
+		t.Fatalf("the control plane rendered replicas = %d", spec.Replicas)
+	}
+	if len(spec.Hosts) == 0 || len(spec.Ports) == 0 {
+		t.Fatalf("fixture case lost its hosts/ports; nothing would exercise the ingress: %+v", spec)
 	}
 	secrets := []Secret{
 		{Name: "DATABASE_URL", Value: "postgres://u:p@h:5432/db\nevil: true", EnvVar: true},
@@ -109,7 +129,7 @@ func TestK8sE2EManifestAcceptedByAPIServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deployment not readable: %v\n%s", err, out)
 	}
-	want := fmt.Sprintf("2 %s %s-registry", spec.Image, spec.Name)
+	want := fmt.Sprintf("%d %s %s-registry", spec.Replicas, spec.Image, spec.Name)
 	if strings.TrimSpace(out) != want {
 		t.Fatalf("deployment = %q, want %q", strings.TrimSpace(out), want)
 	}
@@ -140,47 +160,55 @@ func TestK8sE2EManifestAcceptedByAPIServer(t *testing.T) {
 		t.Fatalf("env value round-trip = %q (err %v), want %q", out, err, "a\nb")
 	}
 
+	// The domain the control plane attached must be the domain the API server
+	// ended up routing — not a hostname this test invented.
 	if out, err := kubectl("", "get", "ingress", spec.Name, "-n", spec.Namespace,
-		"-o", "jsonpath={.spec.rules[0].host}"); err != nil || strings.TrimSpace(out) != "app.example.com" {
-		t.Fatalf("ingress host = %q (err %v)", strings.TrimSpace(out), err)
+		"-o", "jsonpath={.spec.rules[0].host}"); err != nil || strings.TrimSpace(out) != spec.Hosts[0] {
+		t.Fatalf("ingress host = %q (err %v), want %q", strings.TrimSpace(out), err, spec.Hosts[0])
 	}
 }
 
 // A Compose app is N workloads in one namespace. They must not collide: same
 // namespace, distinct object names, each its own Deployment and Service.
+//
+// The workloads are the ones the control plane renders for a real Compose
+// graph (SIGMA-338) — read from its fixture rather than invented here, so the
+// object names the API server sees are the names dsd.K8sWorkloadName produces
+// and the portless service is portless because the control plane said so.
 func TestK8sE2EComposeWorkloadsCoexist(t *testing.T) {
 	kubectl := e2eKubectl(t)
 	ns := e2eNamespace("sigmahub-prj-compose")
 	defer func() { _, _ = kubectl("", "delete", "namespace", ns, "--ignore-not-found", "--wait=false") }()
 
-	for _, svc := range []struct {
-		name  string
-		image string
-		ports []int
-	}{
-		{"sigmahub-res-1-web", "ghcr.io/acme/res-1-web:abc", []int{8080}},
-		{"sigmahub-res-1-worker", "ghcr.io/acme/res-1-worker:abc", nil}, // portless: no Service
-		{"sigmahub-res-1-db", "postgres:16", []int{5432}},
-	} {
-		manifest, err := renderManifests(ApplySpec{
-			ResourceID: "res_1", Service: svc.name, Name: svc.name, Namespace: ns,
-			Image: svc.image, Replicas: 1, Ports: svc.ports,
-		}, ns, nil, nil)
+	specs := cpApplySpecs(t, "compose-graph")
+	if len(specs) < 2 {
+		t.Fatalf("the compose fixture has %d workloads; it is meant to be a graph", len(specs))
+	}
+	var portless []string
+	for _, spec := range specs {
+		spec.Namespace = ns
+		if len(spec.Ports) == 0 {
+			portless = append(portless, spec.Name)
+		}
+		manifest, err := renderManifests(spec, ns, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if out, err := kubectl(manifest, "apply", "-f", "-"); err != nil {
-			t.Fatalf("service %s rejected: %v\n%s\n--- manifest ---\n%s", svc.name, err, out, manifest)
+			t.Fatalf("workload %s rejected: %v\n%s\n--- manifest ---\n%s", spec.Name, err, out, manifest)
 		}
+	}
+	if len(portless) == 0 {
+		t.Fatal("the compose fixture has no portless workload; the no-Service rule below is untested")
 	}
 
 	out, err := kubectl("", "get", "deployments", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"sigmahub-res-1-web", "sigmahub-res-1-worker", "sigmahub-res-1-db"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("deployments = %q, missing %s", out, want)
+	for _, spec := range specs {
+		if !strings.Contains(out, spec.Name) {
+			t.Fatalf("deployments = %q, missing %s", out, spec.Name)
 		}
 	}
 	// A portless worker has nothing to expose; emitting a Service with no ports
@@ -189,8 +217,10 @@ func TestK8sE2EComposeWorkloadsCoexist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(svcOut, "sigmahub-res-1-worker") {
-		t.Fatalf("a portless service must not get a Service object: %q", svcOut)
+	for _, name := range portless {
+		if strings.Contains(svcOut, name) {
+			t.Fatalf("a portless workload must not get a Service object: %q", svcOut)
+		}
 	}
 }
 

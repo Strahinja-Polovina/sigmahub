@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
@@ -83,6 +84,14 @@ type Reconciler struct {
 	// rather than one server's.
 	onResync func(error)
 	onRender func(time.Duration)
+	// onResyncPass times a whole fleet-resync pass (SIGMA-320). Distinct from
+	// onResync, which only says whether a pass converged: the resync IS the
+	// drift-repair SLO the agent advertises ("a change lands within 60s"), and
+	// the way that SLO dies is not an error but a pass that quietly takes four
+	// minutes because the fleet grew. Nothing measured it, so the degradation
+	// from 60s to 20 minutes produced no signal anywhere and the first symptom
+	// was a customer noticing.
+	onResyncPass func(time.Duration)
 }
 
 func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
@@ -119,6 +128,10 @@ const (
 	// request handling. Throughput is not the constraint — a render is a
 	// handful of milliseconds, so a 25-server org still re-renders in well
 	// under a second.
+	//
+	// It also sizes the fleet resync's worker pool (SIGMA-320): the resync
+	// competes for the same connections, so widening the pass means using these
+	// slots properly rather than adding a second, unaccounted bound.
 	reconcileConcurrency = 4
 	// reconcileQueueWait bounds how long a queued ReconcileAsync waits for a
 	// slot before giving up. Fire-and-forget goroutines must not pile up
@@ -151,6 +164,11 @@ func (r *Reconciler) acquireSlot(ctx context.Context) (func(), bool) {
 func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Duration)) {
 	r.onResync, r.onRender = onResync, onRender
 }
+
+// SetResyncPassObserver installs the fleet-resync pass timer (SIGMA-320).
+// Additive to SetObservers so existing callers need no change; optional and nil
+// in most tests.
+func (r *Reconciler) SetResyncPassObserver(fn func(time.Duration)) { r.onResyncPass = fn }
 
 // ChangeBus carries DSD change announcements between control-plane replicas
 // (SIGMA-291). cp/internal/store implements it over Postgres LISTEN/NOTIFY; the
@@ -607,32 +625,88 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			servers, err := r.st.AllServerIDs(ctx)
-			if err != nil {
-				r.log.Error("resync: list servers", "err", err)
-				r.reportResync(err)
-				continue
-			}
-			// The pass's verdict for the heartbeat (SIGMA-248): the first server
-			// that failed to reconcile. A resync that could not converge some of
-			// the fleet has not done its job, and dating it as a success would
-			// hide exactly the state worth alerting on.
-			var passErr error
-			for _, sv := range servers {
-				// The resync walks the fleet serially, but it shares the pool
-				// with whatever ReconcileAsync fan-out is in flight, so it takes
-				// a slot too (SIGMA-288) — otherwise the bound is only two
-				// thirds honoured and the resync's connections are unaccounted.
+			passStart := time.Now()
+			passErr := r.resyncPass(ctx)
+			r.reportResyncPass(time.Since(passStart), interval)
+			r.reportResync(passErr)
+		}
+	}
+}
+
+// resyncPass reconciles the whole fleet once, with the reconcile semaphore's
+// worth of servers in flight at a time, and returns the pass's verdict.
+//
+// It used to be an inline serial loop: take a slot, reconcile, release, move to
+// the next server (SIGMA-320). That cost N x one-reconcile no matter how much
+// headroom the semaphore had — the bound from SIGMA-288 was being used as a
+// serialiser rather than as a ceiling. A reconcile is a session advisory lock
+// plus ~15 sequential round trips, so at a few thousand hosts the pass outran
+// the 60s tick, time.Ticker dropped the ticks that arrived while it was still
+// running, and the fleet's real drift-repair interval quietly became the pass
+// duration. Everything downstream is written assuming it is 60s: the agent
+// advertises that as its convergence SLO, and Reconcile's own lock-contention
+// path drops work on the explicit promise that "the 60s resync re-runs anything
+// skipped".
+//
+// The workers share the SAME semaphore ReconcileAsync uses, so a wide resync
+// still cannot starve the pool of the connections request handlers need — the
+// pass gets faster without the ceiling moving. Servers are claimed off a shared
+// index rather than pre-partitioned, so one slow server delays only itself.
+func (r *Reconciler) resyncPass(ctx context.Context) error {
+	servers, err := r.st.AllServerIDs(ctx)
+	if err != nil {
+		r.log.Error("resync: list servers", "err", err)
+		return err
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	workers := reconcileConcurrency
+	if workers > len(servers) {
+		workers = len(servers)
+	}
+
+	// The pass's verdict for the heartbeat (SIGMA-248): a server that failed to
+	// reconcile. A resync that could not converge some of the fleet has not done
+	// its job, and dating it as a success would hide exactly the state worth
+	// alerting on. Which of several failures is kept is not meaningful — the
+	// verdict is read as a boolean — so it is simply the first one recorded.
+	var (
+		mu      sync.Mutex
+		passErr error
+		next    atomic.Int64
+		wg      sync.WaitGroup
+	)
+	fail := func(e error) {
+		mu.Lock()
+		if passErr == nil {
+			passErr = e
+		}
+		mu.Unlock()
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				idx := int(next.Add(1)) - 1
+				if idx >= len(servers) {
+					return
+				}
+				sv := servers[idx]
+				// Each reconcile takes a slot, exactly as the serial loop did:
+				// the resync shares the pool with whatever ReconcileAsync
+				// fan-out is in flight, so its connections have to be accounted
+				// against the same bound (SIGMA-288).
 				release, ok := r.acquireSlot(ctx)
 				if !ok {
 					// Either shutdown or a queue so long the pass cannot
 					// finish; the rest of the fleet is left to the next tick,
 					// and the pass is reported as failed so the heartbeat's
 					// last-success clock goes stale (SIGMA-248).
-					if passErr == nil {
-						passErr = fmt.Errorf("resync: no reconcile slot for server %s", sv.ServerID)
-					}
-					break
+					fail(fmt.Errorf("resync: no reconcile slot for server %s", sv.ServerID))
+					return
 				}
 				// safeReconcile, not Reconcile: one bad row must quarantine one
 				// server, not end the process for every tenant (SIGMA-250).
@@ -640,13 +714,31 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 				release()
 				if err != nil {
 					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)
-					if passErr == nil {
-						passErr = err
-					}
+					fail(err)
 				}
 			}
-			r.reportResync(passErr)
-		}
+		}()
+	}
+	wg.Wait()
+	return passErr
+}
+
+// reportResyncPass publishes how long a fleet-resync pass took and complains
+// when it outran the tick (SIGMA-320).
+//
+// A pass longer than the interval means every subsequent tick fires late —
+// time.Ticker drops the ticks that arrive while a pass is running — so the
+// fleet's drift-repair interval silently becomes the pass duration instead of
+// the configured 60s. That is the moment the SLO the agent advertises stops
+// being true, and it is worth a line in the log as well as a metric, because
+// the metric only helps whoever already knew to look.
+func (r *Reconciler) reportResyncPass(d, interval time.Duration) {
+	if r.onResyncPass != nil {
+		r.onResyncPass(d)
+	}
+	if interval > 0 && d > interval {
+		r.log.Warn("resync pass outran its tick — drift repair is now slower than configured",
+			"pass", d, "interval", interval)
 	}
 }
 

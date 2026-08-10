@@ -489,18 +489,81 @@ func (s *Store) ListOrgDeployments(ctx context.Context, orgID string, recentLimi
 	if err != nil {
 		return OrgDeployments{}, err
 	}
-	rows, err = s.Pool.Query(ctx, `
-		SELECT DISTINCT ON (resource_id) `+deploymentCols+` FROM deployments
-		 WHERE org_id = $1 ORDER BY resource_id, created_at DESC`, orgID)
+	rows, err = s.Pool.Query(ctx, LatestDeploymentPerResourceQuery, orgID)
 	if err != nil {
 		return OrgDeployments{}, err
 	}
-	out.Latest, err = scanDeployments(rows)
+	out.Latest, err = scanLatestDeployments(rows)
 	rows.Close()
 	if err != nil {
 		return OrgDeployments{}, err
 	}
 	return out, nil
+}
+
+// LatestDeploymentPerResourceQuery is the Latest half of the org deploy feed:
+// one row per resource, however old. Exported so the query-plan regression test
+// in internal/integration can EXPLAIN the real query rather than a copy that
+// drifts (SIGMA-318).
+//
+// It is UNBOUNDED by construction — "the latest per resource" has no useful
+// LIMIT — and the web mirror polls it every 30 seconds for every org with a
+// dashboard open. So its cost has to be proportional to the org's RESOURCE
+// count, and it used to be proportional to the org's DEPLOY HISTORY instead:
+//
+//	SELECT DISTINCT ON (resource_id) <every column> FROM deployments
+//	 WHERE org_id = $1 ORDER BY resource_id, created_at DESC
+//
+// Postgres has no loose/skip index scan, so a DISTINCT ON like that is always
+// "walk every row in resource_id order, keep the first of each group" — for an
+// org with 300 resources and 40,000 deployments it read 40,000 rows, with their
+// service_status jsonb blobs, to return 300. Nothing bounded it but retention,
+// so a two-year-old org degraded its own dashboard and, because the poll holds a
+// pool connection, everyone else's requests too.
+//
+// The lateral does the skip scan explicitly: one probe per resource into
+// deployments_org_resource_idx (org_id, resource_id, created_at DESC), each
+// stopping at the first row. That is 300 index descents instead of 40,000 row
+// reads, and it stays 300 no matter how long the install has been running. The
+// result set is identical — deployments.resource_id is ON DELETE CASCADE, so
+// every deployment has a live resource row, and a resource with no deployments
+// contributes nothing under either form.
+//
+// It also projects only the columns the web mirror actually writes, NOT
+// deploymentCols: cp-sync.ts reads id, resourceId, status, gitSha, createdBy,
+// durationSeconds, startedAt and createdAt from this list and nothing else (see
+// resourceMirrorRow and step 4b there). Anything a consumer starts reading must
+// be added here too, or it silently arrives as a zero value.
+const LatestDeploymentPerResourceQuery = `
+		SELECT d.id, d.org_id, d.resource_id, d.git_sha, d.status, d.duration_seconds,
+		       d.created_by, d.created_at, d.started_at
+		  FROM resources r
+		  CROSS JOIN LATERAL (
+		       SELECT dd.id, dd.org_id, dd.resource_id, dd.git_sha, dd.status, dd.duration_seconds,
+		              dd.created_by, dd.created_at, dd.started_at
+		         FROM deployments dd
+		        WHERE dd.org_id = $1 AND dd.resource_id = r.id
+		        ORDER BY dd.created_at DESC
+		        LIMIT 1) d
+		 WHERE r.org_id = $1
+		 ORDER BY d.resource_id`
+
+// scanLatestDeployments scans LatestDeploymentPerResourceQuery's narrowed
+// projection. The unselected fields stay at their zero values, which the
+// Deployment JSON tags already omit.
+func scanLatestDeployments(rows pgx.Rows) ([]Deployment, error) {
+	out := []Deployment{}
+	for rows.Next() {
+		var d Deployment
+		var sha *string
+		if err := rows.Scan(&d.ID, &d.OrgID, &d.ResourceID, &sha, &d.Status, &d.DurationSeconds,
+			&d.CreatedBy, &d.CreatedAt, &d.StartedAt); err != nil {
+			return nil, err
+		}
+		d.GitSHA = deref(sha)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 // RollbackTargets returns a resource's last N SUCCESSFUL releases whose exact
@@ -925,6 +988,41 @@ func (s *Store) RecordBuildResult(ctx context.Context, orgID, resourceID, server
 // ServerRef identifies a server to reconcile after a mutation.
 type ServerRef struct{ ServerID, OrgID string }
 
+// drainBatchLimit caps one drain pass, as a SQL literal so the query below stays
+// a compile-time constant that EXPLAIN can take without parameters. The loop
+// ticks every 3s, so a backlog still clears at 200 requests per tick; the cap
+// only stops a single pass from claiming an unbounded batch — holding row locks
+// on all of it, inside one transaction, while it creates a deployment per app
+// resource for each.
+const drainBatchLimit = "200"
+
+// DrainDeployRequestsQuery is the driving query of DrainDeployRequests. It is
+// exported so the query-plan regression test in internal/integration can EXPLAIN
+// the REAL query rather than a copy that drifts (SIGMA-317): the whole point of
+// deploy_requests_queued_idx is a property of the plan, not of the result.
+//
+// The branch map carries the optional dedicated build server, so a deployment
+// records where its build should run at the moment it is created (rather than
+// re-reading a mapping that may change mid-flight).
+//
+// The WHERE clause is written to match deploy_requests_queued_idx exactly —
+// `kind = 'deploy' AND status = 'queued'`, the index's own predicate — because
+// that partial index is the only thing keeping this query's cost proportional to
+// the work outstanding instead of to the install's entire push history. It runs
+// 28,800 times a day and on a healthy install finds nothing every single time.
+const DrainDeployRequestsQuery = `
+		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id,
+		       COALESCE((SELECT bm.build_server_id FROM git_branch_map bm
+		                  WHERE bm.connection_id = dr.connection_id
+		                    AND bm.environment_id = dr.environment_id
+		                  LIMIT 1), '')
+		  FROM deploy_requests dr
+		  JOIN git_connections c ON c.id = dr.connection_id
+		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
+		 ORDER BY dr.created_at
+		 LIMIT ` + drainBatchLimit + `
+		 FOR UPDATE OF dr SKIP LOCKED`
+
 // DrainDeployRequests turns queued git deploy_requests (P1-7) into queued
 // deployment rows: each request resolves to the app resources in its target
 // environment, and one deployment is created per resource. Returns the distinct
@@ -937,20 +1035,7 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// The branch map carries the optional dedicated build server, so a
-	// deployment records where its build should run at the moment it is created
-	// (rather than re-reading a mapping that may change mid-flight).
-	rows, err := tx.Query(ctx, `
-		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id,
-		       COALESCE((SELECT bm.build_server_id FROM git_branch_map bm
-		                  WHERE bm.connection_id = dr.connection_id
-		                    AND bm.environment_id = dr.environment_id
-		                  LIMIT 1), '')
-		  FROM deploy_requests dr
-		  JOIN git_connections c ON c.id = dr.connection_id
-		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
-		 ORDER BY dr.created_at
-		 FOR UPDATE OF dr SKIP LOCKED`)
+	rows, err := tx.Query(ctx, DrainDeployRequestsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -1109,32 +1194,69 @@ type DeployTarget struct {
 	BuildServerID string
 }
 
+// DeployTargetsForServerQuery drives DeployTargetsForServer. Exported so the
+// query-plan regression test in internal/integration can EXPLAIN the real query
+// rather than a copy that drifts (SIGMA-332).
+//
+// A Compose app may place services on servers OTHER than the one its deployment
+// was created against, so this server is a target when it owns the deployment OR
+// hosts at least one of the app's services. Without that second condition a
+// placed service would never appear in any document and would silently never
+// deploy.
+//
+// The three ways a server is involved are UNION ALL arms rather than OR'd
+// predicates, and that shape is the whole point of this rewrite. This query runs
+// once per server on the 60s fleet resync, once per push, once per resource
+// mutation and once per deploy status report, and the only thing keeping it
+// proportional to the resources on ONE server rather than to the install's whole
+// deploy history is deployments_server_target_idx (server_id, resource_id,
+// created_at DESC) WHERE status IN (...) — plus deployments_build_server_idx and
+// deployments_resource_idx for the other two arms. An index can only drive an
+// arm that is a restriction on `deployments` by itself, so:
+//
+//   - the placement arm used to be `jsonb_typeof(r.spec->'compose'->'services')
+//     = 'array' AND EXISTS (... svc->>'serverId' = $1)`, reading r.spec from the
+//     JOINED resources table. That made the disjunction unindexable and quietly
+//     retired SIGMA-188's index — measured, the plan became a Seq Scan of every
+//     deployment row plus a jsonb function scan per row (SIGMA-332). Placement
+//     now lives in resource_service_placements, so the arm is a semi-join
+//     against a small, directly-indexed table.
+//   - even with all three arms on `deployments`, an OR forces Postgres to pick
+//     ONE access path for the whole scan; separate arms let it pick the right
+//     index for each. Duplicates between arms are free: DISTINCT ON keeps one
+//     row per resource anyway, which is why this is UNION ALL and not UNION —
+//     deduplicating full rows (service_status jsonb included) would cost more
+//     than the duplicates do.
+//
+// deploymentReporterClause must stay the mirror image of the arms below: a
+// server that RENDERS a deployment's ops has to be allowed to REPORT on them.
+const DeployTargetsForServerQuery = `
+		SELECT DISTINCT ON (d.resource_id)
+		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
+		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
+		  FROM (
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success') AND server_id = $1
+		       UNION ALL
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success') AND build_server_id = $1
+		       UNION ALL
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success')
+		          AND resource_id IN (SELECT p.resource_id FROM resource_service_placements p
+		                               WHERE p.server_id = $1)
+		  ) d
+		  JOIN resources r ON r.id = d.resource_id
+		  JOIN git_connections c ON c.id = d.connection_id
+		 ORDER BY d.resource_id, d.created_at DESC`
+
 // DeployTargetsForServer returns the current deploy target per app resource on a
 // server — the latest deployment that is not failed/superseded/rolled_back. The
 // reconciler renders the deploy pipeline from these instead of a bare
 // container.apply.
 func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (map[string]DeployTarget, error) {
-	// A Compose app may place services on servers OTHER than the one its
-	// deployment was created against, so this server is a target when it owns
-	// the deployment OR hosts at least one of the app's services. Without the
-	// second clause a placed service would never appear in any document and
-	// would silently never deploy.
-	rows, err := s.Pool.Query(ctx, `
-		SELECT DISTINCT ON (d.resource_id)
-		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
-		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
-		  FROM deployments d
-		  JOIN resources r ON r.id = d.resource_id
-		  JOIN git_connections c ON c.id = d.connection_id
-		 WHERE d.status IN ('queued','building','deploying','success')
-		   AND (d.server_id = $1
-		        OR d.build_server_id = $1
-		        OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
-		            AND EXISTS (
-		              SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		               WHERE svc->>'serverId' = $1)))
-		 ORDER BY d.resource_id, d.created_at DESC`, serverID)
+	rows, err := s.Pool.Query(ctx, DeployTargetsForServerQuery, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -1211,16 +1333,23 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 //
 // $1 is the reporting server, and the query it is spliced into must expose the
 // deployment as `d` and its resource as `r`.
+//
+// The placement arm reads resource_service_placements, exactly as the render's
+// third UNION arm does (SIGMA-332). Both used to walk r.spec's compose services
+// with jsonb_array_elements; that is what made the RENDER unindexable, and the
+// two must keep reading the same source or a placed service can render on a host
+// whose report is then refused. Every query this is spliced into looks a
+// deployment up by id, so unlike the render it is a point lookup and its cost
+// was never the issue.
 const deploymentReporterClause = `
 		   (d.server_id = $1
 		    OR d.build_server_id = $1
 		    OR (r.cluster_id IS NOT NULL AND EXISTS (
 		          SELECT 1 FROM cluster_nodes n
 		           WHERE n.cluster_id = r.cluster_id AND n.server_id = $1))
-		    OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
-		        AND EXISTS (
-		          SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		           WHERE svc->>'serverId' = $1)))`
+		    OR EXISTS (
+		          SELECT 1 FROM resource_service_placements p
+		           WHERE p.resource_id = d.resource_id AND p.server_id = $1))`
 
 // DeployPeersForResource returns the OTHER servers whose documents are gated on
 // this resource's deployment status, so they can be re-rendered the moment it

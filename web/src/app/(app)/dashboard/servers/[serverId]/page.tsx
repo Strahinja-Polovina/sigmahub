@@ -30,13 +30,21 @@ export default async function ServerDetailPage({
     if (!cpServer) notFound();
     const [points, cpResources] = await Promise.all([
       cpServerMetrics(orgId, serverId).then(cpMetricsToPoints),
-      cpListResources(orgId).catch(() => []),
+      // SIGMA-328: ask the control plane for this server's resources only.
+      // This used to be an org-wide list filtered down to one server in the
+      // browser-facing render path: in a 2,000-resource org that shipped every
+      // resource's full `spec` jsonb over HTTP to render the ~50 rows bound to
+      // this host, and got slower every time anyone created a resource anywhere
+      // in the org — including in projects this viewer cannot see.
+      cpListResources(orgId, undefined, serverId).catch(() => []),
     ]);
     // Hosted resources come from the CP; project/env names resolve from the
-    // local mirror rows (same ids), falling back to raw ids.
+    // local mirror rows (same ids), falling back to raw ids. The serverId
+    // predicate now lives in SQL; project visibility still has to be applied
+    // here because the CP has no notion of this viewer's project scope (P2-7).
     const hosted = await Promise.all(
       cpResources
-        .filter((r) => r.serverId === serverId && (!visible || visible.has(r.projectId)))
+        .filter((r) => !visible || visible.has(r.projectId))
         .map(async (r) => {
           const [project, env, mirror] = await Promise.all([
             getProject(r.projectId),

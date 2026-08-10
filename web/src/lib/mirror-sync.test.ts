@@ -130,6 +130,21 @@ describe("resource mapping", () => {
     expect(resourceMirrorRow(cpResource({ ephemeral: true })).ephemeral).toBe(true);
     expect(resourceMirrorRow(cpResource()).ephemeral).toBe(false);
   });
+
+  // SIGMA-331: a cluster-deployed resource is bound to no server — the cluster
+  // is the only answer to "where does this run". The mirror has had a
+  // cluster_id column since clusters shipped, but the CP never returned the
+  // field, so the column stayed null and every surface that asks where a
+  // resource runs reported "nowhere" for a running workload.
+  it("carries clusterId into the mirror's cluster_id column", () => {
+    const row = resourceMirrorRow(cpResource({ serverId: "", clusterId: "clu_1" }));
+    expect(row.clusterId).toBe("clu_1");
+    expect(row.serverId).toBeNull();
+    // A server-bound resource writes null, not the empty string: the column is
+    // a nullable FK to clusters.
+    expect(resourceMirrorRow(cpResource()).clusterId).toBeNull();
+    expect(resourceMirrorRow(cpResource({ clusterId: "" })).clusterId).toBeNull();
+  });
 });
 
 describe("deploy status mapping", () => {

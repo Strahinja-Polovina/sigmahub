@@ -130,11 +130,54 @@ func (c *Client) Heartbeat(ctx context.Context, agentToken string, req Heartbeat
 	return c.post(ctx, "/v1/agent/heartbeat", agentToken, req, nil)
 }
 
-// MeshPeers fetches this agent's mesh identity and same-org peer list.
-func (c *Client) MeshPeers(ctx context.Context, agentToken string) (MeshPeersResponse, error) {
-	var res MeshPeersResponse
-	err := c.do(ctx, http.MethodGet, "/v1/agent/mesh/peers", agentToken, nil, &res)
-	return res, err
+// MeshPeers fetches this agent's mesh identity and same-org peer list, as a
+// CONDITIONAL request (SIGMA-323).
+//
+// This runs after every successful heartbeat — every 30 seconds — and the
+// answer only changes when a server joins the org, re-keys, changes endpoint or
+// is removed. Sending the previous ETag lets the control plane answer 304 with
+// an empty body, which is what stops N agents each pulling N peer rows every
+// half minute: in a 500-server org the unconditional version was serialising
+// tens of megabytes of unchanged JSON every 30 seconds, and every org on a
+// shared control plane paid it simultaneously.
+//
+// notModified=true means "reuse what you already have"; res is then zero and
+// the returned etag is the one still in force. Pass etag="" to fetch
+// unconditionally, which is also what happens on the first poll after a restart.
+func (c *Client) MeshPeers(ctx context.Context, agentToken, etag string) (res MeshPeersResponse, newETag string, notModified bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/v1/agent/mesh/peers", nil)
+	if err != nil {
+		return MeshPeersResponse{}, "", false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+agentToken)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return MeshPeersResponse{}, "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		// A 304 carries the validator; keep it so the next poll stays
+		// conditional. An older control plane that omits it simply makes the
+		// next poll unconditional, which is the pre-SIGMA-323 behaviour.
+		served := resp.Header.Get("ETag")
+		if served == "" {
+			served = etag
+		}
+		return MeshPeersResponse{}, served, true, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return MeshPeersResponse{}, "", false, &APIError{Status: resp.StatusCode, Body: string(bytes.TrimSpace(b))}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return MeshPeersResponse{}, "", false, err
+	}
+	// A control plane with no ETag support returns "", which keeps every poll
+	// unconditional rather than breaking them.
+	return res, resp.Header.Get("ETag"), false, nil
 }
 
 // GetDSD long-polls for a DSD newer than `after`. The bool is false when the

@@ -30,6 +30,18 @@ type Store struct {
 	// custody-unwrapped (and audited) once per process, not per secret op.
 	dekMu    sync.Mutex
 	dekCache map[string][]byte
+	// clusterTokenCache memoises unwrapped cluster join tokens, keyed by cluster
+	// id, for exactly the same reason dekCache exists (SIGMA-319).
+	//
+	// ClusterMembershipForServer is on the reconcile path, and the reconciler
+	// re-renders every server every 60s, so an unconditional unwrap here is one
+	// Vault transit round trip AND one cp_audit_log row per node per pass — tens
+	// of thousands a day restating a token that never moved. The entry is
+	// validated against the `join_token_wrapped` bytes the membership query
+	// already read, so a token that IS replaced invalidates itself on the next
+	// read without needing any explicit invalidation call.
+	clusterTokenMu    sync.Mutex
+	clusterTokenCache map[string]cachedClusterToken
 	// enabledDBEngines is the P1-10 engine allowlist (CP_DB_ENGINES). Nil means
 	// all engines; the Postgres-only fallback build is this map with one entry.
 	enabledDBEngines map[string]bool
@@ -77,6 +89,21 @@ func (s *Store) SetInstallationTokens(src InstallationTokenSource) {
 func (s *Store) SetCustody(c kms.KeyCustody) {
 	s.custody = c
 	s.dekCache = map[string][]byte{}
+	// Both memos are custody-scoped: a new custody can decrypt different
+	// envelopes, so anything unwrapped under the old one has to go.
+	s.clusterTokenMu.Lock()
+	s.clusterTokenCache = map[string]cachedClusterToken{}
+	s.clusterTokenMu.Unlock()
+}
+
+// cachedClusterToken is one memoised join token plus the wrapped bytes it was
+// derived from. Comparing the envelope is what makes the memo self-invalidating
+// (SIGMA-319): the membership query reads join_token_wrapped anyway, so a
+// replaced token is detected without an extra query and without any caller
+// having to remember to purge.
+type cachedClusterToken struct {
+	wrapped []byte
+	token   string
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {

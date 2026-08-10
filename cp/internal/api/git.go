@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/gitdetect"
@@ -20,7 +21,7 @@ type GitAPI interface {
 	ListBranchMaps(ctx context.Context, orgID, connID string) ([]store.BranchMap, error)
 	DeleteBranchMap(ctx context.Context, orgID, mapID, actor string) error
 	PromoteBranch(ctx context.Context, orgID, mapID, actor string) (store.DeployRequest, error)
-	ListDeployRequests(ctx context.Context, orgID string, limit int) ([]store.DeployRequest, error)
+	ListDeployRequests(ctx context.Context, orgID, connectionID string, limit int) ([]store.DeployRequest, error)
 	// Previews (P1-12): the per-connection toggle + PR environment records.
 	SetConnectionPreviews(ctx context.Context, orgID, connID string, enabled bool, serverID, actor string) error
 	ListPreviewEnvironments(ctx context.Context, orgID, connID string) ([]store.PreviewEnvironment, error)
@@ -432,12 +433,22 @@ func (s *Server) handleSetInstallation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "linked"})
 }
 
+// handleListDeployRequests lists an org's deploy requests, newest first.
+//
+// `connectionId` scopes the answer to one repository and `limit` bounds it; both
+// are optional. The scope exists because the limit applies to the org as a
+// whole, so a project asking for its own pushes out of a shared window can be
+// crowded out entirely by a busier repository (SIGMA-330).
 func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request) {
 	if s.git == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "git integration is not configured"})
 		return
 	}
-	reqs, err := s.git.ListDeployRequests(r.Context(), r.PathValue("orgId"), 0)
+	// An unparsable or absent limit is 0, which the store reads as "the default
+	// window" — the behaviour every existing caller already gets.
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	reqs, err := s.git.ListDeployRequests(r.Context(), r.PathValue("orgId"),
+		r.URL.Query().Get("connectionId"), limit)
 	if err != nil {
 		s.writeStoreErr(w, err, "list deploy requests")
 		return

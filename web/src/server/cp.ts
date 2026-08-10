@@ -311,6 +311,21 @@ export async function cpListServers(orgId: string): Promise<CpServer[]> {
   return servers;
 }
 
+/** How many servers an org has, without the list.
+ *
+ *  The org switcher needs one integer per org the user belongs to and used to
+ *  get it from cpListServers(...).length — which makes the control plane build
+ *  the whole dashboard projection (every column, the facts jsonb blob and a
+ *  correlated readiness subquery per row) for each org, on every render, with
+ *  no caching. `?count=1` answers with `{ count }` and nothing else
+ *  (SIGMA-335). */
+export async function cpServerCount(orgId: string): Promise<number> {
+  const { count } = await cpFetch<{ count: number }>(
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers?count=1`, undefined, { orgId }
+  );
+  return count ?? 0;
+}
+
 export async function cpGetServer(
   orgId: string,
   serverId: string
@@ -492,6 +507,11 @@ export type CpResource = {
   projectId: string;
   environmentId: string;
   serverId: string;
+  /** The other kind of deploy target: a workload deployed INTO a cluster has no
+   *  server, because the Kubernetes scheduler picks the node. Exactly one of
+   *  serverId and clusterId is ever set. Optional here only so an older control
+   *  plane that predates SIGMA-331 still type-checks against this client. */
+  clusterId?: string;
   name: string;
   kind: string;
   spec: Record<string, unknown>;
@@ -1156,8 +1176,23 @@ export async function cpDeleteSecret(orgId: string, secretId: string, actor: CpA
   }, { orgId, actor });
 }
 
-export async function cpListResources(orgId: string, environmentId?: string): Promise<CpResource[]> {
-  const qs = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
+/** List an org's resources, optionally narrowed to one environment and/or the
+ *  server they are bound to.
+ *
+ *  SIGMA-328: `serverId` is not a convenience — the server detail page renders
+ *  one server's hosted resources, and without a filter it pulled every resource
+ *  in the org (each with its full `spec` jsonb) across the wire and discarded
+ *  the ones belonging to the other 39 servers. Both filters are pushed into the
+ *  CP's WHERE clause. */
+export async function cpListResources(
+  orgId: string,
+  environmentId?: string,
+  serverId?: string
+): Promise<CpResource[]> {
+  const params = new URLSearchParams();
+  if (environmentId) params.set("environmentId", environmentId);
+  if (serverId) params.set("serverId", serverId);
+  const qs = params.size > 0 ? `?${params.toString()}` : "";
   const { resources } = await cpFetch<{ resources: CpResource[] }>(
     `${org(orgId)}/resources${qs}`, undefined, { orgId });
   return resources;
@@ -1699,9 +1734,24 @@ export async function cpPromoteBranch(orgId: string, mapId: string, actor: CpAct
  *  the project view renders repo → branch→env tables. Resilient per connection:
  *  one failing detail fetch (e.g. a concurrent delete → 404) drops that repo,
  *  not the whole panel. */
-export async function cpListDeployRequests(orgId: string): Promise<CpDeployRequest[]> {
+/** Deploy requests (pushes) for an org, newest first.
+ *
+ *  `connectionId` scopes the answer to one repository, and it matters: the CP's
+ *  limit applies to the org as a whole, so an unscoped window is shared with
+ *  every other repo in the org and a busy one fills it completely. A project
+ *  filtering that window client-side then shows no pushes at all for a repo it
+ *  pushed to minutes ago (SIGMA-330). */
+export async function cpListDeployRequests(
+  orgId: string,
+  connectionId?: string,
+  limit?: number
+): Promise<CpDeployRequest[]> {
+  const params = new URLSearchParams();
+  if (connectionId) params.set("connectionId", connectionId);
+  if (limit) params.set("limit", String(limit));
+  const qs = params.size > 0 ? `?${params.toString()}` : "";
   const res = await cpFetch<{ deployRequests?: CpDeployRequest[] } | CpDeployRequest[]>(
-    `${org(orgId)}/git/deploy-requests`,
+    `${org(orgId)}/git/deploy-requests${qs}`,
     undefined,
     { orgId }
   );
@@ -1810,7 +1860,16 @@ export async function cpListDeployments(orgId: string, resourceId: string, limit
 
 /** The org-wide deploy feed: recent deployments (activity stream) plus the
  *  latest per resource, however old (SIGMA-161 — the dashboard's "Last deploy",
- *  "Version", "Active deploys" and activity feed read this via the mirror). */
+ *  "Version", "Active deploys" and activity feed read this via the mirror).
+ *
+ *  `latest` is NARROWER than `recent`: it carries only id, orgId, resourceId,
+ *  gitSha, status, durationSeconds, createdBy, createdAt and startedAt. The
+ *  latest-per-resource query is unbounded and polled every 30s, so the CP stopped
+ *  projecting the rest — led by the service_status jsonb blob — to keep it off
+ *  the wire (SIGMA-318). Every other field arrives as its zero value, so reading
+ *  one from `latest` fails silently rather than loudly; if a surface needs it,
+ *  widen LatestDeploymentPerResourceQuery in cp/internal/store/deployments.go
+ *  and this comment together. */
 export async function cpListOrgDeployments(
   orgId: string,
   limit = 50

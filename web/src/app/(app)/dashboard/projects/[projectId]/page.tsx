@@ -29,33 +29,55 @@ import type {
   PushActivity,
 } from "@/components/dashboard/projects/project-git-panel";
 
+/** How many rows the panel shows. */
+const PUSHES_SHOWN = 5;
+/** How many rows to ask the CP for per connection. More than PUSHES_SHOWN
+ *  because PR hooks share the table with pushes and are dropped below, so a
+ *  window of exactly five could render fewer than five deploys. */
+const PUSHES_PER_CONNECTION = 20;
+
 /** Recent pushes for this project's repositories, newest first.
  *
  *  A push that resolved to nothing used to be indistinguishable from one that
- *  deployed, so "I pushed and nothing happened" had no answer anywhere. */
+ *  deployed, so "I pushed and nothing happened" had no answer anywhere.
+ *
+ *  SIGMA-330: this asks the control plane per connection. It used to request the
+ *  org's deploy requests — a 50-row window shared by every repository in the org
+ *  — and filter it down to this project's connections here. In an org with four
+ *  active repos, one repo's CI pushing 60 times in an afternoon owns that whole
+ *  window, so an operator opening a different project saw an EMPTY panel for a
+ *  repo they had pushed to twenty minutes earlier. The panel exists precisely to
+ *  answer "I pushed, why is nothing happening?" (migration 0052), and answering
+ *  it with silence reads as "the webhook never arrived". Scoped in SQL, each
+ *  repo's history is bounded by its own volume. */
 async function loadPushes(
   orgId: string,
   connections: GitConnectionPanel[]
 ): Promise<PushActivity[]> {
   if (!cpEnabled() || connections.length === 0) return [];
-  const mine = new Set(connections.map((c) => c.connection.id));
-  try {
-    const all = await cpListDeployRequests(orgId);
-    return all
-      .filter((d) => mine.has(d.connectionId) && d.kind !== "pr_hook")
-      .slice(0, 5)
-      .map((d) => ({
-        id: d.id,
-        ref: d.ref,
-        sha: d.sha,
-        status: d.status,
-        deploymentsCreated: d.deploymentsCreated ?? 0,
-        detail: d.detail,
-        createdAt: d.createdAt,
-      }));
-  } catch {
-    return [];
-  }
+  // Per connection, and resilient per connection: one repo's failed read (a
+  // concurrent delete → 404) must not blank the other repos' pushes.
+  const perConnection = await Promise.all(
+    connections.map((c) =>
+      cpListDeployRequests(orgId, c.connection.id, PUSHES_PER_CONNECTION).catch(() => [])
+    )
+  );
+  return perConnection
+    .flat()
+    .filter((d) => d.kind !== "pr_hook")
+    // Each connection's rows arrive newest-first; merging several needs the
+    // order re-established across them.
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    .slice(0, PUSHES_SHOWN)
+    .map((d) => ({
+      id: d.id,
+      ref: d.ref,
+      sha: d.sha,
+      status: d.status,
+      deploymentsCreated: d.deploymentsCreated ?? 0,
+      detail: d.detail,
+      createdAt: d.createdAt,
+    }));
 }
 
 /** Fetch the project's Git connections + branch routes (CP mode only). A CP

@@ -36,11 +36,30 @@ const fullSchema = { ...schema, ...authSchema };
  *  for the real one and a query the actions can make is a query the test can. */
 export type DemoDb = NodePgDatabase<typeof fullSchema>;
 
+/** Options for createDemoDb.
+ *
+ *  `onQuery` receives every statement drizzle sends, in order. It exists so a
+ *  test can assert on the SHAPE of a read model's access pattern rather than
+ *  only on its answer: an N+1 loop and a batched join return identical rows, so
+ *  the only way a regression test can tell them apart is by counting the
+ *  statements (SIGMA-326). Migrations run before the hook is armed, so a
+ *  counter only ever sees what the code under test issued. */
+export type DemoDbOptions = {
+  onQuery?: (sql: string, params: unknown[]) => void;
+};
+
 /** A migrated, empty database. In memory: a directory would persist between
  *  runs and make the suite's answers depend on what the last one wrote. */
-export async function createDemoDb(): Promise<DemoDb> {
-  const pglite = drizzle(new PGlite(), { schema: fullSchema });
+export async function createDemoDb(opts: DemoDbOptions = {}): Promise<DemoDb> {
+  let armed = false;
+  const pglite = drizzle(new PGlite(), {
+    schema: fullSchema,
+    logger: opts.onQuery
+      ? { logQuery: (query, params) => armed && opts.onQuery!(query, params) }
+      : undefined,
+  });
   await migrate(pglite, { migrationsFolder: "drizzle" });
+  armed = true;
   // The same widening ../db does: the two drizzle instances are structurally
   // identical at every call site, and the node-postgres type is what the app
   // exports.

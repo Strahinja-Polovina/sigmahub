@@ -91,6 +91,16 @@ type Registry struct {
 	// is a fleet-wide delivery delay rather than a local inconvenience.
 	renderCount   uint64
 	renderSeconds float64
+	// Fleet-resync pass duration (SIGMA-320). The last-success clock above says
+	// whether the resync is alive; this says whether it still meets the 60s
+	// drift-repair interval everything downstream assumes. A pass that grows
+	// past the tick is not an error and never will be — it just makes every
+	// convergence slower, silently, so the pass has to be measured rather than
+	// inferred. The last value is exported alongside the summary because "the
+	// most recent pass took 240 seconds" is the sentence an operator needs.
+	resyncPassCount   uint64
+	resyncPassSeconds float64
+	resyncPassLast    float64
 }
 
 func New() *Registry {
@@ -186,6 +196,19 @@ func (r *Registry) ObserveDSDRender(d time.Duration) {
 	r.renderSeconds += d.Seconds()
 }
 
+// ObserveResyncPass records how long one whole fleet-resync pass took
+// (SIGMA-320).
+func (r *Registry) ObserveResyncPass(d time.Duration) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resyncPassCount++
+	r.resyncPassSeconds += d.Seconds()
+	r.resyncPassLast = d.Seconds()
+}
+
 // WritePrometheus renders the registry in the Prometheus text exposition
 // format.
 func (r *Registry) WritePrometheus(w io.Writer) {
@@ -216,6 +239,7 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	poolFn := r.pool
 	startedAt := r.startedAt
 	renderCount, renderSeconds := r.renderCount, r.renderSeconds
+	passCount, passSeconds, passLast := r.resyncPassCount, r.resyncPassSeconds, r.resyncPassLast
 	r.mu.Unlock()
 
 	fmt.Fprint(w, "# HELP sigmahub_cp_loop_last_success_seconds Unix time of the last fully successful pass of a control-plane background loop; 0 means it has never completed one.\n")
@@ -242,6 +266,14 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	fmt.Fprint(w, "# TYPE sigmahub_cp_dsd_render_seconds summary\n")
 	fmt.Fprintf(w, "sigmahub_cp_dsd_render_seconds_sum %.6f\n", renderSeconds)
 	fmt.Fprintf(w, "sigmahub_cp_dsd_render_seconds_count %d\n", renderCount)
+
+	fmt.Fprint(w, "# HELP sigmahub_cp_resync_pass_seconds Time taken by a whole fleet-resync pass.\n")
+	fmt.Fprint(w, "# TYPE sigmahub_cp_resync_pass_seconds summary\n")
+	fmt.Fprintf(w, "sigmahub_cp_resync_pass_seconds_sum %.6f\n", passSeconds)
+	fmt.Fprintf(w, "sigmahub_cp_resync_pass_seconds_count %d\n", passCount)
+	fmt.Fprint(w, "# HELP sigmahub_cp_resync_pass_last_seconds Duration of the most recent fleet-resync pass; compare against the resync interval (60s), which is the fleet's drift-repair SLO.\n")
+	fmt.Fprint(w, "# TYPE sigmahub_cp_resync_pass_last_seconds gauge\n")
+	fmt.Fprintf(w, "sigmahub_cp_resync_pass_last_seconds %.6f\n", passLast)
 
 	if poolFn != nil {
 		p := poolFn()

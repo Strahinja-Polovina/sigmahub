@@ -33,8 +33,14 @@ type StoreAPI interface {
 	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
 	RecordHeartbeat(ctx context.Context, serverID string, in store.HeartbeatInput) error
 	MeshPeers(ctx context.Context, orgID, selfServerID string) ([]store.MeshPeer, error)
+	// MeshPeersDigest fingerprints that same peer set without materialising it,
+	// so the poll every agent makes every 30s can be answered 304 (SIGMA-323).
+	MeshPeersDigest(ctx context.Context, orgID, selfServerID string) (string, error)
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
+	// CountServers backs GET .../servers?count=1 — the org switcher's "how
+	// many", answered without building the dashboard projection (SIGMA-335).
+	CountServers(ctx context.Context, orgID string) (int, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
 	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error
@@ -117,6 +123,10 @@ type Server struct {
 	// unit tests → telemetry endpoints answer "not configured".
 	telemetry *telemetry.Forwarder
 	tel       TelemetryAPI
+	// telMeta memoises resource label lookups across ingest batches (SIGMA-333),
+	// so the highest-frequency request the control plane serves stops re-asking
+	// the database for an answer that does not change.
+	telMeta *telemetryMetaCache
 	// alertSender test-fires alert channels (P2-6); nil → test endpoint 503s.
 	alertSender AlertSender
 	// Billing (P2-4). billing is the store slice; paddle is the outbound
@@ -289,6 +299,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		s3Engines:           opts.S3Engines,
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
+		telMeta:             newTelemetryMetaCache(),
 		alertSender:         opts.AlertSender,
 		billing:             opts.Billing,
 		paddle:              opts.Paddle,
@@ -652,6 +663,28 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// jsonList makes a collection safe to put on the wire: a nil Go slice marshals
+// to `null`, and every consumer of this API treats a list key as an array it can
+// map over and read .length on. `null` is not an empty list to them, it is a
+// thrown TypeError on a page that was rendering fine.
+//
+// Until now that contract was upheld by a convention in the store — every List*
+// method declaring `out := []T{}` — with nothing asserting it at either end.
+// Changing one of those to `var out []T`, an idiomatic tidy-up, silently turns a
+// brand-new org's empty dashboard into a broken one, and the whole Go suite
+// stays green (SIGMA-337). Wrapping at the point where the bytes are written
+// means the handler no longer depends on how the store happened to build its
+// slice. It is a typed one-liner rather than reflection inside writeJSON on
+// purpose: json.RawMessage is itself a nil-able slice whose `null` is correct
+// and load-bearing, and a blanket coercion would corrupt every spec and status
+// document this API serves.
+func jsonList[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
 }
 
 // maxBodyBytes caps request bodies. The register endpoint is unauthenticated,

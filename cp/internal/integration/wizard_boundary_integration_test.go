@@ -340,7 +340,7 @@ func TestAppWithNoComposeGraphStillRendersOneContainer(t *testing.T) {
 // service name.
 func storedComposeServices(t *testing.T, st *store.Store, orgID, envID, resourceID string) map[string]gitdetect.ComposeService {
 	t.Helper()
-	resources, err := st.ListResources(context.Background(), orgID, envID)
+	resources, err := st.ListResources(context.Background(), orgID, envID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

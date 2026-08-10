@@ -777,6 +777,19 @@ func (s *Store) ListServers(ctx context.Context, orgID string) ([]Server, error)
 	return out, rows.Err()
 }
 
+// CountServers answers "how many servers does this org have" without building
+// serverSelect's projection (SIGMA-335). The org switcher asks it once per org
+// the user belongs to, on every dashboard render; going through ListServers for
+// that meant scanning and serialising every column, every facts blob and a
+// correlated readiness subquery per row, to produce a single integer. Same
+// visibility rule as ListServers — tombstoned rows do not count.
+func (s *Store) CountServers(ctx context.Context, orgID string) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM servers WHERE org_id = $1 AND deleted_at IS NULL`, orgID).Scan(&n)
+	return n, err
+}
+
 func (s *Store) GetServer(ctx context.Context, orgID, serverID string) (Server, error) {
 	var srv Server
 	err := scanServerRow(

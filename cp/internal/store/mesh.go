@@ -52,7 +52,7 @@ func (s *Store) MeshPeers(ctx context.Context, orgID, selfServerID string) ([]Me
 		  FROM servers
 		 WHERE org_id = $1 AND id <> $2 AND pubkey IS NOT NULL AND mesh_ip IS NOT NULL
 		   AND deleted_at IS NULL
-		 ORDER BY created_at`, orgID, selfServerID)
+		 ORDER BY created_at, id`, orgID, selfServerID)
 	if err != nil {
 		return nil, err
 	}
@@ -67,4 +67,40 @@ func (s *Store) MeshPeers(ctx context.Context, orgID, selfServerID string) ([]Me
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// MeshPeersDigest fingerprints EXACTLY the peer set MeshPeers would return, so
+// the API can answer "nothing has changed" without materialising it
+// (SIGMA-323).
+//
+// Every agent re-fetches its org's whole peer list after every heartbeat — a
+// 30-second cadence — and the answer is nearly always identical, because it
+// only moves when a server is enrolled, re-keys, changes endpoint or is
+// deleted. Without a validator that cost grows as the SQUARE of the org: 500
+// servers means 500 requests per 30s each carrying ~499 rows, tens of megabytes
+// of JSON serialised to restate a peer set that has not moved, on a pool the
+// reconciler and every tenant-facing handler are competing for.
+//
+// The digest is computed IN Postgres and comes back as one value, so the steady
+// state is a small aggregate instead of N rows scanned, transferred, allocated
+// and serialised per request. It is derived from the same predicate and the same
+// columns as MeshPeers rather than from a timestamp — `servers` has no
+// updated_at, and a fingerprint over the served data cannot disagree with the
+// data the way a maintained clock can.
+//
+// The ORDER BY matches MeshPeers' (created_at, id) so the digest changes if and
+// only if the rendered list does.
+func (s *Store) MeshPeersDigest(ctx context.Context, orgID, selfServerID string) (string, error) {
+	var digest string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT COALESCE(md5(string_agg(
+		         id || '|' || name || '|' || pubkey || '|' || mesh_ip || '|' || COALESCE(endpoint, ''),
+		         E'\n' ORDER BY created_at, id)), 'empty')
+		  FROM servers
+		 WHERE org_id = $1 AND id <> $2 AND pubkey IS NOT NULL AND mesh_ip IS NOT NULL
+		   AND deleted_at IS NULL`, orgID, selfServerID).Scan(&digest)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
 }

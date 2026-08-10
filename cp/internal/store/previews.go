@@ -209,6 +209,11 @@ func ensurePreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumbe
 		resourceID, conn.OrgID, conn.ProjectID, envID, conn.PreviewServerID, envName, spec); err != nil {
 		return "", "", err
 	}
+	// The template spec is copied verbatim, placements included, so the derived
+	// placement rows have to be written for the copy too (SIGMA-332).
+	if err := syncServicePlacementsTx(ctx, tx, resourceID); err != nil {
+		return "", "", err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO preview_environments (id, org_id, connection_id, pr_number, environment_id, resource_id, branch, sha)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,

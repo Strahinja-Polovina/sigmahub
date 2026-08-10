@@ -26,6 +26,8 @@ type fakeStore struct {
 	serviceTokens  map[string]store.ServicePrincipal
 	provisioned    []store.ProvisionInput
 	registerResult *store.RegisterResult
+	// How many times the full dashboard projection was built (SIGMA-335).
+	listedServers int
 }
 
 func (f *fakeStore) IssueBootstrapToken(_ context.Context, orgID, name, typ, provider, region, createdBy string, ttl time.Duration) (string, string, time.Time, error) {
@@ -88,12 +90,31 @@ func (f *fakeStore) MeshPeers(context.Context, string, string) ([]store.MeshPeer
 	return []store.MeshPeer{}, nil
 }
 
+func (f *fakeStore) MeshPeersDigest(context.Context, string, string) (string, error) {
+	return "empty", nil
+}
+
 func (f *fakeStore) MetricsSince(context.Context, string, string, time.Time) ([]store.MetricPoint, error) {
 	return f.metrics, nil
 }
 
 func (f *fakeStore) ListServers(context.Context, string) ([]store.Server, error) {
+	f.listedServers++
 	return f.servers, nil
+}
+
+// CountServers answers from the same slice, but is counted separately: the
+// point of SIGMA-335 is that the org switcher's "how many" no longer goes
+// through the full dashboard projection, and only a test that can tell the two
+// calls apart can hold that.
+func (f *fakeStore) CountServers(_ context.Context, orgID string) (int, error) {
+	n := 0
+	for _, srv := range f.servers {
+		if orgID == "" || srv.OrgID == orgID {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // GetServer reads from the same slice ListServers serves, so a test that seeds
@@ -230,7 +251,7 @@ func (f *fakeDomain) ControlPlaneServerForCluster(_ context.Context, _, clusterI
 	}
 	return "srv_cp", nil
 }
-func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Resource, error) {
+func (f *fakeDomain) ListResources(context.Context, string, string, string) ([]store.Resource, error) {
 	return []store.Resource{}, nil
 }
 func (f *fakeDomain) DeleteResource(context.Context, string, string, string) (string, error) {
@@ -529,6 +550,56 @@ func TestServiceAuth(t *testing.T) {
 				t.Fatalf("status = %d, want %d; body %s", rec.Code, tc.want, rec.Body)
 			}
 		})
+	}
+}
+
+// TestListServersCount covers the cheap variant the dashboard's org switcher
+// reads (SIGMA-335). The switcher needs one integer per org the user belongs
+// to, and it used to get it by asking for the whole server list and calling
+// .length on it — which makes this store build the full dashboard projection,
+// facts blobs and a correlated readiness subquery per row, for every org, on
+// every render.
+func TestListServersCount(t *testing.T) {
+	fs := &fakeStore{servers: []store.Server{
+		{ID: "srv_1", OrgID: "org_1"},
+		{ID: "srv_2", OrgID: "org_1"},
+		{ID: "srv_3", OrgID: "org_2"},
+	}}
+	s := newTestServer(t, fs)
+
+	req := httptest.NewRequest("GET", "/v1/orgs/org_1/servers?count=1", nil)
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Count != 2 {
+		t.Fatalf("count = %d, want 2; body %s", got.Count, rec.Body)
+	}
+	// The whole point: no projection was built.
+	if fs.listedServers != 0 {
+		t.Fatalf("ListServers called %d times for a count request", fs.listedServers)
+	}
+	// The rows themselves are absent, so nothing downstream can start reading
+	// the list off a response that only promised a number.
+	if strings.Contains(rec.Body.String(), "srv_1") {
+		t.Fatalf("count response carries server rows: %s", rec.Body)
+	}
+
+	// Without the parameter the full list is still what comes back.
+	req = httptest.NewRequest("GET", "/v1/orgs/org_1/servers", nil)
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || fs.listedServers != 1 {
+		t.Fatalf("plain list = %d, ListServers calls = %d", rec.Code, fs.listedServers)
 	}
 }
 

@@ -1,0 +1,26 @@
+-- SIGMA-318: the dashboard's latest-per-resource deploy query was proportional
+-- to the org's deploy history instead of to its resource count.
+--
+-- ListOrgDeployments answers "the latest deployment per resource, however old".
+-- That question is unbounded by construction — there is no useful LIMIT — and
+-- the web mirror asks it every 30 seconds for every org with a dashboard open.
+-- It was written as DISTINCT ON (resource_id) ... WHERE org_id = $1 ORDER BY
+-- resource_id, created_at DESC over the full column list.
+--
+-- Postgres has no loose (skip) index scan, so a DISTINCT ON like that is always
+-- "walk every row in resource_id order and keep the first of each group",
+-- whatever index supplies the order. Measured on an org with 200 resources and
+-- 12,000 deployments, the plan read all 12,000 rows — service_status jsonb blobs
+-- and all — to return 200. At the ticket's real-world shape (300 resources,
+-- 40,000 deployments) that is 40,000 rows read, serialised and re-upserted every
+-- 30 seconds, growing with history and never shrinking, while holding one of the
+-- pool's connections.
+--
+-- The query is now a lateral: one probe per resource, each stopping at the first
+-- row. This index is what those probes descend — org_id and resource_id are the
+-- equality keys and created_at DESC makes "the newest" the first leaf entry, so
+-- a probe is a single index descent with no filter recheck and no sort. Cost
+-- becomes proportional to the org's resource count, which is what the dashboard
+-- is actually asking about.
+CREATE INDEX IF NOT EXISTS deployments_org_resource_idx
+    ON deployments (org_id, resource_id, created_at DESC);

@@ -145,7 +145,7 @@ func (s *Server) handleListServiceTokens(w http.ResponseWriter, r *http.Request)
 		s.writeStoreErr(w, err, "list service tokens")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tokens": tokens})
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": jsonList(tokens)})
 }
 
 // handleRevokeServiceToken revokes a service token. Org Admin.

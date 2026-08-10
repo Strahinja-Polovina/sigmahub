@@ -21,7 +21,7 @@ func (s *Server) handleListDeployments(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list deployments")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deployments": deps})
+	writeJSON(w, http.StatusOK, map[string]any{"deployments": jsonList(deps)})
 }
 
 // handleListOrgDeployments returns the org-wide deploy feed: the most recent
@@ -35,6 +35,10 @@ func (s *Server) handleListOrgDeployments(w http.ResponseWriter, r *http.Request
 		s.writeStoreErr(w, err, "list org deployments")
 		return
 	}
+	// Both arrays, not a null between them: the mirror sync maps over each of
+	// these on every dashboard render, so this is the list whose `null` breaks
+	// the most pages at once (SIGMA-337).
+	feed.Recent, feed.Latest = jsonList(feed.Recent), jsonList(feed.Latest)
 	writeJSON(w, http.StatusOK, feed)
 }
 
@@ -46,7 +50,7 @@ func (s *Server) handleRollbackTargets(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "rollback targets")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"targets": targets})
+	writeJSON(w, http.StatusOK, map[string]any{"targets": jsonList(targets)})
 }
 
 // handleRollback queues a rollback to a prior successful release (by its

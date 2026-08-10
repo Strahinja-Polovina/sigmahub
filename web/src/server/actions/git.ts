@@ -51,6 +51,15 @@ function ensureCp() {
  *  projectId but B's connectionId (SIGMA-93). Returns the actor, the resolved
  *  project, and the connection's branch maps (for map-addressed callers). */
 async function requireConnectionAdmin(orgId: string, connectionId: string) {
+  // Membership FIRST, before the orgId reaches the control-plane client
+  // (SIGMA-334). cpFetch resolves the org's token through getOrgToken, which
+  // PROVISIONS the org — POST /v1/orgs with the deployment provision token —
+  // when it has no cached credential. Authorizing only after that call meant a
+  // signed-in user could mint a live Org Admin token, plus an empty org, for
+  // any orgId they cared to type, on a path that returns them no data at all.
+  // The project-level gate below is still the real authorization; this only
+  // makes sure we know the caller belongs here before spending anything.
+  await requireMembership(orgId);
   const { connection, branchMaps } = await cpGetGitConnection(orgId, connectionId);
   const { user, role } = await requireProjectRole(orgId, connection.projectId, "Project Admin");
   return { user, role, projectId: connection.projectId, branchMaps };
@@ -329,6 +338,12 @@ export async function listPreviews(input: {
   connectionId: string;
 }): Promise<CpPreviewEnvironment[]> {
   ensureCp();
+  // Membership FIRST (SIGMA-334): the org-scoped visibility check below runs
+  // after a control-plane call, and cpFetch PROVISIONS an org it has no cached
+  // token for. A non-member looping this action over invented orgIds therefore
+  // minted an Org Admin credential per id before being refused. Cheap to hoist
+  // — assertProjectVisible reads the same membership row.
+  await requireMembership(input.orgId);
   // P2-7 read scoping (SIGMA-93): resolve the connection's project and require
   // the caller can see it, so a scoped user can't read another project's preview
   // environments by connection id.

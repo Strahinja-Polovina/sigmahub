@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -22,6 +23,133 @@ type TelemetryAPI interface {
 	DeployStatsForOrg(ctx context.Context, orgID string, window int) (store.DeployStats, error)
 	ConnectedServerCount(ctx context.Context, orgID string) (int, error)
 	VerifyDays(ctx context.Context, orgID string, days int) ([]store.VerifyDay, error)
+}
+
+// telemetryMetaTTL is how long a resolved (project, environment) label pair is
+// reused across ingest batches (SIGMA-333).
+//
+// A minute is far longer than the ingest cadence — the agent's metrics shipper
+// pushes every 15s and its log flusher every 3s — and far shorter than anything
+// that can change the answer. In practice the answer cannot change at all: a
+// resource's project, environment and server are written once at creation and
+// no code path updates them, so the only event this TTL exists for is deletion,
+// where a minute of labels on a resource that has just gone away is harmless.
+// That is also why there is no explicit invalidation hook: there is no mutation
+// to hang one on.
+const telemetryMetaTTL = time.Minute
+
+// telemetryMetaCache memoises resource label lookups ACROSS requests, keyed by
+// (serverID, resourceID) — the same scoping the query uses, so the tenant
+// isolation the lookup provides is preserved by the cache key rather than
+// re-checked.
+//
+// Both ingest handlers used to memoise only within a single request, so every
+// batch re-queried the resources table once per distinct resource it mentioned.
+// The labels are static, the batches are not: 500 servers hosting 10 resources
+// each meant 5,000 lookups every 15 seconds from the metrics endpoint alone,
+// about 330 queries a second, plus the log endpoint at a 3-second cadence. All
+// of it competed for the same 20-connection pool as the work that actually has
+// a deadline — DSD renders, long-poll wake-ups, the backup scheduler's minute
+// tick — so telemetry ingest was a database floor that rose linearly with fleet
+// size and pushed out everything else, with no obvious cause from outside.
+//
+// Only POSITIVE results are cached. A resource that is unknown to this server
+// is re-queried every batch, deliberately: caching the "no" would make a
+// resource created moments before a batch unlabelable, and therefore invisible
+// in the dashboard, for the whole TTL.
+//
+// A nil *telemetryMetaCache is usable and never caches, so a zero-value Server
+// needs no branch.
+type telemetryMetaCache struct {
+	mu        sync.Mutex
+	entries   map[string]telemetryMetaEntry
+	lastSweep time.Time
+}
+
+type telemetryMetaEntry struct {
+	meta    store.TelemetryResourceMeta
+	expires time.Time
+}
+
+func newTelemetryMetaCache() *telemetryMetaCache {
+	return &telemetryMetaCache{entries: map[string]telemetryMetaEntry{}, lastSweep: time.Now()}
+}
+
+// telemetryMetaKey uses a NUL separator so no server/resource id pair can be
+// spelled two ways.
+func telemetryMetaKey(serverID, resourceID string) string {
+	return serverID + "\x00" + resourceID
+}
+
+func (c *telemetryMetaCache) get(serverID, resourceID string) (store.TelemetryResourceMeta, bool) {
+	if c == nil {
+		return store.TelemetryResourceMeta{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[telemetryMetaKey(serverID, resourceID)]
+	if !ok || time.Now().After(e.expires) {
+		return store.TelemetryResourceMeta{}, false
+	}
+	return e.meta, true
+}
+
+func (c *telemetryMetaCache) put(serverID, resourceID string, meta store.TelemetryResourceMeta) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[string]telemetryMetaEntry{}
+	}
+	// Sweep expired entries at most once per TTL. Without it the map would keep
+	// a row for every resource ever deleted from the fleet, which is a slow leak
+	// in the one process that is meant to stay up for months.
+	if now.Sub(c.lastSweep) > telemetryMetaTTL {
+		for k, e := range c.entries {
+			if now.After(e.expires) {
+				delete(c.entries, k)
+			}
+		}
+		c.lastSweep = now
+	}
+	c.entries[telemetryMetaKey(serverID, resourceID)] = telemetryMetaEntry{
+		meta: meta, expires: now.Add(telemetryMetaTTL),
+	}
+}
+
+// telemetryResourceMeta resolves a resource's project/env labels through two
+// tiers: the caller's per-request map (so one batch does at most one lookup per
+// id, which is what the handlers already guaranteed) and the process-level TTL
+// cache above. It returns nil when the resource is not this server's — the
+// caller drops the sample or stream.
+func (s *Server) telemetryResourceMeta(ctx context.Context, serverID, resourceID string, perRequest map[string]*store.TelemetryResourceMeta) *store.TelemetryResourceMeta {
+	if meta, ok := perRequest[resourceID]; ok {
+		return meta
+	}
+	if cached, ok := s.telMeta.get(serverID, resourceID); ok {
+		meta := &cached
+		perRequest[resourceID] = meta
+		return meta
+	}
+	m, err := s.tel.TelemetryResourceMetaForServer(ctx, serverID, resourceID)
+	if errors.Is(err, store.ErrNotFound) {
+		perRequest[resourceID] = nil // not cached process-wide; see above
+		return nil
+	}
+	if err != nil {
+		// A transient failure is not an answer: record nothing in either tier so
+		// the next batch retries rather than dropping this resource's telemetry
+		// for a minute.
+		s.log.Error("telemetry meta", "err", err)
+		return nil
+	}
+	s.telMeta.put(serverID, resourceID, m)
+	meta := &m
+	perRequest[resourceID] = meta
+	return meta
 }
 
 // metricNamePattern gates agent-shipped metric names to the sigmahub_
@@ -84,21 +212,9 @@ func (s *Server) handleAgentTelemetryMetrics(w http.ResponseWriter, r *http.Requ
 			labels[k] = v
 		}
 		if resID := labels["resource"]; resID != "" {
-			meta, ok := metaCache[resID]
-			if !ok {
-				m, err := s.tel.TelemetryResourceMetaForServer(r.Context(), srv.ID, resID)
-				if errors.Is(err, store.ErrNotFound) {
-					metaCache[resID] = nil
-					continue // foreign/unknown resource label: dropped
-				} else if err != nil {
-					s.log.Error("telemetry meta", "err", err)
-					continue
-				}
-				meta = &m
-				metaCache[resID] = meta
-			}
+			meta := s.telemetryResourceMeta(r.Context(), srv.ID, resID, metaCache)
 			if meta == nil {
-				continue
+				continue // foreign/unknown resource label: dropped
 			}
 			labels["project"] = meta.ProjectID
 			labels["env"] = meta.EnvironmentID
@@ -183,19 +299,7 @@ func (s *Server) handleAgentTelemetryLogs(w http.ResponseWriter, r *http.Request
 		if st.ResourceID == "" || len(st.Lines) == 0 {
 			continue
 		}
-		meta, ok := metaCache[st.ResourceID]
-		if !ok {
-			m, err := s.tel.TelemetryResourceMetaForServer(r.Context(), srv.ID, st.ResourceID)
-			if errors.Is(err, store.ErrNotFound) {
-				metaCache[st.ResourceID] = nil
-				continue
-			} else if err != nil {
-				s.log.Error("telemetry meta", "err", err)
-				continue
-			}
-			meta = &m
-			metaCache[st.ResourceID] = meta
-		}
+		meta := s.telemetryResourceMeta(r.Context(), srv.ID, st.ResourceID, metaCache)
 		if meta == nil {
 			continue
 		}

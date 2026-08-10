@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func render(t *testing.T, r *Registry) string {
@@ -57,8 +58,27 @@ func TestNilRegistryIsUsable(t *testing.T) {
 	var r *Registry
 	r.Loop("whatever").Report(errors.New("boom"))
 	r.ObserveDSDRender(0)
+	r.ObserveResyncPass(0)
 	r.SetPoolSource(nil)
 	render(t, r)
+}
+
+// SIGMA-320: the pass duration is the series that says whether the fleet's 60s
+// drift-repair interval is still real, so it has to be exported even before the
+// first pass — an absent series alerts on nothing, same as the loop clocks.
+func TestResyncPassDurationIsExported(t *testing.T) {
+	r := New()
+	if out := render(t, r); !strings.Contains(out, "sigmahub_cp_resync_pass_last_seconds 0.000000") {
+		t.Fatalf("pass duration missing before the first pass:\n%s", out)
+	}
+	r.ObserveResyncPass(90 * time.Second)
+	out := render(t, r)
+	if !strings.Contains(out, "sigmahub_cp_resync_pass_last_seconds 90.000000") {
+		t.Fatalf("last pass duration not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "sigmahub_cp_resync_pass_seconds_count 1") {
+		t.Fatalf("pass count not reported:\n%s", out)
+	}
 }
 
 func TestPoolStatsAreSampledAtScrape(t *testing.T) {
