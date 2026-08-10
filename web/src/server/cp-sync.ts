@@ -287,6 +287,13 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
           projectId: s.resources.projectId,
           environmentId: s.resources.environmentId,
           serverId: s.resources.serverId,
+          // Must list every column in RESOURCE_KEYS. The diff below compares
+          // these values against the control plane's to decide whether a row
+          // needs writing; a key that is written but not selected reads as
+          // undefined on the local side, never matches, and makes EVERY row
+          // look changed — which silently undoes the batching this projection
+          // exists to enable. clusterId joined the keys with SIGMA-331.
+          clusterId: s.resources.clusterId,
           name: s.resources.name,
           kind: s.resources.kind,
           status: s.resources.status,

@@ -135,6 +135,11 @@ vi.mock("./cp", async () => {
     cpListOrgDeployments: () => cpListOrgDeployments(),
     cpListEnvironments: (o: string, p: string) => cpListEnvironments(o, p),
     cpEnvServerIds: (o: string, e: string) => cpEnvServerIds(o, e),
+    // SIGMA-331 added a cluster mirror to the same pass. The stub returns an
+    // empty list rather than being omitted: an unmocked export makes every test
+    // in this file fail at import with "No cpListClusters export is defined",
+    // which says nothing about the batching these tests are actually asserting.
+    cpListClusters: async () => ({ clusters: [] }),
   };
 });
 
