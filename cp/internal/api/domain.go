@@ -55,6 +55,11 @@ type DomainAPI interface {
 	IdempotencyFinalize(ctx context.Context, orgID, key string, statusCode int, response []byte) error
 	IdempotencyRelease(ctx context.Context, orgID, key string) error
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
+	// PurgeOrg is the other end of the tenant lifecycle POST /v1/orgs opens
+	// (SIGMA-284): it erases every control-plane row belonging to an org, so a
+	// GDPR erasure request or an ended trial has a code path instead of a
+	// hand-written DELETE tour of forty tables.
+	PurgeOrg(ctx context.Context, orgID string) (map[string]int64, error)
 	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
 	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)
 	// BeginDecommission is the graceful disconnect (SIGMA-204); DeleteServer is
@@ -604,6 +609,44 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 		"role":     string(p.Role),
 		"issuedAt": time.Now().UTC(),
 	})
+}
+
+// handlePurgeOrg erases the tenant from the control plane (SIGMA-284).
+//
+// Gated by the provision token rather than by the org's own Org Admin
+// credential, and deliberately so: this is the inverse of POST /v1/orgs, it
+// destroys backups' key material along with everything else, and an operator
+// answering an erasure request is not the same principal as the dashboard.
+// Requiring the same credential that created the tenant also means a stolen
+// org token cannot delete the tenant it was stolen from.
+//
+// The org id comes from the path, and the body must name the SAME id. A purge
+// is not something to trigger by mistyping a URL, and the confirmation is the
+// cheapest possible guard that the caller meant this org.
+func (s *Server) handlePurgeOrg(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	var req struct {
+		ConfirmOrgID string `json:"confirmOrgId"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		return
+	}
+	if req.ConfirmOrgID != orgID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "confirmOrgId must equal the org in the path",
+		})
+		return
+	}
+	deleted, err := s.domain.PurgeOrg(r.Context(), orgID)
+	if err != nil {
+		// Logged with the org id because a purge that could not finish is the
+		// one failure here an operator has to chase by hand.
+		s.log.Error("purge org", "org", orgID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "purge failed"})
+		return
+	}
+	s.log.Warn("control-plane tenant purged", "org", orgID, "tables", len(deleted))
+	writeJSON(w, http.StatusOK, map[string]any{"orgId": orgID, "deleted": deleted})
 }
 
 // handleGetLLM returns a model endpoint's readout (CP mode, llm kind only).

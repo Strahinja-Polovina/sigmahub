@@ -181,6 +181,45 @@ async function getOrgToken(orgId: string): Promise<string> {
   return winner.rows[0]?.token ?? token;
 }
 
+/** Erase the org from the control plane and forget its credential (SIGMA-284).
+ *
+ *  Authenticated with the PROVISION token rather than the org's own service
+ *  token, matching the CP's gate: erasure is the inverse of provisioning, and
+ *  a stolen dashboard credential must not be able to destroy the tenant it was
+ *  stolen from. It is therefore deliberately NOT routed through cpFetch, which
+ *  exists to attach the org token.
+ *
+ *  The cached credential is dropped in the same breath. Leaving it would make
+ *  the very next call for this org authenticate with a token the CP no longer
+ *  knows and fail 401 — whereas a deleted row means a re-created org
+ *  re-provisions cleanly. */
+export async function cpPurgeOrg(orgId: string): Promise<void> {
+  const provisionToken =
+    process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+  const res = await fetch(`${cpBase()}/v1/orgs/${encodeURIComponent(orgId)}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${provisionToken}`,
+      "Content-Type": "application/json",
+    },
+    // The CP requires the body to name the same org as the path, so a purge is
+    // never one mistyped URL away.
+    body: JSON.stringify({ confirmOrgId: orgId }),
+    cache: "no-store",
+  });
+  // A 404 is success for this call: it means the control plane has nothing for
+  // this org, which is the state we were asking it to reach.
+  if (!res.ok && res.status !== 404) {
+    const body = await res.text().catch(() => "");
+    throw new CpRequestError(
+      `Control plane ${res.status}: ${body.slice(0, 200)}`,
+      res.status
+    );
+  }
+  await ensureOrgTokenTable();
+  await client.query(`DELETE FROM cp_org_tokens WHERE org_id = $1`, [orgId]);
+}
+
 /** Signed actor headers: HMAC-SHA256 over the base64url payload, keyed with
  *  the bearer token both ends already share. */
 function actorHeaders(actor: CpActor, bearerToken: string): Record<string, string> {

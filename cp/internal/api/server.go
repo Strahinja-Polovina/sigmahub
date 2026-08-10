@@ -317,6 +317,8 @@ func (s *Server) routes() {
 
 	// Org provisioning (dedicated token; mints the org's web credential).
 	s.mux.HandleFunc("POST /v1/orgs", s.requireProvision(s.handleProvisionOrg))
+	// …and its inverse: tenant erasure (SIGMA-284), same credential.
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}", s.requireProvision(s.handlePurgeOrg))
 
 	// Git provider webhook (P1-7). Public: unauthenticated but HMAC-verified
 	// against the configured secret; a forged signature is rejected 401.

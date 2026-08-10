@@ -173,6 +173,9 @@ type fakeDomain struct {
 	typeCalls   [][4]string
 	renameCalls [][4]string
 	typeErr     error
+	// Orgs handed to PurgeOrg (SIGMA-284), so a handler test can prove the
+	// confirmation guard let exactly the intended tenant through.
+	purged []string
 }
 
 func (f *fakeDomain) CreateProject(_ context.Context, orgID, name, desc, actor string) (store.Project, error) {
@@ -288,6 +291,10 @@ func (f *fakeDomain) IdempotencyRelease(_ context.Context, orgID, key string) er
 }
 func (f *fakeDomain) IssueServiceToken(_ context.Context, orgID, name string, role store.Role, _ string) (string, store.ServicePrincipal, error) {
 	return "sst_provisioned", store.ServicePrincipal{ID: "st_p", OrgID: orgID, Name: name, Role: role}, nil
+}
+func (f *fakeDomain) PurgeOrg(_ context.Context, orgID string) (map[string]int64, error) {
+	f.purged = append(f.purged, orgID)
+	return map[string]int64{"servers": 1}, nil
 }
 func (f *fakeDomain) IssueConfirmToken(_ context.Context, _, _, _, _, _ string, _ time.Duration) (string, time.Time, error) {
 	return "sct_confirm", time.Now().Add(time.Minute), nil
