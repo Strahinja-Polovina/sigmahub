@@ -13,6 +13,7 @@ import {
   CircleAlert,
   ArrowRight,
   Lock,
+  RotateCw,
 } from "lucide-react";
 
 import {
@@ -228,6 +229,14 @@ export function DeployWizard({
   const [createError, setCreateError] = React.useState<string | null>(null);
   const [credentials, setCredentials] = React.useState<RevealedCredentials | null>(null);
   const createStartedRef = React.useRef(false);
+  /** Bumped by Retry, and a dependency of the create effect.
+   *
+   *  A failed create leaves `step` at "create", and `step` was the effect's
+   *  only dependency — so once createStartedRef had latched there was nothing
+   *  left that could make the create run a second time, and the only way to
+   *  retry a duplicate name or a transient network error was to close the
+   *  wizard and walk all six steps again (SIGMA-305). */
+  const [createAttempt, setCreateAttempt] = React.useState(0);
 
   const projects = targets as WizardProject[];
   const inventory = React.useMemo(
@@ -809,9 +818,37 @@ export function DeployWizard({
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step]);
+  }, [step, createAttempt]);
 
-  const done = createState === "done" || createState === "error";
+  /** Run the create again, on the answers already given (SIGMA-305).
+   *
+   *  Everything the wizard collected is still in state — this only un-latches
+   *  the guard and moves the attempt counter, which is what makes the effect
+   *  above fire while `step` stays where it is. */
+  function retryCreate() {
+    createStartedRef.current = false;
+    setCreateError(null);
+    setCreateState("idle");
+    setCreateAttempt((n) => n + 1);
+  }
+
+  /** Leave a failed create for the step before it, with the answers intact.
+   *
+   *  The guard has to be released here too: coming forward again is a `step`
+   *  change, but a latched createStartedRef would let the user press Deploy on
+   *  a corrected name and watch nothing happen. */
+  function backFromFailedCreate() {
+    createStartedRef.current = false;
+    setCreateError(null);
+    setCreateState("idle");
+    if (backStep) setStep(backStep);
+  }
+
+  /** The create has SETTLED — succeeded OR failed. It decides only whether the
+   *  dialog may be dismissed; the footer's wording and its actions must tell
+   *  the two apart, which is what this used to be called `done` for and what
+   *  put "You're all set." beside "Create failed" (SIGMA-305). */
+  const createSettled = createState === "done" || createState === "error";
   const isLast = step === "create";
   const nextLabel = nextStepId(kind, step) === "create" ? "Deploy" : "Continue";
 
@@ -819,7 +856,7 @@ export function DeployWizard({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         className="flex max-h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-xl"
-        showCloseButton={!isLast || done}
+        showCloseButton={!isLast || createSettled}
       >
         <DialogHeader className="gap-1 border-b p-4">
           <DialogTitle className="flex items-center gap-2">
@@ -1045,13 +1082,50 @@ export function DeployWizard({
             </>
           ) : (
             <>
-              <span className="text-xs text-muted-foreground">
-                {done ? "You're all set." : "Creating…"}
-              </span>
-              <Button size="sm" onClick={() => onOpenChange(false)} disabled={!done}>
-                <Check className="size-4" />
-                Done
-              </Button>
+              {/* A FAILED create is not a finished one. It used to render the
+                  success footer — "You're all set." under a red "Create
+                  failed", with Done as the only enabled control, and pressing
+                  Done threw away every answer the user had spent five minutes
+                  giving. So the failure gets its own footer: the same
+                  Back/forward shape as the configuring steps, plus a Retry that
+                  re-runs the create on the answers already in state
+                  (SIGMA-305). */}
+              {createState === "error" ? (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={backFromFailedCreate}
+                    disabled={!backStep}
+                  >
+                    <ChevronLeft className="size-4" />
+                    {backStep === "review" ? "Back to review" : "Back"}
+                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+                      Close
+                    </Button>
+                    <Button size="sm" onClick={retryCreate}>
+                      <RotateCw className="size-4" />
+                      Retry
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <span className="text-xs text-muted-foreground">
+                    {createState === "done" ? "You're all set." : "Creating…"}
+                  </span>
+                  <Button
+                    size="sm"
+                    onClick={() => onOpenChange(false)}
+                    disabled={createState !== "done"}
+                  >
+                    <Check className="size-4" />
+                    Done
+                  </Button>
+                </>
+              )}
             </>
           )}
         </div>
