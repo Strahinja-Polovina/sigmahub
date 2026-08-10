@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -408,6 +408,22 @@ function hostAlert(
   }
 }
 
+/** The tab ids this page renders, in the order the strip shows them.
+ *
+ *  Written down so `?tab=` can be VALIDATED rather than trusted: the parameter
+ *  comes off the URL, and handing Tabs a value no TabsContent answers to would
+ *  render a page with a strip and no panel — worse than the Overview it opens
+ *  on today. Every id here has a TabsTrigger and a TabsContent below
+ *  (SIGMA-310). */
+const RESOURCE_TAB_IDS = [
+  "overview",
+  "logs",
+  "metrics",
+  "environment",
+  "deployments",
+  "settings",
+];
+
 export function ResourceDetail({
   detail,
   orgId,
@@ -498,6 +514,18 @@ export function ResourceDetail({
 
   // Why this resource may be going nowhere through no fault of its own.
   const host = hostAlert(server);
+
+  // Deep-linkable tabs, the same way the settings page has done it since the
+  // org switcher started linking into it. The overview's per-resource menu
+  // links to /dashboard/resources/<id>?tab=logs — an operator triaging a red
+  // resource during an incident — and this page ignored the parameter and
+  // opened on Overview, so the link read as broken (SIGMA-310). Validated
+  // against the ids actually rendered below; anything else falls back rather
+  // than leaving Tabs with a value no panel answers to.
+  const searchParams = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const initialTab =
+    requestedTab && RESOURCE_TAB_IDS.includes(requestedTab) ? requestedTab : "overview";
 
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
@@ -713,7 +741,7 @@ export function ResourceDetail({
         )
       )}
 
-      <Tabs defaultValue="overview">
+      <Tabs defaultValue={initialTab}>
         <TabsList variant="line" className="w-full justify-start overflow-x-auto">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="logs">Logs</TabsTrigger>

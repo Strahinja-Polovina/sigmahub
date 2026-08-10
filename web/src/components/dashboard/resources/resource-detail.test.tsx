@@ -8,8 +8,10 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 // asks what a control ON THE PAGE actually does, so the boundary is stubbed and
 // the component is rendered for real.
 const refresh = vi.fn();
+let searchParams = new URLSearchParams();
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh, push: vi.fn(), replace: vi.fn() }),
+  useSearchParams: () => searchParams,
 }));
 vi.mock("sonner", () => {
   const toast = Object.assign(vi.fn(), {
@@ -117,6 +119,7 @@ function dangerZone(): HTMLElement {
 
 afterEach(() => {
   cleanup();
+  searchParams = new URLSearchParams();
   vi.clearAllMocks();
 });
 
@@ -293,5 +296,41 @@ describe("ResourceDetail host health", () => {
       ),
     });
     expect(screen.getByText(/being disconnected/i)).toBeTruthy();
+  });
+});
+
+// Overview's per-resource menu links to /dashboard/resources/<id>?tab=logs
+// (SIGMA-310). The page rendered <Tabs defaultValue="overview"> and nothing
+// read searchParams, so an operator triaging a red resource from the overview
+// landed on Overview, assumed they mis-clicked, went back and clicked again.
+// The settings page has honoured ?tab since the org switcher started
+// deep-linking into it; the two surfaces disagreed about whether it means
+// anything.
+describe("ResourceDetail honors ?tab", () => {
+  function activeTab(): string {
+    const tab = screen
+      .getAllByRole("tab")
+      .find(
+        (t) =>
+          t.getAttribute("data-selected") !== null || t.getAttribute("aria-selected") === "true"
+      );
+    return tab?.textContent?.trim() ?? "";
+  }
+
+  it("?tab=logs opens the Logs tab", () => {
+    searchParams = new URLSearchParams("tab=logs");
+    renderCp();
+    expect(activeTab()).toBe("Logs");
+  });
+
+  it("falls back to Overview for a tab id that does not exist", () => {
+    searchParams = new URLSearchParams("tab=nonsense");
+    renderCp();
+    expect(activeTab()).toBe("Overview");
+  });
+
+  it("opens Overview when nothing was asked for", () => {
+    renderCp();
+    expect(activeTab()).toBe("Overview");
   });
 });
