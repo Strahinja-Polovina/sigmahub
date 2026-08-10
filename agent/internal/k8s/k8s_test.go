@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
@@ -219,6 +221,94 @@ func TestManifestIsDeterministic(t *testing.T) {
 			t.Fatal("manifest rendering is not deterministic")
 		}
 	}
+}
+
+// Writing a manifest into k3s's auto-apply directory is not the same as running
+// a workload: the image may not pull, the pods may crash-loop, the scheduler may
+// have nowhere to put them. Returning nil at the moment of the write turns every
+// one of those into a green deploy — the op reports applied, the deployment
+// flips to success, and the release is recorded as a rollback target while no
+// pod has ever served a request. The op must fail, and the failure must carry
+// the cluster's own account of why, the same way the container path's health
+// gate ships the failed container's startup logs.
+func TestApplyWorkloadFailsWhenDeploymentNeverBecomesAvailable(t *testing.T) {
+	d, cap := testDriver(t)
+	d.rolloutTimeout = 30 * time.Millisecond
+	d.rolloutInterval = time.Millisecond
+	base := d.runner
+	d.runner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if !strings.HasSuffix(name, "kubectl") {
+			return base(ctx, name, args...)
+		}
+		cap.commands = append(cap.commands, append([]string{name}, args...))
+		switch {
+		case hasArg(args, "rollout"):
+			// A stuck rollout: kubectl exits non-zero once its own timeout lapses.
+			return []byte(`Waiting for deployment "api" rollout to finish: 0 of 2 updated replicas are available...
+error: timed out waiting for the condition`), errors.New("exit status 1")
+		case hasArg(args, "describe"):
+			return []byte("Events:\n  Warning  Failed  Failed to pull image \"img:1\": not found"), nil
+		case hasArg(args, "logs"):
+			return []byte("Error from server (BadRequest): container is waiting to start"), nil
+		}
+		return nil, nil
+	}
+
+	spec := ApplySpec{
+		ResourceID: "res_1", Name: "api", Namespace: "sigmahub-proj",
+		Image: "img:1", Replicas: 2, Ports: []int{8080},
+	}
+	raw, _ := json.Marshal(spec)
+	err := d.applyWorkload(context.Background(), dsd.Op{ID: "res:res_1", Kind: KindK8sApply, Spec: raw})
+	if err == nil {
+		t.Fatal("a workload whose rollout never completes must fail the op, not report a deploy that never ran")
+	}
+	if !strings.Contains(err.Error(), "Failed to pull image") {
+		t.Fatalf("the failure must carry the cluster's own diagnosis, got: %v", err)
+	}
+	// The manifest stays on disk: k3s keeps retrying it, and a rollout that
+	// completes a minute later must not need a human to re-create the file.
+	if len(cap.files["/manifests/api.yaml"]) == 0 {
+		t.Fatal("a failed rollout must not delete the manifest")
+	}
+
+	// The gate has to ask about THIS deployment in THIS namespace — a rollout
+	// status read from the wrong namespace is a green light for nothing.
+	var gate []string
+	for _, c := range cap.commands {
+		if hasArg(c, "rollout") {
+			gate = c
+		}
+	}
+	if gate == nil {
+		t.Fatalf("no rollout status was ever requested: %v", cap.commands)
+	}
+	joined := strings.Join(gate, " ")
+	for _, want := range []string{"-n sigmahub-proj", "rollout status", "deployment/api"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rollout gate %q missing %q", joined, want)
+		}
+	}
+
+	// And a rollout that does complete still applies cleanly.
+	d.runner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if strings.HasSuffix(name, "kubectl") {
+			return []byte(`deployment "api" successfully rolled out`), nil
+		}
+		return base(ctx, name, args...)
+	}
+	if err := d.applyWorkload(context.Background(), dsd.Op{ID: "res:res_1", Kind: KindK8sApply, Spec: raw}); err != nil {
+		t.Fatalf("a completed rollout must apply cleanly: %v", err)
+	}
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 func containsEnv(env []string, want string) bool {

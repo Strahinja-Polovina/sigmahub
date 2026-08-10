@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -133,6 +134,10 @@ type Driver struct {
 	// reconciled by the server. Using it instead of `kubectl apply` means a
 	// workload survives an API-server restart without us re-running anything.
 	manifestDir string
+	// rolloutTimeout / rolloutInterval bound the wait for a written manifest to
+	// become a running Deployment. Overridable so tests do not sleep.
+	rolloutTimeout  time.Duration
+	rolloutInterval time.Duration
 }
 
 // NewDriver builds a driver bound to the real host.
@@ -324,8 +329,19 @@ func (d *Driver) serviceActive(ctx context.Context, unit string) bool {
 }
 
 // applyWorkload writes the workload's manifests into k3s's auto-apply
-// directory. The server reconciles them, so the workload survives an API-server
+// directory, then waits for the Deployment to actually become available. The
+// server reconciles the directory, so the workload survives an API-server
 // restart with no action from us — and removing the file removes the workload.
+//
+// The wait is the point. Writing a file is not running a workload: an image the
+// nodes cannot pull, a container that crash-loops, a pod nothing can schedule
+// and a namespace over quota all leave the manifest sitting there perfectly
+// applied. Returning nil at the write reported those as APPLIED, which turned
+// the op into a 'success' deployment (rollout phase → AdvanceDeploymentForResource),
+// a green resource badge and a rollback target — while every pod was in
+// ImagePullBackOff and the custom domain 502'd. The container path has always
+// held itself to this bar (gateHealthy + captureStartupLogs); the cluster path
+// now does too.
 func (d *Driver) applyWorkload(ctx context.Context, op dsd.Op) error {
 	var spec ApplySpec
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
@@ -396,7 +412,112 @@ func (d *Driver) applyWorkload(ctx context.Context, op dsd.Op) error {
 	// applying whatever is in this directory, so leaving the file behind leaves
 	// the Deployment alive with nothing in the product describing it.
 	d.pruneManifests(spec)
-	return nil
+	// The manifest stays on disk whatever the gate says: k3s keeps retrying it,
+	// so a rollout that completes after our deadline still converges, and the
+	// next resync re-runs this op and reports the better answer.
+	return d.gateRollout(ctx, ns, spec.Name)
+}
+
+// rollout gate defaults. Five minutes is the same order as a first pull of a
+// large image onto a cold node; the interval is short enough that a fast deploy
+// is not held open waiting for a poll.
+const (
+	defaultRolloutTimeout  = 5 * time.Minute
+	defaultRolloutInterval = 3 * time.Second
+)
+
+// gateRollout blocks until the Deployment reports itself rolled out, or fails
+// with the cluster's own account of why it did not.
+//
+// `kubectl rollout status` is asked with a per-attempt timeout rather than one
+// long watch, because the manifest has only just been written: for the first
+// second or two the Deployment does not exist yet and kubectl exits NotFound.
+// Retrying until the outer deadline covers that window and a genuinely stuck
+// rollout with the same loop.
+func (d *Driver) gateRollout(ctx context.Context, ns, name string) error {
+	if d.runner == nil {
+		return nil
+	}
+	timeout := d.rolloutTimeout
+	if timeout <= 0 {
+		timeout = defaultRolloutTimeout
+	}
+	interval := d.rolloutInterval
+	if interval <= 0 {
+		interval = defaultRolloutInterval
+	}
+	kubectl := filepath.Join(d.binDir, "kubectl")
+	deadline := time.Now().Add(timeout)
+	var last string
+	for {
+		out, err := d.runner(ctx, kubectl, "-n", ns, "rollout", "status",
+			"deployment/"+name, "--timeout="+interval.String())
+		if err == nil {
+			return nil
+		}
+		if l := firstLine(string(out)); l != "" {
+			last = l
+		} else {
+			last = err.Error()
+		}
+		if time.Now().After(deadline) {
+			// The operator has no other window into the cluster, so the failure
+			// carries what a human would have run by hand: the Deployment's and
+			// the pods' events (ImagePullBackOff, unschedulable, quota) and the
+			// pods' own last words (a crash loop's panic).
+			return fmt.Errorf("workload %s/%s did not become available within %s: %s%s",
+				ns, name, timeout, last, d.rolloutDiagnostics(ctx, kubectl, ns, name))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// rolloutDiagnosticChars bounds each collected block. The tail is what matters —
+// events are appended, and a panic is at the end of the log.
+const rolloutDiagnosticChars = 2000
+
+// rolloutDiagnostics collects why the rollout is stuck. Every error here is
+// swallowed on purpose: this runs on the way to reporting a rollout failure and
+// must never replace that error with a worse one about collecting diagnostics.
+func (d *Driver) rolloutDiagnostics(ctx context.Context, kubectl, ns, name string) string {
+	var b strings.Builder
+	collect := func(label string, args ...string) {
+		out, err := d.runner(ctx, kubectl, args...)
+		text := strings.TrimSpace(string(out))
+		if text == "" {
+			if err == nil {
+				return
+			}
+			text = err.Error()
+		}
+		fmt.Fprintf(&b, "\n--- %s ---\n%s", label, tail(text, rolloutDiagnosticChars))
+	}
+	collect("describe deployment", "-n", ns, "describe", "deployment/"+name)
+	collect("describe pods", "-n", ns, "describe", "pods", "-l", "app="+name)
+	collect("pod logs", "-n", ns, "logs", "-l", "app="+name,
+		"--tail="+fmt.Sprint(rolloutLogLines), "--all-containers=true")
+	return b.String()
+}
+
+// rolloutLogLines caps what a crash-looping pod can push into the deploy log,
+// mirroring the container path's startup-log tail.
+const rolloutLogLines = 100
+
+// tail keeps the last n characters, clipped to a line boundary so the output
+// does not start mid-word.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[len(s)-n:]
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[i+1:]
+	}
+	return "…\n" + s
 }
 
 // manifestFile is the manifest a workload owns. Keyed by the workload's own
