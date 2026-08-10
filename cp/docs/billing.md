@@ -1,9 +1,80 @@
 # Billing (P2-4, Paddle)
 
-SigmaHub's price model is one flat unit (€5) per **connected server** per
-month, with the first 3 connected servers free. Billing runs through
-[Paddle](https://www.paddle.com/) as the merchant of record, so VAT/sales tax
-is handled Paddle-side.
+SigmaHub bills **units**, not servers. A connected server is worth a number of
+units that tracks how expensive it is to manage — an ordinary server is one
+unit, a Kubernetes node two, a GPU server four — and you pay a flat price per
+unit per month above a free allowance. Billing runs through
+[Paddle](https://www.paddle.com/) as the merchant of record, so VAT/sales tax is
+handled Paddle-side.
+
+> This section used to price a flat €5 per *server* with the first three
+> servers free, which predated the unit weights and put a three-GPU fleet at €0
+> instead of €45 (SIGMA-296). The tables below are read by
+> `TestBillingDocMatchesPricingConstants` and compared
+> to `store.BillingUnitPrice`, `store.BillingFreeTier` and the catalog's weight
+> table, so the prose can no longer drift on its own. Edit the constants, not
+> just this file.
+
+## The price
+
+| Setting | Value |
+| --- | --- |
+| Unit price | €5 per unit per month |
+| Free tier | 3 units, always included |
+| Currency | EUR |
+
+### What a server is worth
+
+| Server type | Units each |
+| --- | --- |
+| `general` | 1 |
+| `vps` | 1 |
+| `database` | 1 |
+| `storage` | 1 |
+| `gpu` | 4 |
+| `k8s` | 2 |
+| `build` | 1 |
+
+A type this table does not name bills as one unit — never as zero, so a typo in
+a type string cannot silently make a server free.
+
+The billable quantity is `max(0, units − 3)`, where `units` is the **weighted**
+total, not the server count. An all-general fleet therefore prices exactly as it
+did before weights existed: "your first three servers are free" stays literally
+true for ordinary servers, and only for those.
+
+### Worked example: a mixed fleet
+
+| What is connected | Units |
+| --- | --- |
+| 2 general servers | 2 × 1 = 2 |
+| 1 database server | 1 × 1 = 1 |
+| 3 Kubernetes nodes | 3 × 2 = 6 |
+| 1 GPU server | 1 × 4 = 4 |
+| **Total** | **13** |
+
+13 units − 3 free = 10 billable × €5 = **€50/month** for 7 servers.
+
+And the case the old doc got wrong: **three GPU servers** are 12 units, not
+three free servers. 12 − 3 = 9 × €5 = **€45/month**.
+
+### What the subscription is priced on
+
+The quantity pushed to Paddle is the **high-water mark** of the weighted unit
+total over the last 24 hours, minus the free tier. It is deliberately not the
+bare point-in-time count: servers flip to `unreachable` on a missed heartbeat,
+so a network blip across a fleet would otherwise scale the subscription down —
+with an immediate proration credit — and back up minutes later. A scale-up takes
+effect immediately; a scale-down takes effect a day later.
+
+That same number is what the Billing page shows as "Total due" and what the
+checkout transaction carries, computed by one function so the three cannot fork
+(`store.BillableQuantity` / `BilledUnitsForOrg`, SIGMA-292). One exception is
+worth knowing: an active subscription cannot bill zero units, because Paddle
+rejects a zero-quantity item, so a fleet that shrinks into the free tier while
+subscribed still bills a one-unit minimum. The Billing page shows that minimum
+as its own line rather than claiming nothing is due; cancelling in the customer
+portal is what stops it.
 
 ## Honest-off
 
@@ -22,8 +93,13 @@ Nothing is ever silently billed or paused.
 records one row per **connected** (`status='running'`) server per hour — the
 time-integrated meter, so a month's usage reflects actual connected time, not
 a point-in-time snapshot. The Billing summary reports the current connected
-count, the billable count (`max(0, connected - 3)`), the monthly charge, and
-the accrued server-hours this month for reconciliation.
+server count, the weighted unit total, the units it is billed on (the 24-hour
+high-water mark), the billable quantity `max(0, units − 3)`, the monthly charge,
+and the accrued server-hours this month for reconciliation.
+
+`incompatible` and `decommissioning` hosts are not `running`, so neither is
+metered: a host that cannot do the job it was enrolled for is not billed, and
+neither is one the operator has told us to stop using.
 
 ## Subscription lifecycle
 
@@ -95,7 +171,7 @@ SELECT org_id,
 CP_PADDLE_API_KEY=pdl_...              # empty = billing off
 CP_PADDLE_WEBHOOK_SECRET=pdl_ntfset_...# empty = webhook receiver 503
 CP_PADDLE_ENV=sandbox                  # sandbox | production
-CP_PADDLE_PRICE_ID=pri_...             # the connected-server price
+CP_PADDLE_PRICE_ID=pri_...             # the per-UNIT price (quantity = units)
 ```
 
 Point the Paddle webhook at `https://<cp-host>/v1/webhooks/paddle` and set the
