@@ -46,7 +46,7 @@ import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator"
 import type { ResourceKind, Status } from "@/lib/mock";
 import { KIND_LABELS, formatDate, type DeployTarget } from "./resource-meta";
 import { DeployWizard } from "./deploy-wizard";
-import type { WizardCluster } from "@/lib/wizard/availability";
+import type { WizardCluster, WizardServer } from "@/lib/wizard/availability";
 
 const ALL = "__all__";
 
@@ -114,6 +114,9 @@ export function ResourcesView({
   orgId = "",
   clusters = [],
   clusterExcludedKinds = [],
+  /** The whole fleet, so step 1 can tell "no such server" from "one is
+   *  connected but attached to no environment" (SIGMA-309). */
+  orgServers = [],
   /** The GitHub install round trip lands back here with ?wizard=resume, and the
    *  wizard picks the draft it left in sessionStorage back up (SIGMA-208). */
   resumeWizard = false,
@@ -125,6 +128,7 @@ export function ResourcesView({
   orgId?: string;
   clusters?: WizardCluster[];
   clusterExcludedKinds?: string[];
+  orgServers?: WizardServer[];
   resumeWizard?: boolean;
 }) {
   const [wizardOpen, setWizardOpen] = React.useState(resumeWizard);
@@ -294,6 +298,7 @@ export function ResourcesView({
         orgId={orgId}
         clusters={clusters}
         clusterExcludedKinds={clusterExcludedKinds}
+        orgServers={orgServers}
         resume={resumeWizard}
       />
     </div>

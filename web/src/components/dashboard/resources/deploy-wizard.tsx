@@ -48,6 +48,7 @@ import {
   type EngineCapabilities,
   type WizardCluster,
   type WizardProject,
+  type WizardServer,
 } from "@/lib/wizard/availability";
 import {
   kindPickerPhase,
@@ -139,6 +140,12 @@ export function DeployWizard({
   orgId = "",
   clusters = [],
   clusterExcludedKinds = [],
+  /** Every server the organization has, attached to an environment or not.
+   *  `targets` only carries attachments, so without this a connected host that
+   *  nobody attached anywhere is invisible here and step 1 reports it as a
+   *  fleet with no such server — sending a first-run user back to the Servers
+   *  page they just came from (SIGMA-309). */
+  orgServers = [],
   /** The project this wizard was opened from, when it was opened from one. It
    *  brings the GitHub install round trip back to the right page, and it SEEDS
    *  the target project — which is the only reason the model step can ask the
@@ -154,6 +161,7 @@ export function DeployWizard({
   orgId?: string;
   clusters?: WizardCluster[];
   clusterExcludedKinds?: string[];
+  orgServers?: WizardServer[];
   originProjectId?: string;
   resume?: boolean;
 }) {
@@ -240,8 +248,8 @@ export function DeployWizard({
 
   const projects = targets as WizardProject[];
   const inventory = React.useMemo(
-    () => buildInventory(projects, clusters, clusterExcludedKinds, capabilities),
-    [projects, clusters, clusterExcludedKinds, capabilities]
+    () => buildInventory(projects, clusters, clusterExcludedKinds, capabilities, orgServers),
+    [projects, clusters, clusterExcludedKinds, capabilities, orgServers]
   );
   const steps = stepsForKind(kind);
   const decision = React.useMemo(() => decideBuildMethod(detected), [detected]);

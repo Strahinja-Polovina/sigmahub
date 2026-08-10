@@ -77,6 +77,17 @@ export type WizardCluster = {
 export type TargetInventory = {
   /** Server types present on at least one environment the user can deploy to. */
   serverTypes: Set<string>;
+  /** Server types the ORGANIZATION has connected, attached or not — a superset
+   *  of serverTypes.
+   *
+   *  It exists to tell two refusals apart (SIGMA-309). A resource deploys into
+   *  an environment, so a host attached to none of them cannot host anything;
+   *  but "no Storage server is connected" is the wrong sentence to show someone
+   *  who connected one an hour ago, and "connect a server" sends them back to
+   *  the page they just came from. Empty when a caller passed no fleet, which
+   *  reads as "nothing told us" and keeps the connect-a-server wording — the
+   *  behaviour that predates this field. */
+  fleetServerTypes: Set<string>;
   /** Clusters, likewise. */
   clusterCount: number;
   /** Kinds a cluster refuses, as the control plane publishes them. */
@@ -109,7 +120,13 @@ export function buildInventory(
   projects: WizardProject[],
   clusters: WizardCluster[] = [],
   clusterExcludedKinds: string[] = [],
-  capabilities: EngineCapabilities | null = null
+  capabilities: EngineCapabilities | null = null,
+  /** Every server the ORGANIZATION has, attached to an environment or not.
+   *  The tree above only carries attachments, so without this the wizard
+   *  cannot see a connected-but-unattached host at all and reports it as a
+   *  fleet that lacks the type (SIGMA-309). Optional: a caller that has not
+   *  loaded the fleet gets exactly the old wording. */
+  orgServers: WizardServer[] = []
 ): TargetInventory {
   const serverTypes = new Set<string>();
   for (const project of projects) {
@@ -119,8 +136,15 @@ export function buildInventory(
       }
     }
   }
+  // A superset by construction: a host attached somewhere is still in the
+  // fleet, and a caller may pass only the fleet, only the tree, or both.
+  const fleetServerTypes = new Set<string>(serverTypes);
+  for (const server of orgServers) {
+    if (serverIsDeployable(server)) fleetServerTypes.add(server.type);
+  }
   return {
     serverTypes,
+    fleetServerTypes,
     clusterCount: clusters.length,
     clusterExcludedKinds: new Set(clusterExcludedKinds),
     enabledDbEngines: capabilities?.dbEngines.length ? new Set(capabilities.dbEngines) : null,
@@ -169,6 +193,14 @@ export type KindAvailability = {
 };
 
 const CONNECT_SERVER = { label: "Connect a server", href: "/dashboard/servers" };
+/** The fix when the hardware is already here. A server is attached to an
+ *  ENVIRONMENT, and environments live on a project's page — there is no
+ *  org-level attach screen to point at, so the projects list is where the flow
+ *  starts (SIGMA-309). */
+const ATTACH_SERVER = {
+  label: "Attach a server to an environment",
+  href: "/dashboard/projects",
+};
 
 /** "a, b or c" — the form the catalog's own sentences read in. */
 function joinOr(items: string[]): string {
@@ -201,6 +233,16 @@ export function kindAvailability(kind: ResourceKind, inv: TargetInventory): Kind
   const allowed = (ALLOWED_SERVER_TYPES[kind] ?? []) as ServerType[];
   if (allowed.some((t) => inv.serverTypes.has(t))) return { available: true };
   if (inv.clusterCount > 0 && clusterEligible(kind, inv)) return { available: true };
+
+  // Asked before every "connect one" sentence below, including the GPU one:
+  // the hardware may already be here and simply attached to nothing, and that
+  // is a different refusal with a different fix (SIGMA-309). It answers for
+  // `llm` too — "GPU" is the only type in its allowed list, so the generic
+  // sentence names the right hardware without the special case.
+  const inFleet = allowed.filter((t) => inv.fleetServerTypes.has(t));
+  if (inFleet.length > 0) {
+    return needsAttaching(RESOURCE_KIND_LABELS[kind] ?? kind, inFleet);
+  }
 
   // The GPU case gets its own sentence because it is the one where the reason
   // is about HARDWARE, and "connect a General server" would be actively
@@ -260,6 +302,12 @@ export function categoryAvailability(
   for (const kind of kinds) {
     for (const type of (ALLOWED_SERVER_TYPES[kind] ?? []) as ServerType[]) allowed.add(type);
   }
+  // Same order as the kind verdict: the fleet already holding something that
+  // could host this is an attachment problem, not a purchasing one.
+  const inFleet = [...allowed].filter((t) => inv.fleetServerTypes.has(t));
+  if (inFleet.length > 0) {
+    return needsAttaching(RESOURCE_CATEGORY_CATALOG[category].label, inFleet);
+  }
   return nothingToRunOn(RESOURCE_CATEGORY_CATALOG[category].label, [...allowed], {
     // Named only when it is true of the WHOLE category: one kind a cluster
     // refuses is not a reason the category is unreachable.
@@ -284,6 +332,30 @@ function nothingToRunOn(
         : ""
     }. A ${label} needs one to run on.`,
     action: CONNECT_SERVER,
+  };
+}
+
+/**
+ * "The host is here, it is just not anywhere yet."
+ *
+ * The other half of nothingToRunOn, and the reason this module needed the
+ * fleet at all (SIGMA-309). A resource is created INSIDE an environment, so a
+ * server attached to none of them hosts nothing — but the operator who
+ * connected it ten minutes ago and watched it go green does not know that, and
+ * "No Storage server is connected. Connect a server →" pointed them straight
+ * back at the page where it already sits, saying it is connected. The missing
+ * step was never named anywhere in the product.
+ *
+ * `types` is what the FLEET has, not everything the kind allows: telling
+ * someone with a Database box that no General, VPS or Database server is
+ * attached names two machines they do not own.
+ */
+function needsAttaching(label: string, types: ServerType[]): KindAvailability {
+  const names = joinOr(types.map((t) => SERVER_TYPE_LABELS[t] ?? t));
+  return {
+    available: false,
+    reason: `This organization has a ${names} server, but no environment has one attached. A ${label} is created inside an environment — attach it to one on its project's page and this becomes available.`,
+    action: ATTACH_SERVER,
   };
 }
 

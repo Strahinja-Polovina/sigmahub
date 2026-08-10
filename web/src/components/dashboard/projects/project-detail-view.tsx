@@ -652,6 +652,10 @@ export function ProjectDetailView({
           orgId={orgId ?? ""}
           clusters={clusters.filter((c) => c.environmentId === wizardEnvId)}
           clusterExcludedKinds={clusterExcludedKinds}
+          // The fleet, not just this environment's attachments: step 1 has to
+          // be able to say "you have a Storage server, attach it here" rather
+          // than "no Storage server is connected" (SIGMA-309).
+          orgServers={orgServers}
           // So a GitHub install started here comes back HERE, not to the
           // resources list the user was not on.
           originProjectId={project.id}

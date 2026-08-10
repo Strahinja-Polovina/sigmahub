@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getActiveOrgId, getMyOrgs, requireMembership, visibleProjects } from "@/server/active-org";
-import { getDeployTargets, getOrgResources } from "@/server/queries";
+import { getDeployTargets, getOrgResources, getServers } from "@/server/queries";
 import { ResourcesView } from "@/components/dashboard/resources/resources-view";
 import { cpEnabled } from "@/server/cp";
 import { listClusters } from "@/server/actions/clusters";
@@ -19,9 +19,15 @@ export default async function ResourcesPage({
   const { user, role } = await requireMembership(orgId);
   const visible = await visibleProjects(user.id, orgId, role);
 
-  const [resources, targets, myOrgs, clusterData, params] = await Promise.all([
+  const [resources, targets, orgServers, myOrgs, clusterData, params] = await Promise.all([
     getOrgResources(orgId, visible),
     getDeployTargets(orgId, visible),
+    // The whole fleet, beside the ATTACHMENT tree above. A connected server
+    // that no environment has attached contributes nothing to `targets`, so
+    // step 1 of the wizard used to tell a first-run user that no server is
+    // connected — with a link back to the Servers page where theirs sits,
+    // green. Servers are org-wide, so this is not project-scoped (SIGMA-309).
+    getServers(orgId),
     getMyOrgs(),
     // Clusters are a deploy TARGET, and the wizard could not offer them because
     // nothing loaded them here — clusterId has threaded end to end since
@@ -57,6 +63,12 @@ export default async function ResourcesPage({
       orgId={orgId}
       clusters={clusterData.clusters}
       clusterExcludedKinds={clusterData.excludedKinds}
+      orgServers={orgServers.map((sv) => ({
+        id: sv.id,
+        name: sv.name,
+        type: sv.type,
+        status: sv.status,
+      }))}
       // Returning from the GitHub App install: reopen the wizard where it was.
       resumeWizard={params[WIZARD_RESUME_PARAM] === WIZARD_RESUME_VALUE}
     />
