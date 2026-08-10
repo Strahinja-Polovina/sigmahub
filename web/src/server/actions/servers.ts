@@ -216,7 +216,8 @@ function simulatedFacts(serverId: string, type: string, shape: DemoHostShape): H
 export type ConnectServerResult =
   | {
       mode: "cp";
-      /** Full sigmad invocation with the one-time bootstrap token embedded. */
+      /** The same cosign-verified installCommand() line provisionServer hands
+       *  back, with the one-time bootstrap token embedded (SIGMA-315). */
       command: string;
       expiresAt: string;
     }
@@ -258,7 +259,21 @@ export async function connectServer(input: {
   const name = placeholderName(hostIp);
 
   if (cpEnabled()) {
-    const { token, expiresAt } = await cpIssueBootstrapToken(input.orgId, {
+    // SIGMA-315. This branch used to render its own one-liner —
+    // `sigmad --endpoint … --bootstrap-token …` — which was a second answer to
+    // the question installCommand() already answers, and a worse one: it
+    // assumes sigmad is ALREADY on the host, so on the fresh machine an
+    // operator is onboarding it does nothing at all. It fetched nothing, so
+    // there was no cosign verification and no release pin, and it never
+    // touched the https guard the plaintext-into-sudo-bash refusal exists for.
+    // Two renderers of the string an operator pastes into a root shell is two
+    // things that have to stay true; there is one now.
+    const actor = { name: user.name, role };
+    // Asked before the token is minted, for the reason SIGMA-300 gives: the
+    // control plane pre-creates a row here, and a refusal that arrives after
+    // it leaves a ghost host the operator has to disconnect by hand.
+    assertInstallTransportIsTls();
+    const issued = await cpIssueBootstrapToken(input.orgId, {
       // No name: the control plane pre-creates the row under a placeholder and
       // replaces it with the hostname the agent reports, the same rule the SSH
       // path follows (SIGMA-202).
@@ -266,7 +281,23 @@ export async function connectServer(input: {
       type: input.type,
       provider: input.provider?.trim() ?? "",
       region: input.region?.trim() ?? "",
-    }, { name: user.name, role });
+    }, actor);
+    let command: string;
+    try {
+      command = installCommand(issued.token, issued);
+    } catch (err) {
+      // The release the control plane serves only comes back WITH the token,
+      // so this refusal cannot be pre-empted — the pre-created row is undone
+      // instead. See provisionServer for the same shape.
+      if (issued.serverId) {
+        try {
+          await cpDeleteServer(input.orgId, issued.serverId, actor);
+        } catch {
+          // The render's error names the setting to change; it wins.
+        }
+      }
+      throw err;
+    }
     await writeAudit({
       orgId: input.orgId,
       actor: user.name,
@@ -276,8 +307,8 @@ export async function connectServer(input: {
     revalidatePath("/dashboard", "layout");
     return {
       mode: "cp",
-      command: `sigmad --endpoint ${cpPublicUrl()} --bootstrap-token ${token}`,
-      expiresAt,
+      command,
+      expiresAt: issued.expiresAt,
     };
   }
 

@@ -78,7 +78,7 @@ vi.mock("@/server/cp", () => {
   };
 });
 
-import { reissueInstallCommand } from "./servers";
+import { connectServer, reissueInstallCommand } from "./servers";
 
 /** The rendered command. reissueInstallCommand is the leanest of the three
  *  actions that hand one out (provisionServer and connectServer's CP branch
@@ -243,5 +243,71 @@ describe("the install command refuses to pipe plaintext into sudo bash", () => {
   it("names the setting to change rather than the symptom", async () => {
     publicUrl = "http://cp.example.com";
     await expect(renderedCommand()).rejects.toThrow(/SIGMAHUB_CP_PUBLIC_URL/);
+  });
+});
+
+// SIGMA-315. There were two renderings of "the command an operator pastes into
+// a root shell". The one above is cosign-verified, pinned to the control
+// plane's release, and refuses over plaintext. connectServer's CP branch
+// returned `sigmad --endpoint … --bootstrap-token …`: no fetch, no signature
+// check, no version pin, and outside the https guard entirely — a command that
+// does nothing at all on a fresh machine, because it assumes sigmad is already
+// installed there.
+//
+// The connect dialog routes CP mode to provisionServer today, so the branch was
+// reachable only by calling the action directly. That is a property of one
+// caller, not of the action: the second renderer is a second thing that has to
+// stay true, and it had already stopped being true.
+describe("the command connectServer hands out is the same command", () => {
+  const ISSUED = {
+    token: TOKEN,
+    serverId: "srv_connect",
+    expiresAt: new Date(Date.now() + 900_000).toISOString(),
+  };
+
+  async function issuing(over: Partial<typeof release> = {}) {
+    const mod = await import("@/server/cp");
+    return vi
+      .spyOn(mod, "cpIssueBootstrapToken")
+      .mockResolvedValue({ ...ISSUED, ...release, ...over });
+  }
+
+  afterEach(() => {
+    publicUrl = CP_URL;
+    vi.restoreAllMocks();
+  });
+
+  const connect = () =>
+    connectServer({ orgId: "org_demo", type: "general", hostIp: "203.0.113.7" });
+
+  it("fetches and verifies the installer instead of assuming sigmad is on the host", async () => {
+    await issuing();
+    const res = await connect();
+    if (res.mode !== "cp") throw new Error("expected the control-plane branch");
+    expect(res.command).toBe(
+      `curl -fsSL ${CP_URL}/install.sh | SIGMAHUB_ENDPOINT=${CP_URL} ` +
+        `SIGMAHUB_BOOTSTRAP_TOKEN=${TOKEN} SIGMAHUB_VERSION=${VERSION} ` +
+        `SIGMAHUB_DOWNLOAD_BASE=${CP_URL}/dl/${VERSION} sudo -E bash`
+    );
+  });
+
+  it("refuses to render over plaintext, and mints nothing when it refuses", async () => {
+    publicUrl = "http://cp:8080";
+    const issue = await issuing();
+    await expect(connect()).rejects.toThrow(/SIGMAHUB_CP_PUBLIC_URL/);
+    // Same shape as SIGMA-300: a refusal that arrives after the control plane
+    // has pre-created a row and burned a one-time token leaves the operator
+    // retrying against a growing column of Provisioning hosts.
+    expect(issue).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the control plane is pinned to no release, and takes the row back", async () => {
+    // This refusal cannot be pre-empted — the release comes back with the
+    // token — so the row the control plane pre-created is undone instead.
+    const mod = await import("@/server/cp");
+    await issuing({ agentVersion: "", agentVersionError: "CP_AGENT_VERSION is not a released tag" });
+    const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
+    await expect(connect()).rejects.toThrow(/CP_AGENT_VERSION/);
+    expect(remove).toHaveBeenCalledWith("org_demo", ISSUED.serverId, expect.anything());
   });
 });
