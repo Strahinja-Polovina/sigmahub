@@ -117,6 +117,28 @@ export function LlmPanel({ info }: { info: CpLLMInfo }) {
           <InfoRow label="Port" value={String(info.port)} copyable={info.port > 0} />
         </div>
 
+        {/* The licence the weights on this host were pulled under (SIGMA-302).
+            The control plane stores the model id, not the licence, so this links
+            to the model card rather than restating terms that can change under
+            it — the page is where they are stated in full and, for a gated repo,
+            accepted. Only for repo-shaped ids: an ollama tag ("llama3.1:8b") is
+            not a Hugging Face repository and would 404. */}
+        {info.model.includes("/") && (
+          <p className="text-xs text-muted-foreground">
+            These weights were downloaded onto your server from Hugging Face under
+            the model&rsquo;s own licence, which binds whoever runs it.{" "}
+            <a
+              href={`https://huggingface.co/${info.model}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline underline-offset-2"
+            >
+              Read the licence on the model card
+            </a>
+            .
+          </p>
+        )}
+
         <p className="text-xs text-muted-foreground">
           The port is allocated by the control plane, not chosen by you — it is
           stable for the lifetime of this resource. Nothing is published on a

@@ -70,7 +70,7 @@
 
 import { TEXT_GENERATION_TASK, type ModelCard } from "@/lib/wizard/llm";
 
-export const MOCK_MODELS: ModelCard[] = [
+const MOCK_MODEL_METADATA: Omit<ModelCard, "url">[] = [
   {
     id: "meta-llama/Llama-3.1-8B-Instruct",
     name: "Llama 3.1 8B Instruct",
@@ -87,6 +87,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 21_414_029_995,
     vramText: "~21.4 GB",
     sizingBasis: "safetensors",
+    license: "llama3.1",
   },
   {
     id: "meta-llama/Llama-3.1-70B-Instruct",
@@ -104,6 +105,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 188_143_217_323,
     vramText: "~189 GB",
     sizingBasis: "safetensors",
+    license: "llama3.1",
   },
   {
     id: "mistralai/Mistral-7B-Instruct-v0.3",
@@ -121,6 +123,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 19_328_062_806,
     vramText: "~19.3 GB",
     sizingBasis: "safetensors",
+    license: "apache-2.0",
   },
   {
     id: "Qwen/Qwen2.5-7B-Instruct",
@@ -138,6 +141,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 20_308_310_699,
     vramText: "~20.3 GB",
     sizingBasis: "safetensors",
+    license: "apache-2.0",
   },
   {
     // The rung between the demo's cards: 39.4 GB is more than the A10G's 23.8
@@ -161,6 +165,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 39_386_756_438,
     vramText: "~39.4 GB",
     sizingBasis: "safetensors",
+    license: "apache-2.0",
   },
   {
     id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -178,6 +183,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 2_933_462_358,
     vramText: "~2.9 GB",
     sizingBasis: "safetensors",
+    license: "apache-2.0",
   },
   {
     // Sized from the repo NAME rather than the safetensors index, and that is
@@ -199,6 +205,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 8_666_666_667,
     vramText: "~8.7 GB",
     sizingBasis: "name",
+    license: "llama2",
   },
   {
     // The answer the too-big refusal gives, made reachable. Turned away from
@@ -226,6 +233,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 46_666_666_667,
     vramText: "~46.7 GB",
     sizingBasis: "name",
+    license: "llama3.1",
   },
   {
     // The unsizable one, and it is unsizable honestly: a GGUF-only repository
@@ -250,6 +258,7 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 0,
     vramText: "",
     sizingBasis: "unknown",
+    license: "mit",
   },
   {
     // The one the SIZE check cannot save anyone from: whisper sizes cleanly at
@@ -277,8 +286,17 @@ export const MOCK_MODELS: ModelCard[] = [
     vramBytesRequired: 4_115_479_894,
     vramText: "~4.1 GB",
     sizingBasis: "safetensors",
+    license: "apache-2.0",
   },
 ];
+
+/** The model-card page is always the repo id under huggingface.co, so demo mode
+ *  derives it exactly as the control plane does rather than restating ten URLs
+ *  that could drift from their ids (SIGMA-302). */
+export const MOCK_MODELS: ModelCard[] = MOCK_MODEL_METADATA.map((m) => ({
+  ...m,
+  url: `https://huggingface.co/${m.id}`,
+}));
 
 /**
  * Whether demo mode claims a token to DOWNLOAD weights with.

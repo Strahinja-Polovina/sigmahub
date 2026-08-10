@@ -365,4 +365,20 @@ describe("ResourceDetail LLM endpoint", () => {
     renderCp();
     expect(screen.queryByText(/OpenAI-compatible/i)).toBeNull();
   });
+
+  // SIGMA-302: the weights sit on the customer's own disk under terms they were
+  // never shown. The control plane stores the model id and not the licence, so
+  // the route offered is the model card itself — the page the terms are stated
+  // on and, for a gated repo, accepted on.
+  it("the panel links to the model card where the licence is stated", () => {
+    renderCp({
+      detail: makeDetail({ kind: "llm", name: "llama", repo: null, domain: null }),
+      llm: llmInfo,
+    });
+    const link = screen.getByRole("link", { name: /licence/i });
+    expect(link.getAttribute("href")).toBe(
+      "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"
+    );
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
 });

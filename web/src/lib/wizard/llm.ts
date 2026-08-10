@@ -68,6 +68,19 @@ export type ModelCard = {
   vramText: string;
   /** safetensors | name | unknown */
   sizingBasis: string;
+  /** The Hub's licence identifier ("llama3.1", "apache-2.0", "mit"…), or empty
+   *  when the Hub did not say — which is the ordinary answer for a gated
+   *  repository read without a token. Empty is UNKNOWN, never "unlicensed".
+   *
+   *  It is on the card because a deploy pulls these weights onto the customer's
+   *  OWN machine under terms nobody had shown them: the Llama Community Licence
+   *  alone carries an acceptable-use policy, an attribution requirement and a
+   *  700M-MAU clause, all binding whoever runs the model (SIGMA-302). */
+  license: string;
+  /** The model-card page on huggingface.co — where the licence is stated in full
+   *  and, for a gated repo, accepted. Always present: it is derived from the id,
+   *  so it survives the 401 that leaves every other field empty. */
+  url: string;
 };
 
 /** What a search answered, plus the one fact the picker cannot see for itself:

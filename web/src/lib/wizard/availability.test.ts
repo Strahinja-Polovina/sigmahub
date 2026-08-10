@@ -60,6 +60,8 @@ function modelCard(over: Partial<ModelCard> = {}): ModelCard {
     vramBytesRequired: 188_143_217_323,
     vramText: "~189 GB",
     sizingBasis: "safetensors",
+    license: "llama3.1",
+    url: "https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct",
     ...over,
   };
 }

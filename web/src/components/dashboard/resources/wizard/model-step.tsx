@@ -337,6 +337,34 @@ export function ModelStep({
               {unresolved ?? "Served by the runtime this control plane picks for it."}
             </p>
           )}
+          {/* The licence, named and linked (SIGMA-302). These weights are
+              downloaded onto the customer's OWN host, and the terms bind
+              whoever runs the model — the Llama Community Licence carries an
+              acceptable-use policy, an attribution requirement and a 700M-MAU
+              clause. None of it appeared anywhere in the product. An empty
+              licence is the Hub declining to say (a gated repo read without a
+              token), so it is reported as unknown and the link still goes to the
+              page that states it. */}
+          {card?.url && (
+            <p className="text-xs text-muted-foreground">
+              Licence:{" "}
+              {card.license ? (
+                <span className="font-mono">{card.license}</span>
+              ) : (
+                "not stated by the Hub"
+              )}{" "}
+              —{" "}
+              <a
+                href={card.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2"
+              >
+                read it on the model card
+              </a>
+              . The weights are downloaded onto your own server under those terms.
+            </p>
+          )}
           <p className="text-xs text-muted-foreground">
             Pulled on first start, so the endpoint takes a few minutes to become ready.
             It listens on the private mesh only — never a public interface.
