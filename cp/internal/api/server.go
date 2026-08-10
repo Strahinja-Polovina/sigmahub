@@ -33,6 +33,9 @@ type StoreAPI interface {
 	AuthenticateServiceToken(ctx context.Context, token string) (store.ServicePrincipal, error)
 	RecordHeartbeat(ctx context.Context, serverID string, in store.HeartbeatInput) error
 	MeshPeers(ctx context.Context, orgID, selfServerID string) ([]store.MeshPeer, error)
+	// MeshPeersDigest fingerprints that same peer set without materialising it,
+	// so the poll every agent makes every 30s can be answered 304 (SIGMA-323).
+	MeshPeersDigest(ctx context.Context, orgID, selfServerID string) (string, error)
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)

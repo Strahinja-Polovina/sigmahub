@@ -482,6 +482,11 @@ func run() error {
 	// reported on the next one to drive the CP's mesh-gated Ready state.
 	var meshApplied bool
 	var meshPeers int
+	// The peer set we last fetched, plus its validator (SIGMA-323). syncMesh
+	// polls every 30s and the answer is almost always the same, so it asks
+	// conditionally and reuses this on a 304. It lives out here, across
+	// iterations, because that reuse is the entire point.
+	var meshView meshPeerView
 	for {
 		hb++
 		// Re-probe the endpoint roughly every 10 minutes to track IP changes.
@@ -524,7 +529,7 @@ func run() error {
 		case err == nil:
 			backoff = *interval
 			log.Info("heartbeat ok", "server_id", st.ServerID)
-			meshApplied, meshPeers = syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp)
+			meshApplied, meshPeers = syncMesh(ctx, log, c, st.AgentToken, *dataDir, meshPriv, *wgUp, &meshView)
 			// Report Traefik-issued certificate state (P1-8). A no-op on non-proxy
 			// servers (no ACME store); never fails the loop.
 			reportCertStatus(ctx, log, c, st.AgentToken, driver)
@@ -725,11 +730,38 @@ func reportCertStatus(ctx context.Context, log *slog.Logger, c *client.Client, a
 // drive the CP's mesh-gated Ready state. "applied" here means the peer config for
 // the current peer set is rendered/written (the CP is outbound-only and never on
 // the WG data plane, so it cannot observe a real handshake in v1).
-func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToken, dataDir, meshPriv string, wgUp bool) (applied bool, peerCount int) {
-	res, err := c.MeshPeers(ctx, agentToken)
+// meshPeerView is the last peer set the control plane served, plus the ETag it
+// served it under (SIGMA-323). Holding it across heartbeats is what lets the
+// 30-second poll be conditional: on a 304 the agent re-applies THIS, so the
+// steady state costs one empty response instead of the org's whole peer list.
+type meshPeerView struct {
+	etag   string
+	res    client.MeshPeersResponse
+	loaded bool
+}
+
+func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToken, dataDir, meshPriv string, wgUp bool, view *meshPeerView) (applied bool, peerCount int) {
+	// Only send a validator when there is something to fall back on: a 304 with
+	// no cached response would leave the agent with no peers at all.
+	cond := ""
+	if view.loaded {
+		cond = view.etag
+	}
+	res, etag, notModified, err := c.MeshPeers(ctx, agentToken, cond)
 	if err != nil {
 		log.Warn("mesh: peer fetch failed", "err", err)
 		return false, 0
+	}
+	if notModified {
+		// Unchanged. Re-apply the cached set rather than returning early: the
+		// apply below is deliberately unconditional (SIGMA-144), because a
+		// reboot leaves the config file identical while the interface is down.
+		res = view.res
+		if etag != "" {
+			view.etag = etag
+		}
+	} else {
+		view.etag, view.res, view.loaded = etag, res, true
 	}
 	if res.Self.MeshIP == nil || *res.Self.MeshIP == "" {
 		log.Warn("mesh: no mesh IP allocated yet")

@@ -88,6 +88,10 @@ func (f *fakeStore) MeshPeers(context.Context, string, string) ([]store.MeshPeer
 	return []store.MeshPeer{}, nil
 }
 
+func (f *fakeStore) MeshPeersDigest(context.Context, string, string) (string, error) {
+	return "empty", nil
+}
+
 func (f *fakeStore) MetricsSince(context.Context, string, string, time.Time) ([]store.MetricPoint, error) {
 	return f.metrics, nil
 }

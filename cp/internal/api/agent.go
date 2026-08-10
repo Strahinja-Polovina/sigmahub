@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -100,11 +102,72 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// meshPeersETag builds the validator for one agent's view of the mesh: the
+// org's peer-set fingerprint plus this server's own identity, which the
+// response also carries and which changes when the agent re-keys or is given a
+// mesh address.
+func meshPeersETag(digest string, srv store.Server) string {
+	self := ""
+	if srv.MeshIP != nil {
+		self = *srv.MeshIP
+	}
+	if srv.Pubkey != nil {
+		self += "|" + *srv.Pubkey
+	}
+	sum := sha256.Sum256([]byte(digest + "|" + srv.ID + "|" + self))
+	return `"` + hex.EncodeToString(sum[:16]) + `"`
+}
+
+// etagMatches implements the If-None-Match comparison for our own validators:
+// a comma-separated list, `*`, and the weak `W/` prefix, which we ignore
+// because a 304 here is about the peer set being byte-identical either way.
+func etagMatches(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			return true
+		}
+		if strings.TrimPrefix(candidate, "W/") == etag {
+			return true
+		}
+	}
+	return false
+}
+
 // handleMeshPeers returns the requesting agent's own mesh identity plus its
 // same-org peers. Org isolation falls out of the query: peers are looked up
 // by the authenticated server's org, never by caller-supplied input.
+//
+// The answer is conditional (SIGMA-323). Every agent polls this after every
+// heartbeat — every 30 seconds — and the peer set only moves when a server is
+// enrolled, re-keys, changes endpoint or is deleted, so the unconditional
+// version made the steady-state cost quadratic in the size of the org: N agents
+// x N rows scanned, allocated and serialised every 30s, over a million rows a
+// minute at 500 servers, all of it restating an unchanged answer. Worse, none
+// of it was distinguishable from real work, so an operator saw pool contention
+// and rising p99 on tenant endpoints with nothing to attribute it to.
+//
+// With a validator the steady state is one small aggregate and an empty 304,
+// and the full payload is paid only when membership actually changes.
 func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
 	srv := serverFrom(r)
+	// The fingerprint comes first because a match means the peer list never has
+	// to be read at all — that skipped read IS the fix. A digest that cannot be
+	// computed is not a reason to fail a request the agent needs: fall through
+	// to the unconditional answer, which is exactly the old behaviour.
+	if digest, derr := s.store.MeshPeersDigest(r.Context(), srv.OrgID, srv.ID); derr == nil {
+		etag := meshPeersETag(digest, srv)
+		w.Header().Set("ETag", etag)
+		// Peer sets are per-agent and security-relevant; no shared cache in
+		// front of the control plane may hand one agent another's answer.
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	} else {
+		s.log.Warn("mesh peers digest", "err", derr, "server", srv.ID)
+	}
 	peers, err := s.store.MeshPeers(r.Context(), srv.OrgID, srv.ID)
 	if err != nil {
 		s.log.Error("mesh peers", "err", err, "server", srv.ID)
