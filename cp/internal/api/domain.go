@@ -150,7 +150,15 @@ type DomainAPI interface {
 func (s *Server) writeStoreErr(w http.ResponseWriter, err error, op string) {
 	var inv store.ErrInvalid
 	var notClusterable store.ErrKindNotClusterable
+	var capped store.ErrBillingCapped
 	switch {
+	// SIGMA-295: an org past its billing grace period is refused NEW servers and
+	// resources. 402 rather than 422 because the fix is a payment, not a
+	// different request, and the message names the portal.
+	case errors.As(err, &capped):
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{
+			"error": capped.Error(), "billingStatus": capped.Status,
+		})
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	case errors.Is(err, store.ErrConflict):

@@ -549,6 +549,15 @@ func run() error {
 					} else if n > 0 {
 						log.Info("billing quantity synced", "subscriptions", n)
 					}
+					// SIGMA-295: chase delinquent orgs on a schedule. Warn rather
+					// than Info — alert channels are per-org, so this log line is
+					// the operator's only notice that a tenant is not paying.
+					if n, err := st.SweepBillingDunning(ctx, time.Now()); err != nil {
+						log.Error("billing dunning sweep", "err", err)
+						fail(err)
+					} else if n > 0 {
+						log.Warn("billing dunning: delinquent orgs reminded", "orgs", n)
+					}
 					return passErr
 				}))
 			}

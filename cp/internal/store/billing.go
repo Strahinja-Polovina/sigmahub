@@ -331,8 +331,8 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 	// would otherwise clobber the winner even if it is older. The WHERE makes the
 	// stale one a no-op, and RowsAffected==0 then skips its audit/alert.
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO org_billing (org_id, paddle_customer_id, paddle_subscription_id, status, quantity, last_event_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, now())
+		INSERT INTO org_billing (org_id, paddle_customer_id, paddle_subscription_id, status, quantity, last_event_at, status_since, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now(), now())
 		ON CONFLICT (org_id) DO UPDATE SET
 			paddle_customer_id     = EXCLUDED.paddle_customer_id,
 			-- Never blank the stored subscription id: a transaction.* event with no
@@ -341,6 +341,15 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 			status                 = EXCLUDED.status,
 			quantity               = EXCLUDED.quantity,
 			last_event_at          = EXCLUDED.last_event_at,
+			-- The grace clock (SIGMA-295) restarts only on a real status CHANGE.
+			-- Re-applying the same status — Paddle re-sends subscription.updated
+			-- for quantity edits — must not hand a delinquent org another two
+			-- weeks. dunning_last_at resets with it so a NEW delinquency reminds
+			-- on its own schedule instead of inheriting the previous one's.
+			status_since           = CASE WHEN org_billing.status IS DISTINCT FROM EXCLUDED.status
+			                              THEN now() ELSE org_billing.status_since END,
+			dunning_last_at        = CASE WHEN org_billing.status IS DISTINCT FROM EXCLUDED.status
+			                              THEN NULL ELSE org_billing.dunning_last_at END,
 			updated_at             = now()
 		WHERE org_billing.last_event_at IS NULL OR EXCLUDED.last_event_at >= org_billing.last_event_at`,
 		orgID, in.CustomerID, in.SubscriptionID, in.Status, in.Quantity, occurredAt)
@@ -355,15 +364,280 @@ func (s *Store) upsertSubscriptionTx(ctx context.Context, tx pgx.Tx, orgID strin
 	if err := auditTx(ctx, tx, orgID, actor, "Subscription "+in.Status, in.SubscriptionID); err != nil {
 		return err
 	}
-	if in.Status == "past_due" && prevStatus != "past_due" {
-		if err := enqueueAlertTx(ctx, tx, orgID, AlertPaymentFailed,
-			"billing:"+in.SubscriptionID+":past_due", 0,
-			"Payment failed — subscription past due",
-			"A subscription payment failed. Update the payment method in Billing; your servers keep running during the grace period, nothing is paused."); err != nil {
-			return err
+	// SIGMA-295: a delinquency is announced on ENTRY here, and then repeated by
+	// SweepBillingDunning until it is resolved or the grace period expires. A
+	// cancellation used to announce nothing at all — the org simply stopped
+	// paying and kept everything, and neither side was told.
+	if in.Status != prevStatus {
+		if title, body, ok := dunningNotice(in.Status, BillingGracePeriod); ok {
+			if err := enqueueAlertTx(ctx, tx, orgID, AlertPaymentFailed,
+				dunningDedupKey(in.SubscriptionID, in.Status), BillingDunningInterval,
+				title, body); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE org_billing SET dunning_last_at = now() WHERE org_id = $1`, orgID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// ── Dunning: what actually happens when an org stops paying (SIGMA-295) ─────
+//
+// The policy, written down so the behaviour is deliberate rather than emergent:
+//
+//  1. Entering past_due or canceled alerts the org immediately (UpsertSubscription).
+//  2. SweepBillingDunning repeats that alert every BillingDunningInterval for as
+//     long as the org stays delinquent. One alert, ever, was the whole sequence
+//     before this, and it fired into the CUSTOMER's channels — the operator was
+//     never told at all.
+//  3. After BillingGracePeriod the org is CAPPED: it may not add servers or
+//     provision new resources. Everything already running keeps running —
+//     deploys, certificates, backups and restores are what a customer would lose
+//     data over, and we do not hold data hostage over an expired card.
+//  4. DelinquentOrgs is the operator's list, so a non-paying tenant is something
+//     you can see rather than something you reconcile against Paddle by hand.
+//
+// Resolving the delinquency (a successful payment, a resumed subscription) moves
+// the status back to active, which resets status_since and clears the cap.
+const (
+	// BillingGracePeriod is how long full service continues after a subscription
+	// goes past_due or canceled. Two weeks is longer than Paddle's own retry
+	// schedule for a failed card, so a customer whose card simply expired gets
+	// through the retries before anything they can notice changes.
+	BillingGracePeriod = 14 * 24 * time.Hour
+	// BillingDunningInterval is how often the reminder repeats while delinquent.
+	BillingDunningInterval = 72 * time.Hour
+)
+
+// ErrBillingCapped is returned when an org past its grace period tries to grow.
+// It is a distinct type (not ErrInvalid) so the API can answer 402 Payment
+// Required and the message can say exactly what to do about it.
+type ErrBillingCapped struct {
+	OrgID      string
+	Status     string
+	Since      time.Time
+	GraceUntil time.Time
+}
+
+func (e ErrBillingCapped) Error() string {
+	what := "payment is past due"
+	if e.Status == "canceled" {
+		what = "the subscription was canceled"
+	}
+	return fmt.Sprintf("billing is not current for this organization (%s since %s; the grace period ended %s) — "+
+		"existing servers, deploys and backups keep running, but new servers and resources are paused until billing is restored in the customer portal",
+		what, e.Since.UTC().Format("2006-01-02"), e.GraceUntil.UTC().Format("2006-01-02"))
+}
+
+// billingDelinquent reports whether a subscription status means "not paying".
+// `paused` is deliberately NOT here: a pause is an agreed, reversible state the
+// customer arranged, not a failure to pay (SIGMA-294).
+func billingDelinquent(status string) bool {
+	return status == "past_due" || status == "canceled"
+}
+
+// dunningDedupKey is the alert dedup key for a delinquency. `suffix` separates
+// the transition alert from the repeating reminder so the reminder's schedule is
+// not swallowed by the transition's.
+func dunningDedupKey(subscriptionID, status string, suffix ...string) string {
+	key := "billing:" + subscriptionID + ":" + status
+	for _, s := range suffix {
+		key += ":" + s
+	}
+	return key
+}
+
+// dunningNotice is the alert text for a delinquency, or ok=false for a status
+// that is not one. capped changes the message from "nothing is paused" to what
+// actually is — saying "nothing is paused" after the cap engaged would be the
+// same dishonesty the alert exists to avoid.
+func dunningNotice(status string, remaining time.Duration) (title, body string, ok bool) {
+	capped := remaining <= 0
+	switch status {
+	case "past_due":
+		title = "Payment failed — subscription past due"
+		if capped {
+			body = "A subscription payment is still outstanding and the grace period has ended. " +
+				"Your existing servers, deploys and backups keep running, but new servers and resources are paused. " +
+				"Update the payment method in the customer portal to restore them."
+			return title, body, true
+		}
+		body = fmt.Sprintf("A subscription payment failed. Update the payment method in Billing; your servers keep running "+
+			"for the next %d days, nothing is paused. After that, new servers and resources are paused — existing ones keep running.",
+			int(remaining.Hours()/24))
+		return title, body, true
+	case "canceled":
+		title = "Subscription canceled"
+		if capped {
+			body = "This organization's subscription is canceled and the grace period has ended. " +
+				"Existing servers, deploys and backups keep running, but new servers and resources are paused. " +
+				"Subscribe again from the Billing page to restore them."
+			return title, body, true
+		}
+		body = fmt.Sprintf("This organization's subscription was canceled. Everything keeps running for the next %d days; "+
+			"after that, new servers and resources are paused (existing ones keep running). Subscribe again from the Billing page to avoid it.",
+			int(remaining.Hours()/24))
+		return title, body, true
+	default:
+		return "", "", false
+	}
+}
+
+// DelinquentOrg is one non-paying tenant, for the operator's view.
+type DelinquentOrg struct {
+	OrgID          string    `json:"orgId"`
+	Status         string    `json:"status"`
+	SubscriptionID string    `json:"subscriptionId,omitempty"`
+	Since          time.Time `json:"since"`
+	GraceExpiresAt time.Time `json:"graceExpiresAt"`
+	// Capped is true once the grace period has expired — the org can no longer
+	// add servers or resources.
+	Capped bool `json:"capped"`
+	// Servers/Units are what the org is still consuming while not paying, and
+	// MonthlyValue what that fleet would bill at the current price. This is the
+	// number that makes the list actionable: it is the revenue being lost and
+	// the infrastructure cost still being incurred.
+	Servers      int    `json:"servers"`
+	Units        int    `json:"units"`
+	MonthlyValue int    `json:"monthlyValue"`
+	Currency     string `json:"currency"`
+}
+
+// DelinquentOrgs lists every org whose subscription is past_due or canceled,
+// oldest delinquency first. This is the operator-visible half of SIGMA-295:
+// before it, the only way to find a non-paying tenant was to reconcile Paddle
+// against org_billing by hand.
+func (s *Store) DelinquentOrgs(ctx context.Context, now time.Time) ([]DelinquentOrg, error) {
+	query := fmt.Sprintf(`
+		SELECT b.org_id, b.status, b.paddle_subscription_id, b.status_since,
+		       (SELECT COUNT(*) FROM servers sv
+		         WHERE sv.org_id = b.org_id AND sv.deleted_at IS NULL AND sv.status = 'running'),
+		       %s
+		  FROM org_billing b
+		 WHERE b.status IN ('past_due', 'canceled')
+		 ORDER BY b.status_since`, billedUnitsSQL("b.org_id", "$1"))
+	rows, err := s.Pool.Query(ctx, query, now.UTC().Add(-quantitySyncWindow))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DelinquentOrg
+	for rows.Next() {
+		var d DelinquentOrg
+		if err := rows.Scan(&d.OrgID, &d.Status, &d.SubscriptionID, &d.Since, &d.Servers, &d.Units); err != nil {
+			return nil, err
+		}
+		d.GraceExpiresAt = d.Since.Add(BillingGracePeriod)
+		d.Capped = !now.UTC().Before(d.GraceExpiresAt)
+		// Valued as if they were paying — hasSubscription=false, because the
+		// point of the number is the revenue at stake, not a minimum line.
+		d.MonthlyValue = BillableQuantity(d.Units, false) * BillingUnitPrice
+		d.Currency = BillingCurrency
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// SweepBillingDunning re-alerts every delinquent org whose last reminder is
+// older than BillingDunningInterval, and returns how many were reminded.
+//
+// The transition alert in upsertSubscriptionTx fires once, on entry. Without
+// this sweep that WAS the entire dunning sequence: a customer whose card failed
+// got one Slack message and then silence, indefinitely, while the control plane
+// kept deploying, renewing certificates and running backups for free.
+func (s *Store) SweepBillingDunning(ctx context.Context, now time.Time) (int, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT org_id, status, paddle_subscription_id, status_since
+		  FROM org_billing
+		 WHERE status IN ('past_due', 'canceled')
+		   AND (dunning_last_at IS NULL OR dunning_last_at <= $1)
+		 ORDER BY status_since`, now.UTC().Add(-BillingDunningInterval))
+	if err != nil {
+		return 0, err
+	}
+	type due struct {
+		orgID, status, subID string
+		since                time.Time
+	}
+	var pending []due
+	for rows.Next() {
+		var d due
+		if err := rows.Scan(&d.orgID, &d.status, &d.subID, &d.since); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		pending = append(pending, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	reminded := 0
+	for _, d := range pending {
+		remaining := d.since.Add(BillingGracePeriod).Sub(now.UTC())
+		title, body, ok := dunningNotice(d.status, remaining)
+		if !ok {
+			continue
+		}
+		// Per-org transaction: the alert and the cursor move together, so a
+		// failure re-reminds next pass rather than silently skipping a cycle.
+		if err := func() error {
+			tx, err := s.Pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if err := enqueueAlertTx(ctx, tx, d.orgID, AlertPaymentFailed,
+				dunningDedupKey(d.subID, d.status, "dunning"), BillingDunningInterval,
+				title, body); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE org_billing SET dunning_last_at = $2 WHERE org_id = $1`,
+				d.orgID, now.UTC()); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}(); err != nil {
+			return reminded, err
+		}
+		reminded++
+	}
+	return reminded, nil
+}
+
+// assertBillingNotCappedTx refuses growth for an org whose grace period has
+// expired. Called from precreateServerTx, the single chokepoint both
+// server-creation paths go through.
+//
+// Nothing anywhere used to consult org_billing.status before creating a server,
+// provisioning a resource or running a deploy — a canceled 40-unit fleet kept
+// every capability forever (SIGMA-295).
+func assertBillingNotCappedTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) error {
+	var status string
+	var since time.Time
+	err := tx.QueryRow(ctx,
+		`SELECT status, status_since FROM org_billing WHERE org_id = $1`, orgID).Scan(&status, &since)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Never subscribed. The free tier is a product, not a delinquency.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !billingDelinquent(status) {
+		return nil
+	}
+	graceUntil := since.Add(BillingGracePeriod)
+	if now.UTC().Before(graceUntil) {
+		// Inside the grace period the past_due alert's promise holds literally:
+		// your servers keep running and nothing is paused.
+		return nil
+	}
+	return ErrBillingCapped{OrgID: orgID, Status: status, Since: since, GraceUntil: graceUntil}
 }
 
 // quantitySyncDebounce is how long a pushed quantity is trusted before the sweep

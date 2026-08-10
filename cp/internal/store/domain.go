@@ -594,6 +594,13 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// SIGMA-295: same cap as server creation — an org past its billing grace
+	// period does not get to provision NEW resources. Existing resources, their
+	// deploys, certificates and backups are untouched.
+	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
+		return Resource{}, err
+	}
+
 	var projectID, envName string
 	var envProduction bool
 	if err := tx.QueryRow(ctx,
