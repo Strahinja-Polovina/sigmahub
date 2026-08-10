@@ -35,7 +35,7 @@ func renderOneLLM(t *testing.T, target store.LLMTarget, refs []store.SecretRefMe
 		map[string][]store.SecretRefMeta{"res_llm": refs},
 		store.HostHardening{MeshIP: llmMeshIP}, nil, nil, nil, nil,
 		map[string]store.LLMTarget{"res_llm": target},
-		nil, nil, ACMEConfig{}, clusterRender{}, registryRender{})
+		nil, nil, ACMEConfig{}, clusterRender{}, registryRender{}, "")
 
 	op, ok := opByID(ops, "res:res_llm")
 	if !ok {

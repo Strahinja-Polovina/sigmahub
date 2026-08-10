@@ -616,7 +616,7 @@ func TestHeldBackRenderStillNamesContainersToRetain(t *testing.T) {
 	render := func(serverID string, rs store.ResourceSpec, target store.DeployTarget, reg registryRender) []dsd.Op {
 		ops, _ := renderOps(serverID, []store.ResourceSpec{rs}, nil, nil, store.HostHardening{}, nil,
 			map[string]store.DeployTarget{rs.ResourceID: target}, nil, nil, nil, nil, nil,
-			ACMEConfig{}, clusterRender{}, reg)
+			ACMEConfig{}, clusterRender{}, reg, "")
 		return ops
 	}
 

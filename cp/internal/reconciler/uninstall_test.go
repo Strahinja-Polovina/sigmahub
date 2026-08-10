@@ -25,7 +25,7 @@ func TestDecommissioningRendersOnlyTheUninstallOp(t *testing.T) {
 	}
 	ops, hash := renderOps("srv_gone", dbSpecs("postgres"), nil, nil,
 		hardening, nil, nil, dbTargets("postgres", "database"), nil, nil, nil, nil,
-		ACMEConfig{}, clusterRender{}, registryRender{})
+		ACMEConfig{}, clusterRender{}, registryRender{}, "")
 
 	if len(ops) != 1 {
 		ids := make([]string, 0, len(ops))
@@ -87,9 +87,9 @@ func TestPurgeVolumesOptInReachesTheOpSpec(t *testing.T) {
 func TestUninstallOpIDIsStable(t *testing.T) {
 	hh := store.HostHardening{MeshInterface: "sigma0", Decommissioning: true}
 	a, hashA := renderOps("srv_x", nil, nil, nil, hh, nil, nil, nil, nil, nil, nil, nil,
-		ACMEConfig{}, clusterRender{}, registryRender{})
+		ACMEConfig{}, clusterRender{}, registryRender{}, "")
 	b, hashB := renderOps("srv_x", nil, nil, nil, hh, nil, nil, nil, nil, nil, nil, nil,
-		ACMEConfig{}, clusterRender{}, registryRender{})
+		ACMEConfig{}, clusterRender{}, registryRender{}, "")
 	if hashA != hashB {
 		t.Fatalf("hash churned across identical renders: %s vs %s", hashA, hashB)
 	}

@@ -56,6 +56,12 @@ type Reconciler struct {
 	st   Store
 	priv ed25519.PrivateKey
 	acme ACMEConfig
+	// publicURL is this control plane's own base URL (CP_PUBLIC_URL). It is
+	// rendered into agent.update so a self-updating agent downloads through this
+	// control plane's /dl proxy instead of github.com (SIGMA-262). Empty when the
+	// deployment has not set one, in which case the op omits the base and the
+	// agent falls back to the public release repo.
+	publicURL string
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
@@ -83,6 +89,14 @@ func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Durat
 // ops (Let's Encrypt account email + CA directory; the staging/Pebble URL is
 // injected for e2e). Called at boot before serving.
 func (r *Reconciler) SetACMEConfig(cfg ACMEConfig) { r.acme = cfg }
+
+// SetPublicURL installs this control plane's own public base URL, which
+// agent.update ops carry so the agent self-updates through the /dl proxy
+// (SIGMA-262). Called at boot before serving; empty is supported and means
+// "this control plane cannot name itself", so the op omits the base.
+func (r *Reconciler) SetPublicURL(u string) {
+	r.publicURL = strings.TrimRight(strings.TrimSpace(u), "/")
+}
 
 // clusterRender is a server's Kubernetes context for one render pass.
 type clusterRender struct {
@@ -114,7 +128,7 @@ type registryRender struct {
 // address; the remaining kinds (s3/llm) keep the P1-2 no-op "resource.sync"
 // stub until they are containerised. Confirmed destructive ops are appended as
 // volume.remove.
-func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender, registry registryRender) ([]dsd.Op, string) {
+func renderOps(serverID string, specs []store.ResourceSpec, pending []store.PendingDestructiveOp, secretRefs map[string][]store.SecretRefMeta, hardening store.HostHardening, domains map[string][]store.Domain, deployTargets map[string]store.DeployTarget, dbTargets map[string]store.DBTarget, s3Targets map[string]store.S3Target, llmTargets map[string]store.LLMTarget, backupRuns []store.BackupRunSpec, s3Ops []store.S3OpSpec, acme ACMEConfig, cluster clusterRender, registry registryRender, publicURL string) ([]dsd.Op, string) {
 	// A server being decommissioned renders ONE op and nothing else — see
 	// renderUninstallOps for why the teardown cannot share a document with the
 	// state it is tearing down. Checked before anything is rendered so no other
@@ -255,7 +269,7 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	// Host-hardening ops (P1-5) are appended in a fixed order so the document
 	// hash stays deterministic. They have no dependencies (host-level, independent
 	// of the container graph).
-	ops = append(ops, renderHostOps(serverID, hardening)...)
+	ops = append(ops, renderHostOps(serverID, hardening, publicURL)...)
 	// Ingress (P1-8): a proxy-role server runs Traefik. P1-5's nftables op has
 	// already opened 80/443 (proxyRole feeds renderHostOps), so this only stands
 	// up the proxy + ACME resolver; the router labels ride on the app containers.
@@ -402,7 +416,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 		return err
 	}
 	renderStart := time.Now()
-	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster, registry)
+	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster, registry, r.publicURL)
 	if r.onRender != nil {
 		r.onRender(time.Since(renderStart))
 	}

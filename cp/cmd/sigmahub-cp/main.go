@@ -347,6 +347,9 @@ func run() error {
 
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
+	// SIGMA-262: agent.update ops point the agent at this control plane's own
+	// /dl proxy, so a fleet on a private release repo can be upgraded.
+	rec.SetPublicURL(cfg.PublicURL)
 	rec.SetObservers(metrics.Loop(cpmetrics.LoopReconcilerResync).Report, metrics.ObserveDSDRender)
 	go rec.Run(ctx, 60*time.Second)
 
