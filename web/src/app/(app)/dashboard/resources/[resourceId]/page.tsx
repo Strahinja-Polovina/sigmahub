@@ -307,14 +307,39 @@ export default async function ResourceDetailPage({
             // Carried so the restore dialogs can refuse a dead target
             // (SIGMA-241) instead of queueing an op nobody will poll for.
             status: sv.status,
+            // The last heartbeat, which only the control plane has — the web
+            // mirror keeps no such column. It is what lets the host banner say
+            // "since 08:14" rather than a vague "is not answering" (SIGMA-251).
+            lastSeenAt: sv.lastSeenAt,
           })),
-        [] as { id: string; name: string; type: string; status: string }[])
+        [] as {
+          id: string;
+          name: string;
+          type: string;
+          status: string;
+          lastSeenAt: string | null;
+        }[])
       : Promise.resolve([]),
   ]);
 
+  // The host's live state, preferred over the reconciled mirror when the control
+  // plane answered. Both carry a status; only the CP carries a heartbeat, and a
+  // resource stuck on a silent machine is exactly the case where the mirror is
+  // most likely to be the stale copy (SIGMA-251).
+  const cpHost = detail.server
+    ? placementServers.find((sv) => sv.id === detail.server!.id)
+    : undefined;
+  const server = detail.server
+    ? {
+        ...detail.server,
+        status: cpHost?.status ?? detail.server.status,
+        lastSeenAt: cpHost?.lastSeenAt ?? null,
+      }
+    : null;
+
   return (
     <ResourceDetail
-      detail={{ ...detail, secrets, canManage }}
+      detail={{ ...detail, server, secrets, canManage }}
       statusError={statusError}
       loadFailures={loadFailures}
       orgId={orgId}
