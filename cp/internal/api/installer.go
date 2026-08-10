@@ -152,6 +152,14 @@ const (
 // pattern does not admit — which is why the handler validates and refuses
 // rather than cleaning and continuing. RE2 matches in linear time, so an
 // attacker-supplied segment cannot make the check itself expensive.
+//
+// It is also the version vocabulary of the agent.update op, and therefore has
+// a second copy in agent/internal/selfupdate (SIGMA-289): what an operator may
+// ask for here has to be what sigmad will actually install, or an accepted
+// upgrade is one no host in the fleet can ever apply. cp and agent are separate
+// Go modules and neither can import the other, so the two copies are held
+// together by agent_version_vocabulary_test.go here and
+// version_vocabulary_test.go there, each reading the other module off disk.
 var releaseTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
 
 // fixedAssets is the version-independent half of the allowlist, mapped to the

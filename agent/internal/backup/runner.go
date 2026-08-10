@@ -118,6 +118,44 @@ func (r *Runner) fail(ctx context.Context, runID string, err error) error {
 	return err
 }
 
+// walRetentionTimeout bounds the retention pass that runs after a FAILED backup
+// run. It is deliberately short next to opTimeout: this is cleanup, not the
+// run's work, and it must not hold the apply loop while the next op waits.
+const walRetentionTimeout = 5 * time.Minute
+
+// boundWALRetention forgets out-of-window WAL bundles and reclaims their space,
+// independently of whether this run's dump worked (SIGMA-283).
+//
+// resticForgetWAL is the only thing in the system that ever forgets a WAL
+// bundle: the repo-wide forget groups by (host,paths) and each bundle has a
+// unique stored path, so it keeps every one of them (SIGMA-108). It used to be
+// reachable only after the dump, the stdin backup and the check had all
+// succeeded. The WAL shipper, meanwhile, pushes on its own cadence and forgets
+// nothing — so a database that outgrows the agent's op cap (pg_dump killed,
+// nightly run failed) accumulates ~1,440 wal-*.tar snapshots a day that nothing
+// will ever remove. The customer's bucket and bill grow without limit, restore
+// times degrade as the snapshot list grows, and the only symptom in the product
+// is a failed backup badge that says nothing about storage.
+//
+// The context is deliberately NOT the op's: the canonical failure this exists
+// for is a dump killed by the 25-minute op cap, which leaves ctx already
+// expired. Inheriting it would skip retention in exactly the case that needs it.
+// Errors are logged, never surfaced: the run has already failed for its own
+// reason and overwriting that detail with a retention error would hide it.
+func (r *Runner) boundWALRetention(ctx context.Context, cred Credential, spec opSpec) {
+	if spec.KeepDaily <= 0 {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), walRetentionTimeout)
+	defer cancel()
+	// prune=true: this is the only retention this run will do, and forgetting
+	// alone merely unreferences the bundles — the bytes stay billed until pruned.
+	if err := resticForgetWAL(rctx, cred, spec.KeepDaily, true); err != nil {
+		r.log.Warn("wal retention failed after a failed backup run",
+			"run", spec.RunID, "resource", spec.ResourceID, "err", err)
+	}
+}
+
 // shortSha caps a digest for error messages. A raw `s[:12]` slice-panics if the
 // CP ever sends a non-empty digest shorter than 12 chars, and there is no
 // recover() anywhere in the agent — one malformed field would take the process
@@ -181,20 +219,26 @@ func (r *Runner) opBackupRun(ctx context.Context, op dsd.Op) error {
 	// blocked io.Pipe write; closing pr can.
 	_ = pr.Close()
 	dumpErr := <-execDone
+	// From here the repo is open and usable, so every exit must still bound WAL
+	// retention — it is the WAL shipper's growth we are capping, and that shipper
+	// does not care whether tonight's dump worked (SIGMA-283).
 	if dumpErr != nil {
+		r.boundWALRetention(ctx, cred, spec)
 		return r.fail(ctx, spec.RunID, dumpErr)
 	}
 	if backupErr != nil {
+		r.boundWALRetention(ctx, cred, spec)
 		return r.fail(ctx, spec.RunID, backupErr)
 	}
 	if err := resticCheck(ctx, cred); err != nil {
+		r.boundWALRetention(ctx, cred, spec)
 		return r.fail(ctx, spec.RunID, fmt.Errorf("post-backup check: %w", err))
 	}
 	if spec.KeepDaily > 0 {
 		// Forget out-of-window WAL bundles first (no prune) so the single prune in
 		// resticForget reclaims their data too — the repo-wide forget can never
 		// prune WAL on its own because each bundle has a unique path (SIGMA-108).
-		if err := resticForgetWAL(ctx, cred, spec.KeepDaily); err != nil {
+		if err := resticForgetWAL(ctx, cred, spec.KeepDaily, false); err != nil {
 			sha := hex.EncodeToString(hasher.Sum(nil))
 			r.report(ctx, spec.RunID, true, snapshotID, sha, "backup ok; WAL retention failed: "+err.Error())
 			return nil

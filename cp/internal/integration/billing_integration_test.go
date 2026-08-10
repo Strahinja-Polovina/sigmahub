@@ -7,6 +7,8 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -200,6 +202,25 @@ func TestBillingSubscriptionWebhookFlow(t *testing.T) {
 		t.Fatalf("subscription = %+v", got)
 	}
 
+	// SIGMA-293: an event with no custom_data is still correlatable — either
+	// stored Paddle id identifies the org, and an unknown id resolves to no org
+	// rather than to some other tenant's row.
+	for _, tc := range []struct{ sub, ctm, want string }{
+		{"sub_1", "", orgID},
+		{"", "ctm_1", orgID},
+		{"sub_unknown", "ctm_1", orgID}, // falls through to the customer id
+		{"sub_unknown", "ctm_unknown", ""},
+		{"", "", ""},
+	} {
+		found, err := st.OrgForPaddleIDs(ctx, tc.sub, tc.ctm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found != tc.want {
+			t.Fatalf("OrgForPaddleIDs(%q, %q) = %q, want %q", tc.sub, tc.ctm, found, tc.want)
+		}
+	}
+
 	// past_due transition enqueues a payment_failed alert exactly once.
 	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
 		OrgID: orgID, CustomerID: "ctm_1", SubscriptionID: "sub_1", Status: "past_due", Quantity: 2,
@@ -310,5 +331,272 @@ func TestIdempotencyClaimSemantics(t *testing.T) {
 	}
 	if c, _, _ := st.IdempotencyClaim(ctx, org2, key2, hashA); !c {
 		t.Fatal("after release a retry must be able to re-claim")
+	}
+}
+
+// TestPastDueOrgIsCappedAfterGracePeriod is the SIGMA-295 guard. A past_due
+// transition enqueued exactly one alert and nothing else ever happened: no
+// repeat, no canceled alert, no grace-period expiry, and no code path anywhere
+// consulted org_billing.status before creating a server. A customer running a
+// 40-unit fleet could stop paying and keep every capability indefinitely.
+func TestPastDueOrgIsCappedAfterGracePeriod(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// A paying org that stopped paying, with a fleet already running.
+	orgID := "org_delinquent"
+	connectServer(t, st, orgID, "existing-1")
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_d", SubscriptionID: "sub_d", Status: "past_due", Quantity: 5,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inside the grace period nothing changes: the whole promise of the
+	// past_due alert is "your servers keep running, nothing is paused".
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "grace-ok", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("a past_due org inside its grace period must keep working: %v", err)
+	}
+
+	// Now push the past_due transition beyond the grace window.
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE org_billing SET status_since = $2 WHERE org_id = $1`,
+		orgID, now.Add(-store.BillingGracePeriod-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, err := st.IssueBootstrapToken(ctx, orgID, "new-server", "general", "", "", "admin", time.Hour)
+	if err == nil {
+		t.Fatal("an org past_due beyond the grace period was allowed to add a server")
+	}
+	var capped store.ErrBillingCapped
+	if !errors.As(err, &capped) {
+		t.Fatalf("refusal must be a billing refusal the API can explain, got %T: %v", err, err)
+	}
+
+	// The existing fleet is untouched: this is a cap on GROWTH, not a shutdown.
+	if _, _, units, uerr := st.ConnectedServerUnits(ctx, orgID); uerr != nil || units == 0 {
+		t.Fatalf("existing fleet must keep running: units=%d err=%v", units, uerr)
+	}
+
+	// A paying org is unaffected.
+	paying := "org_paying"
+	if err := st.UpsertSubscription(ctx, paying, store.BillingStatus{
+		OrgID: paying, CustomerID: "ctm_p", SubscriptionID: "sub_p", Status: "active", Quantity: 5,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.IssueBootstrapToken(ctx, paying, "fine", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("an active subscription must not be capped: %v", err)
+	}
+	// So is an org that never subscribed — the free tier is a product, not a
+	// delinquency.
+	if _, _, _, err := st.IssueBootstrapToken(ctx, "org_free", "free", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("a free-tier org must not be capped: %v", err)
+	}
+
+	// The operator can see it, and the org is told again rather than once.
+	del, err := st.DelinquentOrgs(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *store.DelinquentOrg
+	for i := range del {
+		if del[i].OrgID == orgID {
+			found = &del[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("delinquent org missing from the operator view: %+v", del)
+	}
+	if !found.Capped || found.Status != "past_due" {
+		t.Fatalf("delinquent row = %+v, want capped past_due", *found)
+	}
+}
+
+// TestBillingDunningRepeatsAndAlertsOnCancel covers the rest of SIGMA-295: one
+// alert, ever, was the entire dunning sequence, and a cancellation produced no
+// alert at all.
+func TestBillingDunningRepeatsAndAlertsOnCancel(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	orgID := "org_dunning"
+	ch, err := st.CreateAlertChannel(ctx, orgID, "admin", store.CreateAlertChannelInput{
+		// SIGMA-259 pins Slack channels to the hooks.slack.com prefix at create
+		// time, so a placeholder host never becomes the row this test alerts on.
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/B000/dunning",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAlertRules(ctx, orgID, ch.ID, []string{store.AlertPaymentFailed}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	countAlerts := func() int {
+		var n int
+		if err := st.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM alert_outbox WHERE org_id = $1 AND event = $2`,
+			orgID, store.AlertPaymentFailed).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_x", SubscriptionID: "sub_x", Status: "past_due", Quantity: 4,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countAlerts(); got != 1 {
+		t.Fatalf("transition alerts = %d, want 1", got)
+	}
+
+	// A sweep run immediately must NOT re-alert — the reminder is on a schedule,
+	// not on every 10-minute pass.
+	if _, err := st.SweepBillingDunning(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if got := countAlerts(); got != 1 {
+		t.Fatalf("immediate re-sweep alerted again: %d", got)
+	}
+
+	// A sweep one dunning interval later must remind them.
+	if _, err := st.SweepBillingDunning(ctx, now.Add(store.BillingDunningInterval+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := countAlerts(); got != 2 {
+		t.Fatalf("dunning reminder never fired: alerts = %d, want 2", got)
+	}
+
+	// A cancellation is an event the org must hear about too.
+	cancelOrg := "org_canceled"
+	cch, err := st.CreateAlertChannel(ctx, cancelOrg, "admin", store.CreateAlertChannelInput{
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/B000/cancel",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAlertRules(ctx, cancelOrg, cch.ID, []string{store.AlertPaymentFailed}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscription(ctx, cancelOrg, store.BillingStatus{
+		OrgID: cancelOrg, CustomerID: "ctm_c", SubscriptionID: "sub_c", Status: "active", Quantity: 4,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscription(ctx, cancelOrg, store.BillingStatus{
+		OrgID: cancelOrg, CustomerID: "ctm_c", SubscriptionID: "sub_c", Status: "canceled", Quantity: 4,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM alert_outbox WHERE org_id = $1 AND event = $2`,
+		cancelOrg, store.AlertPaymentFailed).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("cancellation alerts = %d, want 1", n)
+	}
+}
+
+// TestBillableQuantityAgreesAcrossSummaryAndSync is the SIGMA-292 guard: the
+// number the Billing page shows, the number handleBillingCheckout puts on the
+// Paddle transaction and the number the drift sweep PATCHes onto the
+// subscription must be the SAME number. They used to be computed by two
+// different formulas over two different windows with two different floors, so
+// an org that shrank in the morning approved one quantity at checkout and was
+// invoiced another within ten minutes.
+func TestBillableQuantityAgreesAcrossSummaryAndSync(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// (a) A fleet that shrank this morning. 20 general servers ran overnight and
+	// were metered; 15 were deleted before the org subscribed in the afternoon.
+	orgID := "org_shrunk"
+	var ids []string
+	for i := 0; i < 20; i++ {
+		ids = append(ids, connectServer(t, st, orgID, fmt.Sprintf("shrunk-%d", i)))
+	}
+	if _, err := st.SweepServerHours(ctx, now.Add(-6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids[:15] {
+		if err := st.DeleteServer(ctx, orgID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := st.BillingSummaryForOrg(ctx, orgID, now, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The customer subscribes at exactly the quantity checkout showed them.
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_shrunk", SubscriptionID: "sub_shrunk",
+		Status: "active", Quantity: summary.BillableUnits,
+	}, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+
+	drift, err := st.SubscriptionsNeedingQuantitySync(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range drift {
+		if d.OrgID != orgID {
+			continue
+		}
+		t.Fatalf("sweep wants to re-price a subscription the customer just approved: "+
+			"summary/checkout showed %d billable units, sweep wants %d",
+			summary.BillableUnits, d.Want)
+	}
+
+	// (b) An org that shrank BELOW the free tier. The page must not say "nothing
+	// due" while the sweep keeps the subscription at a quantity Paddle invoices.
+	small := "org_shrunk_small"
+	smallIDs := []string{
+		connectServer(t, st, small, "small-1"),
+		connectServer(t, st, small, "small-2"),
+		connectServer(t, st, small, "small-3"),
+		connectServer(t, st, small, "small-4"),
+	}
+	if _, err := st.SweepServerHours(ctx, now.Add(-30*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range smallIDs[:3] {
+		if err := st.DeleteServer(ctx, small, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertSubscription(ctx, small, store.BillingStatus{
+		OrgID: small, CustomerID: "ctm_small", SubscriptionID: "sub_small",
+		Status: "active", Quantity: 1,
+	}, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	smallSummary, err := st.BillingSummaryForOrg(ctx, small, now, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallDrift, err := st.SubscriptionsNeedingQuantitySync(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 1 // nothing drifted → Paddle keeps invoicing the stored quantity
+	for _, d := range smallDrift {
+		if d.OrgID == small {
+			want = d.Want
+		}
+	}
+	if smallSummary.BillableUnits != want {
+		t.Fatalf("below the free tier the page shows %d billable units (%d %s due) "+
+			"while the subscription is billed for %d",
+			smallSummary.BillableUnits, smallSummary.Amount, smallSummary.Currency, want)
 	}
 }

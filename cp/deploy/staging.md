@@ -229,6 +229,76 @@ Without this the disk is the limit: a 200-server install doing 30 deploys a day
 writes ~27M `deploy_logs` rows a year, and a full disk takes Postgres
 read-only, which fails every tenant at once.
 
+## 9. Migrations and rollback (SIGMA-290)
+
+Both halves migrate on boot: the control plane runs its embedded SQL migrations
+from `setupStore`, and the dashboard runs its drizzle migrations from
+`instrumentation.ts`. Each run now holds a session-level Postgres advisory lock
+on `hashtext('sigmahub:migrate')`, so a second process starting mid-migration
+**waits** instead of racing the DDL. Before that lock existed, two replicas
+starting milliseconds apart both saw the same file unapplied, one created the
+object and the other failed with `relation "x" already exists`, exited 1, and
+was restarted by `unless-stopped` — a crash loop whose only clue was a
+migration that had plainly already applied.
+
+Migration is also available as an explicit **deploy step**, which is what you
+want as soon as more than one replica exists:
+
+```
+docker compose -f cp/deploy/docker-compose.yml run --rm cp migrate
+```
+
+`sigmahub-cp migrate` applies the schema and exits. It needs only
+`CP_DATABASE_URL` — no KMS backend, no key material.
+
+### The rollback contract
+
+Rollback here is "edit `CP_IMAGE` / `WEB_IMAGE` in `cp/deploy/.env` and
+`compose up -d`". That runs the **N-1 binary against schema N**, because
+rolling an image back does not roll the schema back. So:
+
+- **Every migration must be additive.** New tables, new nullable columns, new
+  indexes. A column the N-1 binary does not know about is invisible to it; a
+  column it *needs* that you dropped is an outage it cannot be rolled back out
+  of.
+- **Never drop or rename a column or table in the same release that stops using
+  it.** Stop writing it in release N, stop reading it in N+1, drop it in N+2 —
+  by which point N-1 is no longer a rollback target you would reach for.
+- **Never add a NOT NULL column without a default**, and never narrow a type or
+  add a constraint an N-1 write would violate: the old binary is still writing
+  rows while you decide whether to roll forward again.
+- **Roll the schema forward only.** If a migration is wrong, fix it with another
+  migration. There are no down-migrations, by design — a down-migration is a
+  destructive operation run at the worst possible moment.
+
+## 10. Running more than one control-plane replica (SIGMA-291)
+
+Nearly all of the control plane's shared state already lives in Postgres —
+advisory locks around reconciles and migrations, `SKIP LOCKED` work leases,
+partial unique indexes — so a second replica is safe for correctness. Two things
+are worth knowing before you scale `cp` past one instance.
+
+**Agent long-poll wake-ups are shared, and must stay that way.** The
+reconciler's long-poll waiter map is per-process. A change rendered on replica B
+is announced to replica A over Postgres `LISTEN`/`NOTIFY`
+(`SubscribeDSDChanges` / `PublishDSDChange`, wired in `main.go`), so an agent
+polling A is woken immediately. Without that fan-out roughly half of all DSD
+changes would be delivered a full long-poll window (25s) late, with no error
+anywhere: deploys and config changes would simply feel intermittently sluggish.
+The delivery is best-effort — `NOTIFY` is not durable — which is fine, because
+a missed wake costs one long-poll window and the 60s fleet resync re-renders
+regardless.
+
+**The telemetry ingest budget is per replica, not per org.**
+`orgSamplesPerSec` / `orgLinesPerSec` in `cp/internal/telemetry` are in-memory
+token buckets, so N replicas give each org roughly N times the intended budget.
+This is a stated limitation, not a bug to be surprised by: divide those
+constants by your replica count, or enforce the real limit in front of the
+metrics/logs sink. It is deliberately not backed by a shared counter — that
+would put a database round trip on the highest-frequency request the control
+plane serves, to tighten a backstop that already sits behind the agent-side
+metric allowlist and series cap.
+
 ## Teardown
 
 ```

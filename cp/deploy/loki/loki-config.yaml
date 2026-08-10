@@ -1,0 +1,101 @@
+# SigmaHub's Loki configuration (SIGMA-298).
+#
+# The telemetry profile used to start grafana/loki with the image's stock
+# /etc/loki/local-config.yaml, which is a demo config. Three consequences, all
+# of them wrong for a multi-tenant log store holding customers' application
+# output:
+#
+#   1. auth_enabled defaulted to false, so Loki IGNORED the X-Scope-OrgID header
+#      the control plane sends on every push and query and filed every tenant's
+#      lines under the same internal tenant. The pipeline believed it was
+#      tenant-isolated; the store was not.
+#   2. No compactor and no retention_period: retention was disabled outright, so
+#      every line ever shipped was kept forever, and — because deletes are a
+#      compactor feature — there was no way to delete one tenant's lines at all.
+#      The only lever left was wiping the shared volume, which destroys every
+#      other tenant's logs too.
+#   3. The stock config's path_prefix is /tmp/loki, while the compose file
+#      mounts the loki-data volume at /loki. The volume was never written to;
+#      the logs lived in the container's writable layer and vanished on
+#      recreate.
+#
+# All three are fixed here, and this file is mounted over the image default so
+# the deployment cannot silently fall back to it.
+#
+# Read with -config.expand-env=true: ${VAR:-default} comes from the compose
+# environment, so retention is an operator setting in .env rather than an edit
+# to this file.
+
+# REQUIRED. The control plane's tenancy is the X-Scope-OrgID header it sets on
+# every push, query and delete; with auth_enabled false Loki discards it.
+auth_enabled: true
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  # Matches the loki-data volume mount in docker-compose.yml. The stock config's
+  # /tmp/loki is why nothing survived a container recreate.
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+# The compactor is what makes both halves of this ticket possible: it enforces
+# retention_period, and it is the component that executes delete requests. A
+# Loki without one cannot delete by tenant, which is why the offboarding path
+# depends on this block existing.
+compactor:
+  working_directory: /loki/compactor
+  shared_store: filesystem
+  compaction_interval: 10m
+  retention_enabled: true
+  # Deletes are not immediate: the delay is a grace window in which a mistaken
+  # retention change or delete request can still be reversed. Two hours is short
+  # enough to satisfy an erasure request promptly and long enough to notice.
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+limits_config:
+  # Default retention for every tenant. 30 days is the product default: long
+  # enough to debug last month's incident, short enough that a customer's users'
+  # email addresses — which ordinary application logging puts in these lines —
+  # are not held indefinitely by default.
+  retention_period: ${LOKI_RETENTION_PERIOD:-720h}
+  # filter-and-delete is what makes DELETE /v1/orgs/{orgId} able to erase a
+  # tenant's lines: it both filters them out of queries immediately and removes
+  # them from the chunks. With the default (filter-only) the data would still be
+  # on disk, which is not erasure.
+  deletion_mode: filter-and-delete
+  max_query_lookback: ${LOKI_RETENTION_PERIOD:-720h}
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+# Per-tenant overrides live in a separate file so a customer's contracted
+# retention can be changed without restarting Loki — the runtime config is
+# re-read on the interval below.
+runtime_config:
+  file: /etc/loki/runtime-config.yaml
+  period: 1m
+
+# This is a store of customers' application logs. It does not phone home.
+analytics:
+  reporting_enabled: false

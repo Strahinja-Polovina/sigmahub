@@ -138,13 +138,21 @@ type Server struct {
 	// the fallback metrics path may not advertise a longer window than that
 	// (SIGMA-257). Zero = the built-in default; read via metricsRetention().
 	metricsRetentionCfg time.Duration
-	mux                 *http.ServeMux
+	// orgAdmin backs the tombstone check that stops a purged org id being
+	// provisioned again (SIGMA-298). The erasure itself is DomainAPI.PurgeOrg
+	// (SIGMA-284) — the two tickets each built a delete engine, and this is the
+	// half of SIGMA-298 that PurgeOrg did not already have.
+	orgAdmin OrgAdminAPI
+	mux      *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
 type PaddleClient interface {
 	CreateCheckout(ctx context.Context, in paddle.CreateTransactionInput) (paddle.Transaction, error)
 	CustomerPortalURL(ctx context.Context, customerID string) (string, error)
+	// SetSubscriptionOrg stamps orgId into the subscription's custom_data so
+	// later events on it correlate through the primary path (SIGMA-293).
+	SetSubscriptionOrg(ctx context.Context, subscriptionID, orgID string) error
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.
@@ -242,6 +250,10 @@ type Options struct {
 	// the built-in 24h default. It does not affect the pipeline path, which
 	// reads VictoriaMetrics under its own retention.
 	MetricsRetention time.Duration
+	// OrgAdmin backs the tombstone check on provisioning (SIGMA-298). Nil in
+	// handler unit tests that do not exercise it; provisioning then skips the
+	// check, which is safe because a test store has no tombstones.
+	OrgAdmin OrgAdminAPI
 }
 
 // New builds the HTTP surface.
@@ -282,6 +294,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		release:             opts.Release.normalized(),
 		metrics:             opts.Metrics,
 		metricsRetentionCfg: opts.MetricsRetention,
+		orgAdmin:            opts.OrgAdmin,
 		mux:                 http.NewServeMux(),
 	}
 	if s.metrics == nil {
@@ -317,6 +330,8 @@ func (s *Server) routes() {
 
 	// Org provisioning (dedicated token; mints the org's web credential).
 	s.mux.HandleFunc("POST /v1/orgs", s.requireProvision(s.handleProvisionOrg))
+	// …and its inverse: tenant erasure (SIGMA-284), same credential.
+	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}", s.requireProvision(s.handlePurgeOrg))
 
 	// Git provider webhook (P1-7). Public: unauthenticated but HMAC-verified
 	// against the configured secret; a forged signature is rejected 401.

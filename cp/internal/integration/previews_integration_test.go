@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -108,7 +109,7 @@ func TestPreviewEnvironmentLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.PreviewTeardown == nil || out.PreviewTeardown.ServerID != serverID {
+	if len(out.PreviewTeardown) != 1 || out.PreviewTeardown[0].ServerID != serverID {
 		t.Fatalf("close outcome = %+v", out)
 	}
 	var envCount, resCount int
@@ -193,5 +194,114 @@ func TestPreviewRejectsUnavailablePreviewServer(t *testing.T) {
 		Action: "opened", PRNumber: 2, Branch: "b2", SHA: "s2",
 	}); err == nil {
 		t.Fatal("preview was scheduled onto a tombstoned server")
+	}
+}
+
+// TestTeardownPreview_ArchivesRepoKeys is the SIGMA-280 regression. SIGMA-170
+// established the invariant that a resource's wrapped restic repo password is
+// copied into backup_repo_key_archive BEFORE any DELETE that cascades its
+// backup_policies row away — otherwise the org keeps paying to store offsite
+// snapshots that nobody can ever decrypt. DeleteResource/DeleteProject/
+// DeleteEnvironment all honour it; the preview teardown path did not, so a
+// database created inside a PR preview environment lost its key when the PR
+// merged.
+func TestTeardownPreview_ArchivesRepoKeys(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_prev_keys"
+	envID, serverID := dbTestFixture(t, st, orgID, false, "general")
+
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: projectID, RepoFullName: "acme/shop",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetConnectionPreviews(ctx, orgID, conn.ID, true, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	appSpec, _ := json.Marshal(map[string]any{"image": "", "ports": []map[string]any{{"container": 3000}}})
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "web", Kind: "app", Spec: appSpec,
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// PR #412 opened → preview environment pr-412.
+	if _, err := st.HandleGitWebhook(ctx, store.GitWebhookEvent{
+		DeliveryID: "d-pr412-open", EventType: "pull_request", RepoFullName: "acme/shop",
+		Action: "opened", PRNumber: 412, Branch: "feat/migration", SHA: "aaa111",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previews, err := st.ListPreviewEnvironments(ctx, orgID, conn.ID)
+	if err != nil || len(previews) != 1 {
+		t.Fatalf("previews = %+v err = %v", previews, err)
+	}
+	previewEnvID := previews[0].EnvironmentID
+
+	// The developer adds a managed Postgres to the preview environment through
+	// the normal wizard and points a backup target at it.
+	db, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: previewEnvID, ServerID: serverID, Name: "migration-db", Kind: "postgres",
+		Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://minio.internal:9000", Bucket: "backups",
+		AccessKey: "AKIA123", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := target.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, db.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+		t.Fatal(err)
+	}
+	// A sweep materialises the repo key (ensureRepoKeyTx runs on first schedule).
+	if _, err := st.CreateDueBackupRuns(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var policyID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT id FROM backup_policies WHERE org_id = $1 AND resource_id = $2 AND repo_key_ciphertext IS NOT NULL`,
+		orgID, db.ID).Scan(&policyID); err != nil {
+		t.Fatalf("preview database has no wrapped repo key: %v", err)
+	}
+	before, err := st.ExportRepoKey(ctx, orgID, db.ID, "admin")
+	if err != nil || before == "" {
+		t.Fatalf("export while live: %q err = %v", before, err)
+	}
+
+	// PR merges → teardown deletes the environment, cascading backup_policies.
+	if _, err := st.HandleGitWebhook(ctx, store.GitWebhookEvent{
+		DeliveryID: "d-pr412-close", EventType: "pull_request", RepoFullName: "acme/shop",
+		Action: "closed", PRNumber: 412, Branch: "feat/migration", SHA: "aaa111",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var archived int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM backup_repo_key_archive WHERE policy_id = $1`, policyID).Scan(&archived); err != nil {
+		t.Fatal(err)
+	}
+	if archived != 1 {
+		t.Fatalf("backup_repo_key_archive rows for policy %s = %d, want 1: the preview teardown "+
+			"destroyed the only key to snapshots still sitting in the customer's bucket (SIGMA-280)", policyID, archived)
+	}
+	after, err := st.ExportRepoKey(ctx, orgID, db.ID, "admin")
+	if err != nil {
+		t.Fatalf("export after teardown: %v", err)
+	}
+	if after != before {
+		t.Fatalf("repo key changed across preview teardown: %q → %q", before, after)
 	}
 }

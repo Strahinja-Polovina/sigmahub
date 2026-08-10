@@ -1,0 +1,26 @@
+# Per-tenant Loki overrides (SIGMA-298).
+#
+# Loki re-reads this file on the interval set by runtime_config.period in
+# loki-config.yaml, so a tenant's retention can be changed without a restart.
+# The tenant key is the SigmaHub org id — the same value the control plane sends
+# as X-Scope-OrgID on every push, query and delete.
+#
+# Leave it empty and every tenant inherits the default retention_period from
+# limits_config. Add an entry when a customer has contracted something else:
+#
+# overrides:
+#   org_2f9c1a:
+#     # A design partner who asked for a shorter window than the 30-day default.
+#     retention_period: 168h
+#   org_7bd430:
+#     # A customer whose own compliance obligation is longer. Raising retention
+#     # is a commitment to hold their users' data for that long — it is not a
+#     # free knob, and it should be written down somewhere other than here.
+#     retention_period: 2160h
+#
+# Note what does NOT belong here: erasure. Deleting a departing customer's lines
+# is DELETE /v1/orgs/{orgId} on the control plane, which issues a per-tenant
+# delete request to Loki. Dropping a tenant's retention to zero here would take
+# effect on the compactor's schedule and leave no record that an erasure was
+# requested, by whom, or when.
+overrides: {}

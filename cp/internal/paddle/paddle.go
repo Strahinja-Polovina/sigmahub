@@ -134,6 +134,20 @@ func (c *Client) UpdateSubscriptionQuantity(ctx context.Context, subscriptionID,
 	return c.do(ctx, http.MethodPatch, "/subscriptions/"+subscriptionID, body, nil)
 }
 
+// SetSubscriptionOrg stamps the org id into the SUBSCRIPTION's own custom_data.
+//
+// CreateCheckout puts orgId on the checkout TRANSACTION, and that is the only
+// place it lived: a renewal transaction, a portal cancellation and a support
+// edit in the Paddle dashboard all reach the webhook receiver without it
+// (SIGMA-293). The receiver now falls back to the stored subscription/customer
+// ids, but the fallback is a repair — this makes the primary correlation path
+// work for every later event on the subscription, so an org whose org_billing
+// row is somehow missing an id is still identifiable.
+func (c *Client) SetSubscriptionOrg(ctx context.Context, subscriptionID, orgID string) error {
+	return c.do(ctx, http.MethodPatch, "/subscriptions/"+subscriptionID,
+		map[string]any{"custom_data": map[string]string{"orgId": orgID}}, nil)
+}
+
 // CustomerPortalURL returns a management-portal session URL for a customer.
 func (c *Client) CustomerPortalURL(ctx context.Context, customerID string) (string, error) {
 	var out struct {

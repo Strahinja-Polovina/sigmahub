@@ -55,7 +55,7 @@ func testStore(t *testing.T) (*store.Store, ed25519.PrivateKey) {
 	// cascade by design (SIGMA-170 — outliving its resource is the point), so
 	// nothing else empties it. It must be cleared explicitly, and before
 	// org_deks, which its repo_dek_id references.
-	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "server_hours", "org_billing", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "idempotency_keys", "github_installations", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_repo_key_archive", "backup_targets", "db_credentials", "s3_credentials", "llm_endpoints", "secrets", "org_deks", "env_servers", "resources", "cluster_nodes", "clusters", "org_registries", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets"} {
+	for _, tbl := range []string{"server_dsd", "deploy_logs", "alert_outbox", "alert_rules", "alert_channels", "server_hours", "org_billing", "deployments", "builds", "deploy_requests", "git_branch_map", "webhook_deliveries", "idempotency_keys", "github_installations", "git_connections", "domains", "dns_provider_credentials", "preview_environments", "wal_archive_status", "backup_runs", "backup_policies", "backup_repo_key_archive", "backup_targets", "db_credentials", "s3_credentials", "llm_endpoints", "secrets", "org_deks", "env_servers", "resources", "cluster_nodes", "clusters", "org_registries", "environments", "projects", "agent_tokens", "bootstrap_tokens", "service_tokens", "server_hardening", "servers", "cp_audit_log", "cp_secrets", "org_tombstones"} {
 		if _, err := st.Pool.Exec(ctx, "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
@@ -1107,5 +1107,139 @@ func TestDEKRotationReencryptsAllCredentialTables(t *testing.T) {
 	}
 	if retired == nil {
 		t.Fatal("old DEK should be retired after a full re-encrypt")
+	}
+}
+
+// TestReencryptSecrets_CoversEveryOrgDEKReference holds dekReencTargets against
+// the schema itself. The list is documented as "the exhaustive list of tables
+// encrypted under the org DEK; keep it in sync with every REFERENCES
+// org_deks(id) column", and it is only exhaustive if nobody adds such a column
+// without touching it — llm_endpoints.token_dek_id was added by migration 0055
+// and missed for exactly that reason (SIGMA-281). A missed column means the
+// operator responding to a suspected DEK exposure is told every secret was
+// re-sealed while that ciphertext still sits under the compromised key, and the
+// retirement guard then marks the old DEK retired because, from its point of
+// view, nothing references it — a later hard-delete of retired material makes
+// it permanently unopenable.
+func TestReencryptSecrets_CoversEveryOrgDEKReference(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+
+	rows, err := st.Pool.Query(ctx, `
+		SELECT tc.table_name, kcu.column_name
+		  FROM information_schema.table_constraints tc
+		  JOIN information_schema.key_column_usage kcu
+		    ON kcu.constraint_name = tc.constraint_name
+		   AND kcu.constraint_schema = tc.constraint_schema
+		  JOIN information_schema.constraint_column_usage ccu
+		    ON ccu.constraint_name = tc.constraint_name
+		   AND ccu.constraint_schema = tc.constraint_schema
+		 WHERE tc.constraint_type = 'FOREIGN KEY'
+		   AND tc.table_schema = 'public'
+		   AND ccu.table_name = 'org_deks' AND ccu.column_name = 'id'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type ref struct{ table, column string }
+	var refs []ref
+	for rows.Next() {
+		var r ref
+		if err := rows.Scan(&r.table, &r.column); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		refs = append(refs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("no FK to org_deks(id) found — the introspection query is wrong, not the schema")
+	}
+
+	covered := store.DEKReencryptedColumns()
+	for _, r := range refs {
+		found := false
+		for _, c := range covered[r.table] {
+			if c == r.column {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s.%s references org_deks(id) but rotation never re-encrypts it: "+
+				"add it to dekReencTargets and to the retirement guard (SIGMA-281)", r.table, r.column)
+		}
+	}
+}
+
+// TestReencryptSecrets_RewrapsHubToken is the behavioural half of SIGMA-281: an
+// endpoint's Hugging Face token is a DEK-sealed credential like any other, so a
+// rotation must move it onto the fresh DEK — and it must still open afterwards.
+func TestReencryptSecrets_RewrapsHubToken(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_hubrot"
+	st.SetHuggingFaceToken("hf_secret_token")
+
+	proj, err := st.CreateProject(ctx, orgID, "ai", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpu := connectTypedServer(t, st, orgID, "gpu-rot", "gpu")
+	if err := st.AttachServer(ctx, orgID, env.ID, gpu, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	llm, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: gpu, Name: "llama", Kind: "llm",
+		Spec: json.RawMessage(`{"engine":"vllm","model":"meta-llama/Llama-3.1-8B"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldDEK string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT token_dek_id FROM llm_endpoints WHERE resource_id = $1`, llm.ID).Scan(&oldDEK); err != nil {
+		t.Fatalf("endpoint has no sealed weights token to rotate: %v", err)
+	}
+
+	if _, err := st.RotateDEK(ctx, orgID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReencryptSecrets(ctx, orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	var nowDEK string
+	var retired *time.Time
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT token_dek_id FROM llm_endpoints WHERE resource_id = $1`, llm.ID).Scan(&nowDEK); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Pool.QueryRow(ctx, `SELECT retired_at FROM org_deks WHERE id = $1`, oldDEK).Scan(&retired); err != nil {
+		t.Fatal(err)
+	}
+	if nowDEK == oldDEK {
+		t.Errorf("weights token still sealed under the rotated-away DEK %s (retired_at=%v) — "+
+			"the operator was told the rotation was complete (SIGMA-281)", oldDEK, retired)
+	}
+	// And it still opens: the AAD survived the re-wrap.
+	resolved, err := st.ResolveSecretsForResource(ctx, orgID, gpu, llm.ID, "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	for _, r := range resolved {
+		if r.Name == store.HubTokenSecretName {
+			got = r.Value
+		}
+	}
+	if got != "hf_secret_token" {
+		t.Errorf("weights token after rotation = %q, want the original plaintext", got)
 	}
 }

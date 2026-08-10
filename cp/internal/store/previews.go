@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-
-	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 )
 
 // PreviewEnvironment is one PR's ephemeral environment record.
@@ -223,15 +221,16 @@ func ensurePreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumbe
 	return envID, resourceID, nil
 }
 
-// teardownPreviewTx closes a PR's preview: the ephemeral resource's volumes go
-// through the pre-authorised destructive path (system-audited, uniform with
+// teardownPreviewTx closes a PR's preview: every ephemeral resource's volumes
+// go through the pre-authorised destructive path (system-audited, uniform with
 // the interactive flow), the resource and environment rows are removed, and
-// the preview record is marked closed. Returns the hosting server for the
-// caller's post-commit reconcile (ok=false when no open preview exists).
-func teardownPreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumber int) (serverID string, ok bool, err error) {
+// the preview record is marked closed. Returns the distinct servers that hosted
+// anything in the environment, for the caller's post-commit reconcile
+// (ok=false when no open preview exists).
+func teardownPreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumber int) (servers []string, ok bool, err error) {
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext('preview:' || $1))`, conn.ID); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	var pvID, envID string
 	var resID *string
@@ -240,41 +239,66 @@ func teardownPreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNum
 		 WHERE connection_id = $1 AND pr_number = $2 AND status = 'open'`,
 		conn.ID, prNumber).Scan(&pvID, &envID, &resID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return nil, false, err
+	}
+	// SIGMA-280. A preview environment is not only the ephemeral app resource we
+	// created: a developer testing a migration adds a managed database to it
+	// through the ordinary New Resource wizard and points a backup target at it.
+	// Deleting the environment below cascades those backup_policies away, and
+	// with them the ONLY copy of the wrapped restic repo password — while the
+	// snapshots stay in the customer's bucket, still billing and now permanently
+	// undecryptable. SIGMA-170 made that copy mandatory before any such cascade;
+	// this path bypassed it. Archive first, exactly as DeleteEnvironment does.
+	if err := archiveRepoKeysTx(ctx, tx, conn.OrgID, "environment", envID); err != nil {
+		return nil, false, fmt.Errorf("archive repo keys: %w", err)
+	}
+	// Same reason this is the shared helper rather than a preview-local loop:
+	// the environment may hold more than the preview's own resource, and each
+	// ephemeral one needs its volumes queued for removal and its server
+	// re-rendered. The helper is what DeleteEnvironment uses, so the two paths
+	// cannot drift again.
+	servers, err = cascadeResourceCleanupTx(ctx, tx, conn.OrgID, "environment_id", envID)
+	if err != nil {
+		return nil, false, err
 	}
 	if resID != nil {
-		var spec json.RawMessage
+		// Belt and braces: the preview's own resource is normally inside envID
+		// (and so already handled above), but delete it by id so a stray row can
+		// never outlive its preview.
+		var srv string
 		err = tx.QueryRow(ctx,
-			`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING server_id, spec`,
-			conn.OrgID, *resID).Scan(&serverID, &spec)
+			`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING COALESCE(server_id, '')`,
+			conn.OrgID, *resID).Scan(&srv)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return "", false, err
+			return nil, false, err
 		}
-		if err == nil {
-			for _, vol := range resourceVolumeNames(*resID, spec) {
-				if _, err := insertPendingDestructiveOpTx(ctx, tx, conn.OrgID, serverID, dsd.KindVolumeRemove, vol, "system"); err != nil {
-					return "", false, err
+		if err == nil && srv != "" {
+			seen := false
+			for _, s := range servers {
+				if s == srv {
+					seen = true
+					break
 				}
-				if err := auditTx(ctx, tx, conn.OrgID, "system", "Destructive-op confirmed (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
-					return "", false, err
-				}
+			}
+			if !seen {
+				servers = append(servers, srv)
 			}
 		}
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM environments WHERE org_id = $1 AND id = $2`, conn.OrgID, envID); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE preview_environments SET status = 'closed', closed_at = now() WHERE id = $1`, pvID); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	if err := auditTx(ctx, tx, conn.OrgID, WebhookActor, "Preview environment torn down",
 		fmt.Sprintf("pr-%d (%s)", prNumber, conn.RepoFullName)); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
-	return serverID, true, nil
+	return servers, true, nil
 }

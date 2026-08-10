@@ -43,6 +43,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := migrateOnly(); err != nil {
+			slog.Error("fatal", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
@@ -87,6 +94,42 @@ func mintServiceToken(args []string) error {
 		return err
 	}
 	fmt.Printf("service token %s (org %s, role %s):\n\n  %s\n\nShown once — only its hash is stored.\n", p.ID, p.OrgID, p.Role, tok)
+	return nil
+}
+
+// migrateOnly applies the schema and exits, so migration can be a DEPLOY STEP
+// rather than only a side effect of process start (SIGMA-290).
+//
+// Until this existed, the only way to migrate was to boot something: the API
+// server, or — surprisingly — `mint-service-token`, which goes through
+// setupStore and therefore migrates a database as a side effect of issuing a
+// token. That makes "when does the schema change" an answer nobody can state,
+// and it is the reason `replicas: 2` used to mean two processes racing the DDL.
+// Run this once against the new image before rolling any replicas; the
+// advisory lock in Store.Migrate makes running it concurrently with a booting
+// replica safe rather than merely unlikely.
+//
+// It deliberately does NOT load the KMS custody or the token pepper: applying
+// schema must not require the production key material to be reachable from
+// wherever the deploy step runs.
+func migrateOnly() error {
+	databaseURL := os.Getenv("CP_DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("CP_DATABASE_URL is required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := slog.Default()
+	st, err := store.Open(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, log); err != nil {
+		return err
+	}
+	log.Info("migrations applied")
 	return nil
 }
 
@@ -351,6 +394,13 @@ func run() error {
 	// /dl proxy, so a fleet on a private release repo can be upgraded.
 	rec.SetPublicURL(cfg.PublicURL)
 	rec.SetObservers(metrics.Loop(cpmetrics.LoopReconcilerResync).Report, metrics.ObserveDSDRender)
+	// Cross-replica long-poll wake-ups over Postgres LISTEN/NOTIFY (SIGMA-291):
+	// without this the waiter map is per-process, so an agent long-polling one
+	// replica sleeps out its whole window when another replica renders its
+	// change. Harmless with a single instance — the publish is a no-op fan-out
+	// back to this same listener.
+	rec.SetChangeBus(st)
+	go st.SubscribeDSDChanges(ctx, log, rec.WakeServer)
 	go rec.Run(ctx, 60*time.Second)
 
 	// Deploy-request drain (P1-9): turn queued git deploy_requests into
@@ -499,6 +549,15 @@ func run() error {
 					} else if n > 0 {
 						log.Info("billing quantity synced", "subscriptions", n)
 					}
+					// SIGMA-295: chase delinquent orgs on a schedule. Warn rather
+					// than Info — alert channels are per-org, so this log line is
+					// the operator's only notice that a tenant is not paying.
+					if n, err := st.SweepBillingDunning(ctx, time.Now()); err != nil {
+						log.Error("billing dunning sweep", "err", err)
+						fail(err)
+					} else if n > 0 {
+						log.Warn("billing dunning: delinquent orgs reminded", "orgs", n)
+					}
 					return passErr
 				}))
 			}
@@ -550,6 +609,7 @@ func run() error {
 			DSDPublicKey:         dsdKey.Public().(ed25519.PublicKey),
 			Telemetry:            tel,
 			TelemetryStore:       st,
+			OrgAdmin:             st, // tenant offboarding (SIGMA-298)
 			MetricsRetention:     cfg.MetricsRetention,
 			AlertSender:          alertSender,
 			Billing:              st,

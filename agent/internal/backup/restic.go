@@ -22,6 +22,35 @@ type Credential struct {
 	AccessKey  string
 	SecretKey  string
 	Region     string
+	// ForcePathStyle selects how the bucket is addressed on an S3-compatible
+	// endpoint: path style (https://host/bucket/key, what MinIO and most
+	// gateways want, and the column's default) versus virtual-host style
+	// (https://bucket.host/key, what some gateways require).
+	//
+	// The value has existed since migration 0020 and crossed six layers — API,
+	// store, target list, both credential fetchers, web client, agent client —
+	// before dying here: this field did not exist, so the operator who set it
+	// watched every surface confirm a control that changed nothing (SIGMA-287).
+	ForcePathStyle bool
+}
+
+// opts renders the restic global flags this credential implies — currently just
+// the S3 addressing style.
+//
+// It is an argv flag rather than an environment variable because that is the
+// only control restic exposes: `-o s3.bucket-lookup=auto|dns|path`, read by its
+// minio-go backend. AWS_S3_FORCE_PATH_STYLE is an AWS SDK convention restic
+// never reads, so exporting it would have replaced one inert control with
+// another. The long `--option=` form keeps each flag a single argv element.
+func (c Credential) opts() []string {
+	if !strings.HasPrefix(c.Repository, "s3:") {
+		return nil
+	}
+	lookup := "dns"
+	if c.ForcePathStyle {
+		lookup = "path"
+	}
+	return []string{"--option=s3.bucket-lookup=" + lookup}
 }
 
 // env renders the restic process environment. Credentials ride ONLY in the
@@ -44,7 +73,9 @@ func (c Credential) env() []string {
 // restic runs one restic command with stdin/stdout wiring and returns stderr
 // (capped) for diagnostics.
 func restic(ctx context.Context, cred Credential, stdin io.Reader, stdout io.Writer, args ...string) error {
-	cmd := exec.CommandContext(ctx, resticBin, args...)
+	// Global flags first, then the subcommand: args[0] stays the subcommand name
+	// for the error message below.
+	cmd := exec.CommandContext(ctx, resticBin, append(cred.opts(), args...)...)
 	cmd.Env = cred.env()
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
@@ -151,15 +182,27 @@ func resticForget(ctx context.Context, cred Credential, keepDaily, keepWeekly, k
 // bound. Regrouping the "wal"-tagged snapshots by tag collapses them into one
 // group, so --keep-within can drop WAL older than the window. The window is the
 // base-backup keep-daily span, so any base still retained at daily granularity
-// can still roll forward. No --prune here: the caller's resticForget prune
-// reclaims the newly-unreferenced data in a single pass.
-func resticForgetWAL(ctx context.Context, cred Credential, keepDays int) error {
+// can still roll forward.
+//
+// prune says whether this call must also reclaim the space. On the happy path
+// it is false, because the caller's resticForget already prunes and one pass is
+// enough. It is true when this is the only retention the run will do — a run
+// whose dump failed (SIGMA-283) — since forgetting alone merely unreferences
+// the bundles and the customer keeps paying for the bytes. restic skips the
+// prune when the forget removed nothing, so asking for it costs a metadata read
+// on a repo that ships no WAL.
+func resticForgetWAL(ctx context.Context, cred Credential, keepDays int, prune bool) error {
 	if keepDays <= 0 {
 		return nil
 	}
-	return restic(ctx, cred, nil, io.Discard,
+	args := []string{
 		"forget", "--tag", "wal", "--group-by", "tags",
-		"--keep-within", fmt.Sprintf("%dd", keepDays))
+		"--keep-within", fmt.Sprintf("%dd", keepDays),
+	}
+	if prune {
+		args = append(args, "--prune")
+	}
+	return restic(ctx, cred, nil, io.Discard, args...)
 }
 
 // resticDumpSnapshot streams one LOGICAL-DUMP snapshot's dump file to w.

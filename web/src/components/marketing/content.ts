@@ -452,22 +452,26 @@ export const FOOTER_COLUMNS = [
       { label: "Docs", href: "#docs" },
     ],
   },
-  {
-    heading: "Company",
-    links: [
-      { label: "About", href: "#" },
-      { label: "Blog", href: "#" },
-      { label: "Careers", href: "#" },
-      { label: "Contact", href: "#" },
-    ],
-  },
+  // SIGMA-297. There was a "Company" column here — About, Blog, Careers,
+  // Contact — and all four pointed at "#". None of those pages exist, so every
+  // one of them was a link that scrolls nowhere and leaves the visitor on the
+  // page they were already on. The column is gone rather than faked: bring it
+  // back when the pages behind it exist. The contact addresses that actually
+  // matter (privacy, security, data protection) are published on the legal
+  // documents below, which is where someone looking for them goes.
   {
     heading: "Legal",
+    // These four must stay in step with the routes under
+    // src/app/(marketing)/{privacy,terms,security,dpa} and with LEGAL_DOCS in
+    // components/marketing/legal.tsx. site-footer.test.tsx fails if a footer
+    // link ever again points at a path the app router does not serve — which is
+    // exactly how these shipped as four dead anchors under a "Legal" heading,
+    // blocking Paddle's seller review and failing a design partner's DPO.
     links: [
-      { label: "Privacy", href: "#" },
-      { label: "Terms", href: "#" },
-      { label: "Security", href: "#" },
-      { label: "DPA", href: "#" },
+      { label: "Privacy", href: "/privacy" },
+      { label: "Terms", href: "/terms" },
+      { label: "Security", href: "/security" },
+      { label: "DPA", href: "/dpa" },
     ],
   },
 ] as const;

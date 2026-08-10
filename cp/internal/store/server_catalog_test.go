@@ -7,7 +7,9 @@ package store
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -632,6 +634,79 @@ func TestEveryTypeHasABillingWeight(t *testing.T) {
 	for _, typ := range ServerTypes() {
 		if !strings.Contains(sql, "WHEN '"+typ+"'") {
 			t.Errorf("unitWeightSQL omits %q: %s", typ, sql)
+		}
+	}
+}
+
+// billingDocPath is the repository's ONLY prose description of pricing.
+const billingDocPath = "../../docs/billing.md"
+
+// TestBillingDocMatchesPricingConstants is SIGMA-296. The doc described the
+// pre-units model — "one flat unit (€5) per connected SERVER per month, with the
+// first 3 connected servers free", and a billable count of `max(0, connected -
+// 3)` — long after the billed quantity became weighted UNITS. An operator or a
+// design partner pricing three GPU servers off it computed €0 (three servers,
+// all free) against an actual charge of 12 units − 3 free = 9 × €5 = €45/month.
+// A 4x miss in the customer's favour is a refund conversation; in front of a
+// prospect it is a misrepresentation of price during a sale.
+//
+// The pricing constants and the web read model are already held together by a
+// test. This adds the third party to that agreement, so the prose cannot drift
+// alone. The doc states its numbers in tables precisely so this can read them.
+func TestBillingDocMatchesPricingConstants(t *testing.T) {
+	raw, err := os.ReadFile(billingDocPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", billingDocPath, err)
+	}
+	doc := string(raw)
+
+	one := func(pattern, what string) string {
+		m := regexp.MustCompile(pattern).FindStringSubmatch(doc)
+		if m == nil {
+			t.Fatalf("%s does not state the %s in a form this test can read (pattern %s)",
+				billingDocPath, what, pattern)
+		}
+		return m[1]
+	}
+	if got := one(`\|\s*Unit price\s*\|\s*€(\d+)`, "unit price"); got != strconv.Itoa(BillingUnitPrice) {
+		t.Errorf("the doc prices a unit at €%s; billing.go charges €%d", got, BillingUnitPrice)
+	}
+	if got := one(`\|\s*Free tier\s*\|\s*(\d+) units`, "free tier"); got != strconv.Itoa(BillingFreeTier) {
+		t.Errorf("the doc gives away %s units; billing.go gives away %d", got, BillingFreeTier)
+	}
+	if got := one(`\|\s*Currency\s*\|\s*([A-Z]{3})`, "currency"); got != BillingCurrency {
+		t.Errorf("the doc bills in %s; billing.go bills in %s", got, BillingCurrency)
+	}
+
+	// The weight table, which is the half the old doc did not have at all — and
+	// its absence is exactly what made the GPU example wrong.
+	documented := map[string]int{}
+	for _, m := range regexp.MustCompile("(?m)^\\|\\s*`([a-z0-9_]+)`\\s*\\|\\s*(\\d+)\\s*\\|").FindAllStringSubmatch(doc, -1) {
+		n, _ := strconv.Atoi(m[2])
+		documented[m[1]] = n
+	}
+	weights := ServerUnitWeights()
+	for typ, want := range weights {
+		got, ok := documented[typ]
+		if !ok {
+			t.Errorf("server type %q has no documented weight; a reader pricing a fleet of them guesses", typ)
+			continue
+		}
+		if got != want {
+			t.Errorf("the doc weighs %q at %d units; the catalog weighs it at %d", typ, got, want)
+		}
+	}
+	for typ := range documented {
+		if _, ok := weights[typ]; !ok {
+			t.Errorf("the doc documents a weight for %q, which is not a server type", typ)
+		}
+	}
+
+	// And the formula the old doc stated, which counted SERVERS. Left in prose it
+	// is worse than no formula: it looks authoritative and is off by the weights.
+	for _, stale := range []string{"connected - 3", "connected servers free", "per **connected server**"} {
+		if strings.Contains(doc, stale) {
+			t.Errorf("%s still describes the pre-units model (%q)", billingDocPath, stale)
 		}
 	}
 }

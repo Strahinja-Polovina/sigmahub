@@ -35,6 +35,21 @@ type Config struct {
 
 // Per-org ingest caps (per sweep second): the cardinality/volume backstop
 // behind the agent-side allowlist + series cap.
+//
+// These are enforced PER CONTROL-PLANE PROCESS, not per org across the fleet of
+// replicas (SIGMA-291). The buckets below are an in-memory map, so N replicas
+// behind a load balancer give every org roughly N times this budget: an agent
+// shipping high-cardinality metrics is throttled later than the numbers here
+// say, and the cap protects the telemetry sink less than it looks like it does.
+//
+// That is a deliberate, stated constraint rather than an oversight, and it is
+// the one piece of shared state the control plane does NOT push into Postgres.
+// Backing it with a shared counter means a database round trip on the ingest
+// path — the highest-frequency request the control plane serves — to tighten a
+// backstop that already sits behind two agent-side limits. If you run multiple
+// replicas, divide these constants by the replica count, or put the real limit
+// in front of the sink. cp/deploy/staging.md says the same thing where an
+// operator will actually read it.
 const (
 	orgSamplesPerSec = 2000
 	orgLinesPerSec   = 1000
@@ -134,6 +149,61 @@ func (f *Forwarder) WriteLogs(ctx context.Context, orgID string, streams []LokiS
 	}
 	u := strings.TrimSuffix(f.cfg.LokiURL, "/") + "/loki/api/v1/push"
 	return f.post(ctx, u, "application/json", body, map[string]string{"X-Scope-OrgID": orgID})
+}
+
+// ── Tenant erasure (SIGMA-298) ──────────────────────────────────────────────
+//
+// A customer's application logs a user's email address on every request —
+// ordinary behaviour — and those lines ship here and are stored. When that
+// customer leaves and asks for erasure, retention alone is not an answer: it
+// expires the data eventually, on everybody's schedule, not on request. These
+// two calls are the on-request half.
+//
+// Both are per tenant, which is the whole reason the pipeline is tenant-scoped:
+// Loki holds the org's streams under X-Scope-OrgID and VictoriaMetrics holds
+// its series under a numeric accountID, so one org's data can be deleted
+// without touching another's. The alternative — the only thing available before
+// this — was wiping the shared volume.
+
+// DeleteTenantLogs asks Loki to delete every log line belonging to an org.
+//
+// This REQUIRES a Loki configured with a compactor, retention_enabled and a
+// deletion mode that permits deletes; the stock image config the deployment
+// used to run has none of those and answers 404 here. That is deliberate: a
+// deployment whose Loki cannot delete must fail the erasure loudly rather than
+// return 200 over data it did not touch. cp/deploy/loki/loki-config.yaml is the
+// config that makes it work.
+//
+// The window starts at the Unix epoch: "delete everything this tenant ever
+// sent" is the request, and a delete bounded by a default lookback would leave
+// the oldest lines — the ones most likely to be the subject of the request.
+func (f *Forwarder) DeleteTenantLogs(ctx context.Context, orgID string) error {
+	if !f.LogsEnabled() {
+		return nil
+	}
+	q := url.Values{}
+	// The org label is written on every stream by the ingest handler, so this
+	// selector matches the tenant's whole corpus. Loki refuses a delete with no
+	// selector, which is why it is not simply "everything".
+	q.Set("query", `{org="`+EscapeLabelValue(orgID)+`"}`)
+	q.Set("start", "0")
+	q.Set("end", strconv.FormatInt(time.Now().Unix(), 10))
+	u := strings.TrimSuffix(f.cfg.LokiURL, "/") + "/loki/api/v1/delete?" + q.Encode()
+	return f.post(ctx, u, "application/json", nil, map[string]string{"X-Scope-OrgID": orgID})
+}
+
+// DeleteTenantMetrics asks VictoriaMetrics to delete every series belonging to
+// an org's tenant. vmselect exposes the delete under the tenant path, so the
+// match selector cannot reach across tenants even if it were wrong.
+func (f *Forwarder) DeleteTenantMetrics(ctx context.Context, tenant int) error {
+	if f.cfg.VMReadURL == "" {
+		return nil
+	}
+	q := url.Values{}
+	q.Set("match[]", `{__name__=~"sigmahub_.+"}`)
+	u := strings.TrimSuffix(f.cfg.VMReadURL, "/") +
+		"/delete/" + strconv.Itoa(tenant) + "/prometheus/api/v1/admin/tsdb/delete_series?" + q.Encode()
+	return f.post(ctx, u, "application/x-www-form-urlencoded", nil, nil)
 }
 
 // proxyGet forwards a GET and returns the sink's raw JSON (status, body).

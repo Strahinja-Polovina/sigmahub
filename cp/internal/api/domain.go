@@ -55,6 +55,11 @@ type DomainAPI interface {
 	IdempotencyFinalize(ctx context.Context, orgID, key string, statusCode int, response []byte) error
 	IdempotencyRelease(ctx context.Context, orgID, key string) error
 	IssueServiceToken(ctx context.Context, orgID, name string, role store.Role, createdBy string) (string, store.ServicePrincipal, error)
+	// PurgeOrg is the other end of the tenant lifecycle POST /v1/orgs opens
+	// (SIGMA-284): it erases every control-plane row belonging to an org, so a
+	// GDPR erasure request or an ended trial has a code path instead of a
+	// hand-written DELETE tour of forty tables.
+	PurgeOrg(ctx context.Context, orgID string) (store.PurgeResult, error)
 	IssueConfirmToken(ctx context.Context, orgID, serverID, opKind, target, createdBy string, ttl time.Duration) (string, time.Time, error)
 	ConfirmDestructiveOp(ctx context.Context, orgID, token, serverID, opKind, target, actor string) (string, error)
 	// BeginDecommission is the graceful disconnect (SIGMA-204); DeleteServer is
@@ -145,7 +150,15 @@ type DomainAPI interface {
 func (s *Server) writeStoreErr(w http.ResponseWriter, err error, op string) {
 	var inv store.ErrInvalid
 	var notClusterable store.ErrKindNotClusterable
+	var capped store.ErrBillingCapped
 	switch {
+	// SIGMA-295: an org past its billing grace period is refused NEW servers and
+	// resources. 402 rather than 422 because the fix is a payment, not a
+	// different request, and the message names the portal.
+	case errors.As(err, &capped):
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{
+			"error": capped.Error(), "billingStatus": capped.Status,
+		})
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	case errors.Is(err, store.ErrConflict):
@@ -587,6 +600,25 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid orgId"})
 		return
 	}
+	// A torn-down org id may not come back (SIGMA-298). Org ids are chosen by
+	// the dashboard, so nothing else stops the same id being provisioned again
+	// after an erasure — and the new org would be handed the retired telemetry
+	// tenant by org_tenants, putting a new customer's series in a deleted
+	// customer's tenant. The tombstone is the only record that says no.
+	if s.orgAdmin != nil {
+		gone, err := s.orgAdmin.OrgTombstoned(r.Context(), req.OrgID)
+		if err != nil {
+			s.log.Error("provision org: tombstone check", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if gone {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "orgId was torn down and cannot be reused",
+			})
+			return
+		}
+	}
 	label := req.Name
 	if label == "" {
 		label = "web:" + req.OrgID
@@ -604,6 +636,79 @@ func (s *Server) handleProvisionOrg(w http.ResponseWriter, r *http.Request) {
 		"role":     string(p.Role),
 		"issuedAt": time.Now().UTC(),
 	})
+}
+
+// handlePurgeOrg erases the tenant from the control plane (SIGMA-284).
+//
+// Gated by the provision token rather than by the org's own Org Admin
+// credential, and deliberately so: this is the inverse of POST /v1/orgs, it
+// destroys backups' key material along with everything else, and an operator
+// answering an erasure request is not the same principal as the dashboard.
+// Requiring the same credential that created the tenant also means a stolen
+// org token cannot delete the tenant it was stolen from.
+//
+// The org id comes from the path, and the body must name the SAME id. A purge
+// is not something to trigger by mistyping a URL, and the confirmation is the
+// cheapest possible guard that the caller meant this org.
+func (s *Server) handlePurgeOrg(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	var req struct {
+		ConfirmOrgID string `json:"confirmOrgId"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		return
+	}
+	if req.ConfirmOrgID != orgID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "confirmOrgId must equal the org in the path",
+		})
+		return
+	}
+	res, err := s.domain.PurgeOrg(r.Context(), orgID)
+	if err != nil {
+		// Logged with the org id because a purge that could not finish is the
+		// one failure here an operator has to chase by hand.
+		s.log.Error("purge org", "org", orgID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "purge failed"})
+		return
+	}
+
+	// The customer's log lines and metric series live outside Postgres, so they
+	// cannot be part of the transaction above and are deleted here (SIGMA-298).
+	// Retention alone is not an answer to an erasure request: it expires the
+	// data eventually, on everybody's schedule, not on request.
+	//
+	// A failure here is reported, not swallowed. The database rows are already
+	// gone and re-running the purge will not retry these — so an operator who
+	// is told "done" while a tenant's logs remain has been told the one thing
+	// this endpoint must never say. 500 with the detail is the honest answer.
+	if s.telemetry != nil {
+		if err := s.telemetry.DeleteTenantLogs(r.Context(), orgID); err != nil {
+			s.log.Error("purge org: delete tenant logs", "org", orgID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":   "control-plane rows were purged but the tenant's logs were not deleted",
+				"orgId":   orgID,
+				"deleted": res.Deleted,
+				"detail":  err.Error(),
+			})
+			return
+		}
+		if res.Tenant != 0 {
+			if err := s.telemetry.DeleteTenantMetrics(r.Context(), res.Tenant); err != nil {
+				s.log.Error("purge org: delete tenant metrics", "org", orgID, "tenant", res.Tenant, "err", err)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error":   "control-plane rows were purged but the tenant's metrics were not deleted",
+					"orgId":   orgID,
+					"deleted": res.Deleted,
+					"detail":  err.Error(),
+				})
+				return
+			}
+		}
+	}
+
+	s.log.Warn("control-plane tenant purged", "org", orgID, "tables", len(res.Deleted), "tenant", res.Tenant)
+	writeJSON(w, http.StatusOK, map[string]any{"orgId": orgID, "deleted": res.Deleted, "tenant": res.Tenant})
 }
 
 // handleGetLLM returns a model endpoint's readout (CP mode, llm kind only).
@@ -643,4 +748,19 @@ func (s *Server) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, setup)
+}
+
+// OrgAdminAPI is the org-lifecycle slice of the store that lives outside
+// DomainAPI: the tombstone a purge leaves behind (SIGMA-298).
+//
+// SIGMA-284 and SIGMA-298 were written against the same gap and each shipped a
+// schema-discovering, retry-ordered org delete. Only one survives — PurgeOrg on
+// DomainAPI — because two erasure engines is two things to keep correct and an
+// erasure that disagrees with itself is the failure mode both tickets set out
+// to prevent. What SIGMA-298 had that PurgeOrg did not is here and in the
+// telemetry deletes handlePurgeOrg issues: without the tombstone, org ids being
+// dashboard-chosen, the same id can be provisioned again and org_tenants hands
+// the new org its predecessor's retired telemetry tenant.
+type OrgAdminAPI interface {
+	OrgTombstoned(ctx context.Context, orgID string) (bool, error)
 }

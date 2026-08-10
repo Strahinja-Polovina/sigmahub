@@ -335,6 +335,14 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	if in.Distro != "" && !DistroSupported(in.Distro) {
 		return "", "", ErrUnsupportedDistro
 	}
+	// SIGMA-295: an org whose subscription has been past_due or canceled beyond
+	// the grace period may not GROW. This is the one chokepoint both
+	// server-creation paths (IssueBootstrapToken and ProvisionServer) go through,
+	// so the cap cannot be routed around by picking the other one. Nothing that
+	// is already running is touched — see the dunning policy in billing.go.
+	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
+		return "", "", err
+	}
 	// A name the operator did not give is a name the MACHINE gets to supply:
 	// registration replaces the placeholder with the reported hostname
 	// (SIGMA-202). Until the agent checks in the row still has to be

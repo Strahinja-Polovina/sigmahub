@@ -300,9 +300,29 @@ func (s *Store) ensureRepoKeyTx(ctx context.Context, tx pgx.Tx, orgID, policyID 
 	return err
 }
 
+// runDayUTC renders THE expression that decides which UTC day a backup run
+// belongs to, optionally qualified by a table alias.
+//
+// It is a function rather than four hand-written copies because the copies
+// disagreed: the scheduler and migration 0030's partial unique index keyed a
+// run's day on created_at, while VerifyDays — the query the M1 30-day
+// green-streak gate reads — bucketed on finished_at, so every run that crossed
+// midnight landed on a different day in the calendar than in the schedule
+// (SIGMA-285). Keep the text byte-identical to the index expression in
+// migration 0030, including the 'UTC' literal's case: Postgres matches an
+// expression index by the parsed expression, and 'utc' is a different constant
+// from 'UTC'.
+func runDayUTC(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return "((" + alias + "created_at AT TIME ZONE 'UTC')::date)"
+}
+
 // CreateDueBackupRuns is the scheduler's tick: for every enabled, targeted
 // database policy it inserts (at most) one backup run per day and one verify
-// run per day (verify only once a successful backup exists). Returns the
+// run per day (verify only once THIS day's backup has succeeded and recorded a
+// dump sha — see the predicate below, SIGMA-282). Returns the
 // distinct servers whose DSDs must re-render. The reconciler is level-triggered
 // spec sync with no time primitive — this is the time primitive (SIGMA-50).
 func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers []struct{ ServerID, OrgID string }, err error) {
@@ -319,8 +339,13 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		                  AND r.created_at >= $1) AS backed_today,
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'verify'
 		                  AND r.created_at >= $1) AS verified_today,
+		       -- A verify checks THIS day's dump against THIS day's sha, which is
+		       -- exactly what BackupRunsForServer resolves ExpectedSha from. So the
+		       -- question the enqueue must ask is not "has this policy ever
+		       -- succeeded" but "does today's dump exist yet" (SIGMA-282).
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'backup'
-		                  AND r.status = 'success') AS has_success,
+		                  AND r.status = 'success' AND r.created_at >= $1
+		                  AND COALESCE(r.dump_sha256, '') <> '') AS sha_today,
 		       (p.pitr_enabled AND dc.engine = 'postgres' AND NOT EXISTS (
 		            SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'basebackup'
 		               AND r.created_at >= $1)) AS base_due
@@ -337,13 +362,29 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 	var work []due
 	for rows.Next() {
 		var d due
-		var backedToday, verifiedToday, hasSuccess bool
-		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &hasSuccess, &d.base); err != nil {
+		var backedToday, verifiedToday, shaToday bool
+		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &shaToday, &d.base); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		d.backup = !backedToday
-		d.verify = !verifiedToday && (hasSuccess || d.backup)
+		// Do not enqueue a verify until the dump it is meant to check exists.
+		//
+		// This used to be `!verifiedToday && (hasSuccess || d.backup)`, where
+		// hasSuccess meant "succeeded at any point in this policy's life". Both
+		// halves enqueue a verify for a day whose dump may never appear, and
+		// SIGMA-137 (rightly) taught the reconciler to hold such a verify back
+		// until its own day's sha is known — so on a day whose backup fails the
+		// row is undispatchable by construction. It sat pending until
+		// TimeoutStaleBackupRuns failed it at the 6h queue budget with a detail
+		// blaming the control plane, giving on-call a second, fictitious alert per
+		// database per night ("verify_failed: never dispatched") beside the honest
+		// backup_failed, and marking the day red for a second, invented reason the
+		// M1 green-streak gate cannot tell from real verification breakage.
+		//
+		// The scheduler ticks every minute, so waiting for the sha costs at most a
+		// minute of latency on days that do back up successfully.
+		d.verify = !verifiedToday && shaToday
 		if d.backup || d.verify || d.base {
 			work = append(work, d)
 		}
@@ -361,7 +402,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.backup {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'backup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'backup')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -369,7 +411,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.verify {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'verify') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'verify')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -378,7 +421,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.base {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'basebackup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'basebackup')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -428,7 +472,7 @@ func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, execMaxAge, queueMax
 			SELECT f.org_id, r.channel_id,
 			       CASE WHEN f.kind = 'verify' THEN 'verify_failed' ELSE 'backup_failed' END,
 			       'bkr:' || f.id,
-			       CASE f.kind WHEN 'backup' THEN 'Backup' WHEN 'verify' THEN 'Restore-verify' ELSE 'Restore' END
+			       `+backupRunActionCaseSQL("f.kind")+`
 			         || ' timed out for ' || COALESCE(res.name, f.resource_id),
 			       CASE WHEN f.old_status = 'pending'
 			            THEN 'The run was never dispatched within its queue window and was failed by the scheduler.'
@@ -498,7 +542,7 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 		       CASE WHEN r.kind = 'verify'
 		            THEN COALESCE((SELECT b.dump_sha256 FROM backup_runs b
 		                            WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
-		                              AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
+		                              AND `+runDayUTC("b")+` = `+runDayUTC("r")+`
 		                            ORDER BY b.finished_at DESC LIMIT 1), '')
 		            ELSE COALESCE(r.dump_sha256, '')
 		       END AS expected_sha,
@@ -635,6 +679,53 @@ func (s *Store) BackupCredentialForRun(ctx context.Context, serverID, runID stri
 	}, nil
 }
 
+// backupRunKinds is the vocabulary of backup_runs.kind with the name each
+// operation goes by in front of a human — the audit log's Action and the title
+// of the alert that reaches Slack or an inbox.
+//
+// It is a table because the labels used to be a three-entry map literal inline
+// in SetBackupRunResult while five kinds were being inserted a few hundred lines
+// away. `basebackup` and `restore-pitr` mapped to "", so a PITR-enabled database
+// logged one row per day reading " succeeded" — a leading space and no subject —
+// and a failed base backup alerted as " failed for orders-db", which does not
+// tell on-call which of the five operations broke (SIGMA-286).
+//
+// Adding a kind means adding it here. Order is fixed so the SQL rendering below
+// is deterministic.
+var backupRunKinds = []struct{ Kind, Label string }{
+	{"backup", "Backup"},
+	{"basebackup", "Base backup"},
+	{"verify", "Restore-verify"},
+	{"restore", "Restore"},
+	{"restore-pitr", "Restore to timestamp"},
+}
+
+// backupRunAction labels a run kind for the audit log and alert titles. An
+// unknown kind falls back to the raw kind string rather than to "": a kind
+// somebody adds without touching the table above is at worst ugly, never
+// anonymous.
+func backupRunAction(kind string) string {
+	for _, k := range backupRunKinds {
+		if k.Kind == kind {
+			return k.Label
+		}
+	}
+	return kind
+}
+
+// backupRunActionCaseSQL renders the same table as a SQL CASE over col, for the
+// timeout sweep — which builds its alert titles in SQL and so cannot call
+// backupRunAction. Labels come from the static table above, never from input.
+func backupRunActionCaseSQL(col string) string {
+	var b strings.Builder
+	b.WriteString("CASE " + col)
+	for _, k := range backupRunKinds {
+		b.WriteString(" WHEN '" + k.Kind + "' THEN '" + k.Label + "'")
+	}
+	b.WriteString(" ELSE " + col + " END")
+	return b.String()
+}
+
 // SetBackupRunResult records a run's terminal outcome, reported by the
 // executing agent (BOLA-scoped to the run's server). Audited.
 func (s *Store) SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error {
@@ -661,7 +752,7 @@ func (s *Store) SetBackupRunResult(ctx context.Context, serverID, runID string, 
 	if err != nil {
 		return err
 	}
-	action := map[string]string{"backup": "Backup", "verify": "Restore-verify", "restore": "Restore"}[kind]
+	action := backupRunAction(kind)
 	if ok {
 		action += " succeeded"
 	} else {
@@ -748,6 +839,15 @@ type VerifyDay struct {
 
 // VerifyDays returns the org's last N days of verify outcomes, oldest first,
 // including zero-run (not green) days.
+//
+// The day a run belongs to is its CREATED day, via runDayUTC — the same
+// expression the scheduler and migration 0030's unique index use. It used to
+// bucket on finished_at here, so any run that crossed midnight was counted on
+// the wrong day: a Tuesday verify finishing 00:15 Wednesday left Tuesday reading
+// zero-run (not green) while crediting Wednesday, breaking the 30-day streak on
+// a day nothing was wrong and contradicting the run list (SIGMA-285). The
+// status filter keeps still-open runs out, which is what finished_at was really
+// providing.
 func (s *Store) VerifyDays(ctx context.Context, orgID string, days int) ([]VerifyDay, error) {
 	if days <= 0 || days > 366 {
 		days = 30
@@ -765,7 +865,7 @@ func (s *Store) VerifyDays(ctx context.Context, orgID string, days int) ([]Verif
 		  FROM span
 		  LEFT JOIN backup_runs r
 		    ON r.org_id = $1 AND r.kind = 'verify'
-		   AND (r.finished_at AT TIME ZONE 'utc')::date = span.day
+		   AND `+runDayUTC("r")+` = span.day
 		 GROUP BY span.day ORDER BY span.day`, orgID, days)
 	if err != nil {
 		return nil, err

@@ -66,6 +66,16 @@ type Reconciler struct {
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
 
+	// bus fans DSD changes to the long-poll waiters parked in OTHER control
+	// plane replicas (SIGMA-291). Nil — the default, and every unit test — means
+	// this process is the only one, and notify wakes local waiters only.
+	bus ChangeBus
+
+	// slots bounds how many reconciles run CONCURRENTLY (SIGMA-288). A buffered
+	// channel used as a counting semaphore; nil disables the bound, which is
+	// only the case for a zero-value Reconciler built outside New.
+	slots chan struct{}
+
 	// Observability hooks (SIGMA-248), both optional and both nil in tests.
 	// onResync reports each fleet-resync pass's outcome so a wedged resync is
 	// visible from outside the process; onRender times a single server's render,
@@ -76,7 +86,64 @@ type Reconciler struct {
 }
 
 func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
-	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
+	return &Reconciler{
+		log:     log,
+		st:      st,
+		priv:    priv,
+		waiters: map[string][]chan struct{}{},
+		slots:   make(chan struct{}, reconcileConcurrency),
+	}
+}
+
+const (
+	// reconcileConcurrency caps in-flight reconciles (SIGMA-288).
+	//
+	// ONE reconcile needs TWO pool connections at the same time: it checks a
+	// connection out of the pool for its session-scoped advisory lock and holds
+	// it for the whole pass (LockServerReconcile), and every read after that
+	// asks the pool for a second one. Nothing bounded the fan-out: reconcileOrg
+	// spawns a ReconcileAsync per server in the org, the backup scheduler and
+	// the deploy drain fan out the same way, and each one is a bare goroutine.
+	//
+	// An org with more servers than the pool has connections therefore wedged
+	// the whole process. With a pool of 20 and 25 servers, 20 goroutines won a
+	// connection for their lock, 5 queued for one, and then all 20 winners
+	// queued for the second connection they needed to read anything — every
+	// connection held by a goroutine waiting for a connection. No reconcile
+	// converged, and because the pool is shared, every concurrent HTTP handler
+	// (agent heartbeats, DSD long-polls, dashboard reads) blocked too until the
+	// 10s ReconcileAsync timeouts unwound it. Bigger orgs made it worse.
+	//
+	// 4 is deliberately far below the pool floor of 20 (store.Open), so the
+	// worst case is 8 connections on reconciles and the rest stays available to
+	// request handling. Throughput is not the constraint — a render is a
+	// handful of milliseconds, so a 25-server org still re-renders in well
+	// under a second.
+	reconcileConcurrency = 4
+	// reconcileQueueWait bounds how long a queued ReconcileAsync waits for a
+	// slot before giving up. Fire-and-forget goroutines must not pile up
+	// without limit, and dropping is safe: reconcile is level-triggered and the
+	// 60s fleet resync re-renders anything skipped.
+	reconcileQueueWait = 2 * time.Minute
+)
+
+// acquireSlot takes one of the bounded reconcile slots, blocking until one is
+// free, ctx is done, or the queue wait expires. It returns a release func and
+// whether the slot was taken; call release (deferred) only when ok is true.
+func (r *Reconciler) acquireSlot(ctx context.Context) (func(), bool) {
+	if r.slots == nil {
+		return func() {}, true
+	}
+	timer := time.NewTimer(reconcileQueueWait)
+	defer timer.Stop()
+	select {
+	case r.slots <- struct{}{}:
+		return func() { <-r.slots }, true
+	case <-ctx.Done():
+		return nil, false
+	case <-timer.C:
+		return nil, false
+	}
 }
 
 // SetObservers installs the resync heartbeat and the render timer (SIGMA-248).
@@ -84,6 +151,17 @@ func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Duration)) {
 	r.onResync, r.onRender = onResync, onRender
 }
+
+// ChangeBus carries DSD change announcements between control-plane replicas
+// (SIGMA-291). cp/internal/store implements it over Postgres LISTEN/NOTIFY; the
+// receiving side of the same bus drives WakeServer.
+type ChangeBus interface {
+	PublishDSDChange(ctx context.Context, serverID string) error
+}
+
+// SetChangeBus installs the cross-replica wake-up bus. Called at boot before
+// serving; leaving it unset is the correct single-instance configuration.
+func (r *Reconciler) SetChangeBus(bus ChangeBus) { r.bus = bus }
 
 // SetACMEConfig installs the ACME issuance config rendered into proxy.traefik
 // ops (Let's Encrypt account email + CA directory; the staging/Pebble URL is
@@ -438,7 +516,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 			r.log.Warn("stamp deployment dsd version", "server", serverID, "err", err)
 		}
 		r.log.Info("dsd rendered", "server", serverID, "ops", len(ops))
-		r.notify(serverID)
+		r.notify(ctx, serverID)
 	}
 	return nil
 }
@@ -480,8 +558,24 @@ func (r *Reconciler) safeReconcile(ctx context.Context, orgID, serverID string) 
 
 // ReconcileAsync runs Reconcile in the background (fire-and-forget from an API
 // handler that already returned) with its own short timeout.
+//
+// Callers fan this out over a whole org (reconcileOrg on a registry change, the
+// backup scheduler, the deploy drain), so it waits for one of the bounded
+// reconcile slots first (SIGMA-288). The slot is taken BEFORE the 10s timeout
+// starts, so time spent queueing behind other reconciles is not charged against
+// the reconcile's own budget — otherwise the bound would just convert pool
+// exhaustion into a wave of timeouts.
 func (r *Reconciler) ReconcileAsync(orgID, serverID string) {
 	go func() {
+		release, ok := r.acquireSlot(context.Background())
+		if !ok {
+			// Safe to drop: reconcile is level-triggered and the 60s fleet
+			// resync re-renders this server. Logged because a queue this long
+			// means the CP is not keeping up with its own mutations.
+			r.log.Warn("reconcile dropped: no slot within queue wait, resync will converge", "server", serverID)
+			return
+		}
+		defer release()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		// Recovered for the same reason as the resync, and more urgently: this
@@ -516,9 +610,26 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 			// hide exactly the state worth alerting on.
 			var passErr error
 			for _, sv := range servers {
+				// The resync walks the fleet serially, but it shares the pool
+				// with whatever ReconcileAsync fan-out is in flight, so it takes
+				// a slot too (SIGMA-288) — otherwise the bound is only two
+				// thirds honoured and the resync's connections are unaccounted.
+				release, ok := r.acquireSlot(ctx)
+				if !ok {
+					// Either shutdown or a queue so long the pass cannot
+					// finish; the rest of the fleet is left to the next tick,
+					// and the pass is reported as failed so the heartbeat's
+					// last-success clock goes stale (SIGMA-248).
+					if passErr == nil {
+						passErr = fmt.Errorf("resync: no reconcile slot for server %s", sv.ServerID)
+					}
+					break
+				}
 				// safeReconcile, not Reconcile: one bad row must quarantine one
 				// server, not end the process for every tenant (SIGMA-250).
-				if err := r.safeReconcile(ctx, sv.OrgID, sv.ServerID); err != nil {
+				err := r.safeReconcile(ctx, sv.OrgID, sv.ServerID)
+				release()
+				if err != nil {
 					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)
 					if passErr == nil {
 						passErr = err
@@ -557,7 +668,33 @@ func (r *Reconciler) Wait(serverID string) (<-chan struct{}, func()) {
 	return ch, cancel
 }
 
-func (r *Reconciler) notify(serverID string) {
+// notify wakes every long-poll waiter for a server: the ones parked in THIS
+// process, and — through the change bus — the ones parked in any other replica
+// (SIGMA-291).
+//
+// The local wake happens first and unconditionally. The bus is an addition, not
+// a replacement: a publish failure (or no bus configured at all, which is every
+// unit test) leaves single-process behaviour exactly as it was, rather than
+// making the common case depend on a database round trip.
+func (r *Reconciler) notify(ctx context.Context, serverID string) {
+	r.WakeServer(serverID)
+	if r.bus == nil {
+		return
+	}
+	if err := r.bus.PublishDSDChange(ctx, serverID); err != nil {
+		// Degrades to what every cross-replica change did before the bus
+		// existed: the other replica's waiter finds the change when its
+		// long-poll window expires. Worth a line, not worth failing a
+		// reconcile that has already committed.
+		r.log.Warn("publish dsd change to other replicas", "err", err, "server", serverID)
+	}
+}
+
+// WakeServer closes the long-poll waiters registered in THIS process for a
+// server. Exported so the cross-replica listener can drive it with the server
+// id another replica published (SIGMA-291); a wake for a server nothing here is
+// waiting on is a no-op.
+func (r *Reconciler) WakeServer(serverID string) {
 	r.mu.Lock()
 	list := r.waiters[serverID]
 	delete(r.waiters, serverID)

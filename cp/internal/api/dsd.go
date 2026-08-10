@@ -38,6 +38,10 @@ var longPollTimeout = 25 * time.Second
 // SetLongPollTimeout overrides the DSD long-poll window (tests only).
 func SetLongPollTimeout(d time.Duration) { longPollTimeout = d }
 
+// LongPollTimeout reports the current window, so a test that shortens it can
+// put back what it found rather than guessing the default.
+func LongPollTimeout() time.Duration { return longPollTimeout }
+
 // handleGetDSD is the agent's outbound-only long-poll for its DSD. With
 // ?after=<version>, it returns immediately when a newer signed DSD exists,
 // otherwise blocks up to longPollTimeout for the next change (204 on timeout).

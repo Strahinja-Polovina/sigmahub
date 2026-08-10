@@ -221,6 +221,12 @@ export async function getBillingSummary(orgId: string) {
   return {
     connected,
     units,
+    // Demo mode has no server-hours meter and no subscription, so there is no
+    // high-water mark to bill on and no minimum to floor at: the live unit count
+    // IS the billed one. Present so the view reads one field either way
+    // (SIGMA-292); the window is 0 because none was applied.
+    billedUnits: units,
+    billingWindowHours: 0,
     billableUnits: billable,
     breakdown: lines,
     freeTier: FREE_TIER_UNITS,

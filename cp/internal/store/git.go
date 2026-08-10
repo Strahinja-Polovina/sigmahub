@@ -118,9 +118,11 @@ type WebhookOutcome struct {
 	Enqueued   *DeployRequest // set when an auto-deploy was enqueued
 	PRHook     *DeployRequest // set when a pull_request routing hook was recorded
 	// Previews (P1-12): PreviewDeploy is the enqueued preview deploy request;
-	// PreviewTeardown is the server whose DSD must re-render after a close.
+	// PreviewTeardown holds every server whose DSD must re-render after a close.
+	// It is a set, not one server: a preview environment can hold resources a
+	// developer added by hand, on hosts other than the preview server (SIGMA-280).
 	PreviewDeploy   *DeployRequest
-	PreviewTeardown *ServerRef
+	PreviewTeardown []ServerRef
 }
 
 // gitTokenPurpose namespaces the provider-token wrapping key per org.
@@ -749,12 +751,14 @@ func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (Webho
 				}
 				out.PreviewDeploy = &pd
 			case "closed":
-				serverID, torn, err := teardownPreviewTx(ctx, tx, conn, ev.PRNumber)
+				serverIDs, torn, err := teardownPreviewTx(ctx, tx, conn, ev.PRNumber)
 				if err != nil {
 					return WebhookOutcome{}, err
 				}
-				if torn && serverID != "" {
-					out.PreviewTeardown = &ServerRef{ServerID: serverID, OrgID: conn.OrgID}
+				if torn {
+					for _, sid := range serverIDs {
+						out.PreviewTeardown = append(out.PreviewTeardown, ServerRef{ServerID: sid, OrgID: conn.OrgID})
+					}
 				}
 			}
 		}

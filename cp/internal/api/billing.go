@@ -24,6 +24,9 @@ type BillingStore interface {
 	UpsertSubscription(ctx context.Context, orgID string, in store.BillingStatus, actor string) error
 	WebhookSeen(ctx context.Context, deliveryID, provider, eventType string) (bool, error)
 	ApplyPaddleWebhook(ctx context.Context, deliveryID, provider, eventType, orgID string, in store.BillingStatus, actor string, occurredAt time.Time) (bool, error)
+	// OrgForPaddleIDs correlates an event with no custom_data through the
+	// subscription/customer ids org_billing already stores (SIGMA-293).
+	OrgForPaddleIDs(ctx context.Context, subscriptionID, customerID string) (string, error)
 }
 
 const paddleWebhookMaxBytes = 5 << 20
@@ -51,6 +54,26 @@ func (s *Server) handleBillingCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
+	// SIGMA-294: refuse a SECOND subscription. Checkout never asked whether the
+	// org already had one, and the reachable path to asking twice was a pause:
+	// the CP recorded a paused subscription as "canceled", so the dashboard
+	// offered Subscribe as the only affordance. Completing it left two Paddle
+	// subscriptions on one org — org_billing holds a single
+	// paddle_subscription_id, so the CP tracked one of them and the quantity
+	// sweep re-priced only that one, while the customer was charged twice the
+	// moment the paused one resumed.
+	existing, err := s.billing.GetBillingStatus(r.Context(), orgID)
+	if err != nil {
+		s.writeStoreErr(w, err, "billing checkout")
+		return
+	}
+	if existing.SubscriptionID != "" && existing.Status != "canceled" && existing.Status != "none" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":  "this organization already has a " + existing.Status + " subscription — manage it in the customer portal instead of subscribing again",
+			"status": existing.Status,
+		})
+		return
+	}
 	summary, err := s.billing.BillingSummaryForOrg(r.Context(), orgID, time.Now(), true)
 	if err != nil {
 		s.writeStoreErr(w, err, "billing checkout")
@@ -157,14 +180,52 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	subID := paddleSubscriptionID(ev)
 	orgID := paddleOrgID(ev.Data.CustomData)
 	if orgID == "" {
-		// Not correlated to an org (e.g. a customer-level event) — ack and drop.
+		// SIGMA-293: custom_data.orgId is set once, on the checkout transaction.
+		// A renewal transaction, a subscription support edited in the Paddle
+		// dashboard and a cancellation from the customer portal all arrive
+		// without it. Dropping those meant a customer's card could expire, the
+		// past_due branch never run, no payment_failed alert be enqueued, and the
+		// Billing page keep saying "Active" — with Paddle not retrying, because
+		// it got a 200. Fall back to the ids org_billing already stores.
+		fallback, ferr := s.billing.OrgForPaddleIDs(r.Context(), subID, ev.Data.CustomerID)
+		if ferr != nil {
+			// A lookup failure is NOT a drop: 5xx so Paddle retries rather than
+			// this event disappearing on a transient database error.
+			s.writeStoreErr(w, ferr, "paddle webhook correlate")
+			return
+		}
+		orgID = fallback
+		// Repair the primary path so the NEXT event on this subscription does not
+		// need the fallback. Best effort and time-boxed: a webhook ack must not
+		// hang on an outbound call, and failing to stamp custom_data costs
+		// nothing now that the fallback exists.
+		if orgID != "" && subID != "" && s.paddle != nil {
+			stampCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+			if serr := s.paddle.SetSubscriptionOrg(stampCtx, subID, orgID); serr != nil {
+				s.log.Warn("paddle webhook: could not stamp orgId on subscription custom_data",
+					"err", serr, "subscription_id", subID, "org", orgID)
+			}
+			cancel()
+		}
+	}
+	if orgID == "" {
+		// Genuinely not ours (Paddle has customer-level events that belong to no
+		// org). Ack — but say so at WARN: this used to be silent at every level,
+		// so a dropped payment failure could only be inferred from a subscription
+		// that never changed state.
+		s.log.Warn("paddle webhook: event not correlated to any org — dropped",
+			"event_id", ev.EventID, "event_type", ev.EventType,
+			"subscription_id", subID, "customer_id", ev.Data.CustomerID)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
 	}
 	status := paddleSubStatus(ev.EventType, ev.Data.Status)
 	if status == "" {
+		s.log.Warn("paddle webhook: event type carries no subscription state — dropped",
+			"event_id", ev.EventID, "event_type", ev.EventType, "org", orgID)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
 	}
@@ -187,7 +248,7 @@ func (s *Server) handlePaddleWebhook(w http.ResponseWriter, r *http.Request) {
 	applied, err := s.billing.ApplyPaddleWebhook(r.Context(), ev.EventID, "paddle", ev.EventType, orgID, store.BillingStatus{
 		OrgID:          orgID,
 		CustomerID:     ev.Data.CustomerID,
-		SubscriptionID: paddleSubscriptionID(ev),
+		SubscriptionID: subID,
 		Status:         status,
 		Quantity:       qty,
 	}, "paddle-webhook", occurredAt)
@@ -211,6 +272,11 @@ func paddleOrgID(custom json.RawMessage) string {
 }
 
 // paddleSubStatus maps a Paddle event to our subscription status vocabulary.
+//
+// SIGMA-294: `paused` is its own status, NOT a synonym for `canceled`. A pause
+// is reversible — this very function handles subscription.resumed — and calling
+// it canceled made the dashboard offer a Subscribe button to an org that already
+// had a subscription, which is how one org ended up with two.
 func paddleSubStatus(eventType, dataStatus string) string {
 	switch eventType {
 	case "subscription.created", "subscription.activated", "subscription.updated", "subscription.resumed":
@@ -219,12 +285,16 @@ func paddleSubStatus(eventType, dataStatus string) string {
 			return "active"
 		case "past_due":
 			return "past_due"
-		case "paused", "canceled":
+		case "paused":
+			return "paused"
+		case "canceled":
 			return "canceled"
 		default:
 			return "active"
 		}
-	case "subscription.canceled", "subscription.paused":
+	case "subscription.paused":
+		return "paused"
+	case "subscription.canceled":
 		return "canceled"
 	case "transaction.payment_failed":
 		return "past_due"
