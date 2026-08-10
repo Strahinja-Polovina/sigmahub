@@ -274,13 +274,26 @@ services:
   #   CP_LOKI_URL=http://loki:3100
   #   CP_VM_WRITE_URL=http://vminsert:8480
   #   CP_VM_READ_URL=http://vmselect:8481
+  # Loki runs SigmaHub's own config, not the image's demo one (SIGMA-298). The
+  # stock /etc/loki/local-config.yaml left auth_enabled false — so the CP's
+  # X-Scope-OrgID tenancy was discarded and every customer's lines shared one
+  # tenant — with no compactor and no retention_period, which meant customer log
+  # lines were kept forever AND could not be deleted per tenant when a customer
+  # asked for erasure. See loki/loki-config.yaml for the whole argument.
   loki:
     image: grafana/loki:2.9.8
     profiles: ["telemetry"]
     restart: unless-stopped
     logging: *default-logging
-    command: ["-config.file=/etc/loki/local-config.yaml"]
+    command:
+      - -config.file=/etc/loki/loki-config.yaml
+      - -config.expand-env=true
+    environment:
+      # How long a tenant's log lines live before the compactor expires them.
+      # Per-tenant exceptions go in loki/runtime-config.yaml.
+      LOKI_RETENTION_PERIOD: ${CP_LOKI_RETENTION:-720h}
     volumes:
+      - ./loki:/etc/loki:ro
       - loki-data:/loki
 
   vmstorage:
@@ -288,7 +301,12 @@ services:
     profiles: ["telemetry"]
     restart: unless-stopped
     logging: *default-logging
-    command: ["-storageDataPath=/storage"]
+    # -retentionPeriod is stated explicitly rather than left to the image
+    # default (1 month) for the same reason as Loki's: how long a customer's
+    # telemetry is kept is a policy decision the deployment must make out loud.
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=${CP_VM_RETENTION:-90d}
     volumes:
       - vm-data:/storage
 

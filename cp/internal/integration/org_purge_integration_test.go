@@ -118,6 +118,10 @@ func orgScopedTableNames(t *testing.T, st *store.Store) []string {
 		    ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
 		 WHERE c.table_schema = current_schema() AND c.column_name = 'org_id'
 		   AND tb.table_type = 'BASE TABLE'
+		   -- Excluded for the same reason PurgeOrg excludes it: the tombstone is
+		   -- written BY the purge and has to survive it, so "no rows left for
+		   -- this org" cannot mean it too (SIGMA-298).
+		   AND c.table_name <> 'org_tombstones'
 		 ORDER BY c.table_name`)
 	if err != nil {
 		t.Fatal(err)
@@ -159,10 +163,11 @@ func TestPurgeOrgErasesEveryOrgScopedRow(t *testing.T) {
 		t.Fatalf("fixture only populated %d of %d org-scoped tables; it is not exercising the purge", seeded, len(tables))
 	}
 
-	deleted, err := st.PurgeOrg(ctx, doomed)
+	res, err := st.PurgeOrg(ctx, doomed)
 	if err != nil {
 		t.Fatalf("purge: %v", err)
 	}
+	deleted := res.Deleted
 	if len(deleted) < 12 {
 		t.Fatalf("purge reported deleting from %d tables, want at least 12: %v", len(deleted), deleted)
 	}
@@ -204,5 +209,73 @@ func TestPurgeOrgRefusesEmptyOrg(t *testing.T) {
 	// reached here has a bug and a purge is not the place to be forgiving.
 	if _, err := st.PurgeOrg(context.Background(), ""); err == nil {
 		t.Fatal("PurgeOrg(\"\") returned no error")
+	}
+}
+
+// TestPurgeOrgTombstonesTheIdAndTenant is the half of SIGMA-298 that the purge
+// engine did not already have.
+//
+// Org ids are chosen by the dashboard, not by the control plane, so nothing
+// stops the same id being provisioned again after an erasure — and org_tenants
+// allocates a telemetry tenant per org id, so the re-provisioned org would be
+// handed its predecessor's. That is how a deleted customer's log lines come
+// back under somebody else's account. The tombstone is the record that says no,
+// and it survives the erasure it describes because it holds no personal data.
+func TestPurgeOrgTombstonesTheIdAndTenant(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+
+	const doomed = "org_departed"
+	seedTenant(t, st, doomed)
+
+	// Allocate the telemetry tenant, so the purge has one to retire. Without a
+	// tenant the test would pass on the trivial path and prove nothing.
+	tenant, err := st.OrgTenant(ctx, doomed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant == 0 {
+		t.Fatal("OrgTenant returned 0; the fixture cannot exercise tenant retirement")
+	}
+
+	if gone, err := st.OrgTombstoned(ctx, doomed); err != nil || gone {
+		t.Fatalf("OrgTombstoned before the purge = %v, %v; want false, nil", gone, err)
+	}
+
+	res, err := st.PurgeOrg(ctx, doomed)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	// The tenant has to be read before org_tenants is emptied — after the delete
+	// there is no way to learn which accountID held this org's series, and the
+	// caller could only orphan the metrics rather than delete them.
+	if res.Tenant != tenant {
+		t.Errorf("purge reported tenant %d, want the retired %d", res.Tenant, tenant)
+	}
+
+	gone, err := st.OrgTombstoned(ctx, doomed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gone {
+		t.Error("no tombstone after the purge; the org id could be provisioned again")
+	}
+	var recorded *int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT tenant FROM org_tombstones WHERE org_id = $1`, doomed).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded == nil || *recorded != tenant {
+		t.Errorf("tombstone recorded tenant %v, want %d — the number must never be reused", recorded, tenant)
+	}
+
+	// Idempotent: a retried erasure request must not fail. The second purge
+	// deletes nothing and leaves the first tombstone in place.
+	second, err := st.PurgeOrg(ctx, doomed)
+	if err != nil {
+		t.Fatalf("second purge: %v", err)
+	}
+	if len(second.Deleted) != 0 {
+		t.Errorf("second purge deleted %v; want nothing left", second.Deleted)
 	}
 }

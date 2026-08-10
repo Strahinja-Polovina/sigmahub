@@ -138,7 +138,12 @@ type Server struct {
 	// the fallback metrics path may not advertise a longer window than that
 	// (SIGMA-257). Zero = the built-in default; read via metricsRetention().
 	metricsRetentionCfg time.Duration
-	mux                 *http.ServeMux
+	// orgAdmin backs the tombstone check that stops a purged org id being
+	// provisioned again (SIGMA-298). The erasure itself is DomainAPI.PurgeOrg
+	// (SIGMA-284) — the two tickets each built a delete engine, and this is the
+	// half of SIGMA-298 that PurgeOrg did not already have.
+	orgAdmin OrgAdminAPI
+	mux      *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
@@ -245,6 +250,10 @@ type Options struct {
 	// the built-in 24h default. It does not affect the pipeline path, which
 	// reads VictoriaMetrics under its own retention.
 	MetricsRetention time.Duration
+	// OrgAdmin backs the tombstone check on provisioning (SIGMA-298). Nil in
+	// handler unit tests that do not exercise it; provisioning then skips the
+	// check, which is safe because a test store has no tombstones.
+	OrgAdmin OrgAdminAPI
 }
 
 // New builds the HTTP surface.
@@ -285,6 +294,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		release:             opts.Release.normalized(),
 		metrics:             opts.Metrics,
 		metricsRetentionCfg: opts.MetricsRetention,
+		orgAdmin:            opts.OrgAdmin,
 		mux:                 http.NewServeMux(),
 	}
 	if s.metrics == nil {

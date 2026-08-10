@@ -39,6 +39,18 @@ func (s *Store) OrgTenant(ctx context.Context, orgID string) (int, error) {
 	return tenant, nil
 }
 
+// forgetOrgTenant drops a cached mapping. Called by PurgeOrg (SIGMA-298):
+// the cache comment above says "stable, so cache forever", which was true right
+// up until orgs could be deleted. Without this, an org id provisioned again
+// after a teardown would be handed its predecessor's retired tenant straight
+// out of process memory, with no query to correct it — and the new customer's
+// series would land in the deleted customer's tenant.
+func forgetOrgTenant(orgID string) {
+	tenantMu.Lock()
+	delete(tenantCache, orgID)
+	tenantMu.Unlock()
+}
+
 // TelemetryResourceMeta is the label enrichment for one resource's series and
 // log streams: {org, project, env, server, resource} — the hard allowlist.
 type TelemetryResourceMeta struct {

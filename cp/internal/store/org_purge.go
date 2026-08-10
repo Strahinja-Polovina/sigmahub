@@ -35,6 +35,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -60,22 +61,37 @@ const purgeMaxPasses = 12
 // that outlives this (an offsite restic repository, a database dump) permanently
 // undecryptable: that is what erasure means, and it is why the caller must be
 // sure.
-func (s *Store) PurgeOrg(ctx context.Context, orgID string) (map[string]int64, error) {
+func (s *Store) PurgeOrg(ctx context.Context, orgID string) (PurgeResult, error) {
+	res := PurgeResult{Deleted: map[string]int64{}}
 	if orgID == "" {
-		return nil, fmt.Errorf("purge org: empty org id")
+		return res, fmt.Errorf("purge org: empty org id")
 	}
 	tables, err := s.orgScopedTables(ctx)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	deleted := map[string]int64{}
+	// Read the telemetry tenant BEFORE org_tenants is emptied. After the delete
+	// there is no way to learn which VictoriaMetrics accountID held this org's
+	// series or which Loki tenant held its lines, and the caller could only
+	// orphan them rather than delete them (SIGMA-298).
+	var tenant *int
+	if err := tx.QueryRow(ctx,
+		`SELECT tenant FROM org_tenants WHERE org_id = $1`, orgID).Scan(&tenant); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return res, fmt.Errorf("purge org %s: read tenant: %w", orgID, err)
+	}
+	if tenant != nil {
+		res.Tenant = *tenant
+	}
+
+	deleted := res.Deleted
 	remaining := append([]string(nil), tables...)
 	for pass := 0; pass < purgeMaxPasses && len(remaining) > 0; pass++ {
 		var blocked []string
@@ -95,18 +111,57 @@ func (s *Store) PurgeOrg(ctx context.Context, orgID string) (map[string]int64, e
 			}
 		}
 		if !progress {
-			return nil, fmt.Errorf("purge org %s: no progress; blocked tables: %v", orgID, blocked)
+			return res, fmt.Errorf("purge org %s: no progress; blocked tables: %v", orgID, blocked)
 		}
 		remaining = blocked
 	}
 	if len(remaining) > 0 {
-		return nil, fmt.Errorf("purge org %s: gave up after %d passes; blocked tables: %v",
+		return res, fmt.Errorf("purge org %s: gave up after %d passes; blocked tables: %v",
 			orgID, purgeMaxPasses, remaining)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+
+	// The tombstone outlives the data it records (SIGMA-298). Org ids are chosen
+	// by the dashboard, not by the control plane, so nothing else stops the same
+	// id being provisioned again after an erasure — and org_tenants would hand
+	// the new org its predecessor's retired tenant, which is exactly how a
+	// deleted customer's log lines reappear under somebody else's account. The
+	// row holds an opaque id, a timestamp and a tenant number and no personal
+	// data, which is why keeping it is compatible with the erasure it records.
+	//
+	// ON CONFLICT DO NOTHING because a retried erasure request must not fail:
+	// the second purge finds nothing to delete and says so with an empty map.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO org_tombstones (org_id, tenant) VALUES ($1, $2) ON CONFLICT (org_id) DO NOTHING`,
+		orgID, tenant); err != nil {
+		return res, fmt.Errorf("purge org %s: tombstone: %w", orgID, err)
 	}
-	return deleted, nil
+	if err := tx.Commit(ctx); err != nil {
+		return res, err
+	}
+	// Only after the commit: the in-process org→tenant cache says "stable, so
+	// cache forever", which was true right up until orgs could be deleted.
+	forgetOrgTenant(orgID)
+	return res, nil
+}
+
+// PurgeResult is what a purge did. Deleted maps table name → rows removed,
+// omitting tables that had none — a forty-entry map of zeroes tells an operator
+// nothing. Tenant is the telemetry tenant retired with the org, or 0 if it
+// never sent a sample; the caller uses it to issue the log and metric deletes,
+// which live outside Postgres and so cannot be part of the transaction above.
+type PurgeResult struct {
+	Deleted map[string]int64 `json:"deleted"`
+	Tenant  int              `json:"tenant"`
+}
+
+// OrgTombstoned reports whether an org id has been purged. Provisioning checks
+// it: re-provisioning a purged org id would hand the new org its predecessor's
+// telemetry tenant.
+func (s *Store) OrgTombstoned(ctx context.Context, orgID string) (bool, error) {
+	var exists bool
+	err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM org_tombstones WHERE org_id = $1)`, orgID).Scan(&exists)
+	return exists, err
 }
 
 // purgeTable deletes one table's rows for the org inside a savepoint, so a
@@ -140,6 +195,13 @@ func (s *Store) orgScopedTables(ctx context.Context) ([]string, error) {
 		 WHERE c.table_schema = current_schema()
 		   AND c.column_name = 'org_id'
 		   AND t.table_type = 'BASE TABLE'
+		   -- The one org-scoped table a purge must NOT empty: the tombstone is
+		   -- the record that the purge happened, and it is written by the same
+		   -- transaction that empties everything else (SIGMA-298). Discovering
+		   -- it here would make the second purge of an org delete the first
+		   -- purge's tombstone and free the id for re-provisioning — the exact
+		   -- outcome the tombstone exists to prevent.
+		   AND c.table_name <> 'org_tombstones'
 		 ORDER BY c.table_name`)
 	if err != nil {
 		return nil, fmt.Errorf("discover org-scoped tables: %w", err)

@@ -609,6 +609,7 @@ func run() error {
 			DSDPublicKey:         dsdKey.Public().(ed25519.PublicKey),
 			Telemetry:            tel,
 			TelemetryStore:       st,
+			OrgAdmin:             st, // tenant offboarding (SIGMA-298)
 			MetricsRetention:     cfg.MetricsRetention,
 			AlertSender:          alertSender,
 			Billing:              st,

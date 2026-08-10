@@ -425,7 +425,9 @@ func TestBillingDunningRepeatsAndAlertsOnCancel(t *testing.T) {
 
 	orgID := "org_dunning"
 	ch, err := st.CreateAlertChannel(ctx, orgID, "admin", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.example/x",
+		// SIGMA-259 pins Slack channels to the hooks.slack.com prefix at create
+		// time, so a placeholder host never becomes the row this test alerts on.
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/B000/dunning",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -473,7 +475,7 @@ func TestBillingDunningRepeatsAndAlertsOnCancel(t *testing.T) {
 	// A cancellation is an event the org must hear about too.
 	cancelOrg := "org_canceled"
 	cch, err := st.CreateAlertChannel(ctx, cancelOrg, "admin", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.example/y",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/B000/cancel",
 	})
 	if err != nil {
 		t.Fatal(err)
