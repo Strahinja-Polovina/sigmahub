@@ -219,6 +219,14 @@ export function BillingView({
   /** Why the control plane's billing figures are missing, when they are. */
   cpBillingError?: string | null;
 }) {
+  // Hoisted above the early return below: React requires every hook to run in
+  // the same order on every render, and the SIGMA-242 unreachable-control-plane
+  // branch returns before this point. Called conditionally, the hook's state
+  // would shift slots the first time a failing control plane recovered — the
+  // classic "rendered fewer hooks than expected" crash, on the page a customer
+  // opens when they are already worried about their bill.
+  const { pending: portalPending, go } = useBillingPortal();
+
   // The control plane did not answer (SIGMA-242). Everything below this point is
   // a monetary claim, and the only numbers we could put behind those claims come
   // from the local mirror, which describes a fleet and has never seen an
@@ -253,7 +261,6 @@ export function BillingView({
 
   const { unitPrice, freeTier, currency } = billing;
   const fc = (a: number, cents = false) => money(a, currency, cents);
-  const { pending: portalPending, go } = useBillingPortal();
 
   // Billing counts RUNNING servers only — the CP/Paddle charge basis (SIGMA-91).
   // gross (invoiceTotal) − free-tier credit == billing.amount (Total due), so the
