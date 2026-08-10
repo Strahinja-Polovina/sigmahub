@@ -57,6 +57,46 @@ func TestRenderHostOpsDefault(t *testing.T) {
 	}
 }
 
+// TestRenderHostOpsDoesNotRestateTheWireGuardPort is SIGMA-275.
+//
+// The WireGuard port was written three times with nothing linking the copies:
+// agent/internal/mesh.ListenPort (what the agent LISTENS on and advertises as
+// its endpoint), a bare 51820 literal here, and a second literal default in the
+// agent's nftables renderer. cp and agent are separate Go modules, so the
+// control plane cannot import the constant — but unlike SUPPORTED_ARCHES,
+// nothing else held them together either.
+//
+// Moving the mesh off the WireGuard default would then have every agent listen
+// on the new port while this control plane kept rendering a firewall admitting
+// only 51820: the mesh stops forming fleet-wide on the next reconcile, the agent
+// reports a healthy config, and the firewall silently drops the handshakes.
+//
+// The fix is not a fourth copy to keep in step. The port belongs to the host
+// that opens the socket, so the control plane says nothing about it and the
+// agent's own constant is the single source of truth. The spec field survives
+// as an explicit override; this test is what stops a literal creeping back in.
+func TestRenderHostOpsDoesNotRestateTheWireGuardPort(t *testing.T) {
+	ops := renderHostOps("srv_wg", store.HostHardening{MeshInterface: "sigma0"}, "")
+	var nft dsd.Op
+	for _, op := range ops {
+		if op.Kind == dsd.KindHostNftables {
+			nft = op
+		}
+	}
+	if nft.ID == "" {
+		t.Fatal("missing host.nftables op")
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(nft.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := spec["wireguardPort"]; ok {
+		t.Errorf("host.nftables restates the WireGuard port as %v; the agent's mesh.ListenPort "+
+			"is the single source of truth for it and the control plane cannot import that constant, "+
+			"so a literal here is a copy that drifts silently", v)
+	}
+}
+
 func TestRenderHostOpsKeepPublicSSH(t *testing.T) {
 	ops := renderHostOps("srv_2", store.HostHardening{
 		MeshIP: "10.77.0.6", MeshInterface: "sigma0", KeepPublicSSH: true, CISEnabled: false,

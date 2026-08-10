@@ -18,8 +18,19 @@ import (
 func renderHostOps(serverID string, hh store.HostHardening, publicURL string) []dsd.Op {
 	var ops []dsd.Op
 
+	// No "wireguardPort" (SIGMA-275). The port the mesh listens on is the
+	// agent's own constant (agent/internal/mesh.ListenPort), and cp cannot
+	// import it — separate Go modules. A literal here was therefore a copy that
+	// nothing held to the original: move the mesh off the WireGuard default and
+	// every agent would listen on the new port while this control plane kept
+	// rendering a ruleset admitting only the old one, dropping every handshake
+	// fleet-wide while each agent reported a healthy config.
+	//
+	// So the control plane says nothing and the agent's constant decides. The
+	// spec field survives as an explicit override for the day a deployment needs
+	// one; omitting it is what makes "the port we open" and "the port we listen
+	// on" the same value by construction instead of by two numbers agreeing.
 	nft, _ := json.Marshal(map[string]any{
-		"wireguardPort":  51820,
 		"meshInterface":  hh.MeshInterface,
 		"allowPublicSSH": hh.KeepPublicSSH,
 		"proxyRole":      hh.ProxyRole,

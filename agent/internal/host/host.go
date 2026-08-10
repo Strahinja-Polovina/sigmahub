@@ -18,6 +18,7 @@ import (
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 )
 
 // Op kinds — MUST match the control plane's dsd.KindHost* strings byte-for-byte
@@ -39,7 +40,12 @@ type PortException struct {
 // conditionally allow public SSH (opt-out) and the proxy ports, plus any
 // customer exceptions.
 type NftablesSpec struct {
-	WireguardPort  int             `json:"wireguardPort"` // usually 51820
+	// WireguardPort is an OVERRIDE, not a setting the control plane fills in.
+	// Zero — which is what the control plane sends — means mesh.ListenPort, the
+	// port this same agent actually listens on. See RenderNftables and
+	// SIGMA-275: a control plane that restated the number was a second copy
+	// that could only ever drift out of step with the socket.
+	WireguardPort  int             `json:"wireguardPort,omitempty"`
 	MeshInterface  string          `json:"meshInterface"` // e.g. sigma0
 	AllowPublicSSH bool            `json:"allowPublicSSH"`
 	ProxyRole      bool            `json:"proxyRole"` // opens 80/443
@@ -196,7 +202,13 @@ func (d *Driver) opCIS(ctx context.Context, op dsd.Op) error {
 func RenderNftables(spec NftablesSpec) string {
 	wg := spec.WireguardPort
 	if wg == 0 {
-		wg = 51820
+		// mesh.ListenPort, not a literal (SIGMA-275). This rule and the
+		// `ListenPort = ` line the mesh package writes into sigma0.conf are the
+		// same UDP port seen from two sides: one opens the socket, the other is
+		// what lets a handshake reach it. As two independent literals they
+		// agreed only by luck, and the day they stopped agreeing the agent would
+		// report a healthy config while the kernel dropped every handshake.
+		wg = mesh.ListenPort
 	}
 	mesh := spec.MeshInterface
 	if mesh == "" {
