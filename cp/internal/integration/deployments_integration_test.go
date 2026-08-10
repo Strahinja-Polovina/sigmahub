@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -126,6 +127,37 @@ func TestDeploymentsLifecycle(t *testing.T) {
 	logs2, _ := st.DeployLogsSince(ctx, dep.ID, logs[0].ID, 100)
 	if len(logs2) != 1 || logs2[0].Line != "step 2/5 : COPY . ." {
 		t.Fatalf("log cursor = %+v", logs2)
+	}
+	// Batched append (SIGMA-252): the agent ships hundreds of lines per request
+	// and they go in as ONE statement. Every line must land, in the order it was
+	// produced — deploy_logs.id is the SSE cursor, so insert order is the order
+	// the operator reads the build in.
+	batch := make([]string, 0, 300)
+	for i := 0; i < 300; i++ {
+		batch = append(batch, "batched line "+strconv.Itoa(i))
+	}
+	if err := st.AppendDeployLogs(ctx, serverID, dep.ID, "build", batch); err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.DeployLogsSince(ctx, dep.ID, logs[1].ID, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(batch) {
+		t.Fatalf("batched append wrote %d lines, want %d", len(after), len(batch))
+	}
+	for i, l := range after {
+		if l.Line != batch[i] {
+			t.Fatalf("batched line %d = %q, want %q (order not preserved)", i, l.Line, batch[i])
+		}
+	}
+	// The BOLA guard survives batching: a server with no part in this deployment
+	// writes nothing, even when it posts a whole batch.
+	if err := st.AppendDeployLogs(ctx, "srv_not_involved", dep.ID, "build", []string{"forged"}); err != nil {
+		t.Fatal(err)
+	}
+	if forged, _ := st.DeployLogsSince(ctx, dep.ID, after[len(after)-1].ID, 100); len(forged) != 0 {
+		t.Fatalf("a foreign server forged %d lines into the deploy log", len(forged))
 	}
 
 	// GetDeployment is org-scoped (BOLA): the right org resolves it; a foreign

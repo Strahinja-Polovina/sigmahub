@@ -1,0 +1,21 @@
+-- SIGMA-247: make a stuck apply legible.
+--
+-- server_dsd already knew everything needed to say "this machine has stopped
+-- converging" — apply_ok, applied_version and redrive_count — and nothing read
+-- any of it. The one thing it did NOT know was WHICH ops were failing: the
+-- agent reports a status per op id, but the CP collapsed the whole report into
+-- a single `converged` boolean and threw the op ids away. That is fine for
+-- driving the re-drive, and useless to an operator: "server-1 is not
+-- converging" without "host:nftables:srv_x failed: nft: command not found" is
+-- a pager that cannot be acted on.
+--
+-- So the failing op ids are kept alongside the flag that says the apply failed.
+-- TEXT[] rather than a child table: the set is small (the ops of one document),
+-- it is overwritten wholesale by each status report rather than accumulated,
+-- and it is only ever read back for the one server it belongs to.
+--
+-- Empty for a converged server, which is also the correct backfill for every
+-- existing row: nothing is known to be failing until the next status report
+-- says so.
+ALTER TABLE server_dsd
+    ADD COLUMN IF NOT EXISTS apply_failed_ops TEXT[] NOT NULL DEFAULT '{}';

@@ -39,11 +39,25 @@ const (
 	// nothing in the product describes any more — so this event is the one
 	// notice the operator gets that they now own a host by hand.
 	AlertDecommissionTimedOut = "decommission_timed_out"
+	// AlertDSDApplyFailed fires when a server exhausts its DSD apply re-drive
+	// budget (SIGMA-247) — the CP has re-issued the same failing document
+	// maxDSDRedrive times and is about to go quiet about it.
+	//
+	// It is the only notice that desired state and actual state have diverged
+	// permanently. The host keeps heartbeating, so its status stays 'running'
+	// and every other signal the product has says the machine is fine; what is
+	// actually true is that some op — a firewall ruleset, a container, a proxy
+	// config — has not applied for minutes and will not be retried again until
+	// somebody changes the configuration. Without this event that divergence is
+	// invisible: the re-drive cap is correct, but a cap nobody is told about is
+	// indistinguishable from silence.
+	AlertDSDApplyFailed = "dsd_apply_failed"
 )
 
 // AlertEvents is the full vocabulary, in display order.
 var AlertEvents = []string{
 	AlertServerUnreachable, AlertServerRecovered, AlertDecommissionTimedOut,
+	AlertDSDApplyFailed,
 	AlertDeployFailed, AlertBackupFailed, AlertVerifyFailed, AlertCertFailed,
 	AlertCertExpiring, AlertPaymentFailed,
 }

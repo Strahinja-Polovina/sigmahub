@@ -489,10 +489,21 @@ export async function getResourceDetail(resourceId: string) {
     .where(eq(s.resources.id, resourceId));
   if (!row) return undefined;
 
-  let server: { id: string; name: string; type: string } | null = null;
+  // The host's STATUS travels with its name (SIGMA-251). A resource on a server
+  // that stopped heartbeating has nothing to say for itself — no error, because
+  // nothing failed; no deployment, because none was ever picked up — so the page
+  // needs the one fact that explains the silence. The mirror's status is
+  // reconciled from the control plane (cp-sync writes it on every sync), so it
+  // is the same verdict the servers page renders.
+  let server: { id: string; name: string; type: string; status: string } | null = null;
   if (row.resource.serverId) {
     const [sv] = await db
-      .select({ id: s.servers.id, name: s.servers.name, type: s.servers.type })
+      .select({
+        id: s.servers.id,
+        name: s.servers.name,
+        type: s.servers.type,
+        status: s.servers.status,
+      })
       .from(s.servers)
       .where(eq(s.servers.id, row.resource.serverId));
     server = sv ?? null;

@@ -67,6 +67,25 @@ export type CpServer = {
   decommissioningSince?: string | null;
   /** Whether that request opted into destroying named volumes. */
   purgeVolumes?: boolean;
+  /** DSD convergence (SIGMA-247) — whether the host is DOING what we asked, as
+   *  opposed to `status`, which only says whether it is still talking to us. A
+   *  host whose firewall op has failed every apply for an hour keeps
+   *  heartbeating and reads `running`; `converged` is the field that says
+   *  otherwise, and `applyFailedOps` names the ops.
+   *
+   *  `applyOk` false means the last report failed; `applyOk` true with
+   *  `appliedVersion` behind `dsdVersion` is an apply merely in flight. Once
+   *  `redriveCount` reaches the control plane's cap the divergence is permanent
+   *  until the configuration changes — that is when `dsd_apply_failed` fires.
+   *
+   *  All optional: an older control plane that predates the read model simply
+   *  reads as "nothing known", not as a broken servers page. */
+  dsdVersion?: number;
+  appliedVersion?: number;
+  applyOk?: boolean;
+  redriveCount?: number;
+  applyFailedOps?: string[];
+  converged?: boolean;
 };
 
 export type CpMetricPoint = {
@@ -1003,11 +1022,25 @@ export async function cpListSecrets(
   return secrets;
 }
 
+/** `requestId` identifies the SUBMISSION, not the call (SIGMA-256).
+ *
+ *  This used to be `crypto.randomUUID()`, minted here, per call. A key that is
+ *  never repeated is not an idempotency key: IdempotencyClaim always wins the
+ *  reservation and the mutation always executes, which is the exact
+ *  double-execute the wrapper exists to prevent. The only lasting effect was a
+ *  finalized idempotency_keys row per attempt.
+ *
+ *  And the double-execute is expensive: a second CreateSecret means a second
+ *  audit entry, a second round of config deployments, and a second container
+ *  restart wave across every resource consuming the secret — all during what
+ *  the user believes was a FAILED operation, because what timed out was the
+ *  proxy, after the control plane had already committed. */
 export async function cpCreateSecret(
   orgId: string,
   projectId: string,
   input: { name: string; value: string; environmentId?: string; envVar: boolean },
-  actor: CpActor
+  actor: CpActor,
+  requestId: string
 ): Promise<CpSecret> {
   return cpFetch(
     `${org(orgId)}/projects/${encodeURIComponent(projectId)}/secrets`,
@@ -1020,7 +1053,7 @@ export async function cpCreateSecret(
         envVar: input.envVar,
       }),
     },
-    { orgId, actor, idempotencyKey: crypto.randomUUID() }
+    { orgId, actor, idempotencyKey: `secret:${requestId}` }
   );
 }
 
@@ -2025,15 +2058,28 @@ export async function cpListClusters(
   return cpFetch(`${org(orgId)}/clusters${q}`, undefined, { orgId });
 }
 
+/** `requestId` identifies the SUBMISSION, not the call: the wizard mints one
+ *  and reuses it while the operator retries the same form, and mints a new one
+ *  once the form's content changes or the create succeeds (SIGMA-253).
+ *
+ *  The key used to be `cluster:${environmentId}:${name}` — derived from the
+ *  content, and therefore stable for the entire lifetime of that (environment,
+ *  name) pair. Delete a cluster whose k3s install failed and build it again
+ *  under the same name and the control plane does exactly what it promised:
+ *  same key, same request hash, replay the stored 201 — carrying the DELETED
+ *  cluster's id. No cluster is created, no node is enrolled, the dashboard
+ *  navigates to something that no longer exists, and every retry replays the
+ *  same dead response. */
 export async function cpCreateCluster(
   orgId: string,
   input: { environmentId: string; name: string; controlPlaneId: string },
-  actor: CpActor
+  actor: CpActor,
+  requestId: string
 ): Promise<CpCluster> {
   return cpFetch(
     `${org(orgId)}/clusters`,
     { method: "POST", body: JSON.stringify(input) },
-    { orgId, actor, idempotencyKey: `cluster:${input.environmentId}:${input.name}` }
+    { orgId, actor, idempotencyKey: `cluster:${requestId}` }
   );
 }
 

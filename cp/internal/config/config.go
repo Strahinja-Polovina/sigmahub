@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -17,6 +18,11 @@ import (
 // SIGMAHUB_REPO and the dashboard spells as SIGMAHUB_RELEASE_REPO, so an
 // unmodified deployment of all three agrees with itself out of the box.
 const DefaultReleaseRepo = "Strahinja-Polovina/sigmahub"
+
+// DefaultMetricsRetention is how long server_metrics samples are kept when
+// CP_METRICS_RETENTION says nothing — the value the sweeper has always pruned
+// at, now named once instead of written down in two packages.
+const DefaultMetricsRetention = 24 * time.Hour
 
 // releaseRepoPattern is GitHub's own owner/name vocabulary. Nothing outside it —
 // no scheme, no second slash, no query string, no traversal — reaches a URL that
@@ -143,6 +149,19 @@ type Config struct {
 	// user-facing token is used with no actor. The dev wildcard token is exempt
 	// (it is a system bypass with no per-user identity).
 	RequireActor bool
+	// MetricsRetention (CP_METRICS_RETENTION, a Go duration) is how long host
+	// samples live in server_metrics before the sweeper prunes them. It is ONE
+	// setting because it answers two questions that must not disagree: what the
+	// sweeper deletes, and how far back GET .../metrics can honestly serve when
+	// no telemetry pipeline is configured (SIGMA-257). Those were two hard-coded
+	// 24h literals in different packages, and the API's was only a coincidence —
+	// it advertised a 7d ceiling over a store that held one day, so a week-wide
+	// chart came back with six sevenths empty and read as "the host was down".
+	//
+	// It does NOT cap the pipeline path: with VictoriaMetrics configured the
+	// samples are held there under its own retention, and the endpoint keeps
+	// serving up to its 7d maximum.
+	MetricsRetention time.Duration
 }
 
 func FromEnv() (Config, error) {
@@ -184,6 +203,12 @@ func FromEnv() (Config, error) {
 		return Config{}, err
 	}
 	cfg.RequireActor = requireActor
+	// Same fail-loud contract: a retention that does not parse (or is zero or
+	// negative) must not silently become "keep nothing" in the sweeper and
+	// "serve nothing" in the metrics endpoint.
+	if cfg.MetricsRetention, err = parseDurationEnv("CP_METRICS_RETENTION", DefaultMetricsRetention); err != nil {
+		return Config{}, err
+	}
 	// Validate Env explicitly: a typo (e.g. "production") must not silently
 	// fall through to the dev defaults below (fail-open on auth).
 	switch cfg.Env {
@@ -290,6 +315,25 @@ func parseEngineList(key string, known []string) ([]string, error) {
 		return nil, fmt.Errorf("%s must enable at least one engine", key)
 	}
 	return enabled, nil
+}
+
+// parseDurationEnv reads a Go duration env var, returning def when unset/empty
+// and an error on anything time.ParseDuration rejects or on a non-positive
+// value. A retention typo ("24" for "24h") must fail boot rather than resolve
+// to 24 nanoseconds and quietly delete every sample on the next sweep.
+func parseDurationEnv(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a Go duration (e.g. 24h, 168h), got %q", key, os.Getenv(key))
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %q", key, os.Getenv(key))
+	}
+	return d, nil
 }
 
 func getenv(key, fallback string) string {

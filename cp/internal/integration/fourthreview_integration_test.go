@@ -58,7 +58,7 @@ func TestDSDReDrivesOnOpFailure(t *testing.T) {
 
 	// The agent reports the resource op FAILED for v1 (not converged).
 	failed := map[string]json.RawMessage{"res:" + res.ID: json.RawMessage(`{"state":"failed","error":"registry unreachable"}`)}
-	if ok, err := st.ApplyDSDStatus(ctx, serverID, 1, failed, false); err != nil || !ok {
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, 1, failed, false, nil); err != nil || !ok {
 		t.Fatalf("apply failed status: ok=%v err=%v", ok, err)
 	}
 
@@ -74,7 +74,7 @@ func TestDSDReDrivesOnOpFailure(t *testing.T) {
 	// The agent now reports success for v2 → converged; a further resync with the
 	// same specs must NOT bump the version.
 	okStatus := map[string]json.RawMessage{"res:" + res.ID: json.RawMessage(`{"state":"applied"}`)}
-	if ok, err := st.ApplyDSDStatus(ctx, serverID, 2, okStatus, true); err != nil || !ok {
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, 2, okStatus, true, nil); err != nil || !ok {
 		t.Fatalf("apply ok status: ok=%v err=%v", ok, err)
 	}
 	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
@@ -132,7 +132,7 @@ func TestDSDReDriveIsBounded(t *testing.T) {
 	stable := 0
 	for i := 0; i < 12; i++ {
 		v, _ := st.CurrentDSDVersion(ctx, serverID)
-		if ok, err := st.ApplyDSDStatus(ctx, serverID, v, failed, false); err != nil || !ok {
+		if ok, err := st.ApplyDSDStatus(ctx, serverID, v, failed, false, nil); err != nil || !ok {
 			t.Fatalf("apply failed status: ok=%v err=%v", ok, err)
 		}
 		if err := rec.Reconcile(ctx, orgID, serverID); err != nil {
@@ -210,7 +210,7 @@ func TestDSDReDriveHonorsConvergedParam(t *testing.T) {
 	// Report with an EMPTY resource-status map but converged=false — this is how a
 	// failed host:/proxy:/volrm: op arrives (it produces no res: entry). The
 	// server must NOT be treated as converged.
-	if ok, err := st.ApplyDSDStatus(ctx, serverID, v1, map[string]json.RawMessage{}, false); err != nil || !ok {
+	if ok, err := st.ApplyDSDStatus(ctx, serverID, v1, map[string]json.RawMessage{}, false, nil); err != nil || !ok {
 		t.Fatalf("apply non-resource failure: ok=%v err=%v", ok, err)
 	}
 	if err := rec.Reconcile(ctx, orgID, serverID); err != nil {

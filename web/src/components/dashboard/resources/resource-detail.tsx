@@ -134,7 +134,20 @@ type Detail = {
   };
   projectName: string;
   envName: string;
-  server: { id: string; name: string; type: string } | null;
+  /** The host this resource runs on. `status` and `lastSeenAt` ride along
+   *  because a resource stuck on a silent machine has to be able to explain
+   *  itself (SIGMA-251): the page's other signals — statusError, the deployment
+   *  list, logs, metrics — all describe things that HAPPENED, and a host that
+   *  stopped heartbeating never gets far enough to make any of them happen.
+   *  Optional so the demo mirror, which has no heartbeat column, can leave
+   *  lastSeenAt out without claiming the host is fine. */
+  server: {
+    id: string;
+    name: string;
+    type: string;
+    status?: string;
+    lastSeenAt?: string | Date | null;
+  } | null;
   /** The other kind of deploy target. Exactly one of server and cluster is set;
    *  a workload in a cluster has no server because the scheduler picks its
    *  node, and rendering "—" for it said the resource ran nowhere. */
@@ -342,6 +355,59 @@ function formatList(items: string[]): string {
   return items.slice(0, -1).join(", ") + " and " + items[items.length - 1];
 }
 
+/**
+ * The host's own state, when it is the reason this page has nothing to show.
+ *
+ * SIGMA-251. Every other signal on this page reports something that HAPPENED:
+ * statusError is what the agent said when an op FAILED, the deployment list is
+ * builds that RAN, logs and metrics are output a container PRODUCED. A machine
+ * that stopped heartbeating produces none of those — no op fails, because no op
+ * is ever picked up — so a resource sitting on a dead host renders as an
+ * unbroken row of empty panels and a status that never moves. For a non-app
+ * kind there is not even a Deployments tab to look at. The user's only signal
+ * was a spinner, and the product already knew the host had not checked in for
+ * hours.
+ *
+ * Returns null for the statuses in which the host is doing its job
+ * (`running`, `provisioning`) and for a resource with no host at all — a
+ * cluster workload has no server because the scheduler picks its node.
+ */
+function hostAlert(
+  server: Detail["server"]
+): { title: string; body: string } | null {
+  if (!server?.status) return null;
+  switch (server.status) {
+    case "unreachable": {
+      // The timestamp is what turns "something is wrong" into "this machine
+      // died two hours ago". Omitted rather than faked when the mode we are in
+      // does not track heartbeats.
+      const since = server.lastSeenAt ? ` since ${formatDateTime(server.lastSeenAt)}` : "";
+      return {
+        title: "This resource's host is not answering",
+        body:
+          `has not checked in${since} — nothing on it can converge until it does. ` +
+          "Work queued for this resource is waiting on that agent, so the resource stays exactly as it is.",
+      };
+    }
+    case "decommissioning":
+      return {
+        title: "This resource's host is going away",
+        body:
+          "is being disconnected — its agent is tearing itself down and will not pick up new work, " +
+          "so nothing here will converge. Move this resource to another host.",
+      };
+    case "incompatible":
+      return {
+        title: "This resource's host cannot run work",
+        body:
+          "was refused by the compatibility gate for the type it is enrolled as: it is fully provisioned " +
+          "but unschedulable, so nothing here will converge until its type is changed or the host is replaced.",
+      };
+    default:
+      return null;
+  }
+}
+
 export function ResourceDetail({
   detail,
   orgId,
@@ -429,6 +495,9 @@ export function ResourceDetail({
     const id = setInterval(() => router.refresh(), 5000);
     return () => clearInterval(id);
   }, [deployInFlight, router]);
+
+  // Why this resource may be going nowhere through no fault of its own.
+  const host = hostAlert(server);
 
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
@@ -577,6 +646,28 @@ export function ResourceDetail({
               The control plane didn&apos;t answer for {formatList(loadFailures)}. What you see
               below is incomplete — an empty section here does not mean there is nothing
               there. Reload once the control plane is reachable.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* The host's state outranks everything below it: if the machine is not
+          answering, the empty logs, the empty metrics and the status that never
+          moves all have one cause, and it is not on this page (SIGMA-251). The
+          link is the point — the fix lives on the server. */}
+      {host && server && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <ServerIcon className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
+          <div className="min-w-0 text-sm">
+            <p className="font-medium text-amber-700 dark:text-amber-500">{host.title}</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              <Link
+                href={`/dashboard/servers/${server.id}`}
+                className="font-medium text-foreground underline underline-offset-2"
+              >
+                {server.name}
+              </Link>{" "}
+              {host.body}
             </p>
           </div>
         </div>

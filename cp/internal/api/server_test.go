@@ -126,7 +126,7 @@ func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, st
 func (f *fakeStore) DeployPeersForResource(context.Context, string, string) ([]store.ServerRef, error) {
 	return nil, nil
 }
-func (f *fakeStore) AppendDeployLog(context.Context, string, string, string, string) error {
+func (f *fakeStore) AppendDeployLogs(context.Context, string, string, string, []string) error {
 	return nil
 }
 func (f *fakeStore) BackupCredentialForRun(context.Context, string, string) (store.BackupCredential, error) {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/cpmetrics"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
@@ -44,7 +45,10 @@ type StoreAPI interface {
 	// on this resource's deployment status, so a multi-machine pipeline advances
 	// on the report rather than on the next resync.
 	DeployPeersForResource(ctx context.Context, resourceID, excludeServerID string) ([]store.ServerRef, error)
-	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
+	// AppendDeployLogs takes the whole batch the agent posted and writes it in
+	// one statement — one INSERT per line was thousands of statements per build
+	// (SIGMA-252).
+	AppendDeployLogs(ctx context.Context, serverID, deploymentID, stream string, lines []string) error
 	// Backups (P1-11): the audited per-run credential release and the agent's
 	// terminal result report, plus the op-status failure fallback.
 	BackupCredentialForRun(ctx context.Context, serverID, runID string) (store.BackupCredential, error)
@@ -119,7 +123,16 @@ type Server struct {
 	// and the only place the release credential lives. Zero value (no Repo) =
 	// both routes answer 503 naming the setting. See installer.go.
 	release ReleaseSource
-	mux     *http.ServeMux
+	// metrics is the control plane's own health registry (SIGMA-248). Always
+	// non-nil after New — a *cpmetrics.Registry with no reporters still names
+	// every loop, and an endpoint that exists unconditionally is worth more than
+	// one that quietly disappears in the deployments that forgot to wire it.
+	metrics *cpmetrics.Registry
+	// metricsRetentionCfg is how long the sweeper keeps server_metrics rows;
+	// the fallback metrics path may not advertise a longer window than that
+	// (SIGMA-257). Zero = the built-in default; read via metricsRetention().
+	metricsRetentionCfg time.Duration
+	mux                 *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
@@ -202,6 +215,19 @@ type Options struct {
 	// repository onboardable. Zero value = the routes answer 503 rather than
 	// guessing a repository. See installer.go for the whole security argument.
 	Release ReleaseSource
+	// Metrics is the control plane's own health registry, exposed at GET
+	// /metrics (SIGMA-248). Nil is fine and is what handler unit tests pass: the
+	// route still exists and still lists every background loop, all of them at
+	// "never succeeded", which is the honest reading for a process that is not
+	// running them.
+	Metrics *cpmetrics.Registry
+	// MetricsRetention is how long the sweeper keeps server_metrics rows — the
+	// SAME value passed to sweeper.Config.Retention, which is why it is passed
+	// in rather than written down here a second time. It caps the window
+	// GET .../metrics serves from the fallback store (SIGMA-257); zero means
+	// the built-in 24h default. It does not affect the pipeline path, which
+	// reads VictoriaMetrics under its own retention.
+	MetricsRetention time.Duration
 }
 
 // New builds the HTTP surface.
@@ -238,7 +264,12 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		paddlePriceID:       opts.PaddlePriceID,
 		requireActor:        opts.RequireActor,
 		release:             opts.Release.normalized(),
+		metrics:             opts.Metrics,
+		metricsRetentionCfg: opts.MetricsRetention,
 		mux:                 http.NewServeMux(),
+	}
+	if s.metrics == nil {
+		s.metrics = cpmetrics.New()
 	}
 	s.routes()
 	return s
@@ -247,6 +278,14 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+	// The control plane's own health (SIGMA-248). Unauthenticated, like the two
+	// probes above, and for the same reason: whatever scrapes it runs outside
+	// this process and often before any credential exists. It is safe to leave
+	// open because it carries no tenant data — the series are loop names,
+	// counters, timings and pool gauges, with no org, server or resource
+	// identifier in any label. Anything org-scoped belongs on the tenant
+	// telemetry routes, which are authenticated.
+	s.mux.HandleFunc("GET /metrics", s.metrics.ServeHTTP)
 
 	// Agent onboarding downloads. UNAUTHENTICATED by necessity — the host being
 	// onboarded holds no credential yet, and the bootstrap token in the rendered

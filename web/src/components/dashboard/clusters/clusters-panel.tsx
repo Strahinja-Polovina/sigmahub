@@ -46,6 +46,7 @@ import { StatusDot } from "@/components/dashboard/status-indicator";
 import type { Status } from "@/lib/mock";
 import { resourceKindLabel } from "@/lib/server-catalog.generated";
 import { msUntilNodeReady } from "@/lib/demo-cluster";
+import { createSubmissionId } from "@/lib/request-id";
 import {
   createCluster,
   addClusterNode,
@@ -464,11 +465,22 @@ function CreateClusterDialog({
   const [environmentId, setEnvironmentId] = React.useState("");
   const [controlPlaneId, setControlPlaneId] = React.useState("");
   const [pending, startTransition] = React.useTransition();
+  // One request id per SUBMISSION, not per click and not per cluster name
+  // (SIGMA-253). Pressing the button again after a failure is a retry and
+  // reuses it — that is what the Idempotency-Key promises. Editing a field or
+  // creating a second cluster after this one lands is a new intent and gets a
+  // new one, so the control plane never replays a response describing a cluster
+  // the operator has since deleted.
+  const submission = React.useRef(createSubmissionId());
 
   function submit() {
     startTransition(async () => {
+      const requestId = submission.current.forContent(
+        JSON.stringify([orgId, environmentId, name.trim(), controlPlaneId])
+      );
       try {
-        await createCluster({ orgId, environmentId, name, controlPlaneId });
+        await createCluster({ orgId, environmentId, name, controlPlaneId, requestId });
+        submission.current.settled();
         toast.success("Cluster created", {
           description: "The control-plane node is installing Kubernetes now.",
         });

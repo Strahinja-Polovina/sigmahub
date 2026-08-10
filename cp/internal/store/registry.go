@@ -84,6 +84,31 @@ type Server struct {
 	// reload of the page mid-teardown still says whether application data is
 	// being destroyed.
 	PurgeVolumes bool `json:"purgeVolumes"`
+	// DSD convergence (SIGMA-247). `status` answers "is this machine talking to
+	// us"; these answer "is it doing what we asked". They are different
+	// questions with different failure modes, and only the first one was on this
+	// struct: a host whose nftables op has failed every apply for an hour keeps
+	// heartbeating, so it read as running and Ready while its firewall was
+	// whatever it happened to be before.
+	//
+	// DSDVersion is what the CP has issued, AppliedVersion what the agent last
+	// reported against. ApplyOK is that report's verdict; ApplyFailedOps names
+	// the ops it failed on. RedriveCount is how far into the bounded retry budget
+	// (maxDSDRedrive) this server is — at the cap the CP has stopped re-issuing
+	// and the divergence is permanent until the configuration changes.
+	//
+	// Converged is the single derived answer for a badge: issued == applied AND
+	// that apply succeeded. A server that has never had a document rendered
+	// counts as converged — there is nothing it is failing to do. Note that a
+	// normal deploy is briefly non-converged with ApplyOK still true (issued, not
+	// yet reported); the two fields together distinguish "applying" from "stuck",
+	// which one boolean cannot. Populated by ListServers/GetServer only.
+	DSDVersion     int64    `json:"dsdVersion"`
+	AppliedVersion int64    `json:"appliedVersion"`
+	ApplyOK        bool     `json:"applyOk"`
+	RedriveCount   int      `json:"redriveCount"`
+	ApplyFailedOps []string `json:"applyFailedOps"`
+	Converged      bool     `json:"converged"`
 }
 
 // readinessExpr is the derived Ready predicate: the server is live (running),
@@ -681,24 +706,41 @@ func (s *Store) ServerByAgentToken(ctx context.Context, token string) (Server, e
 }
 
 // serverSelect is the dashboard-facing projection: the base columns plus the
-// declared distro, the reported hardening posture, mesh peer count, and the
-// derived Ready flag. Aliased `s` so readinessExpr's correlated subquery binds.
+// declared distro, the reported hardening posture, mesh peer count, the derived
+// Ready flag, and the DSD convergence state (SIGMA-247). Aliased `s` so
+// readinessExpr's correlated subquery binds.
+//
+// server_dsd is LEFT JOINed and every column of it COALESCEd: a server that has
+// never had a document rendered has no row there, and the honest reading of
+// that is "nothing issued, nothing failing, converged" — not NULL, and
+// certainly not a missing server.
 const serverSelect = `
 	SELECT s.id, s.org_id, s.name, s.type, s.source, s.proxy_role, s.provider, s.region, s.status,
 	       s.agent_version, s.facts, s.mesh_ip, s.endpoint, s.pubkey, s.last_seen_at, s.created_at,
 	       s.distro, s.mesh_peer_count, s.hardening_score, s.disk_encrypted, s.ssh_locked,
 	       COALESCE(h.keep_public_ssh, TRUE), s.incompatible_reasons,
-	       s.decommission_started_at, s.decommission_purge_volumes, ` + readinessExpr + ` AS ready
+	       s.decommission_started_at, s.decommission_purge_volumes, ` + readinessExpr + ` AS ready,
+	       COALESCE(d.version, 0), COALESCE(d.applied_version, 0), COALESCE(d.apply_ok, TRUE),
+	       COALESCE(d.redrive_count, 0), COALESCE(d.apply_failed_ops, '{}'),
+	       COALESCE(d.apply_ok AND d.applied_version >= d.version, TRUE) AS converged
 	  FROM servers s
-	  LEFT JOIN server_hardening h ON h.server_id = s.id`
+	  LEFT JOIN server_hardening h ON h.server_id = s.id
+	  LEFT JOIN server_dsd d ON d.server_id = s.id`
 
 func scanServerRow(row pgx.Row, srv *Server) error {
 	if err := row.Scan(&srv.ID, &srv.OrgID, &srv.Name, &srv.Type, &srv.Source, &srv.ProxyRole, &srv.Provider, &srv.Region,
 		&srv.Status, &srv.AgentVersion, &srv.Facts, &srv.MeshIP, &srv.Endpoint, &srv.Pubkey, &srv.LastSeenAt, &srv.CreatedAt,
 		&srv.Distro, &srv.MeshPeerCount, &srv.HardeningScore, &srv.DiskEncrypted, &srv.SSHLocked,
 		&srv.KeepPublicSSH, &srv.IncompatibleReasons,
-		&srv.DecommissioningSince, &srv.PurgeVolumes, &srv.Ready); err != nil {
+		&srv.DecommissioningSince, &srv.PurgeVolumes, &srv.Ready,
+		&srv.DSDVersion, &srv.AppliedVersion, &srv.ApplyOK, &srv.RedriveCount, &srv.ApplyFailedOps,
+		&srv.Converged); err != nil {
 		return err
+	}
+	// Same "always an array" contract as IncompatibleReasons: '{}' scans to a nil
+	// slice, and a JSON null here would make every consumer invent a meaning for it.
+	if srv.ApplyFailedOps == nil {
+		srv.ApplyFailedOps = []string{}
 	}
 	// The column is NOT NULL '[]', so this only normalizes JSON's `[]` → Go's
 	// nil round trip; the API contract is "always an array", which encoding/json

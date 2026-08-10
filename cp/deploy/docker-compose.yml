@@ -7,10 +7,34 @@
 # Key custody: default is the file backend — the key is generated on first
 # boot inside the cp-data volume; BACK IT UP (every wrapped secret depends on
 # it). For production set CP_KMS_BACKEND=vault + CP_VAULT_* instead.
+
+# Bounded container logs (SIGMA-254). Every service below is restarted forever,
+# and the control plane writes one structured line per HTTP request — dominated
+# by agent long-polls, heartbeats and telemetry pushes, so a fleet of any size
+# produces a steady few lines a second, indefinitely. Docker's json-file driver
+# has NO size limit unless one is asked for, and that file lives on the same
+# filesystem as the db-data and cp-data volumes on the small host this stack
+# targets. Left uncapped the eventual failure is not "the logs got big": it is
+# Postgres unable to write WAL, which reads like a database fault, on a box
+# whose first diagnostic (`docker compose logs`) is the thing that ate the disk.
+#
+# This belongs here rather than in the host's /etc/docker/daemon.json because
+# the compose file is what a self-hoster copies; the daemon config is what they
+# never touch. 10m x 3 caps each service at 30MB of rotated history, which is
+# still hours of request log — enough to debug the incident that sent the
+# operator looking. Ship logs off-box (CP_LOKI_URL, or a compose-level logging
+# driver) if you need more retention than that.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16.6-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: sigmahub
       POSTGRES_PASSWORD: ${CP_DB_PASSWORD:?set CP_DB_PASSWORD in .env}
@@ -33,6 +57,7 @@ services:
     # the default keeps the self-hosted `docker compose build` flow working.
     image: ${CP_IMAGE:-sigmahub-cp:latest}
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
@@ -101,6 +126,9 @@ services:
       CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
       CP_VM_READ_URL: ${CP_VM_READ_URL:-}
       CP_LOKI_URL: ${CP_LOKI_URL:-}
+      # How long server_metrics rows are kept, and (with no pipeline) how far
+      # back GET .../metrics will serve — one setting so the two agree.
+      CP_METRICS_RETENTION: ${CP_METRICS_RETENTION:-24h}
       # Billing (P2-4, Paddle; optional). Empty = billing off (usage preview).
       CP_PADDLE_API_KEY: ${CP_PADDLE_API_KEY:-}
       CP_PADDLE_WEBHOOK_SECRET: ${CP_PADDLE_WEBHOOK_SECRET:-}
@@ -119,6 +147,7 @@ services:
       dockerfile: Dockerfile
     image: ${WEB_IMAGE:-sigmahub-web:latest}
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
@@ -156,6 +185,7 @@ services:
     image: grafana/loki:2.9.8
     profiles: ["telemetry"]
     restart: unless-stopped
+    logging: *default-logging
     command: ["-config.file=/etc/loki/local-config.yaml"]
     volumes:
       - loki-data:/loki
@@ -164,6 +194,7 @@ services:
     image: victoriametrics/vmstorage:v1.102.1-cluster
     profiles: ["telemetry"]
     restart: unless-stopped
+    logging: *default-logging
     command: ["-storageDataPath=/storage"]
     volumes:
       - vm-data:/storage
@@ -172,6 +203,7 @@ services:
     image: victoriametrics/vminsert:v1.102.1-cluster
     profiles: ["telemetry"]
     restart: unless-stopped
+    logging: *default-logging
     command: ["-storageNode=vmstorage:8400"]
     depends_on:
       - vmstorage
@@ -180,6 +212,7 @@ services:
     image: victoriametrics/vmselect:v1.102.1-cluster
     profiles: ["telemetry"]
     restart: unless-stopped
+    logging: *default-logging
     command: ["-storageNode=vmstorage:8401"]
     depends_on:
       - vmstorage

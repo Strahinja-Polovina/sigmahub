@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -86,6 +87,51 @@ func TestRequireActorFromEnv(t *testing.T) {
 			}
 			if cfg.RequireActor != tc.want {
 				t.Fatalf("RequireActor = %v, want %v", cfg.RequireActor, tc.want)
+			}
+		})
+	}
+}
+
+// TestMetricsRetentionFromEnv covers CP_METRICS_RETENTION (SIGMA-257): unset is
+// the documented 24h, a duration overrides it, and anything that is not a
+// positive Go duration fails boot. The last case is the point — "24" parsing to
+// 24 nanoseconds would hand the sweeper a prune window that deletes every sample
+// on its next tick, and hand the metrics endpoint a window it would then
+// advertise as the truth.
+func TestMetricsRetentionFromEnv(t *testing.T) {
+	const db = "postgres://x"
+	for _, tc := range []struct {
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"", DefaultMetricsRetention, false},
+		{"24h", 24 * time.Hour, false},
+		{"168h", 7 * 24 * time.Hour, false},
+		{"90m", 90 * time.Minute, false},
+		{"24", 0, true},
+		{"forever", 0, true},
+		{"0h", 0, true},
+		{"-1h", 0, true},
+	} {
+		t.Run("val="+tc.val, func(t *testing.T) {
+			for _, k := range []string{"CP_ENV", "CP_SERVICE_TOKEN", "CP_ADDR"} {
+				t.Setenv(k, "")
+			}
+			t.Setenv("CP_DATABASE_URL", db)
+			t.Setenv("CP_METRICS_RETENTION", tc.val)
+			cfg, err := FromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got %v", tc.val, cfg.MetricsRetention)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.val, err)
+			}
+			if cfg.MetricsRetention != tc.want {
+				t.Fatalf("MetricsRetention = %v, want %v", cfg.MetricsRetention, tc.want)
 			}
 		})
 	}

@@ -36,6 +36,13 @@ export async function createSecretAction(input: {
   value: string;
   scope: "project" | "environment";
   envVar: boolean;
+  /** Identifies the SUBMISSION this create belongs to (SIGMA-256). The form
+   *  mints it once and reuses it while the user retries, so a create the
+   *  control plane already committed — and whose response was lost at the proxy
+   *  — is replayed instead of executed a second time. A second execution is not
+   *  a duplicate row: it is a second round of config deployments and a second
+   *  restart wave across every resource consuming the secret. */
+  requestId?: string;
 }) {
   const { orgId, projectId, environmentId, resourceName } = await resourceScope(input.resourceId);
   // Create is Project Admin+ on THIS project (P2-7); a Developer is refused
@@ -57,7 +64,8 @@ export async function createSecretAction(input: {
       environmentId: input.scope === "environment" ? environmentId : "",
       envVar: input.envVar,
     },
-    { name: user.name, role }
+    { name: user.name, role },
+    input.requestId
   );
   await writeAudit({
     orgId,

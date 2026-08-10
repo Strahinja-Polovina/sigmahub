@@ -1538,17 +1538,41 @@ func resourceServiceCountTx(ctx context.Context, tx pgx.Tx, orgID, resourceID st
 // the predicate rejects — the deploy view then shows an empty log for the one
 // deployment whose failure you most need to read.
 func (s *Store) AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error {
+	return s.AppendDeployLogs(ctx, serverID, deploymentID, stream, []string{line})
+}
+
+// AppendDeployLogs appends a BATCH of lines as a single statement, with the same
+// scoping guarantee as AppendDeployLog.
+//
+// A build emits thousands of lines and the agent now ships them in batches
+// (SIGMA-252); running one INSERT — each with its own round trip and its own
+// correlated EXISTS subquery over deployments/resources — per line meant a
+// single build could occupy a connection for thousands of statements, and a
+// handful of concurrent builds was enough to saturate the pool on the
+// single-node deployment this product ships as. unnest turns the batch into one
+// statement and evaluates the ownership predicate once.
+//
+// WITH ORDINALITY + ORDER BY is not decoration: deploy_logs.id is the cursor the
+// deploy view's SSE stream pages on, so the insert order IS the order the
+// operator reads the build in. Without it the planner is free to hand back the
+// array's rows in any order and a build log arrives shuffled.
+func (s *Store) AppendDeployLogs(ctx context.Context, serverID, deploymentID, stream string, lines []string) error {
+	if len(lines) == 0 {
+		return nil
+	}
 	if stream == "" {
 		stream = "build"
 	}
 	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO deploy_logs (deployment_id, stream, line)
-		SELECT $2, $3, $4
+		SELECT $2, $3, l.line
+		  FROM unnest($4::text[]) WITH ORDINALITY AS l(line, ord)
 		 WHERE EXISTS (
 		   SELECT 1 FROM deployments d
 		     JOIN resources r ON r.id = d.resource_id
-		    WHERE d.id = $2 AND`+deploymentReporterClause+`)`,
-		serverID, deploymentID, stream, line)
+		    WHERE d.id = $2 AND`+deploymentReporterClause+`)
+		 ORDER BY l.ord`,
+		serverID, deploymentID, stream, lines)
 	return err
 }
 

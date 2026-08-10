@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -536,4 +538,64 @@ func TestBuildImageNixpacksSaysWhatIsMissing(t *testing.T) {
 			t.Fatal("nixpacks was executed despite not being on the host")
 		}
 	}
+}
+
+// TestBuildLogSinkBatches pins the batching invariant: a build that emits
+// thousands of output lines must not turn into thousands of separate sink
+// calls. Each sink call in production is one blocking HTTPS POST to the control
+// plane and one INSERT there, so a per-line sink adds a full round trip of
+// latency per line to a build Docker has already finished (SIGMA-252).
+func TestBuildLogSinkBatches(t *testing.T) {
+	const lineCount = 1000
+	var mu sync.Mutex
+	var calls, got int
+	docker := &lineEmittingBuilder{lines: lineCount}
+	b, _ := newTestBuilder(t, docker, nil)
+	b.sink = func(_ context.Context, _, _ string, lines []string) {
+		mu.Lock()
+		calls++
+		got += len(lines)
+		mu.Unlock()
+	}
+
+	dir := b.ContextDir("res_batch")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "res_batch", SHA: "abc1234", ImageTag: "sigmahub/res_batch:abc1234",
+		DeploymentID: "dep_batch",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls >= 20 {
+		t.Fatalf("%d build lines produced %d sink calls; expected them batched into well under 20", lineCount, calls)
+	}
+	// Batching must not LOSE lines — the whole point of the deploy log is that
+	// it is the complete build output.
+	if got != lineCount {
+		t.Fatalf("shipped %d lines, want all %d", got, lineCount)
+	}
+}
+
+// lineEmittingBuilder writes n newline-terminated lines to the build log writer,
+// the way Docker's build output arrives.
+type lineEmittingBuilder struct {
+	fakeImageBuilder
+	lines int
+}
+
+func (f *lineEmittingBuilder) ImageBuild(_ context.Context, _, _, _ string, logs io.Writer) error {
+	f.built = true
+	for i := 0; i < f.lines; i++ {
+		if _, err := io.WriteString(logs, "step output line "+strconv.Itoa(i)+"\n"); err != nil {
+			return err
+		}
+	}
+	return nil
 }

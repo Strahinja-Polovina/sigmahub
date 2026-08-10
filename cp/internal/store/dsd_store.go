@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -219,12 +221,13 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	var curHash string
 	var applyOK bool
 	var redriveCount int
+	var failedOps []string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO server_dsd (server_id, org_id, version, doc_hash)
 		VALUES ($1, $2, 0, '')
 		ON CONFLICT (server_id) DO UPDATE SET server_id = server_dsd.server_id
-		RETURNING version, doc_hash, applied_version, apply_ok, redrive_count`,
-		serverID, orgID).Scan(&curVersion, &curHash, &appliedVersion, &applyOK, &redriveCount)
+		RETURNING version, doc_hash, applied_version, apply_ok, redrive_count, apply_failed_ops`,
+		serverID, orgID).Scan(&curVersion, &curHash, &appliedVersion, &applyOK, &redriveCount, &failedOps)
 	if err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("lock dsd row: %w", err)
 	}
@@ -245,6 +248,20 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	// the cap we suppress and leave the failure visible on resources.status until a
 	// real config change (a new doc_hash) resets the budget.
 	if sameDoc && !converged && redriveCount >= maxDSDRedrive {
+		// …and tell somebody (SIGMA-247). Going quiet is the right thing to do to
+		// the version counter and the wrong thing to do to the operator: from here
+		// on the server heartbeats normally, its status stays 'running', and the
+		// ops in this document simply never apply. This is the last moment the CP
+		// knows that, so it is where the notice has to be raised.
+		//
+		// The dedup key carries the stuck VERSION, with an at-most-once-ever
+		// window. At the cap the version is frozen (nothing more is issued), so
+		// this fires exactly once per stuck document rather than once per 60s
+		// resync forever; a real config change resets the budget and any later
+		// stall is a different version, hence a new alert.
+		if err := s.alertApplyStuckTx(ctx, tx, orgID, serverID, curVersion, failedOps); err != nil {
+			return dsd.Signed{}, false, err
+		}
 		return dsd.Signed{}, false, tx.Commit(ctx)
 	}
 
@@ -268,7 +285,8 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE server_dsd
-		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, apply_ok = true, redrive_count = $6, updated_at = now()
+		   SET version = $2, doc = $3, signature = $4, doc_hash = $5, apply_ok = true, redrive_count = $6,
+		       apply_failed_ops = '{}', updated_at = now()
 		 WHERE server_id = $1`,
 		serverID, next, docJSON, sig, docHash, nextRedrive); err != nil {
 		return dsd.Signed{}, false, fmt.Errorf("update dsd: %w", err)
@@ -281,6 +299,38 @@ func (s *Store) StoreDSD(ctx context.Context, orgID, serverID string, ops []dsd.
 		return dsd.Signed{}, false, err
 	}
 	return dsd.Signed{Document: doc, Signature: sig}, true, nil
+}
+
+// alertApplyStuckTx raises the SIGMA-247 "this server has stopped converging"
+// notice inside the reconcile transaction, so it can never be lost between the
+// decision to stop re-driving and a separate notify step.
+//
+// The body names the failing op ids because they are the only actionable part:
+// "srv-3 is not converging" sends an operator hunting, "host:nftables:srv_3
+// failed" sends them to the firewall. The server NAME is looked up here rather
+// than threaded down from the reconciler — this path runs at most once per
+// stuck document, so one extra read costs nothing, and a body that says
+// "web-1" beats one that says "srv_9f3c1a2b".
+func (s *Store) alertApplyStuckTx(ctx context.Context, tx pgx.Tx, orgID, serverID string, version int64, failedOps []string) error {
+	var name string
+	if err := tx.QueryRow(ctx, `SELECT name FROM servers WHERE id = $1`, serverID).Scan(&name); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		name = serverID
+	}
+	detail := "no op ids were reported"
+	if len(failedOps) > 0 {
+		detail = strings.Join(failedOps, ", ")
+	}
+	body := fmt.Sprintf(
+		"%s has failed to apply desired-state version %d %d times; the control plane has stopped retrying it. "+
+			"The server is still reachable, so its status will keep reading healthy — but the ops below have not been applied "+
+			"and will not be retried until its configuration changes.\n\nFailing ops: %s",
+		name, version, maxDSDRedrive, detail)
+	return enqueueAlertTx(ctx, tx, orgID, AlertDSDApplyFailed,
+		fmt.Sprintf("dsdfail:%s:%d", serverID, version), 0,
+		"Server stopped converging: "+name, body)
 }
 
 // ResourceSpecsForServer returns the rows the reconciler renders a server's DSD
@@ -430,7 +480,13 @@ func (s *Store) AllServerIDs(ctx context.Context) ([]struct{ ServerID, OrgID str
 // map (SIGMA-117) — otherwise a failed host/proxy/volume.remove op would report
 // false convergence and never be retried. Returns false when the report was
 // superseded (ignored).
-func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool) (bool, error) {
+//
+// failedOps are the ids of the ops that did NOT apply (SIGMA-247). `converged`
+// alone is enough to drive the re-drive but tells an operator nothing about
+// WHAT is broken, so the ids are kept next to the flag, surfaced on the server
+// read model and named in the stuck-apply alert. Empty on a converged report,
+// which clears whatever was failing before.
+func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool, failedOps []string) (bool, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -454,8 +510,17 @@ func (s *Store) ApplyDSDStatus(ctx context.Context, serverID string, version int
 	if version < applied || version > issued {
 		return false, tx.Commit(ctx)
 	}
+	// Normalized to a non-nil slice so a converged report writes '{}' rather than
+	// SQL NULL into a NOT NULL column, and sorted because the caller collects them
+	// from a map — without this the same failure reads as a different set on every
+	// report and the dashboard flickers through permutations of one list.
+	if failedOps == nil {
+		failedOps = []string{}
+	}
+	sort.Strings(failedOps)
 	if _, err := tx.Exec(ctx,
-		`UPDATE server_dsd SET applied_version = $2, apply_ok = $3 WHERE server_id = $1`, serverID, version, converged); err != nil {
+		`UPDATE server_dsd SET applied_version = $2, apply_ok = $3, apply_failed_ops = $4 WHERE server_id = $1`,
+		serverID, version, converged, failedOps); err != nil {
 		return false, err
 	}
 	for resourceID, st := range opStatus {

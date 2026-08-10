@@ -553,7 +553,7 @@ func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
 
 	reported := json.RawMessage(`{"state":"failed","error":"ImagePullBackOff"}`)
 	if _, err := st.ApplyDSDStatus(ctx, cpServer, 1,
-		map[string]json.RawMessage{app.ID: reported}, false); err != nil {
+		map[string]json.RawMessage{app.ID: reported}, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	list, err := st.ListResources(ctx, orgID, envID)
@@ -583,7 +583,7 @@ func TestResourceStatusAcceptedFromTheHostThatRunsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.ApplyDSDStatus(ctx, stranger, 1,
-		map[string]json.RawMessage{app.ID: json.RawMessage(`{"state":"running"}`)}, true); err != nil {
+		map[string]json.RawMessage{app.ID: json.RawMessage(`{"state":"running"}`)}, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	list, _ = st.ListResources(ctx, orgID, envID)

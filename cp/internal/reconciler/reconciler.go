@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -57,10 +59,24 @@ type Reconciler struct {
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
+
+	// Observability hooks (SIGMA-248), both optional and both nil in tests.
+	// onResync reports each fleet-resync pass's outcome so a wedged resync is
+	// visible from outside the process; onRender times a single server's render,
+	// which sits on the agent's poll path and is therefore fleet-wide latency
+	// rather than one server's.
+	onResync func(error)
+	onRender func(time.Duration)
 }
 
 func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
+}
+
+// SetObservers installs the resync heartbeat and the render timer (SIGMA-248).
+// Called at boot before Run; either may be nil.
+func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Duration)) {
+	r.onResync, r.onRender = onResync, onRender
 }
 
 // SetACMEConfig installs the ACME issuance config rendered into proxy.traefik
@@ -385,7 +401,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
+	renderStart := time.Now()
 	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster, registry)
+	if r.onRender != nil {
+		r.onRender(time.Since(renderStart))
+	}
 	signed, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err
@@ -409,13 +429,52 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	return nil
 }
 
+// safeReconcile is Reconcile with a recover, so a panic quarantines ONE server
+// instead of the fleet (SIGMA-250).
+//
+// This is the only thing standing between a single malformed row and total
+// unavailability. HTTP handler panics are caught by net/http; the background
+// loops are not covered by anything, and the fleet resync walks every server in
+// one goroutine. A compose service graph of an unexpected shape, a cluster
+// membership with an empty role — anything that makes a render helper deref nil
+// or index past the end — killed the process for every tenant. Worse, it was
+// repeatable: the supervisor restarts, the resync reaches the same row 60
+// seconds later, and it dies again, so every org loses the dashboard, deploys,
+// backups, alerting and agent long-polls in a restart loop driven by one bad
+// row.
+//
+// The recover sits OUTSIDE Reconcile so Reconcile's own defers — most
+// importantly the advisory-lock unlock — still run as the stack unwinds; a
+// leaked lock would wedge that server's reconciles for good.
+//
+// The panic becomes an ordinary error, which means the caller treats it like
+// any other per-server failure: Run logs it and moves to the next server, and
+// the pass is reported as failed so the resync's last-success clock (SIGMA-248)
+// goes stale rather than a quarantined server being silently skipped. The stack
+// is logged with the org and server, because "the CP is fine but srv_x never
+// converges" is otherwise a very hard thing to explain.
+func (r *Reconciler) safeReconcile(ctx context.Context, orgID, serverID string) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.log.Error("reconcile panic — server quarantined, fleet continues",
+				"org", orgID, "server", serverID, "panic", p, "stack", string(debug.Stack()))
+			err = fmt.Errorf("panic reconciling server %s: %v", serverID, p)
+		}
+	}()
+	return r.Reconcile(ctx, orgID, serverID)
+}
+
 // ReconcileAsync runs Reconcile in the background (fire-and-forget from an API
 // handler that already returned) with its own short timeout.
 func (r *Reconciler) ReconcileAsync(orgID, serverID string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := r.Reconcile(ctx, orgID, serverID); err != nil {
+		// Recovered for the same reason as the resync, and more urgently: this
+		// goroutine has no caller left to return an error to, so an unrecovered
+		// panic here is a process exit triggered by whatever mutation an API
+		// handler just accepted.
+		if err := r.safeReconcile(ctx, orgID, serverID); err != nil {
 			r.log.Error("reconcile", "err", err, "server", serverID)
 		}
 	}()
@@ -434,14 +493,32 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 			servers, err := r.st.AllServerIDs(ctx)
 			if err != nil {
 				r.log.Error("resync: list servers", "err", err)
+				r.reportResync(err)
 				continue
 			}
+			// The pass's verdict for the heartbeat (SIGMA-248): the first server
+			// that failed to reconcile. A resync that could not converge some of
+			// the fleet has not done its job, and dating it as a success would
+			// hide exactly the state worth alerting on.
+			var passErr error
 			for _, sv := range servers {
-				if err := r.Reconcile(ctx, sv.OrgID, sv.ServerID); err != nil {
+				// safeReconcile, not Reconcile: one bad row must quarantine one
+				// server, not end the process for every tenant (SIGMA-250).
+				if err := r.safeReconcile(ctx, sv.OrgID, sv.ServerID); err != nil {
 					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)
+					if passErr == nil {
+						passErr = err
+					}
 				}
 			}
+			r.reportResync(passErr)
 		}
+	}
+}
+
+func (r *Reconciler) reportResync(err error) {
+	if r.onResync != nil {
+		r.onResync(err)
 	}
 }
 

@@ -47,6 +47,9 @@ const EVENT_LABELS: Record<string, string> = {
   // disconnect that did NOT finish, so the host is still running everything we
   // installed on it and somebody has to go and run the cleanup script.
   decommission_timed_out: "Decommission timed out (host not cleaned up)",
+  // SIGMA-247. The server is up and heartbeating; what stopped is its ability
+  // to apply what we asked for, and the control plane has given up retrying.
+  dsd_apply_failed: "Server stopped converging (apply keeps failing)",
   deploy_failed: "Deploy failed",
   backup_failed: "Backup failed",
   verify_failed: "Restore-verify failed",

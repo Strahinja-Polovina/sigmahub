@@ -242,3 +242,56 @@ describe("ResourceDetail telemetry states", () => {
     expect(screen.getByText(/Telemetry pipeline not configured/i)).toBeTruthy();
   });
 });
+
+describe("ResourceDetail host health", () => {
+  /** A resource whose host has gone quiet. There is no statusError — nothing
+   *  FAILED, the agent simply stopped answering — and an `llm` has no
+   *  Deployments tab, so before SIGMA-251 every surface on this page was empty
+   *  and none of them said why. */
+  const stuckOnDeadHost = () =>
+    makeDetail(
+      { kind: "llm", status: "provisioning", repo: null, domain: null, version: null },
+      {
+        server: {
+          id: "srv_1",
+          name: "web-01",
+          type: "gpu",
+          status: "unreachable",
+          lastSeenAt: "2026-08-01T08:00:00Z",
+        },
+      }
+    );
+
+  it("a provisioning resource on an unreachable server shows the host's status", () => {
+    renderCp({ detail: stuckOnDeadHost() });
+
+    // The banner names the host, says it stopped checking in, and says what
+    // that means for this resource — that nothing here converges until the
+    // agent comes back.
+    const banner = screen.getByText(/has not checked in/i);
+    expect(banner.textContent).toMatch(/web-01/);
+    expect(banner.textContent).toMatch(/converge/i);
+
+    // And it is a way OUT of this page: the fix is on the server, so the
+    // banner links to it rather than leaving the user to find it.
+    const link = screen.getByRole("link", { name: /web-01/ });
+    expect(link.getAttribute("href")).toBe("/dashboard/servers/srv_1");
+  });
+
+  it("a healthy host produces no banner", () => {
+    renderCp({
+      detail: makeDetail({}, { server: { id: "srv_1", name: "edge-1", type: "general", status: "running" } }),
+    });
+    expect(screen.queryByText(/has not checked in/i)).toBeNull();
+  });
+
+  it("a decommissioning host is called out too", () => {
+    renderCp({
+      detail: makeDetail(
+        { status: "provisioning" },
+        { server: { id: "srv_1", name: "edge-1", type: "general", status: "decommissioning" } }
+      ),
+    });
+    expect(screen.getByText(/being disconnected/i)).toBeTruthy();
+  });
+});
