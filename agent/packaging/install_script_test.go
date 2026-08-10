@@ -329,6 +329,87 @@ func isThirdPartyDownload(url string) bool {
 	return false
 }
 
+// The whole authenticity story of this installer rests on cosign, and cosign
+// itself was the one artifact fetched with no verification at all: a floating
+// `releases/latest` alias, curled to /usr/local/bin, chmod +x, run as root.
+//
+// Two failures, and the boring one is the likelier. Every onboarded host took
+// whatever sigstore's `latest` resolved to at that moment, with no record of
+// which version — so a breaking CLI change (--certificate-identity-regexp has
+// changed shape across cosign majors) turns every NEW onboarding into "cosign
+// verification failed — refusing to install", fleet-wide and instant, with no
+// change on the SigmaHub side to correlate against, and after the EXIT trap has
+// already spent the one-time bootstrap key. The sharper one: whoever can serve
+// that URL owns root on every host being onboarded, and the signature check that
+// would catch it is the very binary being installed.
+//
+// So: an exact version, and a sha256 checked BEFORE the binary is made
+// executable. The ordering is the point — a checksum verified after the binary
+// is installed and runnable is a log line, not a gate.
+func TestInstallerPinsCosignVersion(t *testing.T) {
+	src := readInstaller(t)
+
+	// Comments explain the alias this file used to fetch from; only what the
+	// shell executes counts, same rule as the download-base check above.
+	if i := indexOfLineMatching(src, regexp.MustCompile(`releases/latest`)); i >= 0 {
+		line := strings.Split(src, "\n")[i]
+		t.Errorf("install.sh fetches from a floating `latest` alias:\n  %s\n"+
+			"The root of this installer's trust chain must be a pinned version, or every host takes "+
+			"a different binary and no two onboardings are the same install.", strings.TrimSpace(line))
+	}
+
+	version := shellVar(t, src, "COSIGN_VERSION")
+	if !regexp.MustCompile(`^v\d+\.\d+\.\d+$`).MatchString(version) {
+		t.Errorf("COSIGN_VERSION is %q, want an exact tag like v2.6.1 — a range or an alias is not a pin", version)
+	}
+
+	// A pinned version alone still trusts whoever serves the bytes. The sha256
+	// is what makes the download self-checking, and it has to be spelled per
+	// architecture because the binaries differ.
+	for _, arch := range selfupdate.SupportedArches() {
+		name := "COSIGN_SHA256_" + strings.ToUpper(arch)
+		sum := shellVar(t, src, name)
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(sum) {
+			t.Errorf("%s is %q, want a 64-hex sha256 of cosign-linux-%s at %s", name, sum, arch, version)
+		}
+	}
+
+	// Ordering: the checksum gate must come before anything that makes the
+	// downloaded file executable.
+	// Matched on a line that names cosign, so the release archive's own
+	// `sha256sum -c` further down cannot stand in for this one.
+	verify := indexOfLineMatching(src, regexp.MustCompile(`cosign.*sha256sum -c`))
+	runnable := indexOfLineMatching(src, regexp.MustCompile(`(chmod \+x|install -m 0755).*cosign`))
+	if verify < 0 {
+		t.Fatal("install.sh never sha256-checks the cosign binary it downloads, so the root of the " +
+			"trust chain is whatever the network handed over")
+	}
+	if runnable < 0 {
+		t.Fatal("install.sh no longer installs cosign in a shape this guard recognises; " +
+			"re-point it rather than deleting it")
+	}
+	if verify > runnable {
+		t.Errorf("install.sh makes cosign executable (line %d) before checking its sha256 (line %d) — "+
+			"a checksum after the fact is a log line, not a gate", runnable+1, verify+1)
+	}
+}
+
+// indexOfLineMatching returns the 0-based index of the first EXECUTED line
+// matching re, skipping comments — this file explains its URLs in prose, and a
+// comment describing a command is not the command.
+func indexOfLineMatching(src string, re *regexp.Regexp) int {
+	for i, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if re.MatchString(trimmed) {
+			return i
+		}
+	}
+	return -1
+}
+
 // Both scripts are executed by root on a machine the operator has just handed
 // us, and until this file existed nothing in any suite so much as parsed them: a
 // stray quote ships in a release asset and the failure is a half-configured host

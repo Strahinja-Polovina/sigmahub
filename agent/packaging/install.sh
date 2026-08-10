@@ -151,6 +151,16 @@ ensure_tool restic restic
 # account of our repository's visibility. A host firewalled off from them could
 # not have installed Docker before this change either.
 #
+# They are NOT equally trusted, though, and the difference matters. cosign is
+# pinned to a version and checked against a sha256 below, because it is the root
+# of this file's trust chain — everything else here is verified BY it. nixpacks
+# and get.docker.com are still `curl | sh` of a script whose content changes
+# under a stable URL, so there is no digest to pin; closing those means distro
+# packages (Docker's apt repository) or vendoring, which is a bigger change than
+# this file. Known gap, written down rather than implied: nixpacks is
+# non-fatal-by-design, and Docker's installer is the same one its own
+# documentation tells operators to pipe into a shell.
+#
 # nixpacks builds a repo that carries no Dockerfile — the wizard's answer to
 # "this repository does not say how to build itself". Without it the auto-build
 # method the dashboard offers fails on the host with "executable file not
@@ -162,11 +172,52 @@ if ! need nixpacks; then
   curl -fsSL https://nixpacks.com/install.sh | bash \
     || echo "warning: could not install nixpacks; repositories with no Dockerfile cannot be auto-built on this host"
 fi
-# cosign is required to verify the release before we run it.
+# cosign is required to verify the release before we run it, which makes it the
+# ROOT of this file's trust chain and the one download nothing downstream can
+# check. It used to be fetched from the floating `releases/latest` alias with no
+# version, no checksum and no signature, straight into /usr/local/bin, chmod +x,
+# run as root. Two things were wrong with that, and the boring one is the more
+# likely:
+#
+#   - Every host took whatever `latest` resolved to at that moment, with no
+#     record of which version. cosign's verify-blob flags have changed shape
+#     across majors (--certificate-identity-regexp among them), so the day
+#     sigstore ships one, EVERY new onboarding fails at "cosign verification
+#     failed — refusing to install" — fleet-wide, instant, with nothing changed
+#     on the SigmaHub side to correlate against, and after the EXIT trap has
+#     already spent the one-time bootstrap key. The operator must re-issue a
+#     token per host and cannot self-diagnose.
+#   - Whoever can serve that URL owns root on every host being onboarded, and
+#     the signature check that would catch it is the binary being installed.
+#
+# So: an exact tag, and the sha256 of the published binary checked BEFORE the
+# file is made executable. The digests are sigstore's own, from
+# cosign_checksums.txt of the pinned release; bumping the version means bumping
+# both, and install_script_test.go fails the commit that bumps one without the
+# other. Read the checksums for a new tag from:
+#   https://github.com/sigstore/cosign/releases/download/<tag>/cosign_checksums.txt
+COSIGN_VERSION="v2.6.1"
+COSIGN_SHA256_AMD64="064954c5d8c7e3b28188eee5b1727b31c411550bc5fefd41aa672d3c761d103a"
+COSIGN_SHA256_ARM64="56a16480bdd56ec789abaa65924402f6b92c0041f06885995853c05567b76f34"
 if ! need cosign; then
-  echo "installing cosign..."
-  curl -fsSL "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-${arch}" -o /usr/local/bin/cosign
-  chmod +x /usr/local/bin/cosign
+  echo "installing cosign ${COSIGN_VERSION}..."
+  case "${arch}" in
+    amd64) cosign_sha="${COSIGN_SHA256_AMD64}" ;;
+    arm64) cosign_sha="${COSIGN_SHA256_ARM64}" ;;
+    # Unreachable behind the SUPPORTED_ARCHES gate above, and deliberately fatal
+    # rather than falling through to an unverified download: an architecture
+    # added to that list without a digest here must stop the install, not
+    # quietly lose the check.
+    *) die "no pinned cosign checksum for ${arch}; add COSIGN_SHA256_$(echo "${arch}" | tr '[:lower:]' '[:upper:]') to install.sh" ;;
+  esac
+  cosign_bin="$(mktemp)"
+  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${arch}" -o "${cosign_bin}"
+  echo "${cosign_sha}  ${cosign_bin}" | sha256sum -c - >/dev/null 2>&1 \
+    || { rm -f "${cosign_bin}"; die "cosign ${COSIGN_VERSION} did not match its pinned sha256 — refusing to install an unverified verifier"; }
+  # install(1) rather than mv+chmod: the file becomes executable and lands in
+  # PATH in one step, AFTER the digest matched.
+  install -m 0755 "${cosign_bin}" /usr/local/bin/cosign
+  rm -f "${cosign_bin}"
 fi
 
 # --- Docker Engine (install if absent) ----------------------------------------
