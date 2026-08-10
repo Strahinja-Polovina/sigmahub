@@ -120,6 +120,10 @@ type Server struct {
 	// unit tests → telemetry endpoints answer "not configured".
 	telemetry *telemetry.Forwarder
 	tel       TelemetryAPI
+	// telMeta memoises resource label lookups across ingest batches (SIGMA-333),
+	// so the highest-frequency request the control plane serves stops re-asking
+	// the database for an answer that does not change.
+	telMeta *telemetryMetaCache
 	// alertSender test-fires alert channels (P2-6); nil → test endpoint 503s.
 	alertSender AlertSender
 	// Billing (P2-4). billing is the store slice; paddle is the outbound
@@ -292,6 +296,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		s3Engines:           opts.S3Engines,
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
+		telMeta:             newTelemetryMetaCache(),
 		alertSender:         opts.AlertSender,
 		billing:             opts.Billing,
 		paddle:              opts.Paddle,
