@@ -79,6 +79,7 @@ import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 import { DatabasePanel } from "./database-panel";
 import { S3Panel } from "./s3-panel";
+import { LlmPanel } from "./llm-panel";
 import { ComposeServicesPanel, type PlacementServer } from "./compose-services-panel";
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
@@ -86,6 +87,7 @@ import type {
   CpHealthCheck,
   CpDatabaseInfo,
   CpS3Info,
+  CpLLMInfo,
   CpComposeServices,
   CpBackupTarget,
   CpBackupRun,
@@ -434,6 +436,7 @@ export function ResourceDetail({
   deploymentsEnabled = false,
   database = null,
   s3 = null,
+  llm = null,
   compose = null,
   placementServers = [],
   backupTargets = [],
@@ -470,6 +473,11 @@ export function ResourceDetail({
   database?: CpDatabaseInfo | null;
   /** P2-1 S3 endpoint metadata (CP mode, s3 kind only). */
   s3?: CpS3Info | null;
+  /** A deployed model's inference endpoint (CP mode, llm kind only). Without it
+   *  the page showed a Running badge and nothing else — no host, no port, no
+   *  model id, no URL — for a model whose port the control plane allocates, so
+   *  it could not even be guessed (SIGMA-303). */
+  llm?: CpLLMInfo | null;
   /** Compose service graph + placement (CP mode, multi-service apps only). */
   compose?: CpComposeServices | null;
   /** Servers a compose service may be placed on. */
@@ -831,6 +839,7 @@ export function ResourceDetail({
                   simulated={!isCp}
                 />
               )}
+              {llm && <LlmPanel info={llm} />}
               {s3 && orgId && (
                 <S3Panel
                   orgId={orgId}

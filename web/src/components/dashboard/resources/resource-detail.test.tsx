@@ -334,3 +334,35 @@ describe("ResourceDetail honors ?tab", () => {
     expect(activeTab()).toBe("Overview");
   });
 });
+
+describe("ResourceDetail LLM endpoint", () => {
+  const llmInfo = {
+    engine: "vllm",
+    model: "meta-llama/Llama-3.1-8B-Instruct",
+    image: "vllm/vllm-openai:v0.6.3",
+    host: "10.8.0.37",
+    port: 15002,
+    endpoint: "http://10.8.0.37:15002/v1",
+  };
+
+  it("an llm resource renders its endpoint URL and port", () => {
+    renderCp({
+      detail: makeDetail({ kind: "llm", name: "llama", repo: null, domain: null }),
+      llm: llmInfo,
+    });
+
+    // The port is allocated by the control plane from MESH_PORT_BASE upward, so
+    // a user cannot guess it; without this panel a successfully deployed model
+    // was unreachable through any path the product offers (SIGMA-303).
+    expect(screen.getByText("http://10.8.0.37:15002/v1")).toBeTruthy();
+    expect(screen.getByText("meta-llama/Llama-3.1-8B-Instruct")).toBeTruthy();
+    expect(screen.getByText("15002")).toBeTruthy();
+    expect(screen.getByText("10.8.0.37")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Copy Endpoint/i })).toBeTruthy();
+  });
+
+  it("a resource with no llm payload renders no endpoint panel", () => {
+    renderCp();
+    expect(screen.queryByText(/OpenAI-compatible/i)).toBeNull();
+  });
+});

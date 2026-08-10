@@ -1442,6 +1442,47 @@ export async function cpGetS3(orgId: string, resourceId: string): Promise<CpS3In
   }
 }
 
+// ── Model endpoints (SIGMA-303) ─────────────────────────────────────────────
+
+/** A deployed model's inference endpoint, as the control plane renders it from
+ *  the engine definition + the port it allocated. Same shape as store.LLMInfo. */
+export type CpLLMInfo = {
+  engine: string;
+  model: string;
+  image: string;
+  /** Mesh IP; empty until the host finishes WireGuard enrollment. */
+  host: string;
+  port: number;
+  /** The full OpenAI-compatible base URL, e.g. http://10.8.0.37:15002/v1. */
+  endpoint: string;
+};
+
+/**
+ * A model endpoint's readout — the only place the product can tell a user where
+ * their model is actually listening.
+ *
+ * The port is allocated by the control plane from MESH_PORT_BASE upward, so it
+ * is not derivable from anything the user chose: before this the whole LLM
+ * wizard could be walked to a running vLLM container and the resource page then
+ * showed a green badge and no host, no port, no model id and no URL. A 404 is a
+ * normal answer (a resource that is not an llm, or one whose endpoint row has
+ * not been created yet) and degrades to null, exactly as cpGetDatabase and
+ * cpGetS3 do; any other failure is surfaced so the page can say the read failed
+ * rather than imply there is nothing to show.
+ */
+export async function cpGetLLM(orgId: string, resourceId: string): Promise<CpLLMInfo | null> {
+  try {
+    return await cpFetch<CpLLMInfo>(
+      `${org(orgId)}/resources/${encodeURIComponent(resourceId)}/llm`,
+      undefined, { orgId });
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Control plane 404")) {
+      return null;
+    }
+    throw err;
+  }
+}
+
 export async function cpRevealS3Connection(
   orgId: string,
   resourceId: string,

@@ -14,9 +14,11 @@ import {
   cpListBackupTargets,
   cpListBackupRuns,
   cpListGitConnectionsWithMaps,
+  cpGetLLM,
   type CpDatabaseInfo,
   type CpHealthCheck,
   type CpS3Info,
+  type CpLLMInfo,
   type CpBackupTarget,
   type CpBackupRun,
 } from "@/server/cp";
@@ -152,6 +154,24 @@ async function loadS3(
   return attempt(failures, "endpoint details", () => getS3Info({ orgId, resourceId }), null);
 }
 
+/** Load a model endpoint's readout (SIGMA-303).
+ *
+ *  Control plane only, and deliberately: the endpoint is a real port allocated
+ *  on a real GPU host from MESH_PORT_BASE upward, so there is nothing offline to
+ *  derive it from the way demoS3Info derives an S3 endpoint. A CP failure goes
+ *  into loadFailures rather than degrading to null, because "no endpoint" and
+ *  "we could not read the endpoint" are the two things a user acting on this
+ *  page must not confuse — the first reads as a model that never came up. */
+async function loadLLM(
+  failures: LoadFailures,
+  orgId: string,
+  resourceId: string,
+  kind: string
+): Promise<CpLLMInfo | null> {
+  if (!cpEnabled() || kind !== "llm") return null;
+  return attempt(failures, "endpoint details", () => cpGetLLM(orgId, resourceId), null);
+}
+
 /** The live per-resource failure the agent reported (mesh bind, image pull,
  *  health-check timeout…). The web mirror only stores a coarse status string,
  *  so the actionable reason lives in the CP resource's status object — surface
@@ -273,6 +293,7 @@ export default async function ResourceDetailPage({
   );
   const database = await loadDatabase(loadFailures, orgId, resourceId, detail.resource.kind);
   const s3 = await loadS3(loadFailures, orgId, resourceId, detail.resource.kind);
+  const llm = await loadLLM(loadFailures, orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null, loadFailures);
   // Telemetry reports its own read failure into loadFailures like every other
   // loader here — an unreachable control plane must not render as "the pipeline
@@ -350,6 +371,7 @@ export default async function ResourceDetailPage({
       deploymentsEnabled={cpEnabled() && detail.resource.kind === "app"}
       database={database}
       s3={s3}
+      llm={llm}
       compose={compose}
       placementServers={placementServers}
       backupTargets={backups.targets}
