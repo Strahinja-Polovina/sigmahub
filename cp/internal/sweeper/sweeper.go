@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/supervise"
 )
 
 type Store interface {
@@ -66,6 +67,10 @@ func (c Config) beat(err error) {
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run it in a goroutine.
+//
+// Each sweep runs under supervise.Pass, so a panic in one iteration abandons
+// that iteration instead of terminating the control plane for every tenant
+// (SIGMA-250), and is reported through the heartbeat like any other failure.
 func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -74,74 +79,79 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// passErr is the sweep's verdict: the FIRST failure of any step, kept
-			// so the heartbeat below reports a partial sweep as a failure. A pass
-			// that pruned metrics but could not flip stale servers has not done
-			// its job, and reporting success for it would put a fresh timestamp on
-			// a loop that is half broken — precisely the reading this is meant to
-			// prevent.
-			var passErr error
-			fail := func(err error) {
-				if passErr == nil {
-					passErr = err
-				}
-			}
-			if n, err := st.MarkStaleUnreachable(ctx, cfg.StaleAfter); err != nil {
-				log.Error("sweeper: mark unreachable", "err", err)
-				fail(err)
-			} else if n > 0 {
-				log.Info("sweeper: servers marked unreachable", "count", n)
-			}
-			if n, err := st.PruneMetrics(ctx, cfg.Retention); err != nil {
-				log.Error("sweeper: prune metrics", "err", err)
-				fail(err)
-			} else if n > 0 {
-				log.Info("sweeper: metrics pruned", "count", n)
-			}
-			if cfg.DeployTimeout > 0 {
-				if n, err := st.TimeoutStaleDeployments(ctx, cfg.DeployTimeout); err != nil {
-					log.Error("sweeper: timeout stale deployments", "err", err)
-					fail(err)
-				} else if n > 0 {
-					log.Info("sweeper: deployments timed out", "count", n)
-				}
-			}
-			if cfg.DecommissionTimeout > 0 {
-				if timedOut, err := st.TimeoutStaleDecommissions(ctx, cfg.DecommissionTimeout); err != nil {
-					log.Error("sweeper: timeout stale decommissions", "err", err)
-					fail(err)
-				} else {
-					for _, d := range timedOut {
-						// Per-server, at warn: the machine still has our binary,
-						// unit, tunnel and containers on it. This line is no
-						// longer the only thing that says so — the store enqueues
-						// a decommission_timed_out alert in the same transaction
-						// as the tombstone (SIGMA-233), because stdout on the
-						// control plane is shipped nowhere and this is the one
-						// ending of a disconnect that leaves a live host behind
-						// without anybody choosing it. The actor is included so
-						// the log agrees with the notification the person who
-						// pressed Disconnect just received.
-						log.Warn("sweeper: decommission timed out; server removed without agent confirmation",
-							"server", d.ServerID, "org", d.OrgID, "name", d.Name, "actor", d.Actor)
-					}
-				}
-			}
-			// Retention for the append-only growth tables (SIGMA-249). Last in the
-			// pass, because everything above it is fleet HEALTH and this is
-			// housekeeping: a sweep that is short on time should flip stale servers
-			// before it retires old log lines.
-			if cfg.Retain.Any() {
-				if deleted, err := st.PruneRetained(ctx, cfg.Retain); err != nil {
-					log.Error("sweeper: prune retained", "err", err)
-					fail(err)
-				} else {
-					for table, n := range deleted {
-						log.Info("sweeper: rows pruned", "table", table, "count", n)
-					}
-				}
-			}
-			cfg.beat(passErr)
+			cfg.beat(supervise.Pass(log, "sweeper", func() error {
+				return sweep(ctx, log, st, cfg)
+			}))
 		}
 	}
+}
+
+// sweep is one pass. It returns the sweep's verdict: the FIRST failure of any
+// step, so the heartbeat reports a partial sweep as a failure. A pass that pruned metrics
+// but could not flip stale servers has not done its job, and reporting success
+// for it would put a fresh timestamp on a loop that is half broken — precisely
+// the reading this is meant to prevent.
+func sweep(ctx context.Context, log *slog.Logger, st Store, cfg Config) error {
+	var passErr error
+	fail := func(err error) {
+		if passErr == nil {
+			passErr = err
+		}
+	}
+	if n, err := st.MarkStaleUnreachable(ctx, cfg.StaleAfter); err != nil {
+		log.Error("sweeper: mark unreachable", "err", err)
+		fail(err)
+	} else if n > 0 {
+		log.Info("sweeper: servers marked unreachable", "count", n)
+	}
+	if n, err := st.PruneMetrics(ctx, cfg.Retention); err != nil {
+		log.Error("sweeper: prune metrics", "err", err)
+		fail(err)
+	} else if n > 0 {
+		log.Info("sweeper: metrics pruned", "count", n)
+	}
+	if cfg.DeployTimeout > 0 {
+		if n, err := st.TimeoutStaleDeployments(ctx, cfg.DeployTimeout); err != nil {
+			log.Error("sweeper: timeout stale deployments", "err", err)
+			fail(err)
+		} else if n > 0 {
+			log.Info("sweeper: deployments timed out", "count", n)
+		}
+	}
+	if cfg.DecommissionTimeout > 0 {
+		if timedOut, err := st.TimeoutStaleDecommissions(ctx, cfg.DecommissionTimeout); err != nil {
+			log.Error("sweeper: timeout stale decommissions", "err", err)
+			fail(err)
+		} else {
+			for _, d := range timedOut {
+				// Per-server, at warn: the machine still has our binary,
+				// unit, tunnel and containers on it. This line is no
+				// longer the only thing that says so — the store enqueues
+				// a decommission_timed_out alert in the same transaction
+				// as the tombstone (SIGMA-233), because stdout on the
+				// control plane is shipped nowhere and this is the one
+				// ending of a disconnect that leaves a live host behind
+				// without anybody choosing it. The actor is included so
+				// the log agrees with the notification the person who
+				// pressed Disconnect just received.
+				log.Warn("sweeper: decommission timed out; server removed without agent confirmation",
+					"server", d.ServerID, "org", d.OrgID, "name", d.Name, "actor", d.Actor)
+			}
+		}
+	}
+	// Retention for the append-only growth tables (SIGMA-249). Last in the
+	// pass, because everything above it is fleet HEALTH and this is
+	// housekeeping: a sweep that is short on time should flip stale servers
+	// before it retires old log lines.
+	if cfg.Retain.Any() {
+		if deleted, err := st.PruneRetained(ctx, cfg.Retain); err != nil {
+			log.Error("sweeper: prune retained", "err", err)
+			fail(err)
+		} else {
+			for table, n := range deleted {
+				log.Info("sweeper: rows pruned", "table", table, "count", n)
+			}
+		}
+	}
+	return passErr
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/supervise"
 )
 
 // deliverySendTimeout caps a single alert delivery so one slow channel can't
@@ -79,17 +80,24 @@ func Run(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Confi
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var passErr error
-			if time.Since(lastCertScan) >= cfg.CertScanEvery {
-				lastCertScan = time.Now()
-				if err := st.EnqueueCertExpiringAlerts(ctx, cfg.CertExpiryWindow); err != nil {
-					log.Error("alerts: cert expiry scan", "err", err)
-					passErr = err
+			// Supervised (SIGMA-250): a panic while rendering or sending one
+			// delivery abandons this drain instead of terminating the control
+			// plane for every tenant. The outbox rows survive — a claimed row's
+			// lease expires and a later drain reclaims it — so nothing is lost.
+			passErr := supervise.Pass(log, "alert_dispatcher", func() error {
+				var err error
+				if time.Since(lastCertScan) >= cfg.CertScanEvery {
+					lastCertScan = time.Now()
+					if serr := st.EnqueueCertExpiringAlerts(ctx, cfg.CertExpiryWindow); serr != nil {
+						log.Error("alerts: cert expiry scan", "err", serr)
+						err = serr
+					}
 				}
-			}
-			if err := drain(ctx, log, st, snd, cfg); err != nil && passErr == nil {
-				passErr = err
-			}
+				if derr := drain(ctx, log, st, snd, cfg); derr != nil && err == nil {
+					err = derr
+				}
+				return err
+			})
 			if cfg.Heartbeat != nil {
 				cfg.Heartbeat(passErr)
 			}

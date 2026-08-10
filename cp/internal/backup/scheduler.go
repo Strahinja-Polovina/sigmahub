@@ -8,6 +8,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/supervise"
 )
 
 // Store is the slice of the persistence layer the scheduler needs.
@@ -60,29 +62,39 @@ func Run(ctx context.Context, log *slog.Logger, st Store, rec Reconciler, cfg Co
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// passErr keeps the FIRST failure of the pass so the heartbeat reports
-			// a half-done sweep as failed: a tick that timed out stale runs but
-			// enqueued none of the due ones has not scheduled anybody's backups.
-			var passErr error
-			servers, err := st.CreateDueBackupRuns(ctx, time.Now())
-			if err != nil {
-				log.Error("backup scheduler: enqueue", "err", err)
-				passErr = err
-			}
-			for _, sv := range servers {
-				rec.ReconcileAsync(sv.OrgID, sv.ServerID)
-			}
-			if n, err := st.TimeoutStaleBackupRuns(ctx, cfg.RunTimeout, cfg.QueueTimeout); err != nil {
-				log.Error("backup scheduler: timeout sweep", "err", err)
-				if passErr == nil {
-					passErr = err
-				}
-			} else if n > 0 {
-				log.Warn("backup scheduler: timed out stale runs", "count", n)
-			}
+			// Supervised (SIGMA-250): a panic in one sweep abandons that sweep
+			// instead of terminating the control plane for every tenant.
+			err := supervise.Pass(log, "backup_scheduler", func() error {
+				return sweep(ctx, log, st, rec, cfg)
+			})
 			if cfg.Heartbeat != nil {
-				cfg.Heartbeat(passErr)
+				cfg.Heartbeat(err)
 			}
 		}
 	}
+}
+
+// sweep is one pass. The returned error is the FIRST failure of the pass, so
+// the heartbeat reports a half-done sweep as failed: a tick that timed out
+// stale runs but enqueued none of the due ones has not scheduled anybody's
+// backups.
+func sweep(ctx context.Context, log *slog.Logger, st Store, rec Reconciler, cfg Config) error {
+	var passErr error
+	servers, err := st.CreateDueBackupRuns(ctx, time.Now())
+	if err != nil {
+		log.Error("backup scheduler: enqueue", "err", err)
+		passErr = err
+	}
+	for _, sv := range servers {
+		rec.ReconcileAsync(sv.OrgID, sv.ServerID)
+	}
+	if n, err := st.TimeoutStaleBackupRuns(ctx, cfg.RunTimeout, cfg.QueueTimeout); err != nil {
+		log.Error("backup scheduler: timeout sweep", "err", err)
+		if passErr == nil {
+			passErr = err
+		}
+	} else if n > 0 {
+		log.Warn("backup scheduler: timed out stale runs", "count", n)
+	}
+	return passErr
 }

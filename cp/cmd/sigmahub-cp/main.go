@@ -27,6 +27,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/reconciler"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/supervise"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/sweeper"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
 )
@@ -229,16 +230,19 @@ func runDeployDrain(ctx context.Context, log *slog.Logger, st *store.Store, rec 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			refs, err := st.DrainDeployRequests(ctx)
-			if err != nil {
-				log.Error("deploy drain", "err", err)
-				beat.Report(err)
-				continue
-			}
-			for _, r := range refs {
-				rec.ReconcileAsync(r.OrgID, r.ServerID)
-			}
-			beat.Report(nil)
+			// Supervised (SIGMA-250): a panic in one drain abandons that drain
+			// rather than terminating the control plane for every tenant.
+			beat.Report(supervise.Pass(log, "deploy_drain", func() error {
+				refs, err := st.DrainDeployRequests(ctx)
+				if err != nil {
+					log.Error("deploy drain", "err", err)
+					return err
+				}
+				for _, r := range refs {
+					rec.ReconcileAsync(r.OrgID, r.ServerID)
+				}
+				return nil
+			}))
 		}
 	}
 }
@@ -450,39 +454,43 @@ func run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// The pass's verdict for the heartbeat: the first step that failed.
-				// All four steps meter or bill, so a pass that ran three of them is
-				// a pass that under-reported somebody's usage.
-				var passErr error
-				fail := func(err error) {
-					if passErr == nil {
-						passErr = err
+				// Supervised (SIGMA-250): a panic here abandons this pass rather
+				// than terminating the control plane for every tenant. The pass's
+				// verdict for the heartbeat is the FIRST step that failed — all
+				// four meter or bill, so a pass that ran three of them is a pass
+				// that under-reported somebody's usage.
+				usageBeat.Report(supervise.Pass(log, "usage_sweep", func() error {
+					var passErr error
+					fail := func(err error) {
+						if passErr == nil {
+							passErr = err
+						}
 					}
-				}
-				if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
-					log.Error("usage sweep", "err", err)
-					fail(err)
-				}
-				// P2-4: the time-integrated connected-server meter billing reads.
-				if _, err := st.SweepServerHours(ctx, time.Now()); err != nil {
-					log.Error("server-hours sweep", "err", err)
-					fail(err)
-				}
-				// SIGMA-65: enqueue a daily per-bucket storage measurement so the
-				// object-storage meter stays current.
-				if _, err := st.SweepS3Measure(ctx, time.Now()); err != nil {
-					log.Error("s3 measure sweep", "err", err)
-					fail(err)
-				}
-				// SIGMA-171: turn the meter into an invoice — push the current
-				// billable-server count to any subscription that has drifted.
-				if n, err := quantitySync.Sync(ctx, time.Now()); err != nil {
-					log.Error("billing quantity sync", "err", err)
-					fail(err)
-				} else if n > 0 {
-					log.Info("billing quantity synced", "subscriptions", n)
-				}
-				usageBeat.Report(passErr)
+					if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
+						log.Error("usage sweep", "err", err)
+						fail(err)
+					}
+					// P2-4: the time-integrated connected-server meter billing reads.
+					if _, err := st.SweepServerHours(ctx, time.Now()); err != nil {
+						log.Error("server-hours sweep", "err", err)
+						fail(err)
+					}
+					// SIGMA-65: enqueue a daily per-bucket storage measurement so the
+					// object-storage meter stays current.
+					if _, err := st.SweepS3Measure(ctx, time.Now()); err != nil {
+						log.Error("s3 measure sweep", "err", err)
+						fail(err)
+					}
+					// SIGMA-171: turn the meter into an invoice — push the current
+					// billable-server count to any subscription that has drifted.
+					if n, err := quantitySync.Sync(ctx, time.Now()); err != nil {
+						log.Error("billing quantity sync", "err", err)
+						fail(err)
+					} else if n > 0 {
+						log.Info("billing quantity synced", "subscriptions", n)
+					}
+					return passErr
+				}))
 			}
 		}
 	}()
