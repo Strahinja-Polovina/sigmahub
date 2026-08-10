@@ -600,3 +600,245 @@ func TestBillableQuantityAgreesAcrossSummaryAndSync(t *testing.T) {
 			smallSummary.BillableUnits, smallSummary.Amount, smallSummary.Currency, want)
 	}
 }
+
+// ── SIGMA-321: the billed-quantity statement, executed ─────────────────────
+
+// seedPaddleSubscription puts an org_billing row in a known state (the sweep
+// reads status, paddle_subscription_id and quantity from it).
+func seedPaddleSubscription(t *testing.T, st *store.Store, orgID, subID, status string, qty int) {
+	t.Helper()
+	if err := st.UpsertSubscription(context.Background(), orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_" + orgID, SubscriptionID: subID,
+		Status: status, Quantity: qty,
+	}, "test"); err != nil {
+		t.Fatalf("seed subscription %s: %v", orgID, err)
+	}
+}
+
+// quantityDriftFor runs the fleet-wide sweep and picks out one org's row, so
+// each sub-test below can seed its own org and assert on it in isolation.
+func quantityDriftFor(t *testing.T, st *store.Store, orgID string, now time.Time) (store.SubscriptionDrift, bool) {
+	t.Helper()
+	rows, err := st.SubscriptionsNeedingQuantitySync(context.Background(), now)
+	if err != nil {
+		t.Fatalf("SubscriptionsNeedingQuantitySync: %v", err)
+	}
+	for _, d := range rows {
+		if d.OrgID == orgID {
+			return d, true
+		}
+	}
+	return store.SubscriptionDrift{}, false
+}
+
+// wantDrift asserts the sweep returns a row for the org with the given
+// billed/want pair.
+func wantDrift(t *testing.T, st *store.Store, orgID string, now time.Time, billed, want int) {
+	t.Helper()
+	d, ok := quantityDriftFor(t, st, orgID, now)
+	if !ok {
+		t.Fatalf("%s: sweep returned no drift; want billed %d → %d", orgID, billed, want)
+	}
+	if d.Billed != billed || d.Want != want {
+		t.Fatalf("%s: sweep says billed %d → %d, want billed %d → %d",
+			orgID, d.Billed, d.Want, billed, want)
+	}
+}
+
+// wantNoDrift asserts the org is absent from the sweep.
+func wantNoDrift(t *testing.T, st *store.Store, orgID string, now time.Time) {
+	t.Helper()
+	if d, ok := quantityDriftFor(t, st, orgID, now); ok {
+		t.Fatalf("%s: sweep wants to re-price (billed %d → %d) but must not", orgID, d.Billed, d.Want)
+	}
+}
+
+// TestSubscriptionsNeedingQuantitySync_Drift executes the billed-quantity
+// statement itself against real Postgres (SIGMA-321).
+//
+// Everything AROUND this query was covered and the query itself was not.
+// billingsync.Sync has four tests, all against a fake store that returns a
+// canned slice and never touches SQL; the two integration tests that do call
+// SubscriptionsNeedingQuantitySync (TestBillableQuantityAgreesAcrossSummaryAndSync)
+// only ever assert that a particular org is ABSENT from the result. So a sweep
+// that returned nothing at all passed the whole suite: mistyping the drift
+// predicate `want <> quantity` as `want < quantity` — a sweep that re-prices
+// shrinking fleets but never growing ones — was green everywhere it ran. It is
+// silent in production too: the ticker in main.go sees no error, so every
+// affected customer's Paddle subscription simply freezes at its last-synced
+// quantity and is under-charged indefinitely.
+//
+// Each sub-test therefore asserts what the sweep RETURNS, one per branch of the
+// statement: both arms of the GREATEST high-water mark, the weight CASE that is
+// spliced in twice under two different aliases (sv and sv2), the free-tier
+// subtraction and its floor, the status filter, and all three legs of the
+// debounce.
+func TestSubscriptionsNeedingQuantitySync_Drift(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// (1) Scale-up. Six live general servers = 6 units, three of them free, so
+	// the subscription should carry 3 while Paddle still bills 1.
+	t.Run("scale up is re-priced", func(t *testing.T) {
+		org := "org_qs_up"
+		for i := 0; i < 6; i++ {
+			connectServer(t, st, org, fmt.Sprintf("up-%d", i))
+		}
+		seedPaddleSubscription(t, st, org, "sub_up", "active", 1)
+		wantDrift(t, st, org, now, 1, 3)
+	})
+
+	// (2) Scale-down INSIDE the 24h window. The high-water mark is what the
+	// customer is billed on, so servers that were metered in the last day still
+	// count even after they are deleted. This is the arm of the GREATEST that
+	// runs through `JOIN servers sv2 ON sv2.id = d.server_id` — a join that
+	// deliberately does NOT filter deleted_at. Adding that filter (or dropping
+	// the join) would let an org that deletes its fleet at 09:00 stop paying for
+	// the hours it already used.
+	t.Run("scale down inside the window keeps the high-water mark", func(t *testing.T) {
+		org := "org_qs_down"
+		var ids []string
+		for i := 0; i < 6; i++ {
+			ids = append(ids, connectServer(t, st, org, fmt.Sprintf("down-%d", i)))
+		}
+		if _, err := st.SweepServerHours(ctx, now.Add(-6*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids[:5] {
+			if err := st.DeleteServer(ctx, org, id, "admin"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seedPaddleSubscription(t, st, org, "sub_down", "active", 1)
+		// Live fleet is 1 unit; the window still holds 6. GREATEST wins → 3.
+		wantDrift(t, st, org, now, 1, 3)
+	})
+
+	// (3) A scale-down that has aged OUT of the window falls back to the live
+	// fleet — the high-water mark is a 24h memory, not a permanent one.
+	t.Run("scale down outside the window drops to the live fleet", func(t *testing.T) {
+		org := "org_qs_stale"
+		var ids []string
+		for i := 0; i < 6; i++ {
+			ids = append(ids, connectServer(t, st, org, fmt.Sprintf("stale-%d", i)))
+		}
+		if _, err := st.SweepServerHours(ctx, now.Add(-30*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids[:5] {
+			if err := st.DeleteServer(ctx, org, id, "admin"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seedPaddleSubscription(t, st, org, "sub_stale", "active", 3)
+		// 1 live unit, nothing left in the window → GREATEST(1, 0) = 1 unit,
+		// which is inside the free tier, so the floor holds it at the minimum.
+		wantDrift(t, st, org, now, 3, store.SubscriptionMinQuantity)
+	})
+
+	// (4) An org at or below the free tier. A subscription cannot go to zero —
+	// SubscriptionMinQuantity is what keeps it alive in Paddle — so the floor
+	// must clamp the negative free-tier subtraction rather than let it through.
+	t.Run("free tier clamps to the subscription minimum", func(t *testing.T) {
+		org := "org_qs_free"
+		connectServer(t, st, org, "free-1")
+		connectServer(t, st, org, "free-2")
+		seedPaddleSubscription(t, st, org, "sub_free", "active", 5)
+		// 2 units − 3 free = −1, floored at SubscriptionMinQuantity.
+		wantDrift(t, st, org, now, 5, store.SubscriptionMinQuantity)
+
+		// Already at the floor → nothing to do.
+		atFloor := "org_qs_free_ok"
+		connectServer(t, st, atFloor, "ok-1")
+		seedPaddleSubscription(t, st, atFloor, "sub_free_ok", "active", store.SubscriptionMinQuantity)
+		wantNoDrift(t, st, atFloor, now)
+	})
+
+	// (5) Only live subscriptions are re-priced. A canceled or past_due org must
+	// never have its quantity PATCHed — that is a write against a subscription
+	// the customer is in the middle of leaving or failing to pay for — and an
+	// org that never checked out has no subscription id to PATCH at all.
+	t.Run("canceled, past_due and never-subscribed orgs are skipped", func(t *testing.T) {
+		for _, tc := range []struct{ org, sub, status string }{
+			{"org_qs_canceled", "sub_canceled", "canceled"},
+			{"org_qs_pastdue", "sub_pastdue", "past_due"},
+			{"org_qs_nosub", "", "active"},
+		} {
+			for i := 0; i < 8; i++ {
+				connectServer(t, st, tc.org, fmt.Sprintf("skip-%d", i))
+			}
+			seedPaddleSubscription(t, st, tc.org, tc.sub, tc.status, 1)
+			wantNoDrift(t, st, tc.org, now)
+		}
+	})
+
+	// (6) Server types are weighted, and weighted IDENTICALLY on both arms of
+	// the GREATEST. unitWeightSQL is rendered twice — once over sv.type and once
+	// over sv2.type — and the two copies have to agree, or an org's bill jumps
+	// the moment a weighted server is deleted and the sweep switches arms.
+	t.Run("both arms weight server types the same", func(t *testing.T) {
+		org := "org_qs_weights"
+		connectServer(t, st, org, "w-app-1")
+		connectServer(t, st, org, "w-app-2")
+		gpu := connectTypedServer(t, st, org, "w-gpu-1", "gpu")
+		seedPaddleSubscription(t, st, org, "sub_weights", "active", 1)
+		// Live arm: 1 + 1 + 4 = 6 units → 3 billable.
+		wantDrift(t, st, org, now, 1, 3)
+
+		// Meter the fleet and delete the GPU box. The live arm now sees 2 units;
+		// the window arm has to weight the deleted GPU at 4 through its own copy
+		// of the CASE for the answer to stay 3.
+		if _, err := st.SweepServerHours(ctx, now.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteServer(ctx, org, gpu, "admin"); err != nil {
+			t.Fatal(err)
+		}
+		wantDrift(t, st, org, now, 1, 3)
+	})
+
+	// (7) The debounce. A quantity we just pushed is trusted for
+	// quantitySyncDebounce so the sweep does not PATCH Paddle every 10 minutes
+	// while waiting for the confirming webhook — but only while the quantity we
+	// pushed is still the quantity we want. All three legs matter: invert the
+	// timestamp comparison and the sweep either hammers Paddle forever or goes
+	// permanently silent after its first push.
+	t.Run("debounce", func(t *testing.T) {
+		org := "org_qs_debounce"
+		for i := 0; i < 6; i++ {
+			connectServer(t, st, org, fmt.Sprintf("deb-%d", i))
+		}
+		seedPaddleSubscription(t, st, org, "sub_debounce", "active", 1)
+		wantDrift(t, st, org, now, 1, 3) // quantity_synced_at IS NULL → always due
+
+		markSynced := func(qty int, at time.Time) {
+			t.Helper()
+			if _, err := st.Pool.Exec(ctx,
+				`UPDATE org_billing SET synced_quantity = $2, quantity_synced_at = $3 WHERE org_id = $1`,
+				org, qty, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Just pushed the quantity we still want → debounced.
+		markSynced(3, now)
+		wantNoDrift(t, st, org, now)
+
+		// Exactly ON the boundary. The clause is a strict `<`, so a row stamped
+		// precisely at now−debounce is still inside the window.
+		markSynced(3, now.Add(-30*time.Minute))
+		wantNoDrift(t, st, org, now)
+
+		// One second past it → due again, so a PATCH that Paddle silently
+		// dropped is retried instead of being trusted forever.
+		markSynced(3, now.Add(-30*time.Minute-time.Second))
+		wantDrift(t, st, org, now, 1, 3)
+
+		// Inside the window but the pushed quantity is NOT what we want now —
+		// the fleet moved again since the last push, so the debounce must not
+		// hold. (synced_quantity IS DISTINCT FROM want.)
+		markSynced(2, now)
+		wantDrift(t, st, org, now, 1, 3)
+	})
+}
