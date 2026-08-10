@@ -39,8 +39,19 @@ import {
   testAlertChannel,
 } from "@/server/actions/alerts";
 import type { CpAlertChannel } from "@/server/cp";
+import type { AlertEvent } from "@/lib/server-catalog.generated";
 
-const EVENT_LABELS: Record<string, string> = {
+// One label per event in the control plane's vocabulary — and the type says
+// EVERY event, not "some strings" (SIGMA-274).
+//
+// It was Record<string, string>, so it was free to enumerate a subset, and it
+// did: payment_failed had no entry and the rules editor rendered its raw
+// snake_case key beside sentence-case neighbours. On a billing-enabled
+// deployment that is the one alert a paying customer most wants to turn on, and
+// it looked like a leaked internal identifier. Keyed on AlertEvent — a union
+// rendered from store.AlertEvents by the catalog generator — the next event
+// added on the Go side is a `tsc --noEmit` failure right here instead.
+export const EVENT_LABELS: Record<AlertEvent, string> = {
   server_unreachable: "Server unreachable",
   server_recovered: "Server recovered",
   // SIGMA-233. Worth its own words rather than the raw event key: this is the
@@ -55,7 +66,21 @@ const EVENT_LABELS: Record<string, string> = {
   verify_failed: "Restore-verify failed",
   cert_failed: "Certificate issuance failed",
   cert_expiring: "Certificate expiring",
+  // Billing (P2-4). The subscription's payment did not go through, which on a
+  // billing-enabled deployment ends with the org losing access — so it is named
+  // in terms of the consequence, not of the webhook that reported it.
+  payment_failed: "Payment failed",
 };
+
+/** Label for an event that may not be one this build knows.
+ *
+ *  The chips are rendered from the list the control plane serves at runtime, so
+ *  a dashboard talking to a NEWER control plane will meet events that were not
+ *  in the catalog it was built from. Showing the key is honest; showing
+ *  "undefined" is not. */
+export function alertEventLabel(event: string): string {
+  return EVENT_LABELS[event as AlertEvent] ?? event;
+}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : "Please try again.";
@@ -209,7 +234,7 @@ export function AlertsTab({ orgId, isAdmin }: { orgId: string; isAdmin: boolean 
                       } ${isAdmin ? "cursor-pointer hover:border-primary/40" : "cursor-default"}`}
                       title={on ? "Click to mute" : "Click to enable"}
                     >
-                      {EVENT_LABELS[ev] ?? ev}
+                      {alertEventLabel(ev)}
                     </button>
                   );
                 })}

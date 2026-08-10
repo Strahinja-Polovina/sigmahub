@@ -6,7 +6,8 @@
 // catalog at cp/internal/store/server_catalog.go, together with the kinds a
 // cluster refuses (cp/internal/store/clusters.go) and the engine catalogs the
 // managed-data panels describe themselves from (cp/internal/store/db_engines.go
-// and cp/internal/store/s3_engines.go).
+// and cp/internal/store/s3_engines.go) and the alert event vocabulary the rules
+// editor labels (cp/internal/store/alerts_store.go).
 //
 // Editing this file by hand re-creates the defect SIGMA-198 removed: a
 // dashboard offering server types the API rejects. Change the Go catalog and
@@ -21,7 +22,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "10822a5ef8b927ad3044ff6eee074e9caae703a1915b6b9a6d59aba21cc8123f";
+export const CATALOG_SOURCE_SHA256 = "51c85b46f6346662251c0eb840a89aaf9a218482660295ee9a35793ab8dfb1b2";
 
 export type ServerType =
   | "general"
@@ -66,6 +67,26 @@ export type DatabaseEngine =
 export type S3Engine =
   | "minio"
   | "seaweedfs";
+
+/** An alert event the control plane can emit (store.AlertEvents).
+ *
+ *  A union rather than a string list, because the dashboard's rules editor
+ *  labels these and its label map used to enumerate a SUBSET: payment_failed
+ *  had none, so the eighth chip rendered as raw snake_case beside seven
+ *  sentence-case ones, on a billing-enabled deployment, with every suite green
+ *  (SIGMA-274). Typed as a union, an event added on the Go side fails
+ *  tsc --noEmit at the label map that forgot it. */
+export type AlertEvent =
+  | "server_unreachable"
+  | "server_recovered"
+  | "decommission_timed_out"
+  | "dsd_apply_failed"
+  | "deploy_failed"
+  | "backup_failed"
+  | "verify_failed"
+  | "cert_failed"
+  | "cert_expiring"
+  | "payment_failed";
 
 /** One precondition a host must meet to enroll as a type. The fact field names
  *  the agent-reported datum it is checked against, so a host that never
@@ -480,6 +501,14 @@ export const S3_ENGINE_CATALOG: Record<S3Engine, S3EngineSpec> = {
 export const S3_ENGINE_NAMES: S3Engine[] = ["minio", "seaweedfs"];
 /** What an s3 resource provisions when its spec names no engine. */
 export const DEFAULT_S3_ENGINE: S3Engine = "minio";
+
+/** Every alert event, in the order the control plane serves them
+ *  (GET /orgs/{id}/alert-channels answers with exactly this list). The rules
+ *  editor renders the runtime list, not this one — a dashboard talking to a
+ *  newer control plane must still show an event it has never heard of — but
+ *  this is what its label map is keyed on, so the labels cannot fall behind
+ *  the vocabulary in silence. */
+export const ALERT_EVENTS: AlertEvent[] = ["server_unreachable", "server_recovered", "decommission_timed_out", "dsd_apply_failed", "deploy_failed", "backup_failed", "verify_failed", "cert_failed", "cert_expiring", "payment_failed"];
 
 /** The first mesh-bound host port the control plane's per-server allocator
  *  hands out (store.MeshPortBase). A managed engine is reachable on an

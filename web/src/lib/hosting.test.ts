@@ -66,6 +66,12 @@ const GENERATED = join("src", "lib", "server-catalog.generated.ts");
 // control plane — postgres:17-alpine against a pin of 16.6, minio/minio:latest
 // against an agent that refuses floating tags — and a version bump on the Go
 // side is exactly the edit this list has to make visible here.
+//
+// alerts_store.go joined when the alert event vocabulary started being rendered
+// as a union (SIGMA-274). The dashboard's rules editor labels those events and
+// its label map enumerated a subset — payment_failed rendered as raw snake_case
+// — so an event the web cannot see change is, again, the same failure wearing a
+// different hat.
 const CATALOG_SOURCES = [
   "server_catalog.go",
   "server_catalog_ts.go",
@@ -73,6 +79,7 @@ const CATALOG_SOURCES = [
   "clusters.go",
   "db_engines.go",
   "s3_engines.go",
+  "alerts_store.go",
 ];
 
 describe("the generated catalog tracks the control plane", () => {

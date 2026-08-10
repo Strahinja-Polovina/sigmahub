@@ -24,7 +24,7 @@ import (
 // go:generate, cwd = this package) and the package's own tests resolve them
 // from there.
 //
-// All SIX, not just the catalog: the generated module also embeds the billing
+// All SEVEN, not just the catalog: the generated module also embeds the billing
 // constants from billing.go, the cluster exclusion list from clusters.go, the
 // engine catalogs from db_engines.go and s3_engines.go, and every literal the
 // renderer itself writes. With only the catalog hashed, changing
@@ -51,6 +51,18 @@ import (
 // not announce itself at all. The engine catalogs are deliberately NOT that:
 // they live in files of their own (the S3 one was split out of s3.go for this),
 // so a query edit beside them cannot cost a regenerate.
+//
+// alerts_store.go is here for the same reason as clusters.go, and at the same
+// cost. The alert event vocabulary (AlertEvents) is served to the dashboard as
+// a plain string list, and the dashboard's label map enumerated a SUBSET of it:
+// payment_failed had no label, so the rules editor rendered a raw
+// "payment_failed" chip beside seven sentence-case ones and nothing anywhere
+// failed (SIGMA-274). Rendering the vocabulary as a union makes the label map a
+// total Record, so the omission is a tsc error at the point of the omission.
+// The cost is that an unrelated edit in this file — a new query, a fixed scan —
+// moves the digest and asks for a regenerate that changes no rendered byte;
+// that failure names the command that fixes it, whereas an unlabelled event
+// does not announce itself at all.
 var CatalogSourceFiles = []string{
 	"server_catalog.go",    // the canonical catalog: types, matrix, requirements
 	"server_catalog_ts.go", // the renderer — its literals are output too
@@ -58,6 +70,7 @@ var CatalogSourceFiles = []string{
 	"clusters.go",          // the kinds a cluster refuses
 	"db_engines.go",        // database images, URL shapes, the mesh port base
 	"s3_engines.go",        // object-storage images and endpoint shapes
+	"alerts_store.go",      // the alert event vocabulary the rules editor labels
 }
 
 // CatalogSourceDigest returns the hex sha256 over the given sources, in the
