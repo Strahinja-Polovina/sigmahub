@@ -19,13 +19,22 @@
 package deploy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-const deployStagingWorkflow = "../../.github/workflows/deploy-staging.yml"
+const (
+	deployStagingWorkflow = "../../.github/workflows/deploy-staging.yml"
+	releaseWorkflow       = "../../.github/workflows/release.yml"
+	goreleaserConfig      = "../../.goreleaser.yaml"
+)
 
 func readFileForTest(t *testing.T, path string) string {
 	t.Helper()
@@ -82,4 +91,137 @@ func TestStagingRolloutIsGatedOnTheWebToControlPlanePath(t *testing.T) {
 			t.Errorf("the rollout polls %s but web/src/app/api/health/route.ts does not exist: %v", webPoll[1], err)
 		}
 	}
+}
+
+// Every file goreleaser hashes into checksums.txt must be readable by the
+// release job's `sha256sum -c` (SIGMA-271, and SIGMA-156 before it).
+//
+// goreleaser hashes checksum.extra_files at their SOURCE paths and lists them in
+// checksums.txt by basename, but does not copy them into dist/. So the verify
+// step has to stage them itself, and when it did that from a hardcoded list —
+// a second copy of extra_files — the two forked the moment a fourth file was
+// added to one and not the other. The consequence is nastier than a missing
+// file: goreleaser has already published the release by then, so the tag ships
+// and the workflow goes red, which teaches a maintainer to ignore a red release
+// run. That is the state in which a genuinely corrupted artifact goes unnoticed.
+//
+// The workflow now stages by looking each name in checksums.txt up in the tree,
+// so there is no second list to fork. This test runs that staging code — the
+// real lines, read out of the workflow — against a synthetic dist/ built from
+// the real extra_files, which is the only way to know it resolves all of them
+// rather than merely looking like it would.
+func TestReleaseVerifyStagesEveryChecksummedExtraFile(t *testing.T) {
+	extras := goreleaserExtraFiles(t)
+	if len(extras) == 0 {
+		t.Fatal("no checksum.extra_files parsed out of .goreleaser.yaml")
+	}
+
+	// A tree shaped like the repo at release time: the extra files at their
+	// source paths, and a dist/ holding an archive plus checksums.txt.
+	root := t.TempDir()
+	dist := filepath.Join(root, "dist")
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	archive := filepath.Join(dist, "sigmahub-cp_9.9.9_linux_amd64.tar.gz")
+	if err := os.WriteFile(archive, []byte("not really a tarball"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines = append(lines, checksumLine(t, archive))
+	for _, rel := range extras {
+		src := filepath.Join("../..", rel)
+		body, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf(".goreleaser.yaml hashes %s, which does not exist: %v", rel, err)
+		}
+		dst := filepath.Join(root, filepath.Clean(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, checksumLine(t, dst))
+	}
+	if err := os.WriteFile(filepath.Join(dist, "checksums.txt"),
+		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", "-euo", "pipefail", "-c", releaseStagingScript(t))
+	cmd.Dir = dist
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the release workflow's verify step cannot check every file it hashes: %v\n%s", err, out)
+	}
+	for _, rel := range extras {
+		name := filepath.Base(rel)
+		if _, err := os.Stat(filepath.Join(dist, name)); err != nil {
+			t.Errorf("%s is hashed into checksums.txt but never staged into dist/", name)
+		}
+	}
+}
+
+// goreleaserExtraFiles reads the `glob:` entries under checksum.extra_files.
+// Hand-parsed rather than through a YAML library: the control plane has no YAML
+// dependency and this block is two nesting levels of plain list.
+func goreleaserExtraFiles(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	inChecksum, inExtras := false, false
+	glob := regexp.MustCompile(`^\s+- glob:\s*(\S+)`)
+	for _, line := range strings.Split(readFileForTest(t, goreleaserConfig), "\n") {
+		switch {
+		case strings.HasPrefix(line, "checksum:"):
+			inChecksum = true
+		case line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "#"):
+			// A new top-level key ends the block; `release:` has extra_files too
+			// and those are NOT hashed, so leaving on this line matters.
+			inChecksum, inExtras = false, false
+		case inChecksum && strings.Contains(line, "extra_files:"):
+			inExtras = true
+		case inExtras:
+			if m := glob.FindStringSubmatch(line); m != nil {
+				out = append(out, m[1])
+			} else if strings.TrimSpace(line) != "" && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+				inExtras = false
+			}
+		}
+	}
+	return out
+}
+
+// releaseStagingScript lifts the staging + verification lines out of the release
+// workflow so the test exercises what CI will actually run, not a paraphrase of
+// it. The cosign verify-blob above them needs a signature this test cannot
+// produce, so the extract starts at the staging loop.
+func releaseStagingScript(t *testing.T) string {
+	t.Helper()
+	lines := strings.Split(readFileForTest(t, releaseWorkflow), "\n")
+	start, end := -1, -1
+	for i, line := range lines {
+		if start < 0 && strings.Contains(line, "while read -r _ name") {
+			start = i
+		}
+		if start >= 0 && strings.Contains(line, "sha256sum -c checksums.txt") {
+			end = i
+			break
+		}
+	}
+	if start < 0 || end < 0 {
+		t.Fatalf("could not find the staging loop in %s — if the verify step was rewritten, "+
+			"this test must be pointed at the new shape rather than deleted", releaseWorkflow)
+	}
+	return strings.Join(lines[start:end+1], "\n")
+}
+
+func checksumLine(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	// sha256sum's own format: hash, two spaces, name.
+	return fmt.Sprintf("%s  %s", hex.EncodeToString(sum[:]), filepath.Base(path))
 }
