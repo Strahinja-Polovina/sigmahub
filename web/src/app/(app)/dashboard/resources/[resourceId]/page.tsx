@@ -300,8 +300,15 @@ export default async function ResourceDetailPage({
       : Promise.resolve(null),
     cpEnabled()
       ? attempt(loadFailures, "the server list", async () =>
-          (await cpListServers(orgId)).map((sv) => ({ id: sv.id, name: sv.name, type: sv.type })),
-        [] as { id: string; name: string; type: string }[])
+          (await cpListServers(orgId)).map((sv) => ({
+            id: sv.id,
+            name: sv.name,
+            type: sv.type,
+            // Carried so the restore dialogs can refuse a dead target
+            // (SIGMA-241) instead of queueing an op nobody will poll for.
+            status: sv.status,
+          })),
+        [] as { id: string; name: string; type: string; status: string }[])
       : Promise.resolve([]),
   ]);
 

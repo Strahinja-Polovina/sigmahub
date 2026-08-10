@@ -29,7 +29,9 @@ import type { CpComposeService } from "@/server/cp";
 
 const HOME = "__home__";
 
-export type PlacementServer = { id: string; name: string; type: string };
+/** `status` rides along because the same org server list is offered as a
+ *  restore target, where an unreachable host has to be refusable (SIGMA-241). */
+export type PlacementServer = { id: string; name: string; type: string; status?: string };
 
 /**
  * Per-service placement for a Compose app.

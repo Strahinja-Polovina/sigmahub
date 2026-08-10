@@ -63,6 +63,100 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : "Please try again.";
 }
 
+/** A server a restore may be provisioned onto. Structurally the org server list
+ *  the resource page already loads; `status` is what makes a target refusable. */
+export type RestoreTargetServer = {
+  id: string;
+  name: string;
+  type?: string;
+  status?: string;
+};
+
+/** Server states in which nothing will ever act on a queued restore, and the
+ *  half-sentence that explains each one to the operator. */
+const DEAD_TARGET_REASON: Record<string, string> = {
+  unreachable: "is unreachable — the control plane stopped hearing from its agent, so nothing there will pick the restore up",
+  decommissioning: "is being decommissioned — its agent is tearing itself down and will not run new work",
+};
+
+/**
+ * Decide what "Queue restore" should do, given the server the operator picked.
+ *
+ * SIGMA-241: both restore dialogs used to take the SOURCE resource's serverId
+ * and pass it straight through, with no way to say otherwise. The one scenario
+ * a restore-into-a-new-database exists for is a host that died — and in that
+ * scenario the source's server is exactly the machine that cannot run the
+ * restore. The control plane accepted the request, provisioned (and billed) a
+ * fresh database, wrote the op into a desired-state document nobody was
+ * polling, and the operator watched a restore that had never started fail to
+ * finish, with no error because nothing had failed.
+ *
+ * So: the dialogs pick a target, and a target that cannot act is refused HERE,
+ * before a resource is provisioned, with a reason that names the host. An id
+ * the org server list does not contain is deferred to the control plane rather
+ * than refused — the list is a page-load read that can fail, and a stale local
+ * list must not be the thing that blocks a restore.
+ */
+export function planRestoreTarget(
+  targetServerId: string,
+  servers: RestoreTargetServer[]
+): { ok: true; serverId: string } | { ok: false; reason: string } {
+  const id = targetServerId.trim();
+  if (!id) {
+    return { ok: false, reason: "Choose the server to restore onto." };
+  }
+  const target = servers.find((s) => s.id === id);
+  if (!target) return { ok: true, serverId: id };
+  const why = target.status ? DEAD_TARGET_REASON[target.status] : undefined;
+  if (why) {
+    return {
+      ok: false,
+      reason: `${target.name} ${why}. Pick a server that is running — the backups themselves are fine.`,
+    };
+  }
+  return { ok: true, serverId: id };
+}
+
+/** The target picker shared by both restore dialogs. */
+function RestoreTargetField({
+  id,
+  servers,
+  value,
+  onChange,
+  sourceServerId,
+}: {
+  id: string;
+  servers: RestoreTargetServer[];
+  value: string;
+  onChange: (v: string) => void;
+  sourceServerId: string | null;
+}) {
+  return (
+    <div className="grid gap-1.5">
+      <Label htmlFor={id}>Restore onto</Label>
+      <Select value={value} onValueChange={(v) => onChange(v ?? "")}>
+        <SelectTrigger id={id} className="w-full">
+          <SelectValue placeholder="Choose a server…" />
+        </SelectTrigger>
+        <SelectContent>
+          {servers.map((sv) => (
+            <SelectItem key={sv.id} value={sv.id}>
+              {sv.name}
+              {sv.id === sourceServerId ? " · current host" : ""}
+              {sv.status && sv.status !== "running" ? ` · ${sv.status}` : ""}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <p className="text-xs text-muted-foreground">
+        Defaults to the source database’s host. When that host is gone, aim the
+        restore at its replacement — the snapshots are in your bucket, not on the
+        dead machine.
+      </p>
+    </div>
+  );
+}
+
 function RunStatus({ status }: { status: string }) {
   switch (status) {
     case "success":
@@ -178,23 +272,37 @@ function RestoreDialog({
   resourceId,
   environmentId,
   serverId,
+  servers,
   sourceName,
 }: {
   orgId: string;
   resourceId: string;
   environmentId: string;
-  serverId: string;
+  serverId: string | null;
+  servers: RestoreTargetServer[];
   sourceName: string;
 }) {
   const router = useRouter();
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState(`${sourceName}-restore`);
+  const [target, setTarget] = React.useState(serverId ?? "");
   const [pending, startTransition] = React.useTransition();
 
   function submit() {
+    const plan = planRestoreTarget(target, servers);
+    if (!plan.ok) {
+      toast.error("Can’t restore onto that server", { description: plan.reason });
+      return;
+    }
     startTransition(async () => {
       try {
-        const out = await restoreDatabase({ orgId, resourceId, name, environmentId, serverId });
+        const out = await restoreDatabase({
+          orgId,
+          resourceId,
+          name,
+          environmentId,
+          serverId: plan.serverId,
+        });
         toast.success("Restore queued", {
           description: `Loading the latest snapshot into ${out.resource.name}.`,
         });
@@ -225,12 +333,21 @@ function RestoreDialog({
             source database is untouched.
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-1.5">
-          <Label htmlFor="restore-name">New resource name</Label>
-          <Input id="restore-name" value={name} onChange={(e) => setName(e.target.value)} />
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="restore-name">New resource name</Label>
+            <Input id="restore-name" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <RestoreTargetField
+            id="restore-target"
+            servers={servers}
+            value={target}
+            onChange={setTarget}
+            sourceServerId={serverId}
+          />
         </div>
         <DialogFooter>
-          <Button onClick={submit} disabled={pending || !name.trim()}>
+          <Button onClick={submit} disabled={pending || !name.trim() || !target}>
             {pending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCcw className="size-4" />}
             Queue restore
           </Button>
@@ -256,13 +373,15 @@ function RestorePITRDialog({
   resourceId,
   environmentId,
   serverId,
+  servers,
   sourceName,
   maxWalAt,
 }: {
   orgId: string;
   resourceId: string;
   environmentId: string;
-  serverId: string;
+  serverId: string | null;
+  servers: RestoreTargetServer[];
   sourceName: string;
   maxWalAt: string;
 }) {
@@ -270,11 +389,17 @@ function RestorePITRDialog({
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState(`${sourceName}-pitr`);
   const [when, setWhen] = React.useState(toLocalInput(maxWalAt));
+  const [target, setTarget] = React.useState(serverId ?? "");
   const [pending, startTransition] = React.useTransition();
 
   function submit() {
     if (!when) {
       toast.error("Pick a recovery time");
+      return;
+    }
+    const plan = planRestoreTarget(target, servers);
+    if (!plan.ok) {
+      toast.error("Can’t restore onto that server", { description: plan.reason });
       return;
     }
     const targetTime = new Date(when).toISOString();
@@ -285,7 +410,7 @@ function RestorePITRDialog({
           resourceId,
           name,
           environmentId,
-          serverId,
+          serverId: plan.serverId,
           targetTime,
         });
         toast.success("Point-in-time restore queued", {
@@ -337,9 +462,16 @@ function RestorePITRDialog({
               archived WAL. Earlier times replay less.
             </p>
           </div>
+          <RestoreTargetField
+            id="pitr-target"
+            servers={servers}
+            value={target}
+            onChange={setTarget}
+            sourceServerId={serverId}
+          />
         </div>
         <DialogFooter>
-          <Button onClick={submit} disabled={pending || !name.trim() || !when}>
+          <Button onClick={submit} disabled={pending || !name.trim() || !when || !target}>
             {pending ? <Loader2 className="size-4 animate-spin" /> : <History className="size-4" />}
             Queue recovery
           </Button>
@@ -362,6 +494,7 @@ export function DatabaseBackupsPanel({
   targets: initialTargets,
   runs: initialRuns,
   canManage,
+  servers = [],
   engine,
   pitrWindow,
 }: {
@@ -374,6 +507,10 @@ export function DatabaseBackupsPanel({
   targets: CpBackupTarget[];
   runs: CpBackupRun[];
   canManage: boolean;
+  /** Servers a restore may be provisioned onto (SIGMA-241). Empty means the
+   *  org server list could not be read; the restore then falls back to the
+   *  source's own server, which is the old behaviour. */
+  servers?: RestoreTargetServer[];
   /** Engine kind — PITR is offered for postgres only (P2-5). */
   engine?: string;
   /** WAL high-water mark: the newest point a PITR restore can currently reach. */
@@ -427,6 +564,12 @@ export function DatabaseBackupsPanel({
 
   const hasTarget = Boolean(policy?.targetId);
   const hasSuccess = runs.some((r) => r.kind === "backup" && r.status === "success");
+  // SIGMA-241: the restore controls used to be gated on the SOURCE resource
+  // having a serverId, which deleted the entire restore path in the one state
+  // it exists for — a database whose host is gone. What a restore actually
+  // needs is somewhere to land: the source's server, or any server the dialog
+  // can aim at.
+  const canRestore = canManage && hasSuccess && (Boolean(serverId) || servers.length > 0);
 
   return (
     <Card>
@@ -444,12 +587,13 @@ export function DatabaseBackupsPanel({
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
-            {canManage && serverId && hasSuccess && (
+            {canRestore && (
               <RestoreDialog
                 orgId={orgId}
                 resourceId={resourceId}
                 environmentId={environmentId}
                 serverId={serverId}
+                servers={servers}
                 sourceName={resourceName}
               />
             )}
@@ -540,16 +684,19 @@ export function DatabaseBackupsPanel({
                     ? `Recoverable up to ${new Date(pitrWindow.lastWalAt).toLocaleString("en-GB")} (last archived segment ${pitrWindow.lastWalSegment ?? "—"}).`
                     : "Waiting for the first WAL segment to ship — the recovery window opens once archiving reports in."}
                 </p>
-                {canManage && serverId && pitrWindow?.lastWalAt && (
-                  <RestorePITRDialog
-                    orgId={orgId}
-                    resourceId={resourceId}
-                    environmentId={environmentId}
-                    serverId={serverId}
-                    sourceName={resourceName}
-                    maxWalAt={pitrWindow.lastWalAt}
-                  />
-                )}
+                {canManage &&
+                  (Boolean(serverId) || servers.length > 0) &&
+                  pitrWindow?.lastWalAt && (
+                    <RestorePITRDialog
+                      orgId={orgId}
+                      resourceId={resourceId}
+                      environmentId={environmentId}
+                      serverId={serverId}
+                      servers={servers}
+                      sourceName={resourceName}
+                      maxWalAt={pitrWindow.lastWalAt}
+                    />
+                  )}
               </div>
             )}
           </div>

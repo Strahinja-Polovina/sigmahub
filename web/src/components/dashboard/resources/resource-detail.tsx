@@ -745,6 +745,10 @@ export function ResourceDetail({
                   targets={backupTargets}
                   runs={backupRuns}
                   canManage={canManage}
+                  // The org's servers double as restore targets: a restore has
+                  // to be aimable somewhere other than the source's own host,
+                  // which is exactly the machine that just died (SIGMA-241).
+                  servers={placementServers ?? []}
                   engine={database.engine}
                   pitrWindow={{
                     lastWalAt: database.lastWalAt,
