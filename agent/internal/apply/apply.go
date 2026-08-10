@@ -56,15 +56,32 @@ func (r *Registry) Apply(ctx context.Context, log *slog.Logger, j *Journal, doc 
 		}
 
 		// Dependent of a failed/skipped prerequisite → skip.
+		//
+		// The skip carries WHICH prerequisite broke and ITS error (SIGMA-301).
+		// This matters far beyond tidiness: most of a deploy pipeline's ops
+		// (image.pull, volume.ensure, network.ensure) map to no deploy phase in
+		// the CP, so the only op whose status the operator ever sees is the
+		// dependent rollout — and a bare "prerequisite failed" turned a registry
+		// 401, a volume-name collision or a full disk into a deploy that failed
+		// for no stated reason, recoverable only by SSHing to the host and
+		// reading the agent journal. Naming the dep and quoting its error fixes
+		// the message for every op kind at once, including the ops the CP has no
+		// other route for.
 		skip := false
+		skipErr := "prerequisite failed"
 		for _, dep := range op.DependsOn {
 			if failed[dep] {
 				skip = true
+				if prev := results[dep]; prev.Err != "" {
+					skipErr = fmt.Sprintf("prerequisite %s failed: %s", dep, prev.Err)
+				} else {
+					skipErr = fmt.Sprintf("prerequisite %s failed", dep)
+				}
 				break
 			}
 		}
 		if skip {
-			res := OpResult{Version: doc.Version, OpID: op.ID, State: "skipped", Err: "prerequisite failed", At: time.Now()}
+			res := OpResult{Version: doc.Version, OpID: op.ID, State: "skipped", Err: skipErr, At: time.Now()}
 			if err := j.Record(res); err != nil {
 				return nil, err
 			}

@@ -41,6 +41,10 @@ type StoreAPI interface {
 	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error
 	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string, reportVersion int64) error
+	// FailDeploymentFromPrereqOp routes a phase-less pipeline op failure
+	// (image.pull, volume.ensure, per-resource network.ensure) into the deploy log
+	// and the deployment's terminal detail (SIGMA-301).
+	FailDeploymentFromPrereqOp(ctx context.Context, serverID, resourceID, opID, errText string, reportVersion int64) error
 	// DeployPeersForResource lists the other servers whose documents are gated
 	// on this resource's deployment status, so a multi-machine pipeline advances
 	// on the report rather than on the next resync.

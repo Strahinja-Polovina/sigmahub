@@ -129,6 +129,48 @@ func deployPhase(opID string) (phase, resourceID, service string, ok bool) {
 	return phase, rest, "", true
 }
 
+// deployPrereqResource maps a deploy-pipeline PREREQUISITE op to the resource it
+// belongs to. These ops — image.pull ("pull:<res>[:<svc>]"), volume.ensure
+// ("vol:<res>:<name>") and the per-resource network.ensure ("net:res:<res>") —
+// have no deploy PHASE: there is no status to advance TO when a volume is
+// created, so deployPhase rejects them and their status only ever flipped the
+// document's `converged` boolean (SIGMA-301).
+//
+// That is fine while they succeed and catastrophic when they don't. A registry
+// 401 on the cross-host pull, a named volume colliding with an unmanaged one, a
+// host out of disk: each fails one of these ops, the agent skips the rollout that
+// depends on it, and the ONLY thing that reached the deployment was the skip. The
+// operator saw "failed — prerequisite failed" with an empty build log — the
+// docker daemon's actual message existed nowhere in the control plane.
+//
+// So a failure here is routed to the resource's in-flight deployment explicitly:
+// one deploy-log line plus the terminal failure detail, both carrying the op's own
+// error. The project-wide "net:<proj>" op is deliberately NOT mapped — it belongs
+// to every resource in the project and to none of them in particular; its failure
+// reaches the deployment through the agent-side skip message, which since
+// SIGMA-301 names the op and quotes its error.
+func deployPrereqResource(opID string) (resourceID string, ok bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(opID, "pull:"):
+		rest = strings.TrimPrefix(opID, "pull:")
+	case strings.HasPrefix(opID, "vol:"):
+		rest = strings.TrimPrefix(opID, "vol:")
+	case strings.HasPrefix(opID, "net:res:"):
+		rest = strings.TrimPrefix(opID, "net:res:")
+	default:
+		return "", false
+	}
+	// Trailing ":<service>" / ":<volume name>" is not part of the resource id.
+	if i := strings.Index(rest, ":"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
 type dsdStatusRequest struct {
 	Version int64 `json:"version"`
 	// Ops maps op id -> reported status object; resource.sync ops carry the
@@ -165,6 +207,11 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		Error string `json:"error,omitempty"`
 	}
 	composeAgg := map[string][]opStatus{}
+	// Failed deploy-pipeline prerequisite ops (pull:/vol:/net:res:) keyed by op
+	// id, in the deterministic order the op ids sort in, so a batch carrying
+	// several of them always reports the same one first (SIGMA-301).
+	type prereqFailure struct{ opID, resID, errText string }
+	var prereqFailures []prereqFailure
 	// Whole-document convergence (SIGMA-117): the version is converged only if
 	// EVERY reported op applied. Computed from the full req.Ops set — including
 	// host:*, proxy, and volrm: ops that never enter byResource — so a failed
@@ -189,6 +236,11 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if phase, resID, service, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
 			advances = append(advances, deployAdvance{phase: phase, resID: resID, service: service, ok: os.State == "applied", errText: os.Error})
+		}
+		if os.State == "failed" {
+			if resID, isPrereq := deployPrereqResource(opID); isPrereq {
+				prereqFailures = append(prereqFailures, prereqFailure{opID: opID, resID: resID, errText: os.Error})
+			}
 		}
 		switch {
 		case strings.HasPrefix(opID, "res:"):
@@ -230,6 +282,19 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 					s.log.Error("fail s3 op from op status", "err", err, "op", opID)
 				}
 			}
+		}
+	}
+	// Prerequisite failures are applied BEFORE the phase advances, and that
+	// ordering is the whole point: the rollout op that depended on the broken
+	// prerequisite reports as skipped in this same batch, and a deployment
+	// freezes on its FIRST terminal transition. Going first means the detail the
+	// operator reads is the docker daemon's own message ("denied: requested
+	// access to the resource is denied") rather than the dependent op's second-
+	// hand account of it (SIGMA-301).
+	sort.SliceStable(prereqFailures, func(i, j int) bool { return prereqFailures[i].opID < prereqFailures[j].opID })
+	for _, p := range prereqFailures {
+		if err := s.store.FailDeploymentFromPrereqOp(r.Context(), srv.ID, p.resID, p.opID, p.errText, req.Version); err != nil {
+			s.log.Error("fail deployment from prerequisite op", "err", err, "op", p.opID, "resource", p.resID)
 		}
 	}
 	sort.SliceStable(advances, func(i, j int) bool {
@@ -285,6 +350,20 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if b, err := json.Marshal(agg); err == nil {
 			byResource[resID] = b
+		}
+	}
+	// A prerequisite failure with no reported op for its resource still has to
+	// show on the resource card (SIGMA-301). Normally the dependent res: op
+	// reports skipped and carries the story, but a prerequisite can also break
+	// for a resource whose ops are all held back this version — and then the
+	// card would sit on its last good state while the deployment says failed.
+	// Never overrides a status the agent actually reported.
+	for _, p := range prereqFailures {
+		if _, ok := byResource[p.resID]; ok {
+			continue
+		}
+		if b, err := json.Marshal(opStatus{State: "failed", Error: p.opID + ": " + p.errText}); err == nil {
+			byResource[p.resID] = b
 		}
 	}
 	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource, converged, failedOps)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -112,5 +113,40 @@ func TestLastAppliedVersionAdvances(t *testing.T) {
 	}
 	if v, _ := j.LastAppliedVersion(); v != 7 {
 		t.Fatalf("version = %d, want 7", v)
+	}
+}
+
+// TestSkipCarriesPrerequisiteError pins SIGMA-301: when an op is skipped because
+// a prerequisite failed, the skip must name WHICH prerequisite and carry ITS
+// error. The dependent rollout op ("res:<id>") is the one the CP routes into the
+// deployment's status, so the bare string "prerequisite failed" was literally all
+// an operator got for a registry 401, a volume collision or a full disk — the
+// failing op ("pull:<id>", "vol:<id>:<name>") maps to no deploy phase and its
+// error reached nothing.
+func TestSkipCarriesPrerequisiteError(t *testing.T) {
+	j := testJournal(t)
+	reg := NewRegistry()
+	reg.Register("image.pull", func(context.Context, dsd.Op) error {
+		return errors.New("pull ghcr.io/o/r:sha: denied: requested access to the resource is denied")
+	})
+	reg.Register("deploy.rollout", func(context.Context, dsd.Op) error { return nil })
+
+	doc := dsd.Document{Version: 3, Ops: []dsd.Op{
+		{ID: "pull:res_a", Kind: "image.pull"},
+		{ID: "res:res_a", Kind: "deploy.rollout", DependsOn: []string{"pull:res_a"}},
+	}}
+	results, err := j.applyWith(reg, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results["res:res_a"].State != "skipped" {
+		t.Fatalf("rollout state = %+v, want skipped", results["res:res_a"])
+	}
+	got := results["res:res_a"].Err
+	if !strings.Contains(got, "pull:res_a") {
+		t.Errorf("skip error %q does not name the failing prerequisite", got)
+	}
+	if !strings.Contains(got, "denied: requested access to the resource is denied") {
+		t.Errorf("skip error %q discards the prerequisite's own error", got)
 	}
 }
