@@ -31,7 +31,7 @@ Fill in `.env` (all required unless noted):
 | `BETTER_AUTH_SECRET` | Dashboard session key — `openssl rand -base64 32`. |
 | `WEB_PUBLIC_URL` | `https://staging.sigmahub.example` (cookies/redirects, and the site address the bundled proxy serves the dashboard on). |
 | `SIGMAHUB_CP_PUBLIC_URL` | Public URL a BYO host dials to reach the CP (e.g. `https://cp.staging.sigmahub.example`) — the in-cluster `http://cp:8080` is not reachable from a host. Rendered into the install command. |
-| `SIGMAHUB_AGENT_VERSION` | Released agent tag the control plane installs (e.g. `v0.3.0`) — there is no asset published under `latest`. It becomes the CP's `CP_AGENT_VERSION`; the dashboard has no copy, it asks the CP. Required here because staging builds from source, which stamps no release tag. |
+| `CP_AGENT_VERSION` | Released agent tag the control plane installs (e.g. `v0.3.0`) — there is no asset published under `latest`. Spelled the way the refusal that asks for it is spelled (SIGMA-269); the dashboard has no copy, it asks the CP. Required here because staging builds from source, which stamps no release tag. |
 | `CP_RELEASE_TOKEN` | GitHub token with `contents:read` on the release repository. Required whenever that repository is **private** — the control plane proxies install.sh and the release assets with it, and a private repo answers 404 to an unauthenticated fetch, so onboarding fails at the first curl without it. Leave empty for a public release repo (the anonymous path has a higher rate limit). |
 | `CP_RELEASE_REPO` | Which repository's releases those are. Leave unset unless you run your own fork — the default is the upstream slug that `install.sh`'s pinned cosign identity already expects. |
 | `CP_ACME_EMAIL` | Let's Encrypt contact for managed-domain TLS. |
@@ -126,12 +126,13 @@ the printed one-liner to install `sigmad`. Every URL in that one-liner is the
 control plane's: it serves `install.sh` and proxies that release's assets with a
 server-side GitHub credential, so a PRIVATE release repository onboards without
 the host ever talking to github.com. Which release is the control plane's answer
-alone (`SIGMAHUB_AGENT_VERSION` → `CP_AGENT_VERSION`) — it comes back with the
-bootstrap token and the dashboard renders it, so the command and the assets
-cannot name different versions. It points the agent at `SIGMAHUB_CP_PUBLIC_URL`,
-which must be `https://`: the command pipes `install.sh` into `sudo bash`, and
-that script is the one artifact cosign cannot cover, because it is what runs
-cosign.
+alone (`CP_AGENT_VERSION`, under that one name in `.env` and in the container) —
+it comes back with the bootstrap token and the dashboard renders it, so the
+command and the assets cannot name different versions. It points the agent at
+`SIGMAHUB_CP_PUBLIC_URL`, which must be `https://`: the command pipes
+`install.sh` into `sudo bash`, and that script is the one artifact cosign cannot
+cover, because it is what runs cosign. The control plane refuses to serve it
+over anything else (step 2b).
 The agent enrolls, joins the WireGuard mesh, and appears under **Servers**.
 Attach it to the `prod` environment to schedule resources on it.
 

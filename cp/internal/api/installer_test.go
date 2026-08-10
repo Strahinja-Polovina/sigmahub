@@ -3,11 +3,17 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -991,4 +997,123 @@ func TestInstallScriptRefusedOverPlaintextPublicURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A refusal that names a setting is a promise: set THIS, and the thing you were
+// trying to do starts working. The promise is broken the moment the deploy files
+// read that setting under a different name — and it broke exactly there
+// (SIGMA-269). installerRelease says "Set CP_AGENT_VERSION to a released tag",
+// the dashboard passes that sentence through verbatim rather than paraphrasing
+// it, and the shipped compose file interpolated ${SIGMAHUB_AGENT_VERSION} into
+// it. A self-hoster on a source build (main.version = "dev") therefore hit the
+// refusal on their first connect-server attempt, put CP_AGENT_VERSION in
+// cp/deploy/.env exactly as instructed, restarted, and got the identical
+// message back.
+//
+// So this reads the sentences and the compose file, and asserts that every CP_*
+// name the installer tells an operator to set is a name the `cp` service
+// actually interpolates from the environment. Only string LITERALS are scanned:
+// prose in a comment is describing history, not making a promise.
+func TestInstallerRefusalsNameASettingTheComposeFileReads(t *testing.T) {
+	named := settingsNamedInStringLiterals(t, "installer.go")
+	if len(named) == 0 {
+		t.Fatal("found no CP_* setting named in installer.go's messages; the scan or the messages moved " +
+			"and this guard can no longer see what it is guarding")
+	}
+	env := composeServiceEnvironment(t, "cp")
+
+	for _, name := range named {
+		value, ok := env[name]
+		if !ok {
+			t.Errorf("an installer refusal tells the operator to set %s, but the cp service in "+
+				"cp/deploy/docker-compose.yml never passes it: they will set it in .env, restart, and "+
+				"get the same refusal back", name)
+			continue
+		}
+		if !strings.Contains(value, "${"+name) {
+			t.Errorf("an installer refusal tells the operator to set %s, but the cp service reads it as "+
+				"%q — the name the product asks for is not the name the deploy file reads, so setting it "+
+				"changes nothing", name, value)
+		}
+	}
+}
+
+// settingsNamedInStringLiterals returns the CP_* settings a source file names in
+// its string literals, sorted. Parsing rather than grepping is what keeps the
+// comments out: this file discusses settings at length in prose, and a comment
+// is not a promise made to an operator.
+func settingsNamedInStringLiterals(t *testing.T, file string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	// Anchored on a non-name character so SIGMAHUB_CP_PUBLIC_URL — the
+	// dashboard's own setting, on the other side of the boundary — is not read
+	// as a reference to CP_PUBLIC_URL.
+	pattern := regexp.MustCompile(`(^|[^A-Za-z0-9_])(CP_[A-Z][A-Z0-9_]*)`)
+	seen := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		s, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			s = lit.Value
+		}
+		for _, m := range pattern.FindAllStringSubmatch(s, -1) {
+			seen[m[2]] = true
+		}
+		return true
+	})
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// composeServiceEnvironment reads one service's environment block out of the
+// deploy compose file as name → raw value, interpolation intact — which is the
+// half that matters here. An indentation-aware line scan, like the compose guard
+// in cp/internal/config: enough for a file this repo owns and formats, and it
+// keeps the test dependency-free.
+func composeServiceEnvironment(t *testing.T, service string) map[string]string {
+	t.Helper()
+	path := filepath.Join("..", "..", "deploy", "docker-compose.yml")
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	out := map[string]string{}
+	inService, inEnv := false, false
+	for _, raw := range strings.Split(string(src), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		switch {
+		case indent == 2 && strings.HasPrefix(trimmed, service+":"):
+			inService, inEnv = true, false
+		case indent <= 2:
+			inService, inEnv = false, false
+		case inService && indent == 4:
+			inEnv = trimmed == "environment:"
+		case inService && inEnv && indent == 6:
+			key, value, ok := strings.Cut(trimmed, ":")
+			if ok {
+				out[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			}
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("parsed no environment entries for service %q out of %s; the file's shape moved and "+
+			"this guard can no longer see what it is guarding", service, path)
+	}
+	return out
 }

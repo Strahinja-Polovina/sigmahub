@@ -98,7 +98,14 @@ services:
       # control-plane binary was built from, which is already correct for a
       # released image (goreleaser stamps cp and sigmad from one tag) and is
       # "dev" for a source build — onboarding then refuses, naming this setting.
-      CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
+      #
+      # And it must be read from the name that refusal PRINTS (SIGMA-269). This
+      # line said ${SIGMAHUB_AGENT_VERSION:-} while the sentence the dashboard
+      # shows says "Set CP_AGENT_VERSION to a released tag such as v0.3.0", so a
+      # self-hoster on a source build did exactly what the product told them,
+      # restarted, and got the identical refusal — the fix had been applied to a
+      # key nothing read.
+      CP_AGENT_VERSION: ${CP_AGENT_VERSION:-}
       # Hugging Face account the control plane acts as (SIGMA-213/214, optional).
       # One setting doing both halves of the LLM path: it authenticates the
       # model picker's Hub calls, and it is seeded into each inference
