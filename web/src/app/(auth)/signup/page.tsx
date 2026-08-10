@@ -12,6 +12,8 @@ import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
 import { SocialButtons } from "@/components/auth/social-buttons";
+import { useAuthProviders } from "@/components/auth/auth-providers";
+import { anyAuthProvider } from "@/lib/auth-providers";
 import {
   validateConfirm,
   validateEmail,
@@ -34,6 +36,7 @@ export default function SignupPage() {
   const [confirm, setConfirm] = React.useState("");
   const [errors, setErrors] = React.useState<Errors>({});
   const [submitting, setSubmitting] = React.useState(false);
+  const ssoAvailable = anyAuthProvider(useAuthProviders());
 
   const clear = (key: keyof Errors) =>
     setErrors((prev) => (prev[key] ? { ...prev, [key]: null } : prev));
@@ -146,11 +149,18 @@ export default function SignupPage() {
         Policy.
       </p>
 
-      <div className="my-6">
-        <AuthDivider label="or sign up with" />
-      </div>
+      {/* Only when a provider is actually configured — divider included, since
+          an "or sign up with" rule over nothing is its own small lie
+          (SIGMA-246). */}
+      {ssoAvailable && (
+        <>
+          <div className="my-6">
+            <AuthDivider label="or sign up with" />
+          </div>
 
-      <SocialButtons action="sign up" />
+          <SocialButtons action="sign up" />
+        </>
+      )}
 
       <p className="mt-8 text-center text-sm text-muted-foreground">
         Already have an account?{" "}

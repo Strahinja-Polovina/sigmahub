@@ -2,6 +2,7 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { twoFactor } from "better-auth/plugins";
 import { db, authSchema } from "../server/db";
+import { configuredAuthProviders } from "./auth-providers";
 
 // Session/token signing key. better-auth falls back to an insecure default
 // when unset — acceptable only in dev; a production SERVER must fail fast, or
@@ -29,6 +30,31 @@ if (
 const requireEmailVerification =
   process.env.AUTH_REQUIRE_EMAIL_VERIFICATION === "true";
 
+// Third-party sign-in, from the same flags the auth screens read (SIGMA-246).
+// Empty on a deployment that has set no OAuth credentials — which is every
+// deployment today — and that is exactly why the Google/GitHub buttons no
+// longer render there. Configuring the credentials wires better-auth and lights
+// up the buttons in one step, so a visible button always has a flow behind it.
+const providerFlags = configuredAuthProviders();
+const socialProviders = {
+  ...(providerFlags.google
+    ? {
+        google: {
+          clientId: process.env.AUTH_GOOGLE_CLIENT_ID!,
+          clientSecret: process.env.AUTH_GOOGLE_CLIENT_SECRET!,
+        },
+      }
+    : {}),
+  ...(providerFlags.github
+    ? {
+        github: {
+          clientId: process.env.AUTH_GITHUB_CLIENT_ID!,
+          clientSecret: process.env.AUTH_GITHUB_CLIENT_SECRET!,
+        },
+      }
+    : {}),
+};
+
 // v1 dev: better-auth over the same PGlite DB (email+password + TOTP 2FA).
 // Orgs/memberships live in our own tables (V1-1); better-auth owns user auth.
 // Production points DATABASE_URL at a real Postgres behind the same adapter.
@@ -55,6 +81,7 @@ export const auth = betterAuth({
       console.info(`[auth] email verification for ${user.email}: ${url}`);
     },
   },
+  socialProviders,
   plugins: [twoFactor()],
 });
 

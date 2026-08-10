@@ -13,6 +13,8 @@ import { AuthField } from "@/components/auth/auth-field";
 import { AuthDivider } from "@/components/auth/auth-divider";
 import { OtpInput } from "@/components/auth/otp-input";
 import { SocialButtons } from "@/components/auth/social-buttons";
+import { useAuthProviders } from "@/components/auth/auth-providers";
+import { anyAuthProvider } from "@/lib/auth-providers";
 import {
   validateEmail,
   validateOtp,
@@ -33,6 +35,8 @@ export default function LoginPage() {
     password?: string | null;
   }>({});
   const [submitting, setSubmitting] = React.useState(false);
+
+  const ssoAvailable = anyAuthProvider(useAuthProviders());
 
   // TOTP state
   const [code, setCode] = React.useState("");
@@ -208,11 +212,17 @@ export default function LoginPage() {
         </Button>
       </form>
 
-      <div className="my-6">
-        <AuthDivider label="or continue with" />
-      </div>
+      {/* Only when a provider is actually configured — divider included
+          (SIGMA-246). */}
+      {ssoAvailable && (
+        <>
+          <div className="my-6">
+            <AuthDivider label="or continue with" />
+          </div>
 
-      <SocialButtons action="continue" />
+          <SocialButtons action="continue" />
+        </>
+      )}
 
       <p className="mt-8 text-center text-sm text-muted-foreground">
         Don&apos;t have an account?{" "}
