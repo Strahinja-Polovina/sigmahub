@@ -20,6 +20,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   revealS3Connection,
   listBuckets,
   createBucket,
@@ -133,6 +142,12 @@ function BucketManager({
   const [buckets, setBuckets] = React.useState<CpBucket[] | null>(null);
   const [name, setName] = React.useState("");
   const [pending, startTransition] = React.useTransition();
+  // SIGMA-311: the trash icon used to call deleteBucket directly, so one click
+  // on a 28px control queued the destruction of a bucket and every object in
+  // it. Nothing about the icon says which bucket it belongs to once the pointer
+  // is over it, and there is no undo on the other side. It now only names the
+  // bucket awaiting confirmation; the delete itself needs a second click.
+  const [confirmDelete, setConfirmDelete] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(() => {
     listBuckets({ orgId, resourceId })
@@ -163,6 +178,7 @@ function BucketManager({
     startTransition(async () => {
       try {
         await deleteBucket({ orgId, resourceId, bucket });
+        setConfirmDelete(null);
         toast.success(`Bucket ${bucket} deletion queued`);
         refresh();
       } catch (err) {
@@ -245,7 +261,7 @@ function BucketManager({
                     variant="ghost"
                     size="icon-sm"
                     aria-label={`Delete ${b.name}`}
-                    onClick={() => remove(b.name)}
+                    onClick={() => setConfirmDelete(b.name)}
                     disabled={pending}
                   >
                     <Trash2 className="size-3.5 text-muted-foreground" />
@@ -256,6 +272,39 @@ function BucketManager({
           ))}
         </div>
       )}
+
+      <Dialog
+        open={confirmDelete !== null}
+        onOpenChange={(next) => {
+          if (pending) return;
+          if (!next) setConfirmDelete(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete bucket {confirmDelete}?</DialogTitle>
+            <DialogDescription>
+              The agent removes <span className="font-mono">{confirmDelete}</span> from the
+              engine and everything in it — every object stored in this bucket goes with it,
+              and nothing here keeps a copy. Any scoped key issued for the bucket stops
+              working too.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+              Cancel
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={() => confirmDelete && remove(confirmDelete)}
+              disabled={pending}
+            >
+              {pending && <Loader2 className="size-4 animate-spin" />}
+              Delete bucket
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

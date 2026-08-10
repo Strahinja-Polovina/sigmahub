@@ -80,7 +80,7 @@ export async function getResource(id: string) {
   return (await db.select().from(s.resources).where(eq(s.resources.id, id)))[0];
 }
 export async function getMembers(orgId: string) {
-  return db
+  const rows = await db
     .select({
       id: user.id,
       name: user.name,
@@ -91,6 +91,22 @@ export async function getMembers(orgId: string) {
     .from(s.memberships)
     .innerJoin(user, eq(s.memberships.userId, user.id))
     .where(eq(s.memberships.orgId, orgId));
+
+  // SIGMA-311: removing a member also deletes every project grant they hold in
+  // this org (removeMember, for the resurrect-on-re-invite reason in SIGMA-148)
+  // and nothing anywhere records what those grants were — re-inviting restores
+  // the membership but not the access. The confirmation dialog therefore has to
+  // be able to say how many grants are about to be destroyed, so the count is
+  // carried alongside the member rather than left for the operator to remember.
+  const grants = await db
+    .select({ userId: s.projectMemberships.userId })
+    .from(s.projectMemberships)
+    .innerJoin(s.projects, eq(s.projectMemberships.projectId, s.projects.id))
+    .where(eq(s.projects.orgId, orgId));
+  const perUser = new Map<string, number>();
+  for (const g of grants) perUser.set(g.userId, (perUser.get(g.userId) ?? 0) + 1);
+
+  return rows.map((r) => ({ ...r, grantCount: perUser.get(r.id) ?? 0 }));
 }
 
 /** Server count per org, for the org switcher (id → count). */

@@ -43,6 +43,12 @@ import type { CpServiceToken } from "@/server/cp";
 export function TokensTab({ orgId, isAdmin }: { orgId: string; isAdmin: boolean }) {
   const [tokens, setTokens] = React.useState<CpServiceToken[] | null>(null);
   const [rotated, setRotated] = React.useState<{ name: string; token: string } | null>(null);
+  // SIGMA-311: Revoke used to fire on the first click of a small red button
+  // sitting immediately beside Rotate. Revocation takes effect at once and
+  // cannot be undone — every CI job, script and integration holding the token
+  // starts failing on its next request, and the only recovery is minting a new
+  // token and updating each consumer. It now opens a dialog that says so.
+  const [confirmRevoke, setConfirmRevoke] = React.useState<CpServiceToken | null>(null);
   const [pending, startTransition] = React.useTransition();
 
   const load = React.useCallback(() => {
@@ -89,6 +95,7 @@ export function TokensTab({ orgId, isAdmin }: { orgId: string; isAdmin: boolean 
     startTransition(async () => {
       try {
         await revokeServiceToken({ orgId, tokenId: t.id, name: t.name });
+        setConfirmRevoke(null);
         toast.success(`Revoked “${t.name}”`);
         load();
       } catch (err) {
@@ -137,7 +144,7 @@ export function TokensTab({ orgId, isAdmin }: { orgId: string; isAdmin: boolean 
                       <RefreshCw className="size-4" />
                       Rotate
                     </Button>
-                    <Button variant="destructive" size="sm" disabled={pending || Boolean(t.revokedAt)} onClick={() => revoke(t)}>
+                    <Button variant="destructive" size="sm" disabled={pending || Boolean(t.revokedAt)} onClick={() => setConfirmRevoke(t)}>
                       <Trash2 className="size-4" />
                       Revoke
                     </Button>
@@ -148,6 +155,39 @@ export function TokensTab({ orgId, isAdmin }: { orgId: string; isAdmin: boolean 
           </Table>
         )}
       </CardContent>
+
+      <Dialog
+        open={confirmRevoke !== null}
+        onOpenChange={(next) => {
+          if (pending) return;
+          if (!next) setConfirmRevoke(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Revoke “{confirmRevoke?.name || "this token"}”?</DialogTitle>
+            <DialogDescription>
+              The credential is invalidated the moment you confirm, and it cannot be brought
+              back. Every integration using it stops working immediately — CI jobs, scripts
+              and anything else authenticating as {confirmRevoke?.role ?? "this role"} with
+              this token will fail on their next request until they are given a new one.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+              Cancel
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={() => confirmRevoke && revoke(confirmRevoke)}
+              disabled={pending}
+            >
+              {pending && <Loader2 className="size-4 animate-spin" />}
+              Revoke token
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={rotated !== null} onOpenChange={(next) => !next && setRotated(null)}>
         <DialogContent className="sm:max-w-lg">
