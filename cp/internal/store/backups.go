@@ -302,7 +302,8 @@ func (s *Store) ensureRepoKeyTx(ctx context.Context, tx pgx.Tx, orgID, policyID 
 
 // CreateDueBackupRuns is the scheduler's tick: for every enabled, targeted
 // database policy it inserts (at most) one backup run per day and one verify
-// run per day (verify only once a successful backup exists). Returns the
+// run per day (verify only once THIS day's backup has succeeded and recorded a
+// dump sha — see the predicate below, SIGMA-282). Returns the
 // distinct servers whose DSDs must re-render. The reconciler is level-triggered
 // spec sync with no time primitive — this is the time primitive (SIGMA-50).
 func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers []struct{ ServerID, OrgID string }, err error) {
@@ -319,8 +320,13 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		                  AND r.created_at >= $1) AS backed_today,
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'verify'
 		                  AND r.created_at >= $1) AS verified_today,
+		       -- A verify checks THIS day's dump against THIS day's sha, which is
+		       -- exactly what BackupRunsForServer resolves ExpectedSha from. So the
+		       -- question the enqueue must ask is not "has this policy ever
+		       -- succeeded" but "does today's dump exist yet" (SIGMA-282).
 		       EXISTS (SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'backup'
-		                  AND r.status = 'success') AS has_success,
+		                  AND r.status = 'success' AND r.created_at >= $1
+		                  AND COALESCE(r.dump_sha256, '') <> '') AS sha_today,
 		       (p.pitr_enabled AND dc.engine = 'postgres' AND NOT EXISTS (
 		            SELECT 1 FROM backup_runs r WHERE r.policy_id = p.id AND r.kind = 'basebackup'
 		               AND r.created_at >= $1)) AS base_due
@@ -337,13 +343,29 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 	var work []due
 	for rows.Next() {
 		var d due
-		var backedToday, verifiedToday, hasSuccess bool
-		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &hasSuccess, &d.base); err != nil {
+		var backedToday, verifiedToday, shaToday bool
+		if err := rows.Scan(&d.policyID, &d.orgID, &d.resourceID, &d.serverID, &backedToday, &verifiedToday, &shaToday, &d.base); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		d.backup = !backedToday
-		d.verify = !verifiedToday && (hasSuccess || d.backup)
+		// Do not enqueue a verify until the dump it is meant to check exists.
+		//
+		// This used to be `!verifiedToday && (hasSuccess || d.backup)`, where
+		// hasSuccess meant "succeeded at any point in this policy's life". Both
+		// halves enqueue a verify for a day whose dump may never appear, and
+		// SIGMA-137 (rightly) taught the reconciler to hold such a verify back
+		// until its own day's sha is known — so on a day whose backup fails the
+		// row is undispatchable by construction. It sat pending until
+		// TimeoutStaleBackupRuns failed it at the 6h queue budget with a detail
+		// blaming the control plane, giving on-call a second, fictitious alert per
+		// database per night ("verify_failed: never dispatched") beside the honest
+		// backup_failed, and marking the day red for a second, invented reason the
+		// M1 green-streak gate cannot tell from real verification breakage.
+		//
+		// The scheduler ticks every minute, so waiting for the sha costs at most a
+		// minute of latency on days that do back up successfully.
+		d.verify = !verifiedToday && shaToday
 		if d.backup || d.verify || d.base {
 			work = append(work, d)
 		}

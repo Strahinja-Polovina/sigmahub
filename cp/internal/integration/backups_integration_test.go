@@ -72,8 +72,11 @@ func TestBackupLifecycle(t *testing.T) {
 		t.Fatal("in-use target must not be deletable")
 	}
 
-	// First sweep enqueues a backup AND a first-day verify; a second sweep the
-	// same day enqueues nothing (once per day).
+	// First sweep enqueues the day's backup — and NOT its verify: a verify checks
+	// this day's dump against this day's sha, which does not exist until the
+	// backup succeeds, so enqueueing it now can only produce an undispatchable
+	// row (SIGMA-282). A second sweep the same day enqueues nothing (once per
+	// day, and still no sha).
 	servers, err = st.CreateDueBackupRuns(ctx, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -92,10 +95,10 @@ func TestBackupLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runs) != 2 || runs[0].Kind != "backup" || runs[1].Kind != "verify" {
+	if len(runs) != 1 || runs[0].Kind != "backup" {
 		t.Fatalf("open runs = %+v", runs)
 	}
-	backupRun, verifyRun := runs[0], runs[1]
+	backupRun := runs[0]
 	if backupRun.KeepDaily != 30 {
 		t.Fatalf("production retention must keep 30 dailies, got %d", backupRun.KeepDaily)
 	}
@@ -112,17 +115,32 @@ func TestBackupLifecycle(t *testing.T) {
 	if _, err := st.BackupCredentialForRun(ctx, "srv_other", backupRun.RunID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("foreign server credential fetch must 404, got %v", err)
 	}
+
+	// Terminal results: backup success records the sha the verify pins…
+	if err := st.SetBackupRunResult(ctx, serverID, backupRun.RunID, true, "snapA", "sha-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	// …and the next tick releases the day's verify against it.
+	if _, err := st.CreateDueBackupRuns(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runs, err = st.BackupRunsForServer(ctx, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Kind != "verify" {
+		t.Fatalf("open runs after a successful backup = %+v", runs)
+	}
+	verifyRun := runs[0]
+	if verifyRun.ExpectedSha != "sha-a" {
+		t.Fatalf("verify must pin this day's dump sha, got %q", verifyRun.ExpectedSha)
+	}
 	cred2, err := st.BackupCredentialForRun(ctx, serverID, verifyRun.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cred2.RepoKey != cred.RepoKey {
 		t.Fatal("verify must open the same repo key")
-	}
-
-	// Terminal results: backup success records the sha the next verify pins.
-	if err := st.SetBackupRunResult(ctx, serverID, backupRun.RunID, true, "snapA", "sha-a", ""); err != nil {
-		t.Fatal(err)
 	}
 	if err := st.SetBackupRunResult(ctx, serverID, verifyRun.RunID, true, "", "sha-a", "checksum ok"); err != nil {
 		t.Fatal(err)
@@ -516,5 +534,130 @@ func TestRepoKeySurvivesDelete(t *testing.T) {
 	// zero-value key that would look like a valid password.
 	if _, err := st.ExportRepoKey(ctx, orgID, "res_nonexistent", "admin"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("export for unknown resource = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCreateDueBackupRuns_NoVerifyBeforeSuccessfulBackup is the SIGMA-282
+// regression. The scheduler used to enqueue the day's restore-verify alongside
+// the day's backup, before any dump existed. SIGMA-137 then (correctly) made
+// the reconciler hold a verify back until its own day's backup has succeeded
+// and its sha is known — so on a day whose backup FAILS the verify row can
+// never be dispatched at all. It sits pending until TimeoutStaleBackupRuns
+// fails it at the queue timeout with "The run was never dispatched within its
+// queue window and was failed by the scheduler", producing a second, fictitious
+// alert per database per night that points on-call at the control plane instead
+// of the expired S3 credentials, and marking the day red twice over.
+//
+// The verify is enqueued on a later tick, once a successful backup exists.
+func TestCreateDueBackupRuns_NoVerifyBeforeSuccessfulBackup(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_verifygate"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	target, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://minio.internal:9000", Bucket: "backups",
+		AccessKey: "AKIA123", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := target.ID
+
+	newDB := func(name string) store.Resource {
+		t.Helper()
+		r, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ServerID: serverID, Name: name, Kind: "postgres",
+			Spec: json.RawMessage(`{}`),
+		}, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.UpdateBackupPolicy(ctx, orgID, r.ID, "admin",
+			store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	countKind := func(resourceID, kind string) int {
+		t.Helper()
+		runs, err := st.ListBackupRuns(ctx, orgID, resourceID, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, r := range runs {
+			if r.Kind == kind {
+				n++
+			}
+		}
+		return n
+	}
+	runOfKind := func(resourceID, kind string) store.BackupRun {
+		t.Helper()
+		runs, err := st.ListBackupRuns(ctx, orgID, resourceID, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range runs {
+			if r.Kind == kind {
+				return r
+			}
+		}
+		t.Fatalf("no %s run for %s: %+v", kind, resourceID, runs)
+		return store.BackupRun{}
+	}
+
+	broken := newDB("orders-db")  // its nightly backup fails (bad target credentials)
+	healthy := newDB("ledger-db") // its nightly backup succeeds
+
+	// The broken database backed up fine until last night — which is the whole
+	// point. "Has this policy ever succeeded" is true for it forever after, so a
+	// verify predicate keyed on that (rather than on TODAY's dump) keeps
+	// enqueueing undispatchable verifies for as long as the credentials stay
+	// expired.
+	var brokenPolicy string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT id FROM backup_policies WHERE org_id = $1 AND resource_id = $2`,
+		orgID, broken.ID).Scan(&brokenPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, status,
+		                         dump_sha256, created_at, finished_at)
+		VALUES ($1, $2, $3, $4, $5, 'backup', 'success', 'cafebabe',
+		        now() - interval '1 day', now() - interval '1 day')`,
+		"run_yesterday", orgID, broken.ID, brokenPolicy, serverID); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	if _, err := st.CreateDueBackupRuns(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	// The day's backup for the broken database fails; the healthy one succeeds.
+	if err := st.SetBackupRunResult(ctx, serverID, runOfKind(broken.ID, "backup").ID,
+		false, "", "", "s3: 403 SignatureDoesNotMatch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetBackupRunResult(ctx, serverID, runOfKind(healthy.ID, "backup").ID,
+		true, "snap-1", "deadbeef", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// A later tick (the scheduler runs every minute).
+	if _, err := st.CreateDueBackupRuns(ctx, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := countKind(broken.ID, "verify"); n != 0 {
+		t.Errorf("verify rows for a database whose day's backup failed = %d, want 0: "+
+			"the row can never be dispatched (no sha to check) and dies at the queue "+
+			"timeout, alerting on-call about the scheduler (SIGMA-282)", n)
+	}
+	// The gate must not swallow the honest case: once a backup has succeeded the
+	// day's verify is enqueued as before.
+	if n := countKind(healthy.ID, "verify"); n != 1 {
+		t.Errorf("verify rows after a successful backup = %d, want 1", n)
 	}
 }

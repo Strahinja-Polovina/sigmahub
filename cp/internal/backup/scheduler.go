@@ -32,8 +32,11 @@ type Config struct {
 	// from dispatch (started_at). Sized just above the agent's 25-minute op cap.
 	RunTimeout time.Duration
 	// QueueTimeout fails a PENDING run that was never dispatched. Queue time is
-	// unbounded by design — verify rows wait for their backup's sha and the
-	// agent applies ops serially (SIGMA-163) — so this is deliberately generous.
+	// unbounded by design — the agent applies ops serially and a verify queues
+	// behind its own day's dump (SIGMA-163) — so this is deliberately generous.
+	// Since SIGMA-282 a verify row is not even created until that day's backup
+	// has recorded a sha, so a run that ages out here is genuinely stuck rather
+	// than merely waiting for something the control plane knows is missing.
 	QueueTimeout time.Duration
 	// Heartbeat, when set, is called once per sweep with that sweep's outcome
 	// (SIGMA-248). This loop is the one that most needs it: when
