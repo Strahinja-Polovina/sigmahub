@@ -151,15 +151,27 @@ func resticForget(ctx context.Context, cred Credential, keepDaily, keepWeekly, k
 // bound. Regrouping the "wal"-tagged snapshots by tag collapses them into one
 // group, so --keep-within can drop WAL older than the window. The window is the
 // base-backup keep-daily span, so any base still retained at daily granularity
-// can still roll forward. No --prune here: the caller's resticForget prune
-// reclaims the newly-unreferenced data in a single pass.
-func resticForgetWAL(ctx context.Context, cred Credential, keepDays int) error {
+// can still roll forward.
+//
+// prune says whether this call must also reclaim the space. On the happy path
+// it is false, because the caller's resticForget already prunes and one pass is
+// enough. It is true when this is the only retention the run will do — a run
+// whose dump failed (SIGMA-283) — since forgetting alone merely unreferences
+// the bundles and the customer keeps paying for the bytes. restic skips the
+// prune when the forget removed nothing, so asking for it costs a metadata read
+// on a repo that ships no WAL.
+func resticForgetWAL(ctx context.Context, cred Credential, keepDays int, prune bool) error {
 	if keepDays <= 0 {
 		return nil
 	}
-	return restic(ctx, cred, nil, io.Discard,
+	args := []string{
 		"forget", "--tag", "wal", "--group-by", "tags",
-		"--keep-within", fmt.Sprintf("%dd", keepDays))
+		"--keep-within", fmt.Sprintf("%dd", keepDays),
+	}
+	if prune {
+		args = append(args, "--prune")
+	}
+	return restic(ctx, cred, nil, io.Discard, args...)
 }
 
 // resticDumpSnapshot streams one LOGICAL-DUMP snapshot's dump file to w.

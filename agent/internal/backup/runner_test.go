@@ -581,3 +581,91 @@ func TestBackupRunDoesNotDeadlockWhenResticExitsEarly(t *testing.T) {
 		t.Fatal("opBackupRun deadlocked on early restic exit (SIGMA-69 regression)")
 	}
 }
+
+// TestWALRetentionRunsWhenDumpFails is the SIGMA-283 regression. resticForgetWAL
+// is the ONLY thing that ever forgets a WAL bundle — the repo-wide forget groups
+// by (host,paths) and every bundle has a unique stored path, so it keeps all of
+// them (SIGMA-108). It used to be reachable only after the dump, the stdin
+// backup and the check had all succeeded, while the WAL shipper kept pushing
+// ~1,440 bundles a day regardless. A database that outgrows the agent's op cap
+// therefore fails its nightly dump forever AND grows the customer's bucket
+// forever, with nothing in the product saying so — the only symptom is a failed
+// backup badge, which says nothing about storage.
+func TestWALRetentionRunsWhenDumpFails(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	fd := &fakeDocker{execFail: true} // pg_dump exits nonzero, as if killed
+	rep := &reported{}
+	r := NewRunner(fd,
+		func(context.Context, string) (Credential, error) {
+			return Credential{Repository: "s3:s3.example/bucket/sigmahub/res_db", RepoKey: "k", AccessKey: "a", SecretKey: "s"}, nil
+		},
+		func(_ context.Context, _ string, ok bool, snapshotID, sha, detail string) {
+			rep.ok, rep.snapshot, rep.sha, rep.detail = ok, snapshotID, sha, detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	err := r.opBackupRun(context.Background(), backupOp(t, KindBackupRun, opSpec{
+		RunID: "run_walret", ResourceID: "res_db", Container: "sigmahub-res_db",
+		Engine: "postgres", Database: "shop", Username: "sigma",
+		KeepDaily: 7, KeepWeekly: 4, KeepMonthly: 6,
+	}))
+	if err == nil {
+		t.Fatal("failed dump must still fail the op")
+	}
+	if rep.ok {
+		t.Fatal("failed dump must not report success")
+	}
+
+	calls, rerr := os.ReadFile(filepath.Join(dir, "calls.log"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !strings.Contains(string(calls), "forget --tag wal") {
+		t.Fatalf("a failed dump left WAL retention unbounded — the shipper keeps adding "+
+			"bundles nothing will ever forget (SIGMA-283):\n%s", calls)
+	}
+	// Forgetting alone only drops snapshots; the customer keeps paying for the
+	// data until it is pruned.
+	if !strings.Contains(string(calls), "--prune") {
+		t.Fatalf("WAL retention on a failed run must reclaim the data, not just "+
+			"unreference it:\n%s", calls)
+	}
+}
+
+// TestWALRetentionSurvivesAnExpiredOpDeadline pins the reason the retention pass
+// does not inherit the op's context: the canonical failure it exists for is a
+// dump killed by the 25-minute op cap, which leaves the op context already dead.
+// Retention that inherited it would be skipped in exactly the case that needs it.
+func TestWALRetentionSurvivesAnExpiredOpDeadline(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	fd := &fakeDocker{execFail: true}
+	rep := &reported{}
+	r := NewRunner(fd,
+		func(context.Context, string) (Credential, error) {
+			return Credential{Repository: "s3:s3.example/bucket/sigmahub/res_db", RepoKey: "k", AccessKey: "a", SecretKey: "s"}, nil
+		},
+		func(_ context.Context, _ string, ok bool, snapshotID, sha, detail string) {
+			rep.ok, rep.snapshot, rep.sha, rep.detail = ok, snapshotID, sha, detail
+			rep.count++
+		},
+		filepath.Join(dir, "work"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	cred := Credential{Repository: "s3:s3.example/bucket/sigmahub/res_db", RepoKey: "k"}
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.boundWALRetention(dead, cred, opSpec{RunID: "run_dead", KeepDaily: 7})
+
+	calls, err := os.ReadFile(filepath.Join(dir, "calls.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "forget --tag wal") {
+		t.Fatalf("retention was skipped because the op context was already dead:\n%s", calls)
+	}
+}
