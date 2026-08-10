@@ -82,3 +82,30 @@ describe("cpCreateCluster's Idempotency-Key", () => {
     expect(keys[0]).not.toBe(keys[1]);
   });
 });
+
+describe("cpCreateSecret's Idempotency-Key", () => {
+  const input = { name: "DATABASE_URL", value: "postgres://…", envVar: true };
+
+  it("is the form's request id, so a resubmitted form does not create twice", async () => {
+    const { cpCreateSecret } = await import("./cp");
+
+    // The user pressed Save, the proxy timed out after the CP had already
+    // committed, and they pressed Save again. Same submission, same key — the
+    // control plane replays instead of minting a second round of config
+    // deployments and restarting every consumer a second time.
+    await cpCreateSecret("org_1", "prj_1", input, ACTOR, "req_form");
+    await cpCreateSecret("org_1", "prj_1", input, ACTOR, "req_form");
+
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]).toContain("req_form");
+  });
+
+  it("differs between two separate submissions", async () => {
+    const { cpCreateSecret } = await import("./cp");
+
+    await cpCreateSecret("org_1", "prj_1", input, ACTOR, "req_one");
+    await cpCreateSecret("org_1", "prj_1", input, ACTOR, "req_two");
+
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+});

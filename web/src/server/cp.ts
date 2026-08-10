@@ -1022,11 +1022,25 @@ export async function cpListSecrets(
   return secrets;
 }
 
+/** `requestId` identifies the SUBMISSION, not the call (SIGMA-256).
+ *
+ *  This used to be `crypto.randomUUID()`, minted here, per call. A key that is
+ *  never repeated is not an idempotency key: IdempotencyClaim always wins the
+ *  reservation and the mutation always executes, which is the exact
+ *  double-execute the wrapper exists to prevent. The only lasting effect was a
+ *  finalized idempotency_keys row per attempt.
+ *
+ *  And the double-execute is expensive: a second CreateSecret means a second
+ *  audit entry, a second round of config deployments, and a second container
+ *  restart wave across every resource consuming the secret — all during what
+ *  the user believes was a FAILED operation, because what timed out was the
+ *  proxy, after the control plane had already committed. */
 export async function cpCreateSecret(
   orgId: string,
   projectId: string,
   input: { name: string; value: string; environmentId?: string; envVar: boolean },
-  actor: CpActor
+  actor: CpActor,
+  requestId: string
 ): Promise<CpSecret> {
   return cpFetch(
     `${org(orgId)}/projects/${encodeURIComponent(projectId)}/secrets`,
@@ -1039,7 +1053,7 @@ export async function cpCreateSecret(
         envVar: input.envVar,
       }),
     },
-    { orgId, actor, idempotencyKey: crypto.randomUUID() }
+    { orgId, actor, idempotencyKey: `secret:${requestId}` }
   );
 }
 

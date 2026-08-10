@@ -51,6 +51,7 @@ import {
   revealSecretAction,
   deleteSecretAction,
 } from "@/server/actions/secrets";
+import { createSubmissionId } from "@/lib/request-id";
 
 type SecretScope = "project" | "environment";
 
@@ -321,6 +322,12 @@ function NewSecretDialog({
   const [scope, setScope] = React.useState<SecretScope>("environment");
   const [envVar, setEnvVar] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  // One request id per SUBMISSION (SIGMA-256). Pressing Save again after an
+  // apparent failure is a retry and reuses it, so a create the control plane
+  // already committed — and whose response died at the proxy — is replayed
+  // rather than executed a second time. Editing a field, or saving a second
+  // secret, is a new intent and gets a new id.
+  const submission = React.useRef(createSubmissionId());
 
   function reset() {
     setName("");
@@ -331,8 +338,12 @@ function NewSecretDialog({
 
   async function submit() {
     setBusy(true);
+    const requestId = submission.current.forContent(
+      JSON.stringify([resourceId, name, value, scope, envVar])
+    );
     try {
-      await createSecretAction({ resourceId, name, value, scope, envVar });
+      await createSecretAction({ resourceId, name, value, scope, envVar, requestId });
+      submission.current.settled();
       toast.success(`Secret ${name} created`);
       reset();
       onOpenChange(false);

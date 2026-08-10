@@ -8,6 +8,7 @@ import "server-only";
 // production store — a dev convenience).
 
 import { client } from "./db";
+import { newRequestId } from "@/lib/request-id";
 import {
   cpEnabled,
   cpListSecrets,
@@ -113,10 +114,15 @@ export async function putSecret(
   orgId: string,
   projectId: string,
   input: { name: string; value: string; environmentId: string; envVar: boolean },
-  actor: CpActor
+  actor: CpActor,
+  /** The submission this create belongs to, so a retry of it is deduplicated
+   *  by the control plane instead of creating the secret twice (SIGMA-256).
+   *  Omitting it degrades to a unique key per call — no deduplication, which is
+   *  what the code did before it was threaded through. */
+  requestId?: string
 ): Promise<void> {
   if (cpEnabled()) {
-    await cpCreateSecret(orgId, projectId, input, actor);
+    await cpCreateSecret(orgId, projectId, input, actor, requestId ?? newRequestId());
     return;
   }
   await ensureDemoSecretsTable();
