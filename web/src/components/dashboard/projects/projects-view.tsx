@@ -24,6 +24,9 @@ export type ProjectCardData = {
   serverCount: number;
   resourceCount: number;
   statusCounts: Record<string, number>;
+  /** SIGMA-314: the resources a delete would cascade away, so the confirmation
+   *  can name them instead of describing the cascade in the abstract. */
+  resources: { id: string; name: string; kind: string; envName: string }[];
 };
 
 // Priority order so the most-severe status floats to the front of the chip row.
@@ -87,6 +90,8 @@ function ProjectCard({ data }: { data: ProjectCardData }) {
           projectId={data.id}
           name={data.name}
           description={data.description}
+          envCount={data.envCount}
+          resources={data.resources}
         />
       </div>
       <CardHeader>

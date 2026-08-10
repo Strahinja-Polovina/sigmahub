@@ -262,6 +262,10 @@ export type ProjectSummary = {
   serverCount: number;
   resourceCount: number;
   statusCounts: Record<string, number>;
+  /** SIGMA-314: what a project delete cascades away, by name and kind. The card
+   *  already counted these rows; the delete dialog has to be able to show them,
+   *  because a count alone can't tell an operator they picked the wrong card. */
+  resources: { id: string; name: string; kind: string; envName: string }[];
 };
 
 /** One card per project: env/server/resource counts + resource-status breakdown. */
@@ -273,12 +277,19 @@ export async function getProjectSummaries(
   return Promise.all(
     projs.map(async (project) => {
       const envs = await db
-        .select({ id: s.environments.id })
+        .select({ id: s.environments.id, name: s.environments.name })
         .from(s.environments)
         .where(eq(s.environments.projectId, project.id));
       const envIds = envs.map((e) => e.id);
+      const envNames = new Map(envs.map((e) => [e.id, e.name]));
       const resources = await db
-        .select({ status: s.resources.status })
+        .select({
+          id: s.resources.id,
+          name: s.resources.name,
+          kind: s.resources.kind,
+          environmentId: s.resources.environmentId,
+          status: s.resources.status,
+        })
         .from(s.resources)
         .where(eq(s.resources.projectId, project.id));
       const serverRows = envIds.length
@@ -295,6 +306,12 @@ export async function getProjectSummaries(
         serverCount: serverRows.length,
         resourceCount: resources.length,
         statusCounts,
+        resources: resources.map((r) => ({
+          id: r.id,
+          name: r.name,
+          kind: r.kind,
+          envName: envNames.get(r.environmentId) ?? "",
+        })),
       };
     })
   );

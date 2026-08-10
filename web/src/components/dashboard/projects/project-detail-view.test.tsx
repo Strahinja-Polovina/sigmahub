@@ -1,7 +1,39 @@
 // @vitest-environment jsdom
+//
+// Removing an environment cascades every resource inside it — the CP's
+// DeleteEnvironment runs cascadeResourceCleanupTx with no refusal and no force
+// flag, so the running Postgres, Redis and app all go, along with their
+// deployment history. The dialog used to be prose only: no count, no list, and
+// a single red button, while deleting ONE resource already demands the
+// resource's name be typed. The confirmation bar was inverted with respect to
+// blast radius, and adjacent environment tabs ("production", "sandbox") made
+// picking the wrong one easy (SIGMA-314).
 import * as React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh: vi.fn(), push: vi.fn(), replace: vi.fn() }),
+}));
+vi.mock("sonner", () => {
+  const toast = Object.assign(vi.fn(), {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    message: vi.fn(),
+  });
+  return { toast };
+});
+vi.mock("@/server/actions/projects", () => ({
+  attachServerToEnv: vi.fn(),
+  deleteEnvironment: vi.fn(),
+  detachServerFromEnv: vi.fn(),
+  createEnvironment: vi.fn(),
+  deleteProject: vi.fn(),
+  renameProject: vi.fn(),
+  setEnvironmentProduction: vi.fn(),
+}));
 
 import type { DeployTarget } from "@/components/dashboard/resources/resource-meta";
 
@@ -36,6 +68,98 @@ vi.mock("@/components/dashboard/resources/deploy-wizard", () => ({
     return <div data-testid="wizard" />;
   },
 }));
+
+import { deleteEnvironment } from "@/server/actions/projects";
+import { DeleteEnvironmentButton } from "./project-detail-view";
+import type { EnvPanel } from "@/server/queries";
+
+type EnvResource = EnvPanel["resources"][number];
+
+function res(id: string, name: string, kind: string): EnvResource {
+  return {
+    id,
+    projectId: "prj_1",
+    environmentId: "env_1",
+    serverId: "srv_1",
+    clusterId: null,
+    name,
+    kind,
+    status: "running",
+    repo: null,
+    branch: null,
+    domain: null,
+    version: null,
+    lastDeployAt: null,
+    createdAt: new Date("2026-08-01T10:00:00Z"),
+    latestDeploy: null,
+  } as unknown as EnvResource;
+}
+
+const RESOURCES: EnvResource[] = [
+  res("res_1", "api", "app"),
+  res("res_2", "db", "postgres"),
+  res("res_3", "cache", "redis"),
+];
+
+function renderButton(resources: EnvResource[] = RESOURCES) {
+  render(
+    <DeleteEnvironmentButton environmentId="env_1" name="production" resources={resources} />
+  );
+  fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+}
+
+function confirmButton(): HTMLButtonElement {
+  return screen.getByRole("button", { name: /^Remove environment$/ }) as HTMLButtonElement;
+}
+
+afterEach(() => {
+  cleanup();
+  wizardTargets.length = 0;
+  vi.clearAllMocks();
+});
+
+describe("DeleteEnvironmentButton", () => {
+  it("stays disabled until the environment's name is typed", async () => {
+    renderButton();
+    await screen.findByRole("dialog");
+
+    expect(confirmButton().disabled).toBe(true);
+
+    const input = screen.getByLabelText(/type/i);
+    fireEvent.change(input, { target: { value: "produc" } });
+    expect(confirmButton().disabled).toBe(true);
+
+    fireEvent.change(input, { target: { value: "production" } });
+    expect(confirmButton().disabled).toBe(false);
+
+    fireEvent.click(confirmButton());
+    expect(deleteEnvironment).toHaveBeenCalledWith({ environmentId: "env_1" });
+  });
+
+  it("renders one row per resource it will destroy, with a count", async () => {
+    renderButton();
+    const dialog = await screen.findByRole("dialog");
+
+    const rows = within(dialog).getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("api"),
+      expect.stringContaining("db"),
+      expect.stringContaining("cache"),
+    ]);
+    // The kinds matter as much as the names: "db" alone doesn't tell you a
+    // Postgres is about to be cascaded away.
+    expect(rows[1]?.textContent).toContain("postgres");
+    expect(dialog.textContent).toMatch(/3 resources/);
+  });
+
+  it("an empty environment says so instead of listing nothing", async () => {
+    renderButton([]);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryAllByRole("listitem")).toHaveLength(0);
+    expect(dialog.textContent).toMatch(/no resources/i);
+  });
+});
 
 import { ProjectDetailView } from "./project-detail-view";
 
@@ -98,12 +222,6 @@ function renderPage() {
     />
   );
 }
-
-afterEach(() => {
-  cleanup();
-  wizardTargets.length = 0;
-  vi.clearAllMocks();
-});
 
 describe("ProjectDetailView deploy wizard targets", () => {
   it("wizard targets from a project page carry gpu facts", () => {
