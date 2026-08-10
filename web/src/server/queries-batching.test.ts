@@ -35,7 +35,7 @@ const cpEnabled = vi.fn(() => false);
 const cpListServers = vi.fn(async () => [] as unknown[]);
 vi.mock("./cp", () => ({
   cpEnabled: () => cpEnabled(),
-  cpListServers: (orgId: string) => cpListServers(orgId),
+  cpListServers: () => cpListServers(),
   cpServerToRow: (r: unknown) => r,
 }));
 vi.mock("./cp-sync", () => ({ reportCpFailure: () => {} }));
