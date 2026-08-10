@@ -54,6 +54,26 @@ func (s *Server) handleBillingCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
+	// SIGMA-294: refuse a SECOND subscription. Checkout never asked whether the
+	// org already had one, and the reachable path to asking twice was a pause:
+	// the CP recorded a paused subscription as "canceled", so the dashboard
+	// offered Subscribe as the only affordance. Completing it left two Paddle
+	// subscriptions on one org — org_billing holds a single
+	// paddle_subscription_id, so the CP tracked one of them and the quantity
+	// sweep re-priced only that one, while the customer was charged twice the
+	// moment the paused one resumed.
+	existing, err := s.billing.GetBillingStatus(r.Context(), orgID)
+	if err != nil {
+		s.writeStoreErr(w, err, "billing checkout")
+		return
+	}
+	if existing.SubscriptionID != "" && existing.Status != "canceled" && existing.Status != "none" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":  "this organization already has a " + existing.Status + " subscription — manage it in the customer portal instead of subscribing again",
+			"status": existing.Status,
+		})
+		return
+	}
 	summary, err := s.billing.BillingSummaryForOrg(r.Context(), orgID, time.Now(), true)
 	if err != nil {
 		s.writeStoreErr(w, err, "billing checkout")
@@ -252,6 +272,11 @@ func paddleOrgID(custom json.RawMessage) string {
 }
 
 // paddleSubStatus maps a Paddle event to our subscription status vocabulary.
+//
+// SIGMA-294: `paused` is its own status, NOT a synonym for `canceled`. A pause
+// is reversible — this very function handles subscription.resumed — and calling
+// it canceled made the dashboard offer a Subscribe button to an org that already
+// had a subscription, which is how one org ended up with two.
 func paddleSubStatus(eventType, dataStatus string) string {
 	switch eventType {
 	case "subscription.created", "subscription.activated", "subscription.updated", "subscription.resumed":
@@ -260,12 +285,16 @@ func paddleSubStatus(eventType, dataStatus string) string {
 			return "active"
 		case "past_due":
 			return "past_due"
-		case "paused", "canceled":
+		case "paused":
+			return "paused"
+		case "canceled":
 			return "canceled"
 		default:
 			return "active"
 		}
-	case "subscription.canceled", "subscription.paused":
+	case "subscription.paused":
+		return "paused"
+	case "subscription.canceled":
 		return "canceled"
 	case "transaction.payment_failed":
 		return "past_due"

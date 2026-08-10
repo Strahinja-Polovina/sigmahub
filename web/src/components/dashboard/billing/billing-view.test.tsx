@@ -82,3 +82,37 @@ describe("BillingView invoices", () => {
     expect(screen.queryByRole("button", { name: /Download invoice/ })).toBeNull();
   });
 });
+
+describe("BillingView subscription card", () => {
+  // SIGMA-294: the CP collapsed `paused` into `canceled`, so a subscription an
+  // Org Admin paused for a month rendered "Canceled" with a live Subscribe
+  // button — the only affordance on the card. Clicking it created a SECOND
+  // Paddle subscription, and the org was charged twice the moment the first
+  // resumed. Paused now has its own status and sends the admin to the portal.
+  it("offers Resume, not Subscribe, while billing is paused", () => {
+    render(
+      <BillingView
+        orgName="Acme"
+        billing={billing}
+        servers={servers}
+        subscription={{ ...subscription, status: "paused" }}
+      />
+    );
+    expect(screen.getByText("Paused")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Subscribe$/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Resume subscription/ }));
+    expect(startCheckout).not.toHaveBeenCalled();
+  });
+
+  it("still offers Subscribe once the subscription is genuinely canceled", () => {
+    render(
+      <BillingView
+        orgName="Acme"
+        billing={billing}
+        servers={servers}
+        subscription={{ ...subscription, status: "canceled" }}
+      />
+    );
+    expect(screen.getByRole("button", { name: /^Subscribe$/ })).toBeTruthy();
+  });
+});

@@ -109,7 +109,9 @@ const INCLUDED_FEATURES: { label: string; icon: React.ElementType }[] = [
 /** Paddle subscription state (P2-4); present only in CP mode. */
 type Subscription = {
   configured: boolean;
-  status: string; // none | active | past_due | canceled
+  /** none | active | past_due | paused | canceled — paused is distinct because
+   *  it is reversible and must not offer a second checkout (SIGMA-294). */
+  status: string;
   billableUnits: number;
   serverHoursThisMonth: number;
   orgId: string;
@@ -168,9 +170,19 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
     none: { text: "No subscription", cls: "text-muted-foreground" },
     active: { text: "Active", cls: "text-emerald-700 dark:text-emerald-400" },
     past_due: { text: "Payment past due", cls: "text-destructive" },
+    // Paused is NOT canceled (SIGMA-294). The CP used to collapse the two, so an
+    // org that paused for a month read "Canceled" and was offered a Subscribe
+    // button — the only affordance on the card — and a second Paddle
+    // subscription is exactly what that button produced.
+    paused: { text: "Paused", cls: "text-amber-700 dark:text-amber-400" },
     canceled: { text: "Canceled", cls: "text-amber-700 dark:text-amber-400" },
   };
   const st = statusLabel[sub.status] ?? statusLabel.none;
+  // A subscription that still exists in Paddle is managed in the portal, never
+  // re-bought here. The CP refuses a second checkout for these states too
+  // (409), so this is the UI half of one rule rather than the whole of it.
+  const hasLiveSubscription =
+    sub.status === "active" || sub.status === "past_due" || sub.status === "paused";
 
   return (
     <Card>
@@ -189,11 +201,18 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
               avoid interruption.
             </span>
           )}
+          {sub.status === "paused" && (
+            <span className="text-xs text-muted-foreground">
+              Billing is paused. Your subscription still exists — resume it in the customer
+              portal rather than starting a new one, or you will be charged twice when it
+              resumes.
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
-          {sub.status === "active" || sub.status === "past_due" ? (
+          {hasLiveSubscription ? (
             <Button variant="outline" size="sm" onClick={() => go(sub.orgId, "portal")} disabled={pending}>
-              Manage subscription
+              {sub.status === "paused" ? "Resume subscription" : "Manage subscription"}
             </Button>
           ) : (
             <Button

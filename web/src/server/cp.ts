@@ -1389,7 +1389,7 @@ export type CpBillingSummary = {
   serverHoursThisMonth: number;
   month: string;
   subscription: {
-    status: string; // none | active | past_due | canceled
+    status: string; // none | active | past_due | paused | canceled
     quantity: number;
     customerId?: string;
     subscriptionId?: string;

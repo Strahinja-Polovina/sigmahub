@@ -96,8 +96,12 @@ type BillingStatus struct {
 	OrgID          string `json:"orgId"`
 	CustomerID     string `json:"customerId,omitempty"`
 	SubscriptionID string `json:"subscriptionId,omitempty"`
-	Status         string `json:"status"` // none|active|past_due|canceled
-	Quantity       int    `json:"quantity"`
+	// none|active|past_due|paused|canceled. `paused` is deliberately distinct
+	// from `canceled` (SIGMA-294): a pause is reversible, and collapsing the two
+	// made the dashboard offer a Subscribe button to an org that already had a
+	// subscription.
+	Status   string `json:"status"`
+	Quantity int    `json:"quantity"`
 }
 
 // BillingSummary is the org's usage + charge readout for a month.

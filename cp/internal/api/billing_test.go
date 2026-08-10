@@ -16,6 +16,7 @@ import (
 
 type fakeBilling struct {
 	summary   store.BillingSummary
+	status    store.BillingStatus
 	applied   []store.BillingStatus
 	seen      map[string]bool
 	seenCalls int
@@ -33,7 +34,10 @@ func (f *fakeBilling) BillingSummaryForOrg(_ context.Context, orgID string, _ ti
 	return s, nil
 }
 func (f *fakeBilling) GetBillingStatus(context.Context, string) (store.BillingStatus, error) {
-	return store.BillingStatus{Status: "none"}, nil
+	if f.status.Status == "" {
+		return store.BillingStatus{Status: "none"}, nil
+	}
+	return f.status, nil
 }
 func (f *fakeBilling) UpsertSubscription(_ context.Context, orgID string, in store.BillingStatus, _ string) error {
 	f.applied = append(f.applied, in)
@@ -282,6 +286,91 @@ func TestPaddleWebhook_UncorrelatedEventIsLogged(t *testing.T) {
 	out := logged.String()
 	if !strings.Contains(out, "evt_orphan") || !strings.Contains(out, "transaction.payment_failed") {
 		t.Fatalf("dropped event left no WARN naming it: %q", out)
+	}
+}
+
+// fakePaddleAPI is the outbound Paddle surface, so checkout can be exercised
+// without pretending billing is unconfigured.
+type fakePaddleAPI struct{ checkouts int }
+
+func (f *fakePaddleAPI) CreateCheckout(_ context.Context, _ paddle.CreateTransactionInput) (paddle.Transaction, error) {
+	f.checkouts++
+	return paddle.Transaction{ID: "txn_new", CustomerID: "ctm_1", CheckoutURL: "https://pay.example/x"}, nil
+}
+func (f *fakePaddleAPI) CustomerPortalURL(context.Context, string) (string, error) {
+	return "https://portal.example/x", nil
+}
+func (f *fakePaddleAPI) SetSubscriptionOrg(context.Context, string, string) error { return nil }
+
+// TestBillingCheckout_RefusesWhenSubscriptionExists covers SIGMA-294: checkout
+// never consulted GetBillingStatus, so an org that already had a subscription
+// could create a second one. The reachable path was a PAUSE — the CP recorded
+// it as "canceled", the dashboard therefore rendered a live Subscribe button as
+// the only affordance, and completing that checkout left the org with two
+// Paddle subscriptions, one of which org_billing cannot even track.
+func TestBillingCheckout_RefusesWhenSubscriptionExists(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   store.BillingStatus
+		wantCode int
+	}{
+		{"paused", store.BillingStatus{SubscriptionID: "sub_1", CustomerID: "ctm_1", Status: "paused"}, http.StatusConflict},
+		{"active", store.BillingStatus{SubscriptionID: "sub_1", CustomerID: "ctm_1", Status: "active"}, http.StatusConflict},
+		{"past_due", store.BillingStatus{SubscriptionID: "sub_1", CustomerID: "ctm_1", Status: "past_due"}, http.StatusConflict},
+		// A genuinely canceled subscription is the one case where a new checkout
+		// is the right answer, and an org that never subscribed must still work.
+		{"canceled", store.BillingStatus{SubscriptionID: "sub_1", CustomerID: "ctm_1", Status: "canceled"}, http.StatusOK},
+		{"none", store.BillingStatus{Status: "none"}, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &fakeBilling{
+				summary: store.BillingSummary{Connected: 8, Units: 8, BilledUnits: 8, BillableUnits: 5, Amount: 25},
+				status:  tc.status,
+			}
+			fp := &fakePaddleAPI{}
+			s := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+				DevServiceToken: testServiceToken,
+				Billing:         fb,
+				Paddle:          fp,
+				PaddlePriceID:   "pri_1",
+			})
+			req := httptest.NewRequest("POST", "/v1/orgs/org_1/billing/checkout", nil)
+			req.Header.Set("Authorization", "Bearer "+testServiceToken)
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("checkout with a %s subscription = %d, want %d (body %s)",
+					tc.name, rec.Code, tc.wantCode, rec.Body)
+			}
+			wantCheckouts := 0
+			if tc.wantCode == http.StatusOK {
+				wantCheckouts = 1
+			}
+			if fp.checkouts != wantCheckouts {
+				t.Fatalf("created %d Paddle transactions, want %d", fp.checkouts, wantCheckouts)
+			}
+		})
+	}
+}
+
+// TestPaddleSubStatus_PausedIsNotCanceled covers the other half of SIGMA-294:
+// paused collapsed into "canceled" even though the same function handles
+// subscription.resumed and therefore knows a pause is reversible. A customer who
+// paused for a month saw "Canceled" and a Subscribe button.
+func TestPaddleSubStatus_PausedIsNotCanceled(t *testing.T) {
+	for _, tc := range []struct{ eventType, dataStatus, want string }{
+		{"subscription.paused", "paused", "paused"},
+		{"subscription.updated", "paused", "paused"},
+		{"subscription.canceled", "canceled", "canceled"},
+		{"subscription.updated", "canceled", "canceled"},
+		{"subscription.resumed", "active", "active"},
+		{"subscription.activated", "active", "active"},
+		{"transaction.payment_failed", "", "past_due"},
+	} {
+		if got := paddleSubStatus(tc.eventType, tc.dataStatus); got != tc.want {
+			t.Errorf("paddleSubStatus(%q, %q) = %q, want %q",
+				tc.eventType, tc.dataStatus, got, tc.want)
+		}
 	}
 }
 
