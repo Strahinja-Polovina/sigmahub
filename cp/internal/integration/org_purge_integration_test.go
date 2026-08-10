@@ -76,7 +76,10 @@ func seedTenant(t *testing.T, st *store.Store, orgID string) string {
 	}
 	// An alert channel: the CP's own PII, a recipient address plus a credential.
 	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.example/T000/x",
+		// A real hooks.slack.com address, not a placeholder host: SIGMA-259 pinned
+		// the Slack prefix at create time, so an example.com stand-in is rejected
+		// before the row this test needs to purge ever exists.
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/B000/xxxx",
 	}); err != nil {
 		t.Fatal(err)
 	}
