@@ -196,9 +196,59 @@ type RegistryCredential struct {
 	Password string `json:"password"`
 }
 
+// serverNeedsRegistry reports whether this server has a reason to hold the org's
+// registry credential right now (SIGMA-258).
+//
+// There are exactly three of them, and they mirror what the reconciler renders:
+//
+//   - PUSH. The server is the build_server_id of a deployment that is still in
+//     flight, so it is about to run `docker push` (renderDeployOps only
+//     qualifies an image with the registry when the build and the run are on
+//     different daemons, and ClusterBuildSpecsForServer renders cluster builds
+//     for the same statuses).
+//   - PULL, single host. The server is the deploy target of a deployment whose
+//     build happened somewhere else, so its rollout carries an image.pull op
+//     against the org's private registry (SIGMA-243). 'success' counts: the
+//     rollout stays in that server's document after the deploy finishes and a
+//     restart re-pulls the same image.
+//   - PULL, cluster node. The server is a node of a cluster that carries
+//     workloads; the k8s driver mints an imagePullSecret from this credential.
+//
+// Nothing else has a use for it, and the credential is in practice a registry
+// PAT with push rights over every image the org publishes — so anything else is
+// a 404. Before this, the query filtered on org_id alone and the server id only
+// labelled the audit row, which made every enrolled host in the org — including
+// a low-value staging box — a full supply-chain compromise of the whole tenant.
+func (s *Store) serverNeedsRegistry(ctx context.Context, orgID, serverID string) (bool, error) {
+	var need bool
+	err := s.Pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		         SELECT 1 FROM deployments
+		          WHERE org_id = $1 AND build_server_id = $2
+		            AND status IN ('queued','building','deploying'))
+		    OR EXISTS (
+		         SELECT 1 FROM deployments
+		          WHERE org_id = $1 AND server_id = $2
+		            AND build_server_id IS NOT NULL AND build_server_id <> $2
+		            AND status IN ('queued','building','deploying','success'))
+		    OR EXISTS (
+		         SELECT 1 FROM cluster_nodes n
+		           JOIN clusters c ON c.id = n.cluster_id
+		           JOIN resources r ON r.cluster_id = n.cluster_id
+		          WHERE n.server_id = $2 AND c.org_id = $1)`,
+		orgID, serverID).Scan(&need)
+	if err != nil {
+		return false, fmt.Errorf("check registry need: %w", err)
+	}
+	return need, nil
+}
+
 // RegistryCredentialForServer resolves the registry credential for one server,
-// scoped by the agent token the caller already authenticated. Audited: handing
-// out a push credential is exactly the kind of access that has to leave a trail.
+// scoped by the agent token the caller already authenticated AND by whether that
+// server has anything to push or pull (see serverNeedsRegistry). Audited either
+// way: handing out a push credential is exactly the kind of access that has to
+// leave a trail, and so is refusing one — a host asking for a credential it has
+// no business holding is the first line of an incident timeline.
 func (s *Store) RegistryCredentialForServer(ctx context.Context, orgID, serverID string) (RegistryCredential, error) {
 	var cred RegistryCredential
 	var wrapped []byte
@@ -210,6 +260,21 @@ func (s *Store) RegistryCredentialForServer(ctx context.Context, orgID, serverID
 	}
 	if err != nil {
 		return RegistryCredential{}, err
+	}
+	need, err := s.serverNeedsRegistry(ctx, orgID, serverID)
+	if err != nil {
+		return RegistryCredential{}, err
+	}
+	if !need {
+		if _, aerr := s.Pool.Exec(ctx, `
+			INSERT INTO cp_audit_log (org_id, actor, action, target)
+			VALUES ($1, $2, 'Registry credential refused', $3)`,
+			orgID, "agent:"+serverID, cred.Host); aerr != nil {
+			return RegistryCredential{}, fmt.Errorf("audit: %w", aerr)
+		}
+		// The same answer an org with no registry gets: a server that is not part
+		// of a build or a pull learns nothing about the registry from asking.
+		return RegistryCredential{}, ErrNotFound
 	}
 	if len(wrapped) > 0 {
 		plain, uerr := s.custody.Unwrap(ctx, registryPurpose(orgID), wrapped)
