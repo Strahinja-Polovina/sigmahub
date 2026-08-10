@@ -154,8 +154,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	// A preview teardown removed a resource — re-render its server so the
 	// container and (pre-authorised) volume removal actually ship. Preview
 	// deploys ride the ordinary deploy-request drain.
-	if outcome.PreviewTeardown != nil && s.reconcile != nil {
-		s.reconcile.ReconcileAsync(outcome.PreviewTeardown.OrgID, outcome.PreviewTeardown.ServerID)
+	if s.reconcile != nil {
+		for _, ref := range outcome.PreviewTeardown {
+			s.reconcile.ReconcileAsync(ref.OrgID, ref.ServerID)
+		}
 	}
 
 	resp := map[string]any{"delivered": true, "event": event}
@@ -176,7 +178,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	case outcome.PreviewDeploy != nil:
 		resp["status"] = "preview deploy enqueued"
 		resp["deployRequestId"] = outcome.PreviewDeploy.ID
-	case outcome.PreviewTeardown != nil:
+	case len(outcome.PreviewTeardown) > 0:
 		resp["status"] = "preview torn down"
 	case outcome.PRHook != nil:
 		resp["status"] = "pr recorded"
