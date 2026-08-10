@@ -20,7 +20,7 @@ import (
 type DSDStore interface {
 	GetDSD(ctx context.Context, serverID string) (dsd.Signed, error)
 	CurrentDSDVersion(ctx context.Context, serverID string) (int64, error)
-	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool) (bool, error)
+	ApplyDSDStatus(ctx context.Context, serverID string, version int64, opStatus map[string]json.RawMessage, converged bool, failedOps []string) (bool, error)
 	MarkDestructiveOpApplied(ctx context.Context, serverID, id string) error
 }
 
@@ -166,6 +166,13 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 	// host:*, proxy, and volrm: ops that never enter byResource — so a failed
 	// non-resource op still clears apply_ok and triggers the SIGMA-104 re-drive.
 	converged := true
+	// The ids behind that boolean (SIGMA-247). A host/proxy/agent op has no
+	// resource to route its status into, so before this its only trace anywhere
+	// was flipping `converged` to false — an operator could see that a machine
+	// had stopped converging but never which op was refusing to apply. Collected
+	// here (the only place that sees the full op set) and stored alongside
+	// apply_ok.
+	var failedOps []string
 	for opID, st := range req.Ops {
 		var os struct {
 			State string `json:"state"`
@@ -174,6 +181,7 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(st, &os)
 		if os.State == "failed" || os.State == "skipped" {
 			converged = false
+			failedOps = append(failedOps, opID)
 		}
 		if phase, resID, service, isDeploy := deployPhase(opID); isDeploy && os.State != "" {
 			advances = append(advances, deployAdvance{phase: phase, resID: resID, service: service, ok: os.State == "applied", errText: os.Error})
@@ -275,7 +283,7 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 			byResource[resID] = b
 		}
 	}
-	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource, converged)
+	applied, err := s.dsdStore.ApplyDSDStatus(r.Context(), srv.ID, req.Version, byResource, converged, failedOps)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no DSD for this server"})
 		return

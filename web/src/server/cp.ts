@@ -67,6 +67,25 @@ export type CpServer = {
   decommissioningSince?: string | null;
   /** Whether that request opted into destroying named volumes. */
   purgeVolumes?: boolean;
+  /** DSD convergence (SIGMA-247) — whether the host is DOING what we asked, as
+   *  opposed to `status`, which only says whether it is still talking to us. A
+   *  host whose firewall op has failed every apply for an hour keeps
+   *  heartbeating and reads `running`; `converged` is the field that says
+   *  otherwise, and `applyFailedOps` names the ops.
+   *
+   *  `applyOk` false means the last report failed; `applyOk` true with
+   *  `appliedVersion` behind `dsdVersion` is an apply merely in flight. Once
+   *  `redriveCount` reaches the control plane's cap the divergence is permanent
+   *  until the configuration changes — that is when `dsd_apply_failed` fires.
+   *
+   *  All optional: an older control plane that predates the read model simply
+   *  reads as "nothing known", not as a broken servers page. */
+  dsdVersion?: number;
+  appliedVersion?: number;
+  applyOk?: boolean;
+  redriveCount?: number;
+  applyFailedOps?: string[];
+  converged?: boolean;
 };
 
 export type CpMetricPoint = {
