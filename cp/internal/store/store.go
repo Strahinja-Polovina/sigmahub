@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -105,10 +106,57 @@ func (s *Store) Close() { s.Pool.Close() }
 
 func (s *Store) Ping(ctx context.Context) error { return s.Pool.Ping(ctx) }
 
+// migrateLockKey is the advisory-lock key every migration run takes
+// (SIGMA-290). It is a NAME hashed by Postgres rather than a magic number so
+// the web half — which migrates the same database with drizzle from
+// web/src/server/db/migrate-prod.ts — can take the identical lock by writing
+// the identical string. The two migration ledgers are separate; the exclusion
+// between the processes touching one database is not.
+const migrateLockKey = "sigmahub:migrate"
+
 // Migrate applies embedded migrations in filename order. Each migration runs
 // in a transaction and is recorded in schema_migrations, so re-running on
 // boot is idempotent.
+//
+// The whole run is serialised behind a session-level advisory lock (SIGMA-290).
+// Migration is a side effect of process start, so the number of processes
+// racing it is the number of replicas, and the migrations are bare,
+// non-idempotent DDL. Without the lock two replicas of the same release both
+// see a file unapplied, one takes ACCESS EXCLUSIVE on the new object and the
+// other fails with `relation "x" already exists` — Migrate returns an error,
+// the process exits 1, the supervisor restarts it and the operator watches a
+// crash-looping control plane. Even the CREATE TABLE IF NOT EXISTS below races:
+// concurrent creates collide on pg_type's unique index, not on the IF NOT
+// EXISTS check.
+//
+// BLOCKING is the correct behaviour, which is why this is pg_advisory_lock and
+// not the try/skip loop LockServerReconcile uses: a replica that arrives second
+// must wait for the first to finish and then find every migration recorded,
+// rather than serve requests against a schema it has not seen applied. The lock
+// is held on ONE checked-out connection for the whole run; the loop's own
+// queries take other pool connections, so the pool must have at least two —
+// Open floors it at 20.
 func (s *Store) Migrate(ctx context.Context, log *slog.Logger) error {
+	lockConn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock connection: %w", err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(hashtext($1))`, migrateLockKey); err != nil {
+		return fmt.Errorf("take migration lock: %w", err)
+	}
+	// Unlock explicitly rather than relying on the session ending: the
+	// connection goes back to the pool, and a session-level lock left behind on
+	// a pooled connection would wedge every later migration run against this
+	// database, including the next boot of this same process.
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := lockConn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext($1))`, migrateLockKey); err != nil {
+			log.Warn("release migration lock", "err", err)
+		}
+	}()
+
 	if _, err := s.Pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			filename   TEXT PRIMARY KEY,

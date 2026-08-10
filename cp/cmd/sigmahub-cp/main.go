@@ -43,6 +43,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := migrateOnly(); err != nil {
+			slog.Error("fatal", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
@@ -87,6 +94,42 @@ func mintServiceToken(args []string) error {
 		return err
 	}
 	fmt.Printf("service token %s (org %s, role %s):\n\n  %s\n\nShown once — only its hash is stored.\n", p.ID, p.OrgID, p.Role, tok)
+	return nil
+}
+
+// migrateOnly applies the schema and exits, so migration can be a DEPLOY STEP
+// rather than only a side effect of process start (SIGMA-290).
+//
+// Until this existed, the only way to migrate was to boot something: the API
+// server, or — surprisingly — `mint-service-token`, which goes through
+// setupStore and therefore migrates a database as a side effect of issuing a
+// token. That makes "when does the schema change" an answer nobody can state,
+// and it is the reason `replicas: 2` used to mean two processes racing the DDL.
+// Run this once against the new image before rolling any replicas; the
+// advisory lock in Store.Migrate makes running it concurrently with a booting
+// replica safe rather than merely unlikely.
+//
+// It deliberately does NOT load the KMS custody or the token pepper: applying
+// schema must not require the production key material to be reachable from
+// wherever the deploy step runs.
+func migrateOnly() error {
+	databaseURL := os.Getenv("CP_DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("CP_DATABASE_URL is required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log := slog.Default()
+	st, err := store.Open(ctx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, log); err != nil {
+		return err
+	}
+	log.Info("migrations applied")
 	return nil
 }
 
