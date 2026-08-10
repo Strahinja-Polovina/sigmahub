@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, inArray, desc } from "drizzle-orm";
+import { and, count, eq, inArray, desc } from "drizzle-orm";
 import { db } from "./db";
 import * as s from "./db/schema";
 import { user } from "./db/auth-schema";
@@ -292,47 +292,93 @@ export async function getProjectSummaries(
   visible?: Set<string> | null
 ): Promise<ProjectSummary[]> {
   const projs = await getProjects(orgId, visible);
-  return Promise.all(
-    projs.map(async (project) => {
-      const envs = await db
-        .select({ id: s.environments.id, name: s.environments.name })
-        .from(s.environments)
-        .where(eq(s.environments.projectId, project.id));
-      const envIds = envs.map((e) => e.id);
-      const envNames = new Map(envs.map((e) => [e.id, e.name]));
-      const resources = await db
-        .select({
-          id: s.resources.id,
-          name: s.resources.name,
-          kind: s.resources.kind,
-          environmentId: s.resources.environmentId,
-          status: s.resources.status,
-        })
-        .from(s.resources)
-        .where(eq(s.resources.projectId, project.id));
-      const serverRows = envIds.length
-        ? await db
-            .selectDistinct({ serverId: s.envServers.serverId })
-            .from(s.envServers)
-            .where(inArray(s.envServers.environmentId, envIds))
-        : [];
-      const statusCounts: Record<string, number> = {};
-      for (const r of resources) statusCounts[r.status] = (statusCounts[r.status] ?? 0) + 1;
-      return {
-        project,
-        envCount: envs.length,
-        serverCount: serverRows.length,
-        resourceCount: resources.length,
-        statusCounts,
-        resources: resources.map((r) => ({
-          id: r.id,
-          name: r.name,
-          kind: r.kind,
-          envName: envNames.get(r.environmentId) ?? "",
-        })),
-      };
+  if (projs.length === 0) return [];
+  const projIds = projs.map((p) => p.id);
+
+  // SIGMA-326: three queries for the whole page, not three PER CARD. This used
+  // to be a Promise.all over the projects issuing an environments, a resources
+  // and an env_servers query each, so the Projects page cost 1 + 3n round-trips
+  // — and every read here is `no-store`, so an org with twenty projects paid
+  // sixty-one sequential-ish round-trips on every single navigation. The rows
+  // are the same rows; only the grouping moved from SQL into memory.
+  const envs = await db
+    .select({
+      id: s.environments.id,
+      name: s.environments.name,
+      projectId: s.environments.projectId,
     })
-  );
+    .from(s.environments)
+    .where(inArray(s.environments.projectId, projIds));
+  const resources = await db
+    .select({
+      id: s.resources.id,
+      name: s.resources.name,
+      kind: s.resources.kind,
+      projectId: s.resources.projectId,
+      environmentId: s.resources.environmentId,
+      status: s.resources.status,
+    })
+    .from(s.resources)
+    .where(inArray(s.resources.projectId, projIds));
+  const envIds = envs.map((e) => e.id);
+  const attachments = envIds.length
+    ? await db
+        .selectDistinct({
+          environmentId: s.envServers.environmentId,
+          serverId: s.envServers.serverId,
+        })
+        .from(s.envServers)
+        .where(inArray(s.envServers.environmentId, envIds))
+    : [];
+
+  const envNames = new Map(envs.map((e) => [e.id, e.name]));
+  const envsByProject = new Map<string, string[]>();
+  for (const e of envs) {
+    const list = envsByProject.get(e.projectId);
+    if (list) list.push(e.id);
+    else envsByProject.set(e.projectId, [e.id]);
+  }
+  const resourcesByProject = new Map<string, typeof resources>();
+  for (const r of resources) {
+    const list = resourcesByProject.get(r.projectId);
+    if (list) list.push(r);
+    else resourcesByProject.set(r.projectId, [r]);
+  }
+  const serversByEnv = new Map<string, string[]>();
+  for (const a of attachments) {
+    const list = serversByEnv.get(a.environmentId);
+    if (list) list.push(a.serverId);
+    else serversByEnv.set(a.environmentId, [a.serverId]);
+  }
+
+  return projs.map((project) => {
+    const projectEnvIds = envsByProject.get(project.id) ?? [];
+    const projectResources = resourcesByProject.get(project.id) ?? [];
+    // Distinct across the project's environments, exactly as the per-project
+    // selectDistinct did: one server attached to two of a project's
+    // environments is one server on the card, not two.
+    const serverIds = new Set<string>();
+    for (const envId of projectEnvIds) {
+      for (const sv of serversByEnv.get(envId) ?? []) serverIds.add(sv);
+    }
+    const statusCounts: Record<string, number> = {};
+    for (const r of projectResources) {
+      statusCounts[r.status] = (statusCounts[r.status] ?? 0) + 1;
+    }
+    return {
+      project,
+      envCount: projectEnvIds.length,
+      serverCount: serverIds.size,
+      resourceCount: projectResources.length,
+      statusCounts,
+      resources: projectResources.map((r) => ({
+        id: r.id,
+        name: r.name,
+        kind: r.kind,
+        envName: envNames.get(r.environmentId) ?? "",
+      })),
+    };
+  });
 }
 
 /** Sidebar nav: each project with its environments (id + name). */
@@ -431,15 +477,24 @@ export async function getServersWithCounts(
     .from(s.servers)
     .where(eq(s.servers.orgId, orgId))
     .orderBy(s.servers.connectedAt);
-  return Promise.all(
-    rows.map(async (sv) => ({
-      ...sv,
-      resourceCount: await db.$count(
-        s.resources,
-        eq(s.resources.serverId, sv.id)
-      ),
-    }))
-  );
+  if (rows.length === 0) return [];
+  // SIGMA-326: one GROUP BY instead of a $count per server. The previous shape
+  // was 1 + n round-trips for a page that shows n rows, which is the same N+1
+  // getOrgResources had — a fleet of a hundred hosts made the Servers page a
+  // hundred and one queries deep, on every navigation, for n integers.
+  const counts = await db
+    .select({ serverId: s.resources.serverId, n: count() })
+    .from(s.resources)
+    .where(
+      inArray(
+        s.resources.serverId,
+        rows.map((sv) => sv.id)
+      )
+    )
+    .groupBy(s.resources.serverId);
+  const byServer = new Map<string, number>();
+  for (const c of counts) if (c.serverId) byServer.set(c.serverId, Number(c.n));
+  return rows.map((sv) => ({ ...sv, resourceCount: byServer.get(sv.id) ?? 0 }));
 }
 
 /** Resources scheduled on a server, with their project + environment names. */
@@ -610,22 +665,39 @@ export async function getOrgResources(
     .innerJoin(s.environments, eq(s.resources.environmentId, s.environments.id))
     .where(eq(s.projects.orgId, orgId));
   const scoped = visible ? rows.filter((row) => visible.has(row.resource.projectId)) : rows;
-  return Promise.all(
-    scoped.map(async (row) => {
-      const [latest] = await db
-        .select()
-        .from(s.deployments)
-        .where(eq(s.deployments.resourceId, row.resource.id))
-        .orderBy(desc(s.deployments.startedAt))
-        .limit(1);
-      return {
-        ...row.resource,
-        projectName: row.projectName,
-        envName: row.envName,
-        latestDeploy: latest ?? null,
-      };
-    })
-  );
+  if (scoped.length === 0) return [];
+
+  // SIGMA-326: ONE query for every resource's most recent deployment.
+  //
+  // This used to be a `Promise.all` over `scoped` issuing a `… WHERE
+  // resource_id = ? ORDER BY started_at DESC LIMIT 1` per resource, so the
+  // Overview and Resources pages cost 1 + n round-trips against the web
+  // database before their first byte of HTML. Both pages are `no-store`, so an
+  // org with six hundred resources paid six hundred and one queries on every
+  // navigation and a handful of concurrent users queued behind the pool.
+  //
+  // DISTINCT ON is the Postgres way to say "the first row of each group": the
+  // ORDER BY must lead with the DISTINCT ON expression, and the trailing
+  // `started_at DESC` then decides WHICH row of each group survives — the same
+  // row the per-resource LIMIT 1 picked.
+  const latest = await db
+    .selectDistinctOn([s.deployments.resourceId])
+    .from(s.deployments)
+    .where(
+      inArray(
+        s.deployments.resourceId,
+        scoped.map((row) => row.resource.id)
+      )
+    )
+    .orderBy(s.deployments.resourceId, desc(s.deployments.startedAt));
+  const latestByResource = new Map(latest.map((d) => [d.resourceId, d]));
+
+  return scoped.map((row) => ({
+    ...row.resource,
+    projectName: row.projectName,
+    envName: row.envName,
+    latestDeploy: latestByResource.get(row.resource.id) ?? null,
+  }));
 }
 
 /** P2-7b: pending (unaccepted, unrevoked) invitations for an org's Members tab. */
