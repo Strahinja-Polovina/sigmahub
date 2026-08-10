@@ -97,7 +97,11 @@ export const auth = betterAuth({
     // Reset emails: no SMTP is bundled, so the reset link goes to the server
     // log — genuinely usable in dev/self-hosted setups (the operator can
     // relay it), and honest about what happens instead of silently dropping.
-    // Wire a real transport here for hosted deployments.
+    // Wire a real transport here for hosted deployments — and in the SAME
+    // commit teach lib/mail.ts about it, because that is what /forgot reads to
+    // decide whether to say "check your inbox" or "ask your administrator for
+    // the link" (SIGMA-307). A transport wired here and not there puts the
+    // locked-out user back in their spam folder.
     sendResetPassword: async ({ user, url }) => {
       console.info(`[auth] password reset requested for ${user.email}: ${url}`);
     },
