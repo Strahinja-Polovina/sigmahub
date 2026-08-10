@@ -70,6 +70,19 @@ var llmEngines = map[string]LLMEngineDef{
 	},
 }
 
+// llmEngineOrder is the presentation order of the runtimes, default first.
+//
+// A map has no order, so LLMEngineNames used to answer in whatever order Go's
+// randomised range produced: the dashboard's runtime picker would have listed
+// its two options differently on consecutive loads, and — since this list is
+// now RENDERED into the dashboard's generated catalog (SIGMA-278) — the
+// generator would have emitted a different file on every run and the staleness
+// test would have failed at random. llmEngines is the source of truth for which
+// runtimes exist; this is the source of truth for the order they are shown in,
+// and it must name every key in llmEngines (asserted by
+// TestGeneratedTypeScriptCarriesTheRuntimeCatalog).
+var llmEngineOrder = []string{"vllm", "ollama"}
+
 // DefaultLLMEngine is what an `llm` resource gets when its spec names none.
 const DefaultLLMEngine = "vllm"
 
@@ -85,11 +98,18 @@ func IsLLMKind(kind string) bool { return kind == "llm" }
 // IsLLMEngine reports whether a runtime name is known.
 func IsLLMEngine(engine string) bool { _, ok := llmEngines[engine]; return ok }
 
-// LLMEngineNames lists the runtimes, for the API to publish to the dashboard.
+// LLMEngineNames lists the runtimes in presentation order, for the API to
+// publish to the dashboard and for the catalog generator to render.
+//
+// The order is llmEngineOrder's, not the map's: see the comment there — a
+// randomised order made this endpoint's answer, and the generated TypeScript,
+// different on every call.
 func LLMEngineNames() []string {
 	out := make([]string, 0, len(llmEngines))
-	for name := range llmEngines {
-		out = append(out, name)
+	for _, name := range llmEngineOrder {
+		if _, ok := llmEngines[name]; ok {
+			out = append(out, name)
+		}
 	}
 	return out
 }

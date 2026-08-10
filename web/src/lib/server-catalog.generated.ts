@@ -22,7 +22,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "51c85b46f6346662251c0eb840a89aaf9a218482660295ee9a35793ab8dfb1b2";
+export const CATALOG_SOURCE_SHA256 = "d13a157635ac284009760a94bb5e8720331e6c91ac72416848a49cbd54ab1206";
 
 export type ServerType =
   | "general"
@@ -67,6 +67,18 @@ export type DatabaseEngine =
 export type S3Engine =
   | "minio"
   | "seaweedfs";
+
+/** An inference runtime this control plane knows how to render (store.llmEngines).
+ *
+ *  Rendered rather than restated for the reason the S3 list is: the wizard kept
+ *  a two-entry copy, so renaming or replacing the default runtime on the Go
+ *  side left it sending engine "vllm" for every model whose card did not
+ *  resolve — a Hub timeout, a control plane with no Hub catalogue, a pasted repo
+ *  id the Hub does not know — and provisionLLMTx answered with a 422 at the end
+ *  of the LLM wizard while every suite stayed green (SIGMA-278). */
+export type LLMEngine =
+  | "vllm"
+  | "ollama";
 
 /** An alert event the control plane can emit (store.AlertEvents).
  *
@@ -501,6 +513,13 @@ export const S3_ENGINE_CATALOG: Record<S3Engine, S3EngineSpec> = {
 export const S3_ENGINE_NAMES: S3Engine[] = ["minio", "seaweedfs"];
 /** What an s3 resource provisions when its spec names no engine. */
 export const DEFAULT_S3_ENGINE: S3Engine = "minio";
+
+/** The inference runtimes, in the order the picker offers them (the same
+ *  order GET /llm/engines answers with). */
+export const LLM_ENGINE_NAMES: LLMEngine[] = ["vllm", "ollama"];
+/** What an llm resource is served by when its spec names no runtime — and
+ *  therefore what the wizard must send for a model whose card did not resolve. */
+export const DEFAULT_LLM_ENGINE: LLMEngine = "vllm";
 
 /** Every alert event, in the order the control plane serves them
  *  (GET /orgs/{id}/alert-channels answers with exactly this list). The rules

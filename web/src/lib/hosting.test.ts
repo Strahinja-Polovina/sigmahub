@@ -80,6 +80,7 @@ const CATALOG_SOURCES = [
   "db_engines.go",
   "s3_engines.go",
   "alerts_store.go",
+  "llm_engines.go",
 ];
 
 describe("the generated catalog tracks the control plane", () => {

@@ -181,6 +181,17 @@ func RenderTypeScript(srcSHA string) []byte {
 		" *  kind: `s3` is the kind, and which engine serves it is a choice under it. */\n")
 	fmt.Fprintf(&b, "export type S3Engine =\n%s;\n\n", tsUnion(S3EngineNames()))
 
+	b.WriteString(`/** An inference runtime this control plane knows how to render (store.llmEngines).
+ *
+ *  Rendered rather than restated for the reason the S3 list is: the wizard kept
+ *  a two-entry copy, so renaming or replacing the default runtime on the Go
+ *  side left it sending engine "vllm" for every model whose card did not
+ *  resolve — a Hub timeout, a control plane with no Hub catalogue, a pasted repo
+ *  id the Hub does not know — and provisionLLMTx answered with a 422 at the end
+ *  of the LLM wizard while every suite stayed green (SIGMA-278). */
+`)
+	fmt.Fprintf(&b, "export type LLMEngine =\n%s;\n\n", tsUnion(LLMEngineNames()))
+
 	b.WriteString(`/** An alert event the control plane can emit (store.AlertEvents).
  *
  *  A union rather than a string list, because the dashboard's rules editor
@@ -448,6 +459,13 @@ export type ResourceCategorySpec = {
 	fmt.Fprintf(&b, "export const S3_ENGINE_NAMES: S3Engine[] = %s;\n", tsStringArray(S3EngineNames()))
 	b.WriteString("/** What an s3 resource provisions when its spec names no engine. */\n")
 	fmt.Fprintf(&b, "export const DEFAULT_S3_ENGINE: S3Engine = %s;\n\n", tsString(DefaultS3Engine))
+
+	b.WriteString("/** The inference runtimes, in the order the picker offers them (the same\n" +
+		" *  order GET /llm/engines answers with). */\n")
+	fmt.Fprintf(&b, "export const LLM_ENGINE_NAMES: LLMEngine[] = %s;\n", tsStringArray(LLMEngineNames()))
+	b.WriteString("/** What an llm resource is served by when its spec names no runtime — and\n" +
+		" *  therefore what the wizard must send for a model whose card did not resolve. */\n")
+	fmt.Fprintf(&b, "export const DEFAULT_LLM_ENGINE: LLMEngine = %s;\n\n", tsString(DefaultLLMEngine))
 
 	b.WriteString(`/** Every alert event, in the order the control plane serves them
  *  (GET /orgs/{id}/alert-channels answers with exactly this list). The rules

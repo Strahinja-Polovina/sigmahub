@@ -9,10 +9,13 @@
  */
 
 import {
+  DEFAULT_LLM_ENGINE,
   DEFAULT_S3_ENGINE,
+  LLM_ENGINE_NAMES,
   RESOURCE_KIND_LABELS,
   S3_ENGINE_NAMES,
   categoryForKind,
+  type LLMEngine,
   type ResourceKind,
   type S3Engine,
 } from "@/lib/server-catalog.generated";
@@ -75,13 +78,35 @@ export const S3_ENGINES = S3_ENGINE_NAMES.map((id) => ({ id, ...S3_ENGINE_COPY[i
 // a different statement that was true only by luck.
 export { DEFAULT_S3_ENGINE };
 
-/** Inference runtimes the control plane knows how to render. */
-export const LLM_ENGINES = [
-  { id: "vllm", label: "vLLM", detail: "High-throughput serving for most open models" },
-  { id: "ollama", label: "Ollama", detail: "Simple single-model serving" },
-] as const;
+/**
+ * How each inference runtime is described in the picker.
+ *
+ * Same story as S3_ENGINE_COPY above, and the last hand-kept copy in this file
+ * (SIGMA-278): the runtimes were a two-entry literal beside a control plane
+ * that already knew the same fact. Renaming or replacing the default runtime in
+ * store.llmEngines — vllm → vllm-openai, or making ollama the default — left
+ * the wizard sending engine "vllm" for every model whose card did not resolve
+ * (a Hub timeout, a control plane with no Hub catalogue, a pasted repo id the
+ * Hub does not know), and provisionLLMTx answers that with `unknown inference
+ * runtime "vllm"` — a 422 at the end of the LLM wizard, with every Go and
+ * TypeScript suite green.
+ *
+ * Only the COPY lives here, typed as a total Record so a runtime added on the
+ * Go side stops the build until someone writes the sentence an operator picks
+ * it by, rather than appearing as a bare id or not at all.
+ */
+const LLM_ENGINE_COPY: Record<LLMEngine, { label: string; detail: string }> = {
+  vllm: { label: "vLLM", detail: "High-throughput serving for most open models" },
+  ollama: { label: "Ollama", detail: "Simple single-model serving" },
+};
 
-export const DEFAULT_LLM_ENGINE = LLM_ENGINES[0].id;
+/** The picker's options, in the control plane's own order. */
+export const LLM_ENGINES = LLM_ENGINE_NAMES.map((id) => ({ id, ...LLM_ENGINE_COPY[id] }));
+
+// Re-exported rather than derived from LLM_ENGINES[0]: the default is the
+// control plane's choice (store.DefaultLLMEngine), and "whichever the catalog
+// happens to list first" is a different statement that was true only by luck.
+export { DEFAULT_LLM_ENGINE };
 
 /**
  * A runtime's display name, for every screen that shows one.
