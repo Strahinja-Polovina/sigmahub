@@ -253,12 +253,16 @@ func (s *Server) handleDSDStatus(w http.ResponseWriter, r *http.Request) {
 				resID := key[:strings.Index(key, ":")]
 				composeAgg[resID] = append(composeAgg[resID], opStatus{State: os.State, Error: os.Error})
 			}
-		case strings.HasPrefix(opID, "volrm:"):
+		case strings.HasPrefix(opID, "volrm:"), strings.HasPrefix(opID, "k8srm:"):
+			// Both are pending_destructive_ops rows — a Docker volume removal and a
+			// cluster workload teardown (SIGMA-312) — so both retire the same way:
+			// mark the row applied and it stops being rendered.
 			var os struct {
 				State string `json:"state"`
 			}
 			if json.Unmarshal(st, &os) == nil && os.State == "applied" {
-				if err := s.dsdStore.MarkDestructiveOpApplied(r.Context(), srv.ID, strings.TrimPrefix(opID, "volrm:")); err != nil {
+				pdoID := opID[strings.IndexByte(opID, ':')+1:]
+				if err := s.dsdStore.MarkDestructiveOpApplied(r.Context(), srv.ID, pdoID); err != nil {
 					s.log.Error("mark destructive op applied", "err", err, "op", opID)
 				}
 			}

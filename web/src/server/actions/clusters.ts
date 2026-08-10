@@ -16,7 +16,7 @@
 // timestamps — see @/lib/demo-cluster for why, and for the timescale.
 
 import { revalidatePath } from "next/cache";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import {
@@ -366,36 +366,24 @@ export async function deleteCluster(input: {
   } else {
     const cluster = await demoClusterInOrg(input.orgId, input.clusterId);
     name = cluster.name;
-    // The workloads survive their target, which is what the delete dialog
-    // promises: resources.cluster_id is ON DELETE SET NULL, so they are left
-    // with no target and stop running rather than being deleted with it. Say
-    // so in the audit — a resource that silently stops is the kind of thing an
-    // operator finds out about from a customer.
-    const orphaned = await db
-      .select({ id: s.resources.id, name: s.resources.name })
+    // The workloads go first, the cluster second (SIGMA-312). This used to leave
+    // them behind with no target at all — which the control plane cannot even
+    // represent (a resource names exactly one target), and which left their
+    // Kubernetes manifests running on a node the product had forgotten. The
+    // refusal is the ordering: deleting each app is what tears its Deployment,
+    // Service and Ingress down.
+    const deployed = await db
+      .select({ name: s.resources.name })
       .from(s.resources)
       .where(eq(s.resources.clusterId, cluster.id));
-    await db.delete(s.clusters).where(eq(s.clusters.id, cluster.id));
-    if (orphaned.length > 0) {
-      await db
-        .update(s.resources)
-        .set({ status: "stopped" })
-        .where(
-          inArray(
-            s.resources.id,
-            orphaned.map((r) => r.id)
-          )
-        );
-      await writeAudit({
-        orgId: input.orgId,
-        actor: user.name,
-        action: `Cluster deleted — ${orphaned.length} workload(s) lost their target and stopped`,
-        target: orphaned
-          .map((r) => r.name)
-          .sort()
-          .join(", "),
-      });
+    if (deployed.length > 0) {
+      const names = deployed.map((r) => r.name).sort();
+      throw new Error(
+        `Cluster still runs ${names.length} workload(s): ${names.join(", ")}. ` +
+          "Delete or re-home them first."
+      );
     }
+    await db.delete(s.clusters).where(eq(s.clusters.id, cluster.id));
   }
   await writeAudit({
     orgId: input.orgId,

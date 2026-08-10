@@ -371,7 +371,12 @@ describe("removing a node from a demo cluster", () => {
 });
 
 describe("deleting a demo cluster", () => {
-  it("leaves the workloads behind, stopped, rather than deleting them with it", async () => {
+  // SIGMA-312: the workloads go first, the cluster second. Leaving them behind
+  // with no target is not a state the control plane can even represent (a
+  // resource names exactly one target), and on a real node their Kubernetes
+  // manifests kept running — still serving the attached domain — because the
+  // only thing that ever pruned a manifest was applying that same workload.
+  it("refuses while apps are still deployed into it, and names them", async () => {
     await existingCluster({
       id: "cls_prod",
       environmentId: FIXTURE.prodEnvId,
@@ -388,12 +393,14 @@ describe("deleting a demo cluster", () => {
       status: "running",
     });
 
-    await deleteCluster({ orgId: FIXTURE.orgId, clusterId: "cls_prod" });
+    await expect(deleteCluster({ orgId: FIXTURE.orgId, clusterId: "cls_prod" })).rejects.toThrow(
+      /still runs 1 workload\(s\): api/
+    );
+    expect(await db.select().from(s.clusters)).toHaveLength(1);
 
-    const [resource] = await db.select().from(s.resources).where(eq(s.resources.id, "res_api"));
-    expect(resource).toBeDefined();
-    expect(resource.clusterId).toBeNull();
-    expect(resource.status).toBe("stopped");
+    // Once the app is gone the cluster deletes.
+    await db.delete(s.resources).where(eq(s.resources.id, "res_api"));
+    await deleteCluster({ orgId: FIXTURE.orgId, clusterId: "cls_prod" });
     expect(await db.select().from(s.clusters)).toEqual([]);
   });
 });

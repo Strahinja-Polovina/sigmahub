@@ -22,6 +22,7 @@ package reconciler
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -70,6 +71,30 @@ type k8sApplyOpSpec struct {
 	// agent prunes its manifests down to this set, so a service deleted from the
 	// Compose file stops running instead of outliving its own definition.
 	Workloads []string `json:"workloads,omitempty"`
+}
+
+// k8sRemoveOpSpec mirrors the agent's k8s.RemoveSpec — the workloads whose
+// manifests must go from the control-plane node (SIGMA-312).
+type k8sRemoveOpSpec struct {
+	Workloads []string `json:"workloads"`
+}
+
+// renderK8sRemoveOp renders a queued cluster teardown. The op id carries the
+// pending-op id so the agent's status report maps back to the
+// pending_destructive_ops row, exactly as volrm: does.
+//
+// The workload names travel in the row's single `target` column, comma
+// separated: Kubernetes object names are [a-z0-9-] (dsd.K8sName guarantees it),
+// so nothing a name can contain is ambiguous with the separator.
+func renderK8sRemoveOp(p store.PendingDestructiveOp) dsd.Op {
+	var names []string
+	for _, n := range strings.Split(p.Target, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	spec, _ := json.Marshal(k8sRemoveOpSpec{Workloads: names})
+	return dsd.Op{ID: "k8srm:" + p.ID, Kind: dsd.KindK8sRemove, Spec: spec}
 }
 
 // defaultClusterReplicas is what a workload gets when nothing asked otherwise.

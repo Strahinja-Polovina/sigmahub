@@ -12,8 +12,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
@@ -127,6 +129,115 @@ func TestClusterLifecycle(t *testing.T) {
 	}
 	if after, _ := st.ListClusters(ctx, orgID, ""); len(after) != 0 {
 		t.Fatalf("cluster survived delete: %+v", after)
+	}
+}
+
+// SIGMA-312: deleting a cluster-deployed resource — or the whole cluster — must
+// queue the teardown of its Kubernetes manifests on the control-plane node.
+//
+// A cluster workload's manifests were only ever pruned as a side effect of
+// APPLYING that workload, so a deletion (which stops the resource being rendered
+// at all) left the Deployment, Service and Ingress running in k3s forever:
+// answering on the attached domain, consuming node CPU/RAM and holding the org's
+// registry pull secret, with nothing left in the product describing them.
+// DeleteResource did not even name a server to re-render, because a cluster
+// resource has no server_id of its own.
+func TestDeletedClusterWorkloadsAreTornDown(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cluster_teardown"
+	envID, cpServer, _ := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkApp := func(name string, spec json.RawMessage) store.Resource {
+		t.Helper()
+		res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ClusterID: cluster.ID, Name: name, Kind: "app", Spec: spec,
+		}, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	// A Compose app is N workloads, so the teardown has to name all of them.
+	app := mkApp("api", json.RawMessage(`{"compose":{"services":[
+		{"name":"web","image":"nginx:1.27","ports":[80]},
+		{"name":"worker","image":"busybox:1"}]}}`))
+
+	// ── Deleting one resource ────────────────────────────────────────────────
+	serverID, err := st.DeleteResource(ctx, orgID, app.ID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverID != cpServer {
+		t.Fatalf("DeleteResource returned server %q, want the cluster's control plane %q — "+
+			"nothing nudges the reconciler otherwise", serverID, cpServer)
+	}
+	pending, err := st.PendingDestructiveOpsForServer(ctx, orgID, cpServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target string
+	for _, p := range pending {
+		if p.OpKind == dsd.KindK8sRemove {
+			target = p.Target
+		}
+	}
+	if target == "" {
+		t.Fatalf("no k8s teardown queued for the deleted cluster resource: %+v", pending)
+	}
+	for _, svc := range []string{"web", "worker"} {
+		if want := dsd.K8sWorkloadName(app.ID, svc); !strings.Contains(target, want) {
+			t.Fatalf("teardown target %q does not name workload %q", target, want)
+		}
+	}
+
+	// ── Deleting the whole cluster ───────────────────────────────────────────
+	//
+	// The cluster goes AFTER its workloads. Deleting it first would leave their
+	// manifests on a node the product has forgotten, with the cluster_nodes rows
+	// (and therefore the only address a teardown could be sent to) cascaded away.
+	// It could not even succeed: a resource must name exactly one target, so the
+	// ON DELETE SET NULL this once promised violated resources_one_target and the
+	// delete failed with a check-constraint error and no explanation.
+	survivor := mkApp("site", json.RawMessage(`{"image":"nginx:1.27","ports":[{"container":80}]}`))
+	_, err = st.DeleteCluster(ctx, orgID, cluster.ID, "admin")
+	var stillRunning store.ErrClusterWorkloads
+	if !errors.As(err, &stillRunning) {
+		t.Fatalf("deleting a cluster that still runs workloads err = %v, want ErrClusterWorkloads", err)
+	}
+	if !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("the refusal must be a 409: %v", err)
+	}
+	if len(stillRunning.Names) != 1 || stillRunning.Names[0] != "site" {
+		t.Fatalf("the refusal must name what is in the way: %+v", stillRunning.Names)
+	}
+
+	// Delete the workload — which queues ITS teardown — and the cluster goes.
+	if _, err := st.DeleteResource(ctx, orgID, survivor.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = st.PendingDestructiveOpsForServer(ctx, orgID, cpServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := dsd.K8sWorkloadName(survivor.ID, "")
+	found := false
+	for _, p := range pending {
+		if p.OpKind == dsd.KindK8sRemove && strings.Contains(p.Target, want) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no teardown queued for workload %q: %+v", want, pending)
+	}
+	if _, err := st.DeleteCluster(ctx, orgID, cluster.ID, "admin"); err != nil {
+		t.Fatalf("an emptied cluster must delete: %v", err)
 	}
 }
 

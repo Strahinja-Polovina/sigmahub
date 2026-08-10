@@ -374,6 +374,15 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 	// resource's container op (SIGMA-73) so it never runs before the engine is up.
 	ops = append(ops, renderS3ConfigureOps(s3Ops, renderedIDs)...)
 	for _, p := range pending {
+		// A confirmed destructive op is not always a volume: a deleted cluster
+		// workload queues the removal of its Kubernetes manifests against the
+		// control-plane node (SIGMA-312). Rendering that row as a volume.remove
+		// would ask the agent to delete a Docker volume named after a Deployment,
+		// and leave the workload itself running.
+		if p.OpKind == dsd.KindK8sRemove {
+			ops = append(ops, renderK8sRemoveOp(p))
+			continue
+		}
 		ops = append(ops, renderVolumeRemoveOp(p))
 	}
 	return ops, dsd.SpecHash(ops)

@@ -65,6 +65,14 @@ const (
 	// control-plane node. Names must match the agent's k8s package byte-for-byte.
 	KindK8sNode  = "k8s.node"
 	KindK8sApply = "k8s.apply"
+	// k8s.remove tears a cluster workload down (SIGMA-312). It exists because
+	// k8s.apply is the only thing that ever pruned manifests, and a DELETED
+	// resource renders no apply op at all: the Deployment, Service and Ingress
+	// went on running, answering on the attached domain and holding the org's
+	// registry pull secret, with nothing left in the product describing them.
+	// Recorded as a pending destructive op against the cluster's control-plane
+	// node, exactly as a volume removal is recorded against a server.
+	KindK8sRemove = "k8s.remove"
 )
 
 // DeployImageTag is the deterministic local image tag for a resource at a SHA,

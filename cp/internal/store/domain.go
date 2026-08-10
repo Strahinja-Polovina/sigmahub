@@ -330,25 +330,29 @@ func (s *Store) UpdateEnvironmentProduction(ctx context.Context, orgID, envID st
 // every resource a project/environment cascade is about to remove (SIGMA-193):
 // it queues the pre-authorised volume teardown for EPHEMERAL resources (the
 // same carve-out DeleteResource applies — non-ephemeral volumes deliberately
-// stay on disk) and returns the distinct servers whose DSD must re-render.
+// stay on disk), queues the Kubernetes manifest teardown for CLUSTER-deployed
+// resources (SIGMA-312 — deleting the project is as final for those workloads as
+// deleting them one by one, and nothing else will ever ask the node to stop
+// running them), and returns the distinct servers whose DSD must re-render.
 // MUST run BEFORE the DELETE that triggers the cascade — afterwards there is
 // nothing left to read. scopeCol is an internal constant, never user input.
 func cascadeResourceCleanupTx(ctx context.Context, tx pgx.Tx, orgID, scopeCol, scopeID string) ([]string, error) {
 	rows, err := tx.Query(ctx,
-		`SELECT id, COALESCE(server_id,''), spec, ephemeral FROM resources WHERE org_id = $1 AND `+scopeCol+` = $2`,
+		`SELECT id, COALESCE(server_id,''), COALESCE(cluster_id,''), spec, ephemeral
+		   FROM resources WHERE org_id = $1 AND `+scopeCol+` = $2`,
 		orgID, scopeID)
 	if err != nil {
 		return nil, err
 	}
 	type res struct {
-		id, serverID string
-		spec         json.RawMessage
-		ephemeral    bool
+		id, serverID, clusterID string
+		spec                    json.RawMessage
+		ephemeral               bool
 	}
 	var all []res
 	for rows.Next() {
 		var r res
-		if err := rows.Scan(&r.id, &r.serverID, &r.spec, &r.ephemeral); err != nil {
+		if err := rows.Scan(&r.id, &r.serverID, &r.clusterID, &r.spec, &r.ephemeral); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -365,6 +369,18 @@ func cascadeResourceCleanupTx(ctx context.Context, tx pgx.Tx, orgID, scopeCol, s
 		if r.serverID != "" && !seen[r.serverID] {
 			seen[r.serverID] = true
 			servers = append(servers, r.serverID)
+		}
+		// A cluster workload is bound to no server, so its re-render target is the
+		// control-plane node that will apply the teardown.
+		if r.clusterID != "" {
+			cpServer, err := insertK8sTeardownTx(ctx, tx, orgID, r.clusterID, r.id, r.spec)
+			if err != nil {
+				return nil, err
+			}
+			if cpServer != "" && !seen[cpServer] {
+				seen[cpServer] = true
+				servers = append(servers, cpServer)
+			}
 		}
 		if !r.ephemeral {
 			continue
@@ -797,8 +813,10 @@ func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resou
 	return out, rows.Err()
 }
 
-// DeleteResource removes a resource and returns the server it was bound to, so
-// the caller can re-render that server's DSD.
+// DeleteResource removes a resource and returns the server whose DSD must be
+// re-rendered: the server it was bound to, or — for a cluster-deployed resource,
+// which is bound to no server at all — the cluster's control-plane node, which
+// is where its Kubernetes teardown is applied (SIGMA-312).
 func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -817,12 +835,14 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 
 	var (
 		name      string
+		clusterID string
 		spec      json.RawMessage
 		ephemeral bool
 	)
 	err = tx.QueryRow(ctx,
-		`DELETE FROM resources WHERE org_id = $1 AND id = $2 RETURNING name, COALESCE(server_id,''), spec, ephemeral`,
-		orgID, resourceID).Scan(&name, &serverID, &spec, &ephemeral)
+		`DELETE FROM resources WHERE org_id = $1 AND id = $2
+		 RETURNING name, COALESCE(server_id,''), COALESCE(cluster_id,''), spec, ephemeral`,
+		orgID, resourceID).Scan(&name, &serverID, &clusterID, &spec, &ephemeral)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -848,6 +868,22 @@ func (s *Store) DeleteResource(ctx context.Context, orgID, resourceID, actor str
 			if err := auditTx(ctx, tx, orgID, "system", "Destructive-op confirmed (ephemeral)", dsd.KindVolumeRemove+" "+vol); err != nil {
 				return "", err
 			}
+		}
+	}
+	// A cluster workload has no server, so deleting the row used to be the whole
+	// story: the reconciler simply stopped rendering it, k3s kept applying the
+	// manifest it already had, and the Deployment, Service and Ingress went on
+	// serving the attached domain forever (SIGMA-312). Queue the manifest
+	// teardown on the control-plane node and re-render THAT server. Last, so the
+	// ephemeral volume ops above are still addressed to the resource's own
+	// (empty, for a cluster workload) server rather than to the control plane.
+	if clusterID != "" {
+		cpServer, terr := insertK8sTeardownTx(ctx, tx, orgID, clusterID, resourceID, spec)
+		if terr != nil {
+			return "", terr
+		}
+		if cpServer != "" {
+			serverID = cpServer
 		}
 	}
 	return serverID, tx.Commit(ctx)

@@ -9,6 +9,7 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +27,11 @@ import (
 const (
 	KindK8sNode  = "k8s.node"
 	KindK8sApply = "k8s.apply"
+	// KindK8sRemove tears named workloads down. Pruning used to happen only as a
+	// side effect of APPLYING a workload, so a resource the control plane no
+	// longer renders — a deleted app — kept its Deployment, Service and Ingress
+	// running here forever.
+	KindK8sRemove = "k8s.remove"
 )
 
 // Node roles.
@@ -68,6 +74,14 @@ type ApplySpec struct {
 	// service deleted from a Compose file stops running instead of outliving
 	// its own definition.
 	Workloads []string `json:"workloads,omitempty"`
+}
+
+// RemoveSpec is a teardown: the workloads whose manifests must go from this
+// node. Named explicitly rather than derived from a resource id, because the
+// control plane is the only side that knows which names it ever rendered.
+type RemoveSpec struct {
+	ResourceID string   `json:"resourceId,omitempty"`
+	Workloads  []string `json:"workloads"`
 }
 
 // SecretRef is a secret the CP resolves at apply time; the DSD carries only the
@@ -176,6 +190,7 @@ func NewDriver(fetchSecrets SecretFetcher, fetchRegistry RegistryFetcher, report
 func (d *Driver) Register(reg *apply.Registry) {
 	reg.Register(KindK8sNode, d.applyNode)
 	reg.Register(KindK8sApply, d.applyWorkload)
+	reg.Register(KindK8sRemove, d.removeWorkloads)
 }
 
 // applyNode converges this host into its cluster role. Idempotent: an already
@@ -518,6 +533,47 @@ func tail(s string, n int) string {
 		s = s[i+1:]
 	}
 	return "…\n" + s
+}
+
+// removeWorkloads deletes the named workloads' manifests, which is how a
+// workload stops existing: k3s reconciles this directory, so a file that is gone
+// takes its Deployment, Service and Ingress with it.
+//
+// This is the ONLY teardown path a cluster workload has. pruneManifests runs
+// inside applyWorkload and is driven by that op's Workloads list, so it can only
+// ever remove a workload the resource STILL has — a deleted resource renders no
+// apply op at all, and its manifests survived every resync, its pods kept
+// serving the attached domain and its imagePullSecret kept the org's registry
+// password on the node.
+//
+// Idempotent, as every handler must be: a manifest already gone is a success,
+// because the op is re-rendered until the control plane hears that it applied.
+func (d *Driver) removeWorkloads(_ context.Context, op dsd.Op) error {
+	var spec RemoveSpec
+	if err := json.Unmarshal(op.Spec, &spec); err != nil {
+		return fmt.Errorf("decode k8s.remove spec: %w", err)
+	}
+	if len(spec.Workloads) == 0 {
+		// An empty set is refused rather than treated as "remove nothing": it can
+		// only be a control plane that failed to say what it meant, and silently
+		// acking would retire the teardown with the workloads still running.
+		return fmt.Errorf("k8s.remove requires at least one workload")
+	}
+	if d.removeFile == nil {
+		return fmt.Errorf("k8s.remove has no way to remove files")
+	}
+	for _, name := range spec.Workloads {
+		// The name becomes a path, so it is validated as the Kubernetes label it
+		// claims to be — a name with a slash or a '..' would escape the manifest
+		// directory entirely.
+		if !dnsName.MatchString(name) {
+			return fmt.Errorf("workload name %q is not a valid Kubernetes name", name)
+		}
+		if err := d.removeFile(filepath.Join(d.manifestDir, manifestFile(name))); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove manifest for %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // manifestFile is the manifest a workload owns. Keyed by the workload's own
