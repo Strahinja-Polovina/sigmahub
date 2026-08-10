@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -116,10 +117,51 @@ func (d *Driver) requireRoot() error {
 	return nil
 }
 
+// defaultMeshInterface is the WireGuard link name every agent uses unless the
+// spec names another.
+const defaultMeshInterface = "sigma0"
+
+// ifnameRe is the kernel's interface-name shape: at most IFNAMSIZ-1 (15) bytes
+// from a conservative charset. Anything outside it is either not a name the
+// kernel would accept or not a token nft would parse — and, crucially, cannot
+// contain a quote, whitespace, newline, brace or semicolon.
+var ifnameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
+
+// validIfname gates every DSD-supplied interface name before it is interpolated
+// into the ruleset (SIGMA-342).
+//
+// RenderNftables writes the value straight into a quoted nft token
+// (`iifname "%s" accept`). A value carrying a quote and a newline closes the
+// rule and appends attacker-chosen nft statements — `policy accept` on the very
+// input chain the rest of this file works to keep default-drop — and opNftables
+// then loads the result with `nft -f` as root, reports the op applied, and
+// leaves the dashboard green. The mesh-only guarantee that databases, object
+// storage and the k3s API server depend on would evaporate fleet-wide with the
+// file on disk as the only evidence. The threat model is the same one the
+// container policy is written against: a compromised control plane whose DSD
+// still signs correctly. A merely buggy CP that emits a malformed value is the
+// other half — it produces `nft -f` syntax errors and leaves the firewall
+// unloaded, which is just as silent.
+//
+// "." and ".." pass the charset but are rejected by the kernel's own
+// dev_valid_name, so they are refused here too.
+func validIfname(name string) bool {
+	if name == "." || name == ".." {
+		return false
+	}
+	return ifnameRe.MatchString(name)
+}
+
 func (d *Driver) opNftables(ctx context.Context, op dsd.Op) error {
 	var spec NftablesSpec
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
 		return fmt.Errorf("decode nftables spec: %w", err)
+	}
+	// Refuse a signed-but-forbidden value the way the container driver refuses a
+	// forbidden container spec: before anything is written or loaded (SIGMA-342).
+	// An empty name means "use the default", not "anything goes".
+	if spec.MeshInterface != "" && !validIfname(spec.MeshInterface) {
+		return fmt.Errorf("policy: meshInterface %q is not a valid interface name (at most 15 characters of A-Za-z0-9_.-); refusing to load a ruleset built from it", spec.MeshInterface)
 	}
 	if err := d.requireRoot(); err != nil {
 		return err
@@ -211,8 +253,11 @@ func RenderNftables(spec NftablesSpec) string {
 		wg = mesh.ListenPort
 	}
 	mesh := spec.MeshInterface
-	if mesh == "" {
-		mesh = "sigma0"
+	// opNftables refuses an invalid name outright; falling back here as well
+	// means the renderer can never emit a ruleset carrying injected statements
+	// even if a future caller renders without going through the op (SIGMA-342).
+	if !validIfname(mesh) {
+		mesh = defaultMeshInterface
 	}
 	var b strings.Builder
 	b.WriteString("#!/usr/sbin/nft -f\n")
