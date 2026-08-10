@@ -316,6 +316,9 @@ func (f *fakeDomain) ListSecrets(_ context.Context, _, _, _ string) ([]store.Sec
 func (f *fakeDomain) RevealSecret(_ context.Context, _, _, _ string) (string, error) {
 	return "value", nil
 }
+func (f *fakeDomain) UpdateSecretValue(_ context.Context, _, secretID, _, _ string) (store.Secret, error) {
+	return store.Secret{ID: secretID, ProjectID: "prj_1", Name: "STRIPE_SECRET_KEY", EnvVar: true}, nil
+}
 func (f *fakeDomain) DeleteSecret(_ context.Context, _, _, _ string) (store.Secret, error) {
 	return store.Secret{ID: "sec_1", ProjectID: "prj_1", Name: "DB_URL"}, nil
 }

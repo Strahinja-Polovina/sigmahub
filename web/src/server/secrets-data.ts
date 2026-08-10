@@ -14,6 +14,7 @@ import {
   cpListSecrets,
   cpCreateSecret,
   cpRevealSecret,
+  cpUpdateSecretValue,
   cpDeleteSecret,
   type CpActor,
 } from "./cp";
@@ -207,6 +208,31 @@ export async function secretName(orgId: string, secretId: string): Promise<strin
     [orgId, secretId]
   );
   return res.rows[0]?.name ?? null;
+}
+
+/** Change a secret's VALUE in place, keeping its id, name and scope
+ *  (SIGMA-264). Caller has already authorized (Project Admin+) AND bound the
+ *  secret to the project (assertSecretInProject).
+ *
+ *  The point of an in-place update is that rotation costs one config
+ *  deployment. Delete-then-create costs two, and the first of them re-rolls
+ *  every dependent app without the variable. */
+export async function updateSecretValue(
+  orgId: string,
+  secretId: string,
+  value: string,
+  actor: CpActor
+): Promise<void> {
+  if (cpEnabled()) {
+    await cpUpdateSecretValue(orgId, secretId, value, actor);
+    return;
+  }
+  await ensureDemoSecretsTable();
+  const res = await client.query(
+    `UPDATE demo_secrets SET value = $3 WHERE org_id = $1 AND id = $2 RETURNING id`,
+    [orgId, secretId, value]
+  );
+  if (res.rows.length === 0) throw new Error("Secret not found.");
 }
 
 export async function removeSecret(

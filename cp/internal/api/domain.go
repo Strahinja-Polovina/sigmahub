@@ -68,6 +68,10 @@ type DomainAPI interface {
 	CreateSecret(ctx context.Context, orgID, actor string, in store.CreateSecretInput) (store.Secret, error)
 	ListSecrets(ctx context.Context, orgID, projectID, envID string) ([]store.Secret, error)
 	RevealSecret(ctx context.Context, orgID, secretID, actor string) (string, error)
+	// UpdateSecretValue is the in-place rotation path (SIGMA-264): re-seal the
+	// value, keep the id and every ref, mint ONE config deployment instead of
+	// the two a delete-then-create costs.
+	UpdateSecretValue(ctx context.Context, orgID, secretID, value, actor string) (store.Secret, error)
 	DeleteSecret(ctx context.Context, orgID, secretID, actor string) (store.Secret, error)
 	// Config deployments (SIGMA-166): a secret or domain change alters the
 	// rendered container spec, and the standing SUCCESS target would re-render

@@ -10,6 +10,7 @@ import {
   readSecretValue,
   removeSecret,
   secretName,
+  updateSecretValue,
 } from "../secrets-data";
 
 /** Resolve a resource to its org/project/environment, asserting the caller is a
@@ -94,6 +95,34 @@ export async function revealSecretAction(input: { resourceId: string; secretId: 
     target: name ?? input.secretId,
   });
   return { value };
+}
+
+/** Rotate a secret's value in place (SIGMA-264).
+ *
+ *  Before this existed the only way to change a value was delete-then-create.
+ *  Both halves mint config deployments, so the delete re-rolled every dependent
+ *  app WITHOUT the variable — a live service restarts missing its credential —
+ *  and the create rolled the fleet a second time. One update is one config
+ *  deployment, and the secret keeps its id so nothing that references it breaks. */
+export async function updateSecretAction(input: {
+  resourceId: string;
+  secretId: string;
+  value: string;
+}) {
+  const { orgId, projectId, resourceName } = await resourceScope(input.resourceId);
+  // Same bar as create/reveal/delete: Project Admin+ on THIS project (P2-7).
+  const { user, role } = await requireProjectRole(orgId, projectId, "Project Admin");
+  // Bind the secret to the authorized project (SIGMA-85) before writing it.
+  await assertSecretInProject(orgId, projectId, input.secretId);
+  const name = await secretName(orgId, input.secretId);
+  await updateSecretValue(orgId, input.secretId, input.value, { name: user.name, role });
+  await writeAudit({
+    orgId,
+    actor: user.name,
+    action: "Secret updated",
+    target: name ? `${resourceName} · ${name}` : resourceName,
+  });
+  revalidatePath(`/dashboard/resources/${input.resourceId}`);
 }
 
 export async function deleteSecretAction(input: { resourceId: string; secretId: string }) {

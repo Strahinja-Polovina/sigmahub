@@ -47,6 +47,37 @@ func (s *Server) handleCreateSecret(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, sec)
 }
 
+type updateSecretRequest struct {
+	Value string `json:"value"`
+}
+
+// handleUpdateSecretValue re-seals an existing secret's value in place. Project
+// Admin+, same bar as create/delete.
+//
+// SIGMA-264: rotating a credential used to mean delete-then-create, and because
+// BOTH halves mint config deployments the delete alone re-rolled every dependent
+// app WITHOUT the variable — a live service restarts missing its key, then rolls
+// a second time when the replacement lands. One update is one config deployment,
+// and the secret keeps its id so every ref that names it still resolves.
+func (s *Server) handleUpdateSecretValue(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("orgId")
+	secretID := r.PathValue("secretId")
+	var req updateSecretRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	sec, err := s.domain.UpdateSecretValue(r.Context(), orgID, secretID, req.Value, principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "update secret")
+		return
+	}
+	// Same reconcile rule as create/delete (SIGMA-166): the rendered container
+	// spec changed, so the apps in scope need their own rollout generation.
+	s.mintConfigDeploysForSecretScope(r, orgID, sec, "secret changed")
+	writeJSON(w, http.StatusOK, sec)
+}
+
 // handleListSecrets lists secret METADATA (never values) for a project,
 // optionally filtered to one environment. Developer+ (no raw values exposed).
 func (s *Server) handleListSecrets(w http.ResponseWriter, r *http.Request) {

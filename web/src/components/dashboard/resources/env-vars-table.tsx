@@ -9,6 +9,7 @@ import {
   Copy,
   KeyRound,
   Lock,
+  Pencil,
   Plus,
   Trash2,
   Loader2,
@@ -49,6 +50,7 @@ import {
 import {
   createSecretAction,
   revealSecretAction,
+  updateSecretAction,
   deleteSecretAction,
 } from "@/server/actions/secrets";
 import { createSubmissionId } from "@/lib/request-id";
@@ -82,6 +84,7 @@ export function EnvVarsTable({
   const [revealing, setRevealing] = React.useState<string | null>(null);
   const [confirmReveal, setConfirmReveal] = React.useState<SecretRow | null>(null);
   const [deleting, setDeleting] = React.useState<SecretRow | null>(null);
+  const [editing, setEditing] = React.useState<SecretRow | null>(null);
   const [createOpen, setCreateOpen] = React.useState(false);
 
   async function doReveal(secret: SecretRow) {
@@ -157,7 +160,7 @@ export function EnvVarsTable({
             <TableRow>
               <TableHead className="pl-4">Key</TableHead>
               <TableHead>Value</TableHead>
-              <TableHead className="w-32 pr-4 text-right">Actions</TableHead>
+              <TableHead className="w-40 pr-4 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -233,6 +236,15 @@ export function EnvVarsTable({
                         variant="ghost"
                         size="icon-sm"
                         disabled={!canManage}
+                        aria-label="Edit value"
+                        onClick={() => setEditing(s)}
+                      >
+                        <Pencil className="size-4 text-muted-foreground" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={!canManage}
                         aria-label="Delete secret"
                         onClick={() => setDeleting(s)}
                       >
@@ -271,7 +283,10 @@ export function EnvVarsTable({
         </DialogContent>
       </Dialog>
 
-      {/* Delete confirmation. */}
+      {/* Delete confirmation. The redeploy warning is the point: a delete mints
+          config deployments for EVERY app in the secret's scope, and they come
+          back up without the variable. If the operator is rotating a value they
+          want Edit, not Delete (SIGMA-264). */}
       <Dialog open={deleting !== null} onOpenChange={(o) => !o && setDeleting(null)}>
         <DialogContent>
           <DialogHeader>
@@ -281,6 +296,19 @@ export function EnvVarsTable({
               and the app redeployed without it. This can&apos;t be undone.
             </DialogDescription>
           </DialogHeader>
+          <Alert variant="destructive">
+            <ShieldAlert className="size-4" />
+            <AlertTitle>This redeploys every app that uses it</AlertTitle>
+            <AlertDescription>
+              Deleting restarts{" "}
+              {deleting?.scope === "environment"
+                ? `every app in ${envName}`
+                : "every app in this project"}{" "}
+              without <span className="font-mono">{deleting?.name}</span>. To change the value
+              instead, close this and use Edit — that keeps the variable in place through a single
+              redeploy.
+            </AlertDescription>
+          </Alert>
           <DialogFooter>
             <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
             <Button variant="destructive" onClick={() => deleting && doDelete(deleting)}>
@@ -292,6 +320,21 @@ export function EnvVarsTable({
       </Dialog>
 
       {canManage && (
+        <EditSecretDialog
+          secret={editing}
+          onOpenChange={(o) => !o && setEditing(null)}
+          resourceId={resourceId}
+          envName={envName}
+          onSaved={() => {
+            // A rotated value invalidates whatever this table has revealed.
+            if (editing) hide(editing.id);
+            setEditing(null);
+            router.refresh();
+          }}
+        />
+      )}
+
+      {canManage && (
         <NewSecretDialog
           open={createOpen}
           onOpenChange={setCreateOpen}
@@ -301,6 +344,98 @@ export function EnvVarsTable({
         />
       )}
     </div>
+  );
+}
+
+/** Rotate one secret's value in place (SIGMA-264).
+ *
+ *  The alternative the product used to force — delete, then create — costs two
+ *  rounds of config deployments, and the first of them re-rolls every dependent
+ *  app WITHOUT the variable. That is a self-inflicted outage during routine
+ *  credential rotation, so the value change has to be a single write that keeps
+ *  the secret's id, name and scope.
+ *
+ *  The current value is deliberately NOT pre-filled: reading it is an audited
+ *  action (see the reveal dialog) and rotation doesn't need it. */
+function EditSecretDialog({
+  secret,
+  onOpenChange,
+  resourceId,
+  envName,
+  onSaved,
+}: {
+  secret: SecretRow | null;
+  onOpenChange: (o: boolean) => void;
+  resourceId: string;
+  envName: string;
+  onSaved: () => void;
+}) {
+  const [value, setValue] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  async function submit() {
+    if (!secret) return;
+    setBusy(true);
+    try {
+      await updateSecretAction({ resourceId, secretId: secret.id, value });
+      toast.success(`Updated ${secret.name}`, {
+        description: "Apps using it are redeploying with the new value.",
+      });
+      // Clear the draft on the way out as well as on cancel: the dialog is
+      // controlled by the parent's selection, so a saved value left behind here
+      // would show up pre-filled the next time ANOTHER secret is opened.
+      setValue("");
+      onSaved();
+    } catch (err) {
+      toast.error("Couldn’t update secret", {
+        description: err instanceof Error ? err.message : "Please try again.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open={secret !== null}
+      onOpenChange={(o) => {
+        if (!o) setValue("");
+        onOpenChange(o);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit value</DialogTitle>
+          <DialogDescription>
+            Replace the value of <span className="font-mono text-foreground">{secret?.name}</span>.
+            The key, its {secret?.scope === "environment" ? envName : "project"} scope and its
+            injection mode stay as they are, and every app using it redeploys once with the new
+            value.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-2 py-2">
+          <Label htmlFor="secret-new-value">New value</Label>
+          <Textarea
+            id="secret-new-value"
+            placeholder="Paste the rotated credential…"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            className="font-mono min-h-20"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </div>
+
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+          <Button disabled={busy || value.length === 0} onClick={submit}>
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <Pencil className="size-4" />}
+            Save value
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

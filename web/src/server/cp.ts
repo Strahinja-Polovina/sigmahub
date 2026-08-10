@@ -1087,6 +1087,30 @@ export async function cpRevealSecret(
   return value;
 }
 
+/** Re-seal an existing secret's value in place (SIGMA-264).
+ *
+ *  Rotation used to be delete-then-create, and because BOTH halves mint config
+ *  deployments the delete alone re-rolled every dependent app WITHOUT the
+ *  variable before the replacement existed. One PUT is one config deployment,
+ *  and the secret keeps its id so every ref that names it still resolves.
+ *
+ *  Deliberately NOT idempotency-wrapped: a value update is idempotent by
+ *  construction — replaying it writes the same ciphertext-of-the-same-plaintext
+ *  to the same row. The wrapper exists to stop a retried CREATE from minting a
+ *  second row and a second restart wave. */
+export async function cpUpdateSecretValue(
+  orgId: string,
+  secretId: string,
+  value: string,
+  actor: CpActor
+): Promise<CpSecret> {
+  return cpFetch(
+    `${org(orgId)}/secrets/${encodeURIComponent(secretId)}`,
+    { method: "PUT", body: JSON.stringify({ value }) },
+    { orgId, actor }
+  );
+}
+
 export async function cpDeleteSecret(orgId: string, secretId: string, actor: CpActor): Promise<void> {
   await cpFetch(`${org(orgId)}/secrets/${encodeURIComponent(secretId)}`, {
     method: "DELETE",

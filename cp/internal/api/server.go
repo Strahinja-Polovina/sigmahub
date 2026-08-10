@@ -530,6 +530,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/projects/{projectId}/secrets", s.requireService(store.RoleProjectAdmin, s.idempotent(s.handleCreateSecret)))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/projects/{projectId}/secrets", s.requireService(store.RoleDeveloper, s.handleListSecrets))
 	s.mux.HandleFunc("GET /v1/orgs/{orgId}/secrets/{secretId}/value", s.requireService(store.RoleProjectAdmin, s.handleRevealSecret))
+	// In-place value rotation (SIGMA-264) — one config deployment, id preserved.
+	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/secrets/{secretId}", s.requireService(store.RoleProjectAdmin, s.handleUpdateSecretValue))
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/secrets/{secretId}", s.requireService(store.RoleProjectAdmin, s.handleDeleteSecret))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/secrets/rotate-kek", s.requireService(store.RoleOrgAdmin, s.handleRotateKEK))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/secrets/rotate-dek", s.requireService(store.RoleOrgAdmin, s.handleRotateDEK))
