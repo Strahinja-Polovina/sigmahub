@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
 )
 
 // tsCatalogHeader explains the file to whoever opens it having never seen this
@@ -484,9 +486,68 @@ export type ResourceCategorySpec = {
 `)
 	fmt.Fprintf(&b, "export const MESH_PORT_BASE = %d;\n", MeshPortBase)
 
+	b.WriteString(`
+/** The model-sizing constants, from cp/internal/hf/sizing.go.
+ *
+ *  Demo mode has no control plane to ask, so its model cards carry the VRAM
+ *  figures the control plane would have answered with. They were evaluated by
+ *  hand, once, and the demo's own tests asserted them against themselves — so
+ *  moving UtilizationCap to 0.85 or KVActivationFactor to 1.30 left every suite
+ *  green while the demo went on telling evaluators a model needs ~21.4 GB
+ *  against a product now saying ~22.7 GB (SIGMA-279). A prospect sizes a GPU
+ *  purchase from that number.
+ *
+ *  These are NOT for computing a requirement at runtime: outside demo mode the
+ *  control plane sends the byte count and the dashboard compares it, because
+ *  two implementations of one formula are two answers to one question. They
+ *  exist so the recorded fixtures can be checked against the arithmetic that
+ *  produced them. */
+`)
+	fmt.Fprintf(&b, "export const VRAM_KV_ACTIVATION_FACTOR = %g;\n", hf.KVActivationFactor)
+	fmt.Fprintf(&b, "export const VRAM_UTILIZATION_CAP = %g;\n", hf.UtilizationCap)
+	b.WriteString("/** FormatVRAM's band boundaries: whole MB below the first, tenths of a GB\n" +
+		" *  below the second, whole GB rounded up at or above it. */\n")
+	fmt.Fprintf(&b, "export const VRAM_FORMAT_MB_CEILING = %d;\n", hf.FormatMBCeilingMB)
+	fmt.Fprintf(&b, "export const VRAM_FORMAT_TENTH_CEILING_GB = %d;\n", hf.FormatTenthCeilingGB)
+
 	b.WriteString(tsCatalogHelpers)
+	b.WriteString(tsSizingHelpers)
 	return b.Bytes()
 }
+
+// tsSizingHelpers mirrors hf.RequiredVRAMBytes and hf.FormatVRAM over the
+// constants emitted above. Emitted verbatim for the same reason the other
+// helpers are: a hand-written wrapper module beside the generated one is the
+// second place a copy grows back into. The Go originals are hashed into
+// CATALOG_SOURCE_SHA256, so an edit to either one's SHAPE (as opposed to its
+// constants, which travel above) asks for a regenerate and puts these lines in
+// front of a human.
+const tsSizingHelpers = `
+/** hf.RequiredVRAMBytes: weights, plus what else lives on the card, over the
+ *  share of it vLLM will actually allocate. Zero parameters means "unsized",
+ *  which is the value that turns the fit check OFF everywhere downstream — it
+ *  is never a model that needs no memory. */
+export function requiredVramBytes(parameters: number, bytesPerParam: number): number {
+  if (parameters <= 0 || bytesPerParam <= 0) return 0;
+  const weights = parameters * bytesPerParam;
+  return Math.ceil((weights * VRAM_KV_ACTIVATION_FACTOR) / VRAM_UTILIZATION_CAP);
+}
+
+/** hf.FormatVRAM: the one string both sides show, e.g. "~21.4 GB". Decimal GB,
+ *  because the number being compared against is the one printed on the card.
+ *  Zero renders as the empty string — an unsized model has no size to show, and
+ *  "~0 GB" is a number that lies. */
+export function formatVram(bytes: number): string {
+  if (bytes <= 0) return "";
+  // The unit is chosen from the ROUNDED figure: 999999999 bytes is under a
+  // gigabyte and rounds to 1000 MB, which is a gigabyte spelled the long way.
+  const mb = Math.round(bytes / 1e6);
+  if (mb < VRAM_FORMAT_MB_CEILING) return ` + "`~${Math.max(1, mb)} MB`" + `;
+  const gb = bytes / 1e9;
+  if (gb < VRAM_FORMAT_TENTH_CEILING_GB) return ` + "`~${gb.toFixed(1)} GB`" + `;
+  return ` + "`~${Math.ceil(gb)} GB`" + `;
+}
+`
 
 // requirementIDs is the closed set of precondition ids, in List()'s order.
 func requirementIDs() []string {

@@ -22,9 +22,12 @@ import (
 // CatalogSourceFiles are every input the generated TypeScript is rendered
 // from, relative to this package's directory. Both the generator (run by
 // go:generate, cwd = this package) and the package's own tests resolve them
-// from there.
+// from there. One entry deliberately points OUTSIDE the package — the sizing
+// constants live in cp/internal/hf, and what matters is that everything the
+// output embeds is hashed, not which package it came from. The digest names
+// each file by its base name, so the web-side recomputation must do the same.
 //
-// All EIGHT, not just the catalog: the generated module also embeds the billing
+// All NINE, not just the catalog: the generated module also embeds the billing
 // constants from billing.go, the cluster exclusion list from clusters.go, the
 // engine catalogs from db_engines.go and s3_engines.go, and every literal the
 // renderer itself writes. With only the catalog hashed, changing
@@ -71,6 +74,14 @@ import (
 // The engine files were split out of their query files precisely so a query
 // edit could not cost a regenerate; this one is not split, because its catalog
 // and its provisioning live in one file, and the drift is worth the cost.
+//
+// ../hf/sizing.go carries the VRAM formula's two constants and the bands
+// FormatVRAM renders with (SIGMA-279). Demo mode records what the control plane
+// would have answered for each model card; those figures were evaluated by hand
+// once, and the demo asserted them against themselves — so a change to
+// UtilizationCap or KVActivationFactor left every suite green while the demo
+// quoted VRAM figures the product no longer produces, to exactly the people
+// sizing a GPU purchase from them.
 var CatalogSourceFiles = []string{
 	"server_catalog.go",    // the canonical catalog: types, matrix, requirements
 	"server_catalog_ts.go", // the renderer — its literals are output too
@@ -80,6 +91,7 @@ var CatalogSourceFiles = []string{
 	"s3_engines.go",        // object-storage images and endpoint shapes
 	"alerts_store.go",      // the alert event vocabulary the rules editor labels
 	"llm_engines.go",       // the inference runtimes and which one is the default
+	"../hf/sizing.go",      // the VRAM formula's constants and its rendering bands
 }
 
 // CatalogSourceDigest returns the hex sha256 over the given sources, in the

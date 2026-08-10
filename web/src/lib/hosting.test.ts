@@ -81,6 +81,11 @@ const CATALOG_SOURCES = [
   "s3_engines.go",
   "alerts_store.go",
   "llm_engines.go",
+  // Outside the store package: the VRAM formula's constants and the bands
+  // FormatVRAM renders with (SIGMA-279), which demo mode's model cards are
+  // recorded from. The Go digest names each file by its BASE name, so the
+  // recomputation below does too.
+  "../hf/sizing.go",
 ];
 
 describe("the generated catalog tracks the control plane", () => {
@@ -92,7 +97,7 @@ describe("the generated catalog tracks the control plane", () => {
     const h = createHash("sha256");
     for (const name of CATALOG_SOURCES) {
       const src = readFileSync(join(STORE_GO, name));
-      h.update(`${name}:${src.length}\n`);
+      h.update(`${name.split("/").pop()}:${src.length}\n`);
       h.update(src);
     }
     const sha = h.digest("hex");
