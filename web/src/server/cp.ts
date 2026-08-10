@@ -2305,6 +2305,14 @@ export type CpDNSSetup = {
   /** What DNS currently answers, so a mismatch shows the actual wrong value. */
   observed?: string[];
   reason?: string;
+  /**
+   * Whether the serving server carries the proxy/edge role. False means no
+   * certificate can ever be issued for this domain — the reconciler renders
+   * Traefik (and with it the ACME client) only onto proxy-role servers — so a
+   * verified domain on a non-proxy server is a warning, not a success
+   * (SIGMA-299).
+   */
+  proxyRole: boolean;
   certStatus: string;
   checkedAt: string;
 };

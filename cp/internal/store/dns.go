@@ -37,8 +37,17 @@ type DNSSetup struct {
 	// Observed is what DNS currently answers, so a mismatch shows the actual
 	// wrong value instead of a bare "not verified".
 	Observed []string `json:"observed,omitempty"`
-	// Reason explains an unverified state in the user's terms.
+	// Reason explains whatever still stands between this domain and a working
+	// HTTPS endpoint — including when DNS itself is already correct (SIGMA-299).
 	Reason string `json:"reason,omitempty"`
+	// ProxyRole is whether the serving server carries the proxy/edge role. It is
+	// a hard precondition for issuance, not a detail: the reconciler renders
+	// Traefik (and therefore the ACME client and the HTTP-01 responder) only onto
+	// proxy-role servers, so with this false the certificate can never issue no
+	// matter how correct the record is. The dashboard needs it as its own field
+	// so a verified-but-unservable domain can render as a warning instead of a
+	// green tick with a caption nobody reads.
+	ProxyRole bool `json:"proxyRole"`
 	// CertStatus mirrors the domain's certificate state, since issuance is what
 	// the DNS record actually unblocks.
 	CertStatus string `json:"certStatus"`
@@ -59,15 +68,14 @@ const dnsLookupTimeout = 5 * time.Second
 // and is the single most likely thing to be pasted in by mistake.
 func (s *Store) DNSSetupForDomain(ctx context.Context, orgID, domainID string) (DNSSetup, error) {
 	var out DNSSetup
-	var endpoint, meshIP *string
-	var proxyRole bool
+	var endpoint, meshIP, serverName *string
 	err := s.Pool.QueryRow(ctx, `
-		SELECT d.domain, d.cert_status, sv.endpoint, sv.mesh_ip, sv.proxy_role
+		SELECT d.domain, d.cert_status, sv.name, sv.endpoint, sv.mesh_ip, sv.proxy_role
 		  FROM domains d
 		  JOIN resources r ON r.id = d.resource_id
 		  LEFT JOIN servers sv ON sv.id = r.server_id
 		 WHERE d.org_id = $1 AND d.id = $2`, orgID, domainID).
-		Scan(&out.Domain, &out.CertStatus, &endpoint, &meshIP, &proxyRole)
+		Scan(&out.Domain, &out.CertStatus, &serverName, &endpoint, &meshIP, &out.ProxyRole)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return DNSSetup{}, ErrNotFound
 	}
@@ -76,6 +84,22 @@ func (s *Store) DNSSetupForDomain(ctx context.Context, orgID, domainID string) (
 	}
 
 	out.Apex = isApexDomain(out.Domain)
+
+	// SIGMA-299: the missing proxy/edge role is a blocking fact about this
+	// domain, not a footnote on a DNS mismatch. It used to be mentioned only
+	// inside the "resolves, but not to this server" branch, which meant the one
+	// case where the role is the ONLY thing left — DNS correct, server not an
+	// edge server — came back Verified with an empty Reason and rendered as a
+	// green tick. The operator then waits forever on a certificate that nothing
+	// on that host will ever request, and the fix lives on a settings page they
+	// have just been told they don't need to visit.
+	proxyNote := ""
+	if !out.ProxyRole {
+		proxyNote = serverLabel(serverName) + " isn't marked as a proxy/edge server, so nothing " +
+			"terminates TLS for this domain and no certificate can be issued — turn on the " +
+			"Proxy / edge role on that server."
+	}
+
 	target := publicHost(endpoint)
 	if target == "" {
 		out.Reason = "This resource's server has no public address yet — it is still enrolling, " +
@@ -101,8 +125,8 @@ func (s *Store) DNSSetupForDomain(ctx context.Context, orgID, domainID string) (
 	addrs, lookupErr := net.DefaultResolver.LookupHost(lookupCtx, out.Domain)
 	out.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	if lookupErr != nil {
-		out.Reason = "The domain doesn't resolve yet. Create the record below; changes can take " +
-			"a few minutes to propagate."
+		out.Reason = joinReasons("The domain doesn't resolve yet. Create the record below; changes "+
+			"can take a few minutes to propagate.", proxyNote)
 		return out, nil
 	}
 	out.Observed = addrs
@@ -112,14 +136,37 @@ func (s *Store) DNSSetupForDomain(ctx context.Context, orgID, domainID string) (
 			break
 		}
 	}
-	if !out.Verified {
-		out.Reason = "The domain resolves, but not to this server. Update the record to the value below."
-		if !proxyRole {
-			out.Reason += " This server also isn't marked as a proxy/edge server, so it won't " +
-				"terminate TLS for the domain even once DNS is correct."
-		}
+	if out.Verified {
+		// Verified only says the record is right. proxyNote is empty on a
+		// proxy-role server, which is the genuinely-finished state.
+		out.Reason = proxyNote
+		return out, nil
 	}
+	out.Reason = joinReasons("The domain resolves, but not to this server. Update the record to "+
+		"the value below.", proxyNote)
 	return out, nil
+}
+
+// joinReasons puts two sentences together without leaving a stray separator
+// when the second one doesn't apply.
+func joinReasons(first, second string) string {
+	if second == "" {
+		return first
+	}
+	if first == "" {
+		return second
+	}
+	return first + " " + second
+}
+
+// serverLabel names the server in a sentence an operator can act on. The name
+// is what the servers list and the proxy-role switch are labelled with, so
+// naming it is the difference between "something is wrong" and "go here".
+func serverLabel(name *string) string {
+	if name == nil || strings.TrimSpace(*name) == "" {
+		return "This resource's server"
+	}
+	return *name
 }
 
 // publicHost extracts the host from a stored "ip:port" endpoint. The port is
