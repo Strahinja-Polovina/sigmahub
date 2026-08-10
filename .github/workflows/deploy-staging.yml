@@ -133,5 +133,31 @@ jobs:
             return 1
           }
           wait_for cp http://localhost:8080/readyz
-          wait_for web http://localhost:3000/
+          # NOT the marketing root (SIGMA-265). `/` renders for an anonymous
+          # curl out of static sections: it never reads SIGMAHUB_CP_URL, never
+          # mints a service token and never dials the control plane, so it
+          # answered 200 for every way the web→CP path can break — the env var
+          # renamed, SIGMAHUB_CP_URL dropped from the compose environment (which
+          # this stack has already done once, see CP_HUGGING_FACE_TOKEN in
+          # docker-compose.yml), the CP's auth middleware tightened. `?require=cp`
+          # tells the health route that a control plane is expected here, so
+          # "not configured" is a failure rather than a demo deployment.
+          wait_for web "http://localhost:3000/api/health?require=cp"
+
+          # Provisioning smoke (SIGMA-53/54, SIGMA-265). The gates above prove
+          # the processes are up and that the dashboard's credential is accepted;
+          # this proves the core path a customer arrives on still works —
+          # org → project → environment → agent-enrollment token, plus tenant
+          # isolation — against the stack that was just rolled out. It used to be
+          # a manual step in the runbook, which means it ran when someone
+          # remembered, i.e. never on the deploys that broke it.
+          #
+          # The token is read from the box's own .env rather than passed in from
+          # the workflow: it is the credential the running control plane was
+          # started with (so the check tests the deployed reality, not a second
+          # opinion), and it never appears in an argv on the runner or here.
+          export CP_URL=http://localhost:8080
+          CP_PROVISION_TOKEN="$(sed -n 's/^CP_PROVISION_TOKEN=//p' cp/deploy/.env | head -1)"
+          export CP_PROVISION_TOKEN
+          bash cp/deploy/smoke.sh
           EOS

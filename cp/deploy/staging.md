@@ -118,6 +118,15 @@ cp/deploy/smoke.sh
 Exit 0 = the control plane is healthy and the core provisioning path works. It
 provisions a uniquely-named throwaway org each run.
 
+**This is the same check CI runs.** `.github/workflows/deploy-staging.yml` runs
+`smoke.sh` on the box at the end of every rollout and fails the deploy on a
+non-zero exit, so the manual step above and the automated gate are one artifact
+rather than two that can disagree (SIGMA-265). The rollout also polls the
+dashboard's `GET /api/health?require=cp`, which round-trips to the control plane
+with the dashboard's own credential — the readiness gate used to be the
+marketing home page, which renders without ever touching the control plane and
+therefore reported success for every way the web→CP path can break.
+
 ## 4. Enroll a host (SSH onboarding)
 
 In the dashboard (or via `POST /v1/orgs/{org}/servers/provision`), add a server;

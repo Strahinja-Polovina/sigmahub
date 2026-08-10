@@ -112,6 +112,22 @@ export function cpPublicUrl(): string {
   return (process.env.SIGMAHUB_CP_PUBLIC_URL ?? cpBase()).replace(/\/$/, "");
 }
 
+/** The credential every org's service token descends from: it is the only
+ *  thing this process holds before an org has been provisioned, and losing it
+ *  (renamed variable, missing from the compose environment) breaks every
+ *  authenticated page at once. Named here rather than read inline twice so the
+ *  health check (SIGMA-265) probes the same value getOrgToken spends. */
+export function cpProvisionToken(): string {
+  return process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+}
+
+/** Base URL of the control plane, or null when none is configured. Exported
+ *  for the health check, which must distinguish "not configured" from
+ *  "configured and unreachable" instead of throwing on the first. */
+export function cpBaseOrNull(): string | null {
+  return cpEnabled() ? cpBase() : null;
+}
+
 // ── Org credential store (P1-1) ─────────────────────────────────────────────
 
 let orgTokenTableReady = false;
@@ -137,8 +153,7 @@ async function getOrgToken(orgId: string): Promise<string> {
   );
   if (existing.rows[0]?.token) return existing.rows[0].token;
 
-  const provisionToken =
-    process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+  const provisionToken = cpProvisionToken();
   const res = await fetch(`${cpBase()}/v1/orgs`, {
     method: "POST",
     headers: {
