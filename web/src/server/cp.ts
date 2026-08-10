@@ -1546,6 +1546,19 @@ export async function cpCreateBucketKey(
   }, { orgId, actor });
 }
 
+/** The scoped credential, opened for a human. Audited in the CP, Project
+ *  Admin+ — the counterpart of cpRevealS3Connection for the root credential.
+ *  Minting used to be a one-way door: the secret existed only for the agent,
+ *  so the key the operator was handed could never be used (SIGMA-313). */
+export async function cpRevealBucketKey(
+  orgId: string, resourceId: string, bucket: string, actor: CpActor
+): Promise<{ bucket: string; accessKey: string; secretKey: string }> {
+  return cpFetch(`${bucketsBase(orgId, resourceId)}/${encodeURIComponent(bucket)}/key`, undefined, {
+    orgId,
+    actor,
+  });
+}
+
 // ── Alerting (P2-6) ─────────────────────────────────────────────────────────
 
 export type CpAlertChannel = {

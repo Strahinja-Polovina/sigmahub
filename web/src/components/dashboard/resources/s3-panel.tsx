@@ -34,6 +34,7 @@ import {
   createBucket,
   deleteBucket,
   createBucketKey,
+  revealBucketKey,
 } from "@/server/actions/s3";
 import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type { CpS3Info, CpS3Connection, CpBucket } from "@/server/cp";
@@ -148,6 +149,9 @@ function BucketManager({
   // is over it, and there is no undo on the other side. It now only names the
   // bucket awaiting confirmation; the delete itself needs a second click.
   const [confirmDelete, setConfirmDelete] = React.useState<string | null>(null);
+  const [revealedKey, setRevealedKey] = React.useState<
+    { bucket: string; accessKey: string; secretKey: string } | null
+  >(null);
 
   const refresh = React.useCallback(() => {
     listBuckets({ orgId, resourceId })
@@ -191,12 +195,33 @@ function BucketManager({
     startTransition(async () => {
       try {
         const { accessKey } = await createBucketKey({ orgId, resourceId, bucket });
+        // SIGMA-313: this used to promise the secret would be "shown once it's
+        // active" — and then show it nowhere, because the create response
+        // carries only the key id and the mint button disappears as soon as the
+        // key is recorded. The copy now points at the control that exists.
         toast.success("Per-bucket key created", {
-          description: `Access key ${accessKey}. The secret is provisioned on the engine and shown once it’s active.`,
+          description: `Access key ${accessKey}. Use Reveal on the bucket row to copy its secret.`,
         });
         refresh();
       } catch (err) {
         toast.error("Couldn’t create key", { description: errMsg(err) });
+      }
+    });
+  }
+
+  // SIGMA-313: a minted key without a way back to its secret is a credential
+  // nobody can use. This is the audited reveal — the same shape as the root
+  // credential's, scoped to one bucket.
+  function reveal(bucket: string) {
+    startTransition(async () => {
+      try {
+        const key = await revealBucketKey({ orgId, resourceId, bucket });
+        setRevealedKey(key);
+        toast.message("Bucket key revealed", {
+          description: "This reveal was written to the audit log.",
+        });
+      } catch (err) {
+        toast.error("Couldn’t reveal the bucket key", { description: errMsg(err) });
       }
     });
   }
@@ -244,7 +269,20 @@ function BucketManager({
               </div>
               {canManage && (
                 <div className="flex shrink-0 items-center gap-1">
-                  {!b.accessKey && (
+                  {b.accessKey ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7"
+                      aria-label={`Reveal key for ${b.name}`}
+                      onClick={() => reveal(b.name)}
+                      disabled={pending}
+                      title="Show this bucket's scoped secret (audited)"
+                    >
+                      <Eye className="size-3.5" />
+                      Reveal
+                    </Button>
+                  ) : (
                     <Button
                       variant="ghost"
                       size="sm"
@@ -272,6 +310,34 @@ function BucketManager({
           ))}
         </div>
       )}
+
+      {/* SIGMA-313: the scoped credential, in full, for the operator who minted
+          it. Re-openable from the row — this is a reveal, not a one-time show,
+          because the secret survives at rest and the audit log records each
+          read. */}
+      <Dialog
+        open={revealedKey !== null}
+        onOpenChange={(next) => {
+          if (!next) setRevealedKey(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Key for bucket {revealedKey?.bucket}</DialogTitle>
+            <DialogDescription>
+              A least-privilege credential scoped to this bucket only. This reveal was
+              written to the audit log.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col divide-y divide-border">
+            <ConnRow label="Access key" value={revealedKey?.accessKey ?? ""} copyable />
+            <ConnRow label="Secret key" value={revealedKey?.secretKey ?? ""} copyable />
+          </div>
+          <DialogFooter>
+            <DialogClose render={<Button type="button">Done</Button>} />
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={confirmDelete !== null}

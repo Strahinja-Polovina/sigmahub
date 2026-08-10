@@ -427,6 +427,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBucket))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/quota", s.requireService(store.RoleProjectAdmin, s.handleSetBucketQuota))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/key", s.requireService(store.RoleProjectAdmin, s.handleCreateBucketKey))
+	// The scoped secret's reveal sits at the same role as the root credential's
+	// (SIGMA-313): without it the minted key could never be used.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/key", s.requireService(store.RoleProjectAdmin, s.handleRevealBucketKey))
 
 	// Backups (P1-11). Target metadata + run history + the verify-day feed are
 	// member-visible; target lifecycle, policy edits and the fire-drill restore

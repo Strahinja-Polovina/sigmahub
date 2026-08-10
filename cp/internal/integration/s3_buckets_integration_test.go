@@ -215,6 +215,96 @@ func TestS3BucketsEndToEnd(t *testing.T) {
 	}
 }
 
+// TestS3BucketKeyRevealIsReachable holds the per-bucket key to the same bar as
+// the root credential: the operator who minted it must be able to get it back.
+//
+// SIGMA-313: CreateBucketKey returns only the access key id, the secret is
+// sealed under the org DEK on the bucket row, and there was no route anywhere
+// that opened it for a human — the only reader was the executing agent's
+// per-op credential release. The dashboard nevertheless promised the secret
+// "once it's active", and the mint button disappeared as soon as the key was
+// recorded, so the credential was permanently unusable and the operator's only
+// way forward was the root credential the feature exists to avoid.
+func TestS3BucketKeyRevealIsReachable(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_s3keyreveal"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "storage")
+
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "media", Kind: "s3", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatalf("create s3 resource: %v", err)
+	}
+	if _, _, err := st.CreateBucket(ctx, orgID, res.ID, "uploads", "admin"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	ops, _ := st.PendingS3OpsForServer(ctx, serverID)
+	createOp, ok := findOp(ops, "create-bucket", "uploads")
+	if !ok {
+		t.Fatalf("no create-bucket op in %+v", ops)
+	}
+	if err := st.MarkS3OpApplied(ctx, serverID, createOp.OpID, "bucket created"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A bucket with no scoped key has nothing to reveal.
+	if _, err := st.RevealBucketKey(ctx, orgID, res.ID, "uploads", "admin"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("reveal before mint err = %v, want ErrNotFound", err)
+	}
+
+	accessKey, _, err := st.CreateBucketKey(ctx, orgID, res.ID, "uploads", "admin")
+	if err != nil {
+		t.Fatalf("create bucket key: %v", err)
+	}
+	keyOps, _ := st.PendingS3OpsForServer(ctx, serverID)
+	keyOp, ok := findOp(keyOps, "create-key", "uploads")
+	if !ok {
+		t.Fatalf("no create-key op in %+v", keyOps)
+	}
+	// What the agent will actually program into the engine — the reveal has to
+	// hand the operator the same string, or the credential is a decoration.
+	agentCred, err := st.S3OpCredentialForOp(ctx, serverID, keyOp.OpID)
+	if err != nil {
+		t.Fatalf("op credential: %v", err)
+	}
+	if err := st.MarkS3OpApplied(ctx, serverID, keyOp.OpID, "key created"); err != nil {
+		t.Fatal(err)
+	}
+
+	revealed, err := st.RevealBucketKey(ctx, orgID, res.ID, "uploads", "admin")
+	if err != nil {
+		t.Fatalf("reveal bucket key: %v", err)
+	}
+	if revealed.AccessKey != accessKey {
+		t.Fatalf("revealed access key = %q, want %q", revealed.AccessKey, accessKey)
+	}
+	if revealed.SecretKey != agentCred.NewSecretKey {
+		t.Fatalf("revealed secret = %q, want the secret released to the agent (%q)",
+			revealed.SecretKey, agentCred.NewSecretKey)
+	}
+
+	// Reveals are audited, like every other credential release.
+	var reveals int
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM cp_audit_log WHERE org_id = $1 AND action = 'S3 bucket key revealed'`,
+		orgID).Scan(&reveals); err != nil {
+		t.Fatal(err)
+	}
+	if reveals != 1 {
+		t.Fatalf("bucket key reveal audits = %d, want 1", reveals)
+	}
+
+	// Cross-tenant and unknown-bucket reads 404 rather than leaking.
+	if _, err := st.RevealBucketKey(ctx, "org_other", res.ID, "uploads", "admin"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-org reveal err = %v, want ErrNotFound", err)
+	}
+	if _, err := st.RevealBucketKey(ctx, orgID, res.ID, "nope", "admin"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown-bucket reveal err = %v, want ErrNotFound", err)
+	}
+}
+
 // findOp returns the first op matching an action + bucket.
 func findOp(ops []store.S3OpSpec, action, bucket string) (store.S3OpSpec, bool) {
 	for _, op := range ops {

@@ -85,9 +85,26 @@ func (s *Server) handleCreateBucketKey(w http.ResponseWriter, r *http.Request) {
 	if s.reconcile != nil && serverID != "" {
 		s.reconcile.ReconcileAsync(orgID, serverID)
 	}
-	// The secret is never returned — it is released only to the executing agent
-	// through the audited op-credential path. The dashboard sees the key id.
+	// The secret is not returned here: the op that programs it into the engine
+	// has not run yet, so the only honest answer at this point is the key id.
+	// It is readable afterwards through handleRevealBucketKey, which is the
+	// audited path a human uses (SIGMA-313) — the executing agent still gets it
+	// through its own per-op credential release.
 	writeJSON(w, http.StatusCreated, map[string]string{"accessKey": accessKey})
+}
+
+// handleRevealBucketKey returns a bucket's scoped access key AND secret to a
+// Project Admin+, audited in the store. This mirrors GET .../s3/connection for
+// the root credential; before it existed the per-bucket key was write-only and
+// therefore useless to the operator who minted it (SIGMA-313).
+func (s *Server) handleRevealBucketKey(w http.ResponseWriter, r *http.Request) {
+	key, err := s.domain.RevealBucketKey(r.Context(), r.PathValue("orgId"), r.PathValue("resourceId"),
+		r.PathValue("bucket"), principalFrom(r).Name)
+	if err != nil {
+		s.writeStoreErr(w, err, "reveal bucket key")
+		return
+	}
+	writeJSON(w, http.StatusOK, key)
 }
 
 // ── Agent-facing ────────────────────────────────────────────────────────────
