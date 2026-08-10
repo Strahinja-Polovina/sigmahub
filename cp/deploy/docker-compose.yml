@@ -87,8 +87,9 @@ services:
       # Both are OPTIONAL: empty repo falls through to the upstream slug, and
       # empty token means an unauthenticated fetch, which is what a public
       # release wants (GitHub's anonymous REST API allows 60 requests an hour
-      # and one onboarding costs six). A self-hoster with a private fork sets
-      # both.
+      # and one onboarding costs six). Leave the repo empty — it may only name
+      # the repository install.sh cosign-verifies against, and the control plane
+      # refuses to boot with any other value; see cp/deploy/.env.example.
       CP_RELEASE_REPO: ${CP_RELEASE_REPO:-}
       CP_RELEASE_TOKEN: ${CP_RELEASE_TOKEN:-}
       # Which release the CP installs. This is the ONLY place the version is

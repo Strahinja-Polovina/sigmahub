@@ -364,3 +364,80 @@ func TestTheReleaseRepoIsTheRepositoryInstallShVerifiesAgainst(t *testing.T) {
 			"serve one repository's artifacts to a script that trusts another's", got, DefaultReleaseRepo)
 	}
 }
+
+// The places that tell an operator what CP_RELEASE_REPO is for and the one
+// place that validates it disagreed, and nothing sat between them.
+//
+// FromEnv rejects any value other than DefaultReleaseRepo (see the comment
+// there: install.sh's cosign trust anchor is a literal in the script, so
+// proxying a fork's artifacts to it produces "cosign verification failed" on
+// the host, after the one-time bootstrap key is spent). Meanwhile the
+// ReleaseRepo doc comment invited "a self-hoster running their own (private)
+// fork" to point it at theirs, and cp/deploy/staging.md's table said "Leave
+// unset unless you run your own fork". An operator following either during an
+// upgrade sets the value and the control plane exits at boot — a self-inflicted
+// outage produced by following the project's own runbook.
+//
+// This is a doc lint, deliberately: the contradiction lives in prose, so the
+// guard has to read the prose. Every sentence that mentions a fork must also
+// say the setting cannot move, and the doc must state that the value is
+// constrained at all.
+func TestConfigDocsMatchReleaseRepoValidation(t *testing.T) {
+	// First establish the behaviour the docs have to match: a fork is refused.
+	t.Setenv("CP_DATABASE_URL", "postgres://x")
+	t.Setenv("CP_DB_ENGINES", "")
+	t.Setenv("CP_S3_ENGINES", "")
+	t.Setenv("CP_RELEASE_REPO", "acme/sigmahub-fork")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("FromEnv accepted a fork slug; this guard exists because it does not — " +
+			"if that changed on purpose, the docs it lints below should change with it")
+	}
+
+	// "a fork cannot be pointed at" has to be stated, not merely implied.
+	settled := regexp.MustCompile(`(?i)cannot|can't|\bnot\b|reject|refus|fixed|must be|fails to boot`)
+
+	check := func(where, doc string) {
+		t.Helper()
+		if !settled.MatchString(doc) {
+			t.Errorf("%s never says the value is constrained, but FromEnv rejects anything but %s",
+				where, DefaultReleaseRepo)
+		}
+		for _, sentence := range strings.Split(doc, ". ") {
+			if !strings.Contains(strings.ToLower(sentence), "fork") {
+				continue
+			}
+			if !settled.MatchString(sentence) {
+				t.Errorf("%s promises a fork setting FromEnv rejects at boot: %q",
+					where, strings.Join(strings.Fields(sentence), " "))
+			}
+		}
+	}
+
+	src, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Fatalf("read config.go: %v", err)
+	}
+	doc := string(src)
+	start := strings.Index(doc, "// ReleaseRepo (CP_RELEASE_REPO)")
+	end := strings.Index(doc, "// AgentVersion (CP_AGENT_VERSION)")
+	if start < 0 || end < 0 || end < start {
+		t.Fatal("the ReleaseRepo doc comment moved; this guard can no longer see it")
+	}
+	check("the ReleaseRepo doc comment in config.go", doc[start:end])
+
+	md, err := os.ReadFile(filepath.Join("..", "..", "deploy", "staging.md"))
+	if err != nil {
+		t.Fatalf("read staging.md: %v", err)
+	}
+	var row string
+	for _, line := range strings.Split(string(md), "\n") {
+		if strings.Contains(line, "`CP_RELEASE_REPO`") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("staging.md no longer documents CP_RELEASE_REPO; this guard can no longer see it")
+	}
+	check("the CP_RELEASE_REPO row of cp/deploy/staging.md", row)
+}

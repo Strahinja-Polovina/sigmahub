@@ -242,9 +242,15 @@ type ReleaseSource struct {
 	// /dl/{version}/{asset} carries its own version and is unaffected.
 	Version string
 	// Token is the server-side GitHub credential. Empty is a SUPPORTED
-	// configuration, not a degraded one: a public release repository — the
-	// upstream one, or a self-hoster's own public fork — is proxied
-	// unauthenticated and needs no configuration at all.
+	// configuration, not a degraded one: the upstream release repository is
+	// public, so it is proxied unauthenticated and needs no configuration at
+	// all. (A private release repository is the case the token exists for.)
+	//
+	// Repo, on the other hand, is not a fork switch — config.FromEnv refuses to
+	// boot with anything but config.DefaultReleaseRepo, because install.sh
+	// cosign-verifies against a certificate identity baked into the script. See
+	// the ReleaseRepo comment in cp/internal/config for why the anchor cannot
+	// travel in the install command.
 	//
 	// It is never written to a response, an error body or a log line. See
 	// upstreamError, which names the SETTING and never its value.
