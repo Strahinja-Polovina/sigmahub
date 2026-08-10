@@ -38,6 +38,9 @@ type StoreAPI interface {
 	MeshPeersDigest(ctx context.Context, orgID, selfServerID string) (string, error)
 	MetricsSince(ctx context.Context, orgID, serverID string, since time.Time) ([]store.MetricPoint, error)
 	ListServers(ctx context.Context, orgID string) ([]store.Server, error)
+	// CountServers backs GET .../servers?count=1 — the org switcher's "how
+	// many", answered without building the dashboard projection (SIGMA-335).
+	CountServers(ctx context.Context, orgID string) (int, error)
 	GetServer(ctx context.Context, orgID, serverID string) (store.Server, error)
 	ResolveSecretsForResource(ctx context.Context, orgID, serverID, resourceID, actor string) ([]store.ResolvedSecret, error)
 	SetDomainCertStatus(ctx context.Context, serverID, domain, status, serial string, expiresAt *time.Time, certErr string) error

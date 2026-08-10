@@ -33,9 +33,14 @@ vi.mock("./db", async () => {
 // is the branch that reads the local mirror.
 const cpEnabled = vi.fn(() => false);
 const cpListServers = vi.fn(async () => [] as unknown[]);
+/** What the control plane would answer for each org's ?count=1. Distinct
+ *  numbers so a count attributed to the wrong org is visible. */
+const CP_COUNTS: Record<string, number> = { org_scale: 7, org_other: 4 };
+const cpServerCount = vi.fn(async (orgId: string) => CP_COUNTS[orgId] ?? 0);
 vi.mock("./cp", () => ({
   cpEnabled: () => cpEnabled(),
   cpListServers: () => cpListServers(),
+  cpServerCount: (orgId: string) => cpServerCount(orgId),
   cpServerToRow: (r: unknown) => r,
 }));
 vi.mock("./cp-sync", () => ({ reportCpFailure: () => {} }));
@@ -44,6 +49,7 @@ import * as schema from "./db/schema";
 import {
   getOrgResources,
   getProjectSummaries,
+  getServerCounts,
   getServersWithCounts,
 } from "./queries";
 
@@ -189,6 +195,35 @@ describe("getServersWithCounts", () => {
     const rows = await getServersWithCounts(ORG);
     expect(rows).toHaveLength(SERVERS);
     for (const row of rows) expect(row.resourceCount).toBe(N / SERVERS);
+  });
+});
+
+describe("getServerCounts", () => {
+  it("does not fetch full server projections", async () => {
+    cpEnabled.mockReturnValue(true);
+    const counts = await getServerCounts([ORG, "org_other"]);
+
+    // SIGMA-335: the org switcher renders one integer per org. Asking
+    // GET /v1/orgs/{id}/servers for it makes the control plane build the whole
+    // dashboard projection — every column, the facts jsonb blob and a
+    // correlated readiness subquery per row — and serialise it so the web can
+    // call .length on it. The layout does that on EVERY render, for every org
+    // the user belongs to, with no caching.
+    expect(cpListServers).not.toHaveBeenCalled();
+    expect(cpServerCount).toHaveBeenCalledTimes(2);
+    expect(counts).toEqual({ [ORG]: 7, org_other: 4 });
+  });
+
+  it("a control-plane hiccup shows zero rather than taking down the switcher", async () => {
+    cpEnabled.mockReturnValue(true);
+    cpServerCount.mockRejectedValueOnce(new Error("connect ECONNREFUSED"));
+    expect(await getServerCounts([ORG])).toEqual({ [ORG]: 0 });
+  });
+
+  it("demo mode counts the mirror rows in one query", async () => {
+    const counts = await getServerCounts([ORG, "org_other"]);
+    expect(counts).toEqual({ [ORG]: SERVERS, org_other: 0 });
+    expect(harness.sql).toHaveLength(1);
   });
 });
 

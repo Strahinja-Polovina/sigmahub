@@ -3,7 +3,7 @@ import { and, count, eq, inArray, desc } from "drizzle-orm";
 import { db } from "./db";
 import * as s from "./db/schema";
 import { user } from "./db/auth-schema";
-import { cpEnabled, cpListServers, cpServerToRow } from "./cp";
+import { cpEnabled, cpListServers, cpServerCount, cpServerToRow } from "./cp";
 import { reportCpFailure } from "./cp-sync";
 import { hashInviteToken } from "../lib/invite";
 import {
@@ -119,8 +119,17 @@ export async function getServerCounts(
   if (cpEnabled()) {
     await Promise.all(
       orgIds.map(async (id) => {
+        // SIGMA-335: a COUNT, not a list. This used to be
+        // `cpListServers(id).then((l) => l.length)`, which made the control
+        // plane build and serialise its full dashboard projection — every
+        // column, the facts jsonb blob and a correlated readiness subquery per
+        // row — for every org the user belongs to, on every render of the
+        // layout, so that the switcher could render one integer each. A
+        // consultant in six orgs of a hundred hosts moved six hundred
+        // fully-projected rows per navigation to draw six numbers.
+        //
         // A CP hiccup must not take down the org switcher — show 0 instead.
-        counts[id] = await cpListServers(id).then((l) => l.length).catch(() => 0);
+        counts[id] = await cpServerCount(id).catch(() => 0);
       })
     );
     return counts;

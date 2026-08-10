@@ -337,6 +337,26 @@ func (s *Server) handleRenameServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
+	// SIGMA-335: ?count=1 answers with the number and nothing else.
+	//
+	// The dashboard's org switcher shows one integer per org the user belongs
+	// to, and it used to get each one by fetching that org's whole server list
+	// and calling .length on it. That makes this route build the full dashboard
+	// projection — every column, the facts jsonb blob and a correlated
+	// readiness subquery per row — and serialise it, once per org, on every
+	// render of the layout, with no caching anywhere. A consultant in six orgs
+	// of a hundred hosts moved six hundred fully-projected rows across the wire
+	// to render six numbers.
+	if r.URL.Query().Get("count") == "1" {
+		n, err := s.store.CountServers(r.Context(), r.PathValue("orgId"))
+		if err != nil {
+			s.log.Error("count servers", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"count": n})
+		return
+	}
 	servers, err := s.store.ListServers(r.Context(), r.PathValue("orgId"))
 	if err != nil {
 		s.log.Error("list servers", "err", err)

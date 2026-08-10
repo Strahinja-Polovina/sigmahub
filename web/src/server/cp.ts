@@ -311,6 +311,21 @@ export async function cpListServers(orgId: string): Promise<CpServer[]> {
   return servers;
 }
 
+/** How many servers an org has, without the list.
+ *
+ *  The org switcher needs one integer per org the user belongs to and used to
+ *  get it from cpListServers(...).length — which makes the control plane build
+ *  the whole dashboard projection (every column, the facts jsonb blob and a
+ *  correlated readiness subquery per row) for each org, on every render, with
+ *  no caching. `?count=1` answers with `{ count }` and nothing else
+ *  (SIGMA-335). */
+export async function cpServerCount(orgId: string): Promise<number> {
+  const { count } = await cpFetch<{ count: number }>(
+    `/v1/orgs/${encodeURIComponent(orgId)}/servers?count=1`, undefined, { orgId }
+  );
+  return count ?? 0;
+}
+
 export async function cpGetServer(
   orgId: string,
   serverId: string
