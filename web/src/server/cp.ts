@@ -1810,7 +1810,16 @@ export async function cpListDeployments(orgId: string, resourceId: string, limit
 
 /** The org-wide deploy feed: recent deployments (activity stream) plus the
  *  latest per resource, however old (SIGMA-161 — the dashboard's "Last deploy",
- *  "Version", "Active deploys" and activity feed read this via the mirror). */
+ *  "Version", "Active deploys" and activity feed read this via the mirror).
+ *
+ *  `latest` is NARROWER than `recent`: it carries only id, orgId, resourceId,
+ *  gitSha, status, durationSeconds, createdBy, createdAt and startedAt. The
+ *  latest-per-resource query is unbounded and polled every 30s, so the CP stopped
+ *  projecting the rest — led by the service_status jsonb blob — to keep it off
+ *  the wire (SIGMA-318). Every other field arrives as its zero value, so reading
+ *  one from `latest` fails silently rather than loudly; if a surface needs it,
+ *  widen LatestDeploymentPerResourceQuery in cp/internal/store/deployments.go
+ *  and this comment together. */
 export async function cpListOrgDeployments(
   orgId: string,
   limit = 50

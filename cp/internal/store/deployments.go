@@ -489,18 +489,81 @@ func (s *Store) ListOrgDeployments(ctx context.Context, orgID string, recentLimi
 	if err != nil {
 		return OrgDeployments{}, err
 	}
-	rows, err = s.Pool.Query(ctx, `
-		SELECT DISTINCT ON (resource_id) `+deploymentCols+` FROM deployments
-		 WHERE org_id = $1 ORDER BY resource_id, created_at DESC`, orgID)
+	rows, err = s.Pool.Query(ctx, LatestDeploymentPerResourceQuery, orgID)
 	if err != nil {
 		return OrgDeployments{}, err
 	}
-	out.Latest, err = scanDeployments(rows)
+	out.Latest, err = scanLatestDeployments(rows)
 	rows.Close()
 	if err != nil {
 		return OrgDeployments{}, err
 	}
 	return out, nil
+}
+
+// LatestDeploymentPerResourceQuery is the Latest half of the org deploy feed:
+// one row per resource, however old. Exported so the query-plan regression test
+// in internal/integration can EXPLAIN the real query rather than a copy that
+// drifts (SIGMA-318).
+//
+// It is UNBOUNDED by construction — "the latest per resource" has no useful
+// LIMIT — and the web mirror polls it every 30 seconds for every org with a
+// dashboard open. So its cost has to be proportional to the org's RESOURCE
+// count, and it used to be proportional to the org's DEPLOY HISTORY instead:
+//
+//	SELECT DISTINCT ON (resource_id) <every column> FROM deployments
+//	 WHERE org_id = $1 ORDER BY resource_id, created_at DESC
+//
+// Postgres has no loose/skip index scan, so a DISTINCT ON like that is always
+// "walk every row in resource_id order, keep the first of each group" — for an
+// org with 300 resources and 40,000 deployments it read 40,000 rows, with their
+// service_status jsonb blobs, to return 300. Nothing bounded it but retention,
+// so a two-year-old org degraded its own dashboard and, because the poll holds a
+// pool connection, everyone else's requests too.
+//
+// The lateral does the skip scan explicitly: one probe per resource into
+// deployments_org_resource_idx (org_id, resource_id, created_at DESC), each
+// stopping at the first row. That is 300 index descents instead of 40,000 row
+// reads, and it stays 300 no matter how long the install has been running. The
+// result set is identical — deployments.resource_id is ON DELETE CASCADE, so
+// every deployment has a live resource row, and a resource with no deployments
+// contributes nothing under either form.
+//
+// It also projects only the columns the web mirror actually writes, NOT
+// deploymentCols: cp-sync.ts reads id, resourceId, status, gitSha, createdBy,
+// durationSeconds, startedAt and createdAt from this list and nothing else (see
+// resourceMirrorRow and step 4b there). Anything a consumer starts reading must
+// be added here too, or it silently arrives as a zero value.
+const LatestDeploymentPerResourceQuery = `
+		SELECT d.id, d.org_id, d.resource_id, d.git_sha, d.status, d.duration_seconds,
+		       d.created_by, d.created_at, d.started_at
+		  FROM resources r
+		  CROSS JOIN LATERAL (
+		       SELECT dd.id, dd.org_id, dd.resource_id, dd.git_sha, dd.status, dd.duration_seconds,
+		              dd.created_by, dd.created_at, dd.started_at
+		         FROM deployments dd
+		        WHERE dd.org_id = $1 AND dd.resource_id = r.id
+		        ORDER BY dd.created_at DESC
+		        LIMIT 1) d
+		 WHERE r.org_id = $1
+		 ORDER BY d.resource_id`
+
+// scanLatestDeployments scans LatestDeploymentPerResourceQuery's narrowed
+// projection. The unselected fields stay at their zero values, which the
+// Deployment JSON tags already omit.
+func scanLatestDeployments(rows pgx.Rows) ([]Deployment, error) {
+	out := []Deployment{}
+	for rows.Next() {
+		var d Deployment
+		var sha *string
+		if err := rows.Scan(&d.ID, &d.OrgID, &d.ResourceID, &sha, &d.Status, &d.DurationSeconds,
+			&d.CreatedBy, &d.CreatedAt, &d.StartedAt); err != nil {
+			return nil, err
+		}
+		d.GitSHA = deref(sha)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 // RollbackTargets returns a resource's last N SUCCESSFUL releases whose exact
