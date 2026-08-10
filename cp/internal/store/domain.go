@@ -792,14 +792,27 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	return r, tx.Commit(ctx)
 }
 
-// ListResources returns org resources, optionally filtered by environment.
-func (s *Store) ListResources(ctx context.Context, orgID, envID string) ([]Resource, error) {
+// ListResources returns org resources, optionally filtered by environment and
+// by the server they are bound to. Either filter may be empty, and they compose.
+//
+// SIGMA-328: the server detail page wants one server's hosted resources, and
+// with only the environment filter available it had to ask for the whole org
+// and discard ~98% of the answer client-side — every row's full `spec` jsonb
+// shipped over HTTP for nothing, growing with every resource anyone creates
+// anywhere in the org (including in projects the viewer cannot see). Pushing
+// the predicate into the WHERE clause is one more condition here and turns that
+// page's payload into what it actually renders.
+func (s *Store) ListResources(ctx context.Context, orgID, envID, serverID string) ([]Resource, error) {
 	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), name, kind, spec, status, ephemeral, created_at, updated_at
 	        FROM resources WHERE org_id = $1`
 	args := []any{orgID}
 	if envID != "" {
-		q += ` AND environment_id = $2`
 		args = append(args, envID)
+		q += fmt.Sprintf(` AND environment_id = $%d`, len(args))
+	}
+	if serverID != "" {
+		args = append(args, serverID)
+		q += fmt.Sprintf(` AND server_id = $%d`, len(args))
 	}
 	q += ` ORDER BY created_at`
 	rows, err := s.Pool.Query(ctx, q, args...)

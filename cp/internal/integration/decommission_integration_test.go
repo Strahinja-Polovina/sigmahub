@@ -285,7 +285,7 @@ func TestDecommissionRefusesWithBoundResourceNames(t *testing.T) {
 	}
 
 	// Remove the blockers and the disconnect goes through.
-	bound, err := st.ListResources(ctx, orgID, env.ID)
+	bound, err := st.ListResources(ctx, orgID, env.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -234,7 +234,7 @@ func (f *fakeDomain) ControlPlaneServerForCluster(_ context.Context, _, clusterI
 	}
 	return "srv_cp", nil
 }
-func (f *fakeDomain) ListResources(context.Context, string, string) ([]store.Resource, error) {
+func (f *fakeDomain) ListResources(context.Context, string, string, string) ([]store.Resource, error) {
 	return []store.Resource{}, nil
 }
 func (f *fakeDomain) DeleteResource(context.Context, string, string, string) (string, error) {

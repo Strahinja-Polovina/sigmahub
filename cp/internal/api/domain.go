@@ -37,7 +37,7 @@ type DomainAPI interface {
 	// into. A cluster resource has no server_id, so it is the only handle a
 	// mutation has on the document that has to be rebuilt.
 	ControlPlaneServerForCluster(ctx context.Context, orgID, clusterID string) (string, error)
-	ListResources(ctx context.Context, orgID, envID string) ([]store.Resource, error)
+	ListResources(ctx context.Context, orgID, envID, serverID string) ([]store.Resource, error)
 	DeleteResource(ctx context.Context, orgID, resourceID, actor string) (serverID string, err error)
 	// ForceReapplyResource backs the unconditional Redeploy for resources with
 	// no git deployment to replay (db/s3/registry apps).
@@ -434,8 +434,13 @@ func (s *Server) handleCreateResource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, res)
 }
 
+// handleListResources lists an org's resources. Both `environmentId` and
+// `serverId` are optional filters and compose; `serverId` exists so the server
+// detail page can ask for the ~50 resources it renders instead of the org's
+// 2,000 and filtering client-side (SIGMA-328).
 func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
-	resources, err := s.domain.ListResources(r.Context(), r.PathValue("orgId"), r.URL.Query().Get("environmentId"))
+	resources, err := s.domain.ListResources(r.Context(), r.PathValue("orgId"),
+		r.URL.Query().Get("environmentId"), r.URL.Query().Get("serverId"))
 	if err != nil {
 		s.writeStoreErr(w, err, "list resources")
 		return

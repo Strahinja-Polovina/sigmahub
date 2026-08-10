@@ -1156,8 +1156,23 @@ export async function cpDeleteSecret(orgId: string, secretId: string, actor: CpA
   }, { orgId, actor });
 }
 
-export async function cpListResources(orgId: string, environmentId?: string): Promise<CpResource[]> {
-  const qs = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
+/** List an org's resources, optionally narrowed to one environment and/or the
+ *  server they are bound to.
+ *
+ *  SIGMA-328: `serverId` is not a convenience — the server detail page renders
+ *  one server's hosted resources, and without a filter it pulled every resource
+ *  in the org (each with its full `spec` jsonb) across the wire and discarded
+ *  the ones belonging to the other 39 servers. Both filters are pushed into the
+ *  CP's WHERE clause. */
+export async function cpListResources(
+  orgId: string,
+  environmentId?: string,
+  serverId?: string
+): Promise<CpResource[]> {
+  const params = new URLSearchParams();
+  if (environmentId) params.set("environmentId", environmentId);
+  if (serverId) params.set("serverId", serverId);
+  const qs = params.size > 0 ? `?${params.toString()}` : "";
   const { resources } = await cpFetch<{ resources: CpResource[] }>(
     `${org(orgId)}/resources${qs}`, undefined, { orgId });
   return resources;
