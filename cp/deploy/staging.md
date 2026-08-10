@@ -271,6 +271,34 @@ rolling an image back does not roll the schema back. So:
   migration. There are no down-migrations, by design — a down-migration is a
   destructive operation run at the worst possible moment.
 
+## 10. Running more than one control-plane replica (SIGMA-291)
+
+Nearly all of the control plane's shared state already lives in Postgres —
+advisory locks around reconciles and migrations, `SKIP LOCKED` work leases,
+partial unique indexes — so a second replica is safe for correctness. Two things
+are worth knowing before you scale `cp` past one instance.
+
+**Agent long-poll wake-ups are shared, and must stay that way.** The
+reconciler's long-poll waiter map is per-process. A change rendered on replica B
+is announced to replica A over Postgres `LISTEN`/`NOTIFY`
+(`SubscribeDSDChanges` / `PublishDSDChange`, wired in `main.go`), so an agent
+polling A is woken immediately. Without that fan-out roughly half of all DSD
+changes would be delivered a full long-poll window (25s) late, with no error
+anywhere: deploys and config changes would simply feel intermittently sluggish.
+The delivery is best-effort — `NOTIFY` is not durable — which is fine, because
+a missed wake costs one long-poll window and the 60s fleet resync re-renders
+regardless.
+
+**The telemetry ingest budget is per replica, not per org.**
+`orgSamplesPerSec` / `orgLinesPerSec` in `cp/internal/telemetry` are in-memory
+token buckets, so N replicas give each org roughly N times the intended budget.
+This is a stated limitation, not a bug to be surprised by: divide those
+constants by your replica count, or enforce the real limit in front of the
+metrics/logs sink. It is deliberately not backed by a shared counter — that
+would put a database round trip on the highest-frequency request the control
+plane serves, to tighten a backstop that already sits behind the agent-side
+metric allowlist and series cap.
+
 ## Teardown
 
 ```

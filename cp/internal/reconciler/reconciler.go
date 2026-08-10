@@ -66,6 +66,11 @@ type Reconciler struct {
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
 
+	// bus fans DSD changes to the long-poll waiters parked in OTHER control
+	// plane replicas (SIGMA-291). Nil — the default, and every unit test — means
+	// this process is the only one, and notify wakes local waiters only.
+	bus ChangeBus
+
 	// slots bounds how many reconciles run CONCURRENTLY (SIGMA-288). A buffered
 	// channel used as a counting semaphore; nil disables the bound, which is
 	// only the case for a zero-value Reconciler built outside New.
@@ -146,6 +151,17 @@ func (r *Reconciler) acquireSlot(ctx context.Context) (func(), bool) {
 func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Duration)) {
 	r.onResync, r.onRender = onResync, onRender
 }
+
+// ChangeBus carries DSD change announcements between control-plane replicas
+// (SIGMA-291). cp/internal/store implements it over Postgres LISTEN/NOTIFY; the
+// receiving side of the same bus drives WakeServer.
+type ChangeBus interface {
+	PublishDSDChange(ctx context.Context, serverID string) error
+}
+
+// SetChangeBus installs the cross-replica wake-up bus. Called at boot before
+// serving; leaving it unset is the correct single-instance configuration.
+func (r *Reconciler) SetChangeBus(bus ChangeBus) { r.bus = bus }
 
 // SetACMEConfig installs the ACME issuance config rendered into proxy.traefik
 // ops (Let's Encrypt account email + CA directory; the staging/Pebble URL is
@@ -500,7 +516,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 			r.log.Warn("stamp deployment dsd version", "server", serverID, "err", err)
 		}
 		r.log.Info("dsd rendered", "server", serverID, "ops", len(ops))
-		r.notify(serverID)
+		r.notify(ctx, serverID)
 	}
 	return nil
 }
@@ -652,7 +668,33 @@ func (r *Reconciler) Wait(serverID string) (<-chan struct{}, func()) {
 	return ch, cancel
 }
 
-func (r *Reconciler) notify(serverID string) {
+// notify wakes every long-poll waiter for a server: the ones parked in THIS
+// process, and — through the change bus — the ones parked in any other replica
+// (SIGMA-291).
+//
+// The local wake happens first and unconditionally. The bus is an addition, not
+// a replacement: a publish failure (or no bus configured at all, which is every
+// unit test) leaves single-process behaviour exactly as it was, rather than
+// making the common case depend on a database round trip.
+func (r *Reconciler) notify(ctx context.Context, serverID string) {
+	r.WakeServer(serverID)
+	if r.bus == nil {
+		return
+	}
+	if err := r.bus.PublishDSDChange(ctx, serverID); err != nil {
+		// Degrades to what every cross-replica change did before the bus
+		// existed: the other replica's waiter finds the change when its
+		// long-poll window expires. Worth a line, not worth failing a
+		// reconcile that has already committed.
+		r.log.Warn("publish dsd change to other replicas", "err", err, "server", serverID)
+	}
+}
+
+// WakeServer closes the long-poll waiters registered in THIS process for a
+// server. Exported so the cross-replica listener can drive it with the server
+// id another replica published (SIGMA-291); a wake for a server nothing here is
+// waiting on is a no-op.
+func (r *Reconciler) WakeServer(serverID string) {
 	r.mu.Lock()
 	list := r.waiters[serverID]
 	delete(r.waiters, serverID)

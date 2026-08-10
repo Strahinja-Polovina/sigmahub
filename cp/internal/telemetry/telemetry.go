@@ -35,6 +35,21 @@ type Config struct {
 
 // Per-org ingest caps (per sweep second): the cardinality/volume backstop
 // behind the agent-side allowlist + series cap.
+//
+// These are enforced PER CONTROL-PLANE PROCESS, not per org across the fleet of
+// replicas (SIGMA-291). The buckets below are an in-memory map, so N replicas
+// behind a load balancer give every org roughly N times this budget: an agent
+// shipping high-cardinality metrics is throttled later than the numbers here
+// say, and the cap protects the telemetry sink less than it looks like it does.
+//
+// That is a deliberate, stated constraint rather than an oversight, and it is
+// the one piece of shared state the control plane does NOT push into Postgres.
+// Backing it with a shared counter means a database round trip on the ingest
+// path — the highest-frequency request the control plane serves — to tighten a
+// backstop that already sits behind two agent-side limits. If you run multiple
+// replicas, divide these constants by the replica count, or put the real limit
+// in front of the sink. cp/deploy/staging.md says the same thing where an
+// operator will actually read it.
 const (
 	orgSamplesPerSec = 2000
 	orgLinesPerSec   = 1000

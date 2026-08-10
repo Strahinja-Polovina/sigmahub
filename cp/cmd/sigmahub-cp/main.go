@@ -394,6 +394,13 @@ func run() error {
 	// /dl proxy, so a fleet on a private release repo can be upgraded.
 	rec.SetPublicURL(cfg.PublicURL)
 	rec.SetObservers(metrics.Loop(cpmetrics.LoopReconcilerResync).Report, metrics.ObserveDSDRender)
+	// Cross-replica long-poll wake-ups over Postgres LISTEN/NOTIFY (SIGMA-291):
+	// without this the waiter map is per-process, so an agent long-polling one
+	// replica sleeps out its whole window when another replica renders its
+	// change. Harmless with a single instance — the publish is a no-op fan-out
+	// back to this same listener.
+	rec.SetChangeBus(st)
+	go st.SubscribeDSDChanges(ctx, log, rec.WakeServer)
 	go rec.Run(ctx, 60*time.Second)
 
 	// Deploy-request drain (P1-9): turn queued git deploy_requests into
