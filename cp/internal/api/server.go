@@ -125,7 +125,11 @@ type Server struct {
 	// every loop, and an endpoint that exists unconditionally is worth more than
 	// one that quietly disappears in the deployments that forgot to wire it.
 	metrics *cpmetrics.Registry
-	mux     *http.ServeMux
+	// metricsRetentionCfg is how long the sweeper keeps server_metrics rows;
+	// the fallback metrics path may not advertise a longer window than that
+	// (SIGMA-257). Zero = the built-in default; read via metricsRetention().
+	metricsRetentionCfg time.Duration
+	mux                 *http.ServeMux
 }
 
 // PaddleClient is the outbound Paddle surface the billing handlers need.
@@ -214,6 +218,13 @@ type Options struct {
 	// "never succeeded", which is the honest reading for a process that is not
 	// running them.
 	Metrics *cpmetrics.Registry
+	// MetricsRetention is how long the sweeper keeps server_metrics rows — the
+	// SAME value passed to sweeper.Config.Retention, which is why it is passed
+	// in rather than written down here a second time. It caps the window
+	// GET .../metrics serves from the fallback store (SIGMA-257); zero means
+	// the built-in 24h default. It does not affect the pipeline path, which
+	// reads VictoriaMetrics under its own retention.
+	MetricsRetention time.Duration
 }
 
 // New builds the HTTP surface.
@@ -251,6 +262,7 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		requireActor:        opts.RequireActor,
 		release:             opts.Release.normalized(),
 		metrics:             opts.Metrics,
+		metricsRetentionCfg: opts.MetricsRetention,
 		mux:                 http.NewServeMux(),
 	}
 	if s.metrics == nil {

@@ -384,9 +384,13 @@ func run() error {
 	// short enough that an operator watching the row does not conclude the
 	// product hung.
 	go sweeper.Run(ctx, log, st, sweeper.Config{
-		Interval:            30 * time.Second,
-		StaleAfter:          90 * time.Second,
-		Retention:           24 * time.Hour,
+		Interval:   30 * time.Second,
+		StaleAfter: 90 * time.Second,
+		// Retention is CP_METRICS_RETENTION (24h by default) and is handed to
+		// the API too — what this sweeper deletes is exactly how far back the
+		// metrics endpoint can honestly serve when no pipeline is configured
+		// (SIGMA-257), so the two must never be separate literals again.
+		Retention:           cfg.MetricsRetention,
 		DeployTimeout:       45 * time.Minute,
 		DecommissionTimeout: 10 * time.Minute,
 		Heartbeat:           metrics.Loop(cpmetrics.LoopSweeper).Report,
@@ -538,6 +542,7 @@ func run() error {
 			DSDPublicKey:         dsdKey.Public().(ed25519.PublicKey),
 			Telemetry:            tel,
 			TelemetryStore:       st,
+			MetricsRetention:     cfg.MetricsRetention,
 			AlertSender:          alertSender,
 			Billing:              st,
 			Paddle:               paddleClient,
