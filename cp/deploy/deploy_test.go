@@ -225,3 +225,60 @@ func checksumLine(t *testing.T, path string) string {
 	// sha256sum's own format: hash, two spaces, name.
 	return fmt.Sprintf("%s  %s", hex.EncodeToString(sum[:]), filepath.Base(path))
 }
+
+// The container images a self-hoster runs must be signed and carry an SBOM
+// (SIGMA-272).
+//
+// .goreleaser.yaml signs `artifacts: checksum` and generates SBOMs for
+// `artifacts: archive` — the Go binary archives, and nothing else. But the
+// path README.md puts FIRST for self-hosting is cp/deploy/docker-compose.yml,
+// which runs the images this workflow pushes to GHCR, and those went up with
+// no signature, no SBOM and no provenance: one `image.source` label was the
+// entire chain of custody. The README then closes that section with "Releases …
+// are cosign-signed with per-archive SBOMs", which is true of the archives and
+// reads, where it sits, as covering the artifact the reader was just told to
+// run. So the security review that asks for the signature of
+// ghcr.io/…/sigmahub-cp@<digest> gets "no matching signatures".
+//
+// A signature over a TAG would not close it either: :latest is repointed by the
+// next push, so what gets signed has to be the digest each build emits.
+func TestPushedContainerImagesAreSignedAndCarryAnSBOM(t *testing.T) {
+	wf := readFileForTest(t, deployStagingWorkflow)
+
+	for _, want := range []struct{ needle, why string }{
+		{"sbom: true", "the pushed images carry no SBOM, so there is nothing to hand a security review"},
+		{"provenance: mode=max", "the pushed images carry no provenance, so nothing ties :latest to a commit"},
+		{"cosign sign", "the pushed images are never signed, so cosign verify answers \"no matching signatures\""},
+		{"cosign verify", "nothing checks the signature that was just published, which is how a signing step rots unnoticed"},
+		{"id-token: write", "the build job cannot mint the OIDC token keyless cosign signing needs"},
+	} {
+		if !strings.Contains(wf, want.needle) {
+			t.Errorf("%q missing from the image build/push job: %s", want.needle, want.why)
+		}
+	}
+
+	// Signing must cover the digests the build steps emit. Tags move; digests
+	// are the bytes someone pulls.
+	if strings.Contains(wf, "cosign sign") && !strings.Contains(wf, "outputs.digest") {
+		t.Error("cosign signs something other than the build steps' digest outputs — a signature over " +
+			"a moving tag says nothing about the image that is later pulled")
+	}
+
+	// Both images, not just the control plane: the dashboard is half of what
+	// the compose file starts.
+	for _, repo := range []string{"CP_IMAGE_REPO", "WEB_IMAGE_REPO"} {
+		if !strings.Contains(wf, `cosign sign --yes "$`+repo) {
+			t.Errorf("$%s is pushed but never signed", repo)
+		}
+	}
+
+	// And the README has to hand the reader the command, or the guarantee
+	// exists and nobody can act on it.
+	readme := readFileForTest(t, "../../README.md")
+	for _, needle := range []string{"cosign verify", "ghcr.io/strahinja-polovina/sigmahub-cp", "imagetools inspect"} {
+		if !strings.Contains(readme, needle) {
+			t.Errorf("README.md never mentions %q — it tells a self-hoster to run the container "+
+				"images and documents no way to verify them", needle)
+		}
+	}
+}

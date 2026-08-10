@@ -30,7 +30,19 @@ cd agent && go run ./cmd/sigmad -endpoint http://localhost:8080 \
 ## Self-hosting the control plane
 
 - **Containers:** `cp/deploy/docker-compose.yml` (CP + Postgres; copy
-  `.env.example` → `.env` first). The image builds from `cp/Dockerfile`.
+  `.env.example` → `.env` first). The image builds from `cp/Dockerfile`, or pull
+  the published one. Verify it before you run it — the images are cosign-signed
+  keylessly and carry an SPDX SBOM and max-mode provenance:
+
+  ```sh
+  IMAGE=ghcr.io/strahinja-polovina/sigmahub-cp:latest
+  cosign verify "$IMAGE" \
+    --certificate-identity-regexp '^https://github.com/Strahinja-Polovina/sigmahub/\.github/workflows/deploy-staging\.yml@' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  # The SBOM rides as an in-toto attestation in the image index, so read it with
+  # buildx rather than `cosign download sbom` (which reads the older .sbom tag):
+  docker buildx imagetools inspect "$IMAGE" --format '{{ json .SBOM }}'
+  ```
 - **Bare binary:** goreleaser archives ship `sigmahub-cp`; install
   `cp/packaging/sigmahub-cp.service` and configure `/etc/sigmahub-cp/env`.
 - **Back up the KMS key file** (`CP_KMS_KEY_FILE`): every wrapped secret —
@@ -50,5 +62,8 @@ cd web && pnpm test        # vitest
 ```
 
 CI (`.github/workflows/ci.yml`) runs all three, the CP integration suite
-against a real Postgres, and the agent Docker e2e as root. Releases
-(`.github/workflows/release.yml`) are cosign-signed with per-archive SBOMs.
+against a real Postgres, and the agent Docker e2e as root. Release archives
+(`.github/workflows/release.yml`) ship a cosign-signed `checksums.txt` and a
+per-archive SBOM; the GHCR container images are signed separately, per digest,
+by `.github/workflows/deploy-staging.yml` — see the verification command under
+[Self-hosting](#self-hosting-the-control-plane).
