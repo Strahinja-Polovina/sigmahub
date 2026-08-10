@@ -20,6 +20,24 @@ if (
   );
 }
 
+// Boolean env parsing that mirrors cp/internal/config.parseBoolEnv, which in
+// turn mirrors Go's strconv.ParseBool: the set of accepted spellings is the
+// same on both sides of the product, so an operator who writes `=1` in the CP
+// section of their .env and `=1` in the web section gets the same answer twice.
+// Unset/empty is the documented default; anything else that is not a recognised
+// spelling throws, because a security flag that quietly reads `false` after a
+// typo is worse than one that refuses to start.
+const TRUTHY = new Set(["1", "t", "T", "TRUE", "true", "True"]);
+const FALSY = new Set(["0", "f", "F", "FALSE", "false", "False"]);
+
+export function parseBoolEnv(key: string, raw: string | undefined, def = false): boolean {
+  const v = (raw ?? "").trim();
+  if (v === "") return def;
+  if (TRUTHY.has(v)) return true;
+  if (FALSY.has(v)) return false;
+  throw new Error(`${key} must be a boolean (true/false), got ${JSON.stringify(raw)}`);
+}
+
 // Invite email-match (acceptInvite) rests on the account's email actually
 // belonging to the user. AUTH_REQUIRE_EMAIL_VERIFICATION=true makes better-auth
 // block sign-in until the address is verified, closing that gap (SIGMA-82). It
@@ -27,8 +45,19 @@ if (
 // the reset flow), so turning it on without a real transport would strand
 // sign-ups — a deliberate operator choice once a transport is wired, not a
 // silent default that breaks the beta.
-const requireEmailVerification =
-  process.env.AUTH_REQUIRE_EMAIL_VERIFICATION === "true";
+//
+// It is parsed with parseBoolEnv, not `=== "true"`. The identical fail-open
+// construct on the control-plane side was SIGMA-142: an operator who wrote
+// CP_REQUIRE_ACTOR=1 got a silent `false` and ran with the security control off
+// while believing it was on. This flag is the same shape of control on the same
+// SIGMA-82 gap, so it gets the same contract — every spelling Go's
+// strconv.ParseBool accepts turns it on, and an unrecognised value fails boot
+// loudly instead of leaving sign-in open to unverified addresses with no signal
+// anywhere in the logs or the UI (SIGMA-261).
+const requireEmailVerification = parseBoolEnv(
+  "AUTH_REQUIRE_EMAIL_VERIFICATION",
+  process.env.AUTH_REQUIRE_EMAIL_VERIFICATION
+);
 
 // Third-party sign-in, from the same flags the auth screens read (SIGMA-246).
 // Empty on a deployment that has set no OAuth credentials — which is every
