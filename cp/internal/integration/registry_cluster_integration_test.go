@@ -530,7 +530,7 @@ func TestPushWithNoTargetsSaysSo(t *testing.T) {
 	if _, err := st.DrainDeployRequests(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reqs, err := st.ListDeployRequests(ctx, orgID, 10)
+	reqs, err := st.ListDeployRequests(ctx, orgID, "", 10)
 	if err != nil || len(reqs) != 1 {
 		t.Fatalf("deploy requests = %+v err=%v", reqs, err)
 	}
@@ -553,7 +553,7 @@ func TestPushWithNoTargetsSaysSo(t *testing.T) {
 	if _, err := st.DrainDeployRequests(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reqs, _ = st.ListDeployRequests(ctx, orgID, 10)
+	reqs, _ = st.ListDeployRequests(ctx, orgID, "", 10)
 	var latest store.DeployRequest
 	for _, r := range reqs {
 		if r.SHA == "def7654321" {

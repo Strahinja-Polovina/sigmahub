@@ -45,7 +45,7 @@ func postDelivery(t *testing.T, base, event, delivery, body string) int {
 
 func countKind(t *testing.T, st *store.Store, orgID, kind string) int {
 	t.Helper()
-	reqs, err := st.ListDeployRequests(context.Background(), orgID, 0)
+	reqs, err := st.ListDeployRequests(context.Background(), orgID, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

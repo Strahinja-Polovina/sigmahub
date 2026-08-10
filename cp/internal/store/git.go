@@ -776,16 +776,33 @@ func (s *Store) HandleGitWebhook(ctx context.Context, ev GitWebhookEvent) (Webho
 	return out, nil
 }
 
-// ListDeployRequests returns an org's deploy requests, newest first.
-func (s *Store) ListDeployRequests(ctx context.Context, orgID string, limit int) ([]DeployRequest, error) {
+// ListDeployRequests returns an org's deploy requests, newest first, optionally
+// scoped to one git connection.
+//
+// SIGMA-330: the scope is not a convenience. The limit applies after the filter,
+// so an unscoped call returns a window the whole org shares — and in an org with
+// four active repositories, one repo's CI pushing 60 times in an afternoon fills
+// that window entirely. The project page filtered the shared window down to its
+// own connections client-side, so a project whose last push had been pushed out
+// of the window rendered an EMPTY "Recent pushes" panel: the one place that
+// answers "I pushed, why is nothing happening?" answered it with silence, which
+// reads as "the webhook never arrived". Filtering in SQL means a connection's
+// history is bounded by its own volume, not by its noisiest neighbour's.
+func (s *Store) ListDeployRequests(ctx context.Context, orgID, connectionID string, limit int) ([]DeployRequest, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.Pool.Query(ctx, `
-		SELECT id, org_id, connection_id, environment_id, kind, ref, sha, branch, status,
+	q := `SELECT id, org_id, connection_id, environment_id, kind, ref, sha, branch, status,
 		       deployments_created, detail, created_at
-		  FROM deploy_requests WHERE org_id = $1
-		 ORDER BY created_at DESC, id DESC LIMIT $2`, orgID, limit)
+		  FROM deploy_requests WHERE org_id = $1`
+	args := []any{orgID}
+	if connectionID != "" {
+		args = append(args, connectionID)
+		q += fmt.Sprintf(` AND connection_id = $%d`, len(args))
+	}
+	args = append(args, limit)
+	q += fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT $%d`, len(args))
+	rows, err := s.Pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

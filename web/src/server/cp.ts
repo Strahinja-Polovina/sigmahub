@@ -1714,9 +1714,24 @@ export async function cpPromoteBranch(orgId: string, mapId: string, actor: CpAct
  *  the project view renders repo → branch→env tables. Resilient per connection:
  *  one failing detail fetch (e.g. a concurrent delete → 404) drops that repo,
  *  not the whole panel. */
-export async function cpListDeployRequests(orgId: string): Promise<CpDeployRequest[]> {
+/** Deploy requests (pushes) for an org, newest first.
+ *
+ *  `connectionId` scopes the answer to one repository, and it matters: the CP's
+ *  limit applies to the org as a whole, so an unscoped window is shared with
+ *  every other repo in the org and a busy one fills it completely. A project
+ *  filtering that window client-side then shows no pushes at all for a repo it
+ *  pushed to minutes ago (SIGMA-330). */
+export async function cpListDeployRequests(
+  orgId: string,
+  connectionId?: string,
+  limit?: number
+): Promise<CpDeployRequest[]> {
+  const params = new URLSearchParams();
+  if (connectionId) params.set("connectionId", connectionId);
+  if (limit) params.set("limit", String(limit));
+  const qs = params.size > 0 ? `?${params.toString()}` : "";
   const res = await cpFetch<{ deployRequests?: CpDeployRequest[] } | CpDeployRequest[]>(
-    `${org(orgId)}/git/deploy-requests`,
+    `${org(orgId)}/git/deploy-requests${qs}`,
     undefined,
     { orgId }
   );

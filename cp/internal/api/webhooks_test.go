@@ -66,7 +66,7 @@ func (f *fakeGit) DeleteBranchMap(context.Context, string, string, string) error
 func (f *fakeGit) PromoteBranch(context.Context, string, string, string) (store.DeployRequest, error) {
 	return store.DeployRequest{ID: "dpr_1", Kind: "deploy", Status: "queued"}, nil
 }
-func (f *fakeGit) ListDeployRequests(context.Context, string, int) ([]store.DeployRequest, error) {
+func (f *fakeGit) ListDeployRequests(context.Context, string, string, int) ([]store.DeployRequest, error) {
 	return []store.DeployRequest{}, nil
 }
 func (f *fakeGit) SetConnectionPreviews(context.Context, string, string, bool, string, string) error {
