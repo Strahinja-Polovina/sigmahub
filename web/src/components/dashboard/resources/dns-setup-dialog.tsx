@@ -110,10 +110,20 @@ export function DnsSetupDialog({
         ) : (
           <div className="flex flex-col gap-4 py-1">
             <div className="flex flex-wrap items-center gap-2">
-              {setup.verified ? (
+              {setup.verified && setup.proxyRole ? (
                 <Badge variant="outline" className="gap-1.5 text-emerald-700 dark:text-emerald-400">
                   <CircleCheck className="size-3.5" />
                   DNS points here
+                </Badge>
+              ) : setup.verified ? (
+                // SIGMA-299: the record is right and the certificate still cannot
+                // issue, because the server it points at terminates no TLS. A
+                // green tick here is the worst possible answer — it tells the
+                // operator the one thing they can see is fine and leaves the
+                // blocking fact (a role on a different settings page) unnamed.
+                <Badge variant="outline" className="gap-1.5 text-amber-700 dark:text-amber-500">
+                  <TriangleAlert className="size-3.5" />
+                  DNS points here, but no certificate can be issued
                 </Badge>
               ) : (
                 <Badge variant="outline" className="gap-1.5 text-amber-700 dark:text-amber-500">
@@ -132,7 +142,15 @@ export function DnsSetupDialog({
             </div>
 
             {setup.reason && (
-              <p className="text-sm text-muted-foreground">{setup.reason}</p>
+              <p
+                className={
+                  setup.proxyRole
+                    ? "text-sm text-muted-foreground"
+                    : "text-sm text-amber-700 dark:text-amber-500"
+                }
+              >
+                {setup.reason}
+              </p>
             )}
 
             {setup.records.length > 0 && (

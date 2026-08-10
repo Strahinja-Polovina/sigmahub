@@ -24,7 +24,10 @@ import {
 } from "@/components/ui/breadcrumb";
 import { Button } from "@/components/ui/button";
 import { DeployWizard } from "@/components/dashboard/resources/deploy-wizard";
-import type { DeployTarget } from "@/components/dashboard/resources/resource-meta";
+import {
+  toDeployTargetServer,
+  type DeployTarget,
+} from "@/components/dashboard/resources/resource-meta";
 import type { WizardCluster } from "@/lib/wizard/availability";
 import { WIZARD_RESUME_KEY, decodeWizardDraft } from "@/lib/wizard/resume";
 import {
@@ -43,6 +46,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
   Table,
@@ -351,15 +356,32 @@ function RecentDeploys({ resources }: { resources: EnvPanel["resources"] }) {
   );
 }
 
-function DeleteEnvironmentButton({
+/** SIGMA-314: the confirmation bar used to be inverted with respect to blast
+ *  radius. Deleting ONE resource makes you type the resource's name; removing
+ *  an environment — which runs the CP's cascadeResourceCleanupTx over every
+ *  resource in it, with no refusal and no force flag — asked for a single click
+ *  against prose that never said how many or which. Environment tabs sit side
+ *  by side and both read as capitalised names, so "sandbox" and "production"
+ *  are one tab apart and nothing on screen could catch the mistake before it
+ *  committed. This dialog now itemises what dies and demands the environment's
+ *  name, matching the bar the single-resource delete already sets. */
+export function DeleteEnvironmentButton({
   environmentId,
   name,
+  resources,
 }: {
   environmentId: string;
   name: string;
+  /** Everything the cascade destroys — listed, not summarised away. */
+  resources: EnvPanel["resources"];
 }) {
   const [open, setOpen] = React.useState(false);
+  const [typed, setTyped] = React.useState("");
   const [pending, startTransition] = React.useTransition();
+  // Two DeleteEnvironmentButtons are on the page at once (one per env tab), so
+  // the input's id has to be per-environment or the labels cross-wire.
+  const inputId = `confirm-env-${environmentId}`;
+  const matches = typed.trim() === name;
 
   function confirm() {
     startTransition(async () => {
@@ -367,6 +389,7 @@ function DeleteEnvironmentButton({
         await deleteEnvironment({ environmentId });
         toast.success(`Environment “${name}” removed`);
         setOpen(false);
+        setTyped("");
       } catch (err) {
         toast.error("Couldn’t remove environment", {
           description: err instanceof Error ? err.message : "Please try again.",
@@ -386,20 +409,56 @@ function DeleteEnvironmentButton({
         <Trash2 className="size-4" />
         Remove
       </Button>
-      <Dialog open={open} onOpenChange={(next) => !pending && setOpen(next)}>
+      <Dialog
+        open={open}
+        onOpenChange={(next) => {
+          if (pending) return;
+          setOpen(next);
+          if (!next) setTyped("");
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Remove “{name}”?</DialogTitle>
             <DialogDescription>
-              This removes the environment and its resources and deployment history.
-              Servers stay connected. This can’t be undone.
+              {resources.length === 0
+                ? "This environment has no resources. Removing it deletes the environment and its deployment history. Servers stay connected. This can’t be undone."
+                : `This destroys ${resources.length} ${
+                    resources.length === 1 ? "resource" : "resources"
+                  } and their deployment history. Servers stay connected, and data volumes and offsite snapshots are left in place. This can’t be undone.`}
             </DialogDescription>
           </DialogHeader>
+
+          {resources.length > 0 && (
+            <ul className="max-h-48 overflow-y-auto rounded-md border border-border bg-muted/40 p-2 text-sm">
+              {resources.map((r) => (
+                <li key={r.id} className="flex items-center justify-between gap-3 px-1 py-1">
+                  <span className="truncate font-medium text-foreground">{r.name}</span>
+                  <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                    {r.kind}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={inputId} className="text-xs text-muted-foreground">
+              Type <span className="font-mono text-foreground">{name}</span> to confirm
+            </Label>
+            <Input
+              id={inputId}
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              autoComplete="off"
+            />
+          </div>
+
           <DialogFooter>
             <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
               Cancel
             </DialogClose>
-            <Button variant="destructive" onClick={confirm} disabled={pending}>
+            <Button variant="destructive" onClick={confirm} disabled={pending || !matches}>
               {pending && <Loader2 className="size-4 animate-spin" />}
               Remove environment
             </Button>
@@ -422,7 +481,11 @@ function EnvironmentPanel({
   return (
     <div className="flex flex-col gap-4 pt-4">
       <div className="flex items-center justify-end">
-        <DeleteEnvironmentButton environmentId={panel.env.id} name={panel.env.name} />
+        <DeleteEnvironmentButton
+          environmentId={panel.env.id}
+          name={panel.env.name}
+          resources={panel.resources}
+        />
       </div>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <AttachedServers
@@ -547,14 +610,14 @@ export function ProjectDetailView({
             .map((p) => ({
               id: p.env.id,
               name: p.env.name,
-              servers: p.servers.map((sv) => ({
-                id: sv.id,
-                name: sv.name,
-                type: sv.type,
-                provider: sv.provider ?? "",
-                region: sv.region ?? "",
-                status: sv.status,
-              })),
+              // Built by the SAME helper getDeployTargets uses. This mapping
+              // used to be spelled out here and had lost `gpu`, so a wizard
+              // opened from a project saw every target as UNKNOWN and the
+              // SIGMA-214 VRAM fit check warned about nothing — the 70B model
+              // was offered onto the 24 GB box and only the control plane's
+              // create-time check said no, by which point the wizard had
+              // nowhere to go back to (SIGMA-304).
+              servers: p.servers.map(toDeployTargetServer),
             })),
         },
       ]
@@ -649,6 +712,10 @@ export function ProjectDetailView({
           orgId={orgId ?? ""}
           clusters={clusters.filter((c) => c.environmentId === wizardEnvId)}
           clusterExcludedKinds={clusterExcludedKinds}
+          // The fleet, not just this environment's attachments: step 1 has to
+          // be able to say "you have a Storage server, attach it here" rather
+          // than "no Storage server is connected" (SIGMA-309).
+          orgServers={orgServers}
           // So a GitHub install started here comes back HERE, not to the
           // resources list the user was not on.
           originProjectId={project.id}

@@ -528,7 +528,10 @@ func run() error {
 			// Report Traefik-issued certificate state (P1-8). A no-op on non-proxy
 			// servers (no ACME store); never fails the loop.
 			reportCertStatus(ctx, log, c, st.AgentToken, driver)
-		case errors.As(err, &apiErr) && apiErr.Permanent():
+		case errors.As(err, &apiErr) && apiErr.CredentialRevoked():
+			// Only a dead credential ends the process (systemd restarts us and we
+			// re-establish). A 408/429 from a proxy in front of the CP is a
+			// transient and falls through to the backoff below (SIGMA-340).
 			return err
 		case ctx.Err() != nil:
 			log.Info("shutting down")
@@ -603,8 +606,14 @@ func runDSDLoop(ctx context.Context, log *slog.Logger, c *client.Client, st stat
 				return
 			}
 			var apiErr *client.APIError
-			if errors.As(err, &apiErr) && apiErr.Permanent() {
-				log.Error("dsd: permanent error; stopping loop", "err", err)
+			if errors.As(err, &apiErr) && apiErr.CredentialRevoked() {
+				// Stopping the loop is a one-way door — nothing short of a process
+				// restart brings it back, and the heartbeat goroutine keeps the
+				// dashboard green while this host quietly applies nothing. So only a
+				// revoked credential (401/403) ends it. Every other 4xx — a 408 from
+				// a proxy clipping the 25s long-poll, a 429 from a rate-limit burst —
+				// backs off and retries below (SIGMA-340).
+				log.Error("dsd: credential rejected; stopping loop", "err", err)
 				return
 			}
 			log.Warn("dsd: fetch failed; backing off", "err", err, "retry_in", backoff)

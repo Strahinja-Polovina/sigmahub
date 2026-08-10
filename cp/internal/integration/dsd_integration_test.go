@@ -1243,3 +1243,100 @@ func TestReencryptSecrets_RewrapsHubToken(t *testing.T) {
 		t.Errorf("weights token after rotation = %q, want the original plaintext", got)
 	}
 }
+
+// TestPrereqOpFailureReachesDeployment pins SIGMA-301. The deploy pipeline emits
+// prerequisite ops — image.pull, volume.ensure, the per-resource network.ensure —
+// that carry no deploy PHASE: nothing to advance to, so deployPhase mapped them to
+// nothing and their failure reached no deployment, no deploy log and no resource
+// status. All the operator saw was the dependent rollout's skip, which the agent
+// reported as the fixed string "prerequisite failed".
+//
+// The payload here is exactly what an OLD agent posts (bare "prerequisite failed"
+// on the skipped rollout), because the CP must be able to recover the real cause
+// from the ops it is handed even when the skip message tells it nothing.
+func TestPrereqOpFailureReachesDeployment(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rec := reconciler.New(log, st, dsdKey)
+
+	api.SetLongPollTimeout(400 * time.Millisecond)
+	srv := api.New(log, st, st, st, api.Options{
+		DevServiceToken: "dev",
+		DSDStore:        st,
+		DSDWaiter:       rec,
+		Reconcile:       rec,
+		DSDPublicKey:    dsdKey.Public().(ed25519.PublicKey),
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	orgID := "org_prereq"
+	svcTok, _, err := st.IssueServiceToken(ctx, orgID, "web", store.RoleOrgAdmin, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, agentTok := reg.Server.ID, reg.AgentToken
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	res := createResourceViaAPI(t, ts.URL, svcTok, orgID, env.ID, serverID, "app1", "app")
+
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: res, EnvironmentID: env.ID, ServerID: serverID,
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "sha1",
+	}, "test")
+	if err != nil {
+		t.Fatalf("create deployment: %v", err)
+	}
+
+	const pullErr = "pull ghcr.io/o/r:sha1: denied: requested access to the resource is denied"
+	signed, _ := agentGetDSD(t, ts.URL, agentTok, 0)
+	pullOp, _ := json.Marshal(map[string]string{"state": "failed", "error": pullErr})
+	postDSDStatus(t, ts.URL, agentTok, signed.Document.Version, map[string]json.RawMessage{
+		"pull:" + res: pullOp,
+		"res:" + res:  json.RawMessage(`{"state":"skipped","error":"prerequisite failed"}`),
+	})
+
+	deps, err := st.ListDeployments(ctx, orgID, res, 10)
+	if err != nil || len(deps) != 1 {
+		t.Fatalf("list deployments = %+v (err %v)", deps, err)
+	}
+	if deps[0].Status != "failed" {
+		t.Fatalf("deployment status = %q, want failed", deps[0].Status)
+	}
+	if !strings.Contains(deps[0].Detail, "denied: requested access to the resource is denied") {
+		t.Errorf("deployment detail = %q; the registry error never reached the CP", deps[0].Detail)
+	}
+	if !strings.Contains(deps[0].Detail, "pull:"+res) {
+		t.Errorf("deployment detail = %q; does not name the failing op", deps[0].Detail)
+	}
+
+	logs, err := st.DeployLogsSince(ctx, dep.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var joined string
+	for _, l := range logs {
+		joined += l.Line + "\n"
+	}
+	if !strings.Contains(joined, "denied: requested access to the resource is denied") {
+		t.Errorf("deploy log = %q; the pull failure left no trace in the deploy log", joined)
+	}
+}

@@ -27,6 +27,10 @@ export type SettingsMember = {
   role: string;
   /** SIGMA-167: explicitly project-scoped (sees only granted projects). */
   scoped: boolean;
+  /** SIGMA-311: how many per-project grants this member holds in the org.
+   *  Removing them cascades all of these away and they cannot be reconstructed,
+   *  so the remove confirmation names the number out loud. */
+  grantCount: number;
 };
 export type PendingInvite = {
   id: string;

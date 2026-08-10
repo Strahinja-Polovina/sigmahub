@@ -5,9 +5,11 @@ import { RotateCcw, Server, ShieldCheck } from "lucide-react";
 
 import { auth } from "@/lib/auth";
 import { configuredAuthProviders } from "@/lib/auth-providers";
+import { mailDelivers } from "@/lib/mail";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { AuthProvidersProvider } from "@/components/auth/auth-providers";
+import { MailDeliveryProvider } from "@/components/auth/mail-delivery";
 
 const VALUE_BULLETS = [
   {
@@ -44,6 +46,10 @@ export default async function AuthLayout({
   // configures better-auth from, so the button and the flow behind it can't
   // disagree.
   const authProviders = configuredAuthProviders();
+  // Same reason, for the other promise these screens make: /forgot cannot read
+  // the mail configuration itself, and it must not tell a user to check an
+  // inbox on a deployment whose reset link only reaches a log (SIGMA-307).
+  const mailDelivered = mailDelivers();
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-2">
       {/* Left: form column */}
@@ -60,7 +66,9 @@ export default async function AuthLayout({
 
         <main className="flex flex-1 items-center justify-center px-6 pb-16">
           <div className="w-full max-w-sm">
-            <AuthProvidersProvider value={authProviders}>{children}</AuthProvidersProvider>
+            <AuthProvidersProvider value={authProviders}>
+              <MailDeliveryProvider value={mailDelivered}>{children}</MailDeliveryProvider>
+            </AuthProvidersProvider>
           </div>
         </main>
 

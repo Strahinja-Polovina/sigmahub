@@ -26,6 +26,7 @@ export default async function ProjectsPage() {
     serverCount: s.serverCount,
     resourceCount: s.resourceCount,
     statusCounts: s.statusCounts,
+    resources: s.resources,
   }));
 
   return <ProjectsView orgId={orgId} orgName={orgName} projects={projects} />;

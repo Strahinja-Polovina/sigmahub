@@ -395,9 +395,38 @@ func (s *Store) ListClusters(ctx context.Context, orgID, environmentID string) (
 	return out, nil
 }
 
-// DeleteCluster removes a cluster. Resources deployed into it lose their
-// binding (ON DELETE SET NULL) rather than being deleted — the workloads are
-// the customer's, and a cluster teardown must not take them with it.
+// ErrClusterWorkloads is the 409 a cluster delete answers while apps are still
+// deployed into it. Like ErrBoundResources on the server side it carries the
+// NAMES, because the dialog that raised the refusal has to say what is in the
+// way rather than make the operator guess. It satisfies errors.Is(err,
+// ErrConflict), so writeStoreErr's existing 409 branch handles it untouched.
+type ErrClusterWorkloads struct {
+	Names []string
+}
+
+func (e ErrClusterWorkloads) Error() string {
+	return fmt.Sprintf("%s: cluster still runs %d workload(s): %s",
+		ErrConflict.Error(), len(e.Names), strings.Join(e.Names, ", "))
+}
+
+func (e ErrClusterWorkloads) Is(target error) bool { return target == ErrConflict }
+
+// DeleteCluster removes a cluster, refusing while apps are still deployed into
+// it.
+//
+// The refusal is the SIGMA-312 ordering rule — the cluster is torn down AFTER
+// its workloads, never alongside them — and it is also the only representable
+// answer. This used to promise that a deployed app merely "loses its target"
+// (ON DELETE SET NULL), but a resource must name exactly one target
+// (resources_one_target, migration 0050), so the SET NULL violated a check
+// constraint and deleting a cluster that ran ANY app failed with a 500 and no
+// explanation. Deleting the apps instead is worse: they are the customer's, and
+// their secrets, domains and deploy history would go with them.
+//
+// So the operator deletes (or re-homes) the workloads first, and each of those
+// deletes queues its own k8s.remove against the control-plane node while that
+// node is still a member and can still apply it. By the time the cluster itself
+// goes, nothing is left running on it.
 func (s *Store) DeleteCluster(ctx context.Context, orgID, clusterID, actor string) ([]string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -425,6 +454,35 @@ func (s *Store) DeleteCluster(ctx context.Context, orgID, clusterID, actor strin
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+
+	// Workloads first, cluster second (SIGMA-312). A cluster deleted out from
+	// under running apps leaves their manifests on the node — k3s keeps applying
+	// whatever is in its manifest directory — with nothing left in the product
+	// describing them and no address left to send a teardown to, because this
+	// delete cascades cluster_nodes away and takes the control-plane node with
+	// it. Deleting each workload first is what queues those teardowns (see
+	// DeleteResource), so the refusal is the ordering.
+	resRows, err := tx.Query(ctx,
+		`SELECT name FROM resources WHERE org_id = $1 AND cluster_id = $2 ORDER BY name`, orgID, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	var deployed []string
+	for resRows.Next() {
+		var name string
+		if err := resRows.Scan(&name); err != nil {
+			resRows.Close()
+			return nil, err
+		}
+		deployed = append(deployed, name)
+	}
+	resRows.Close()
+	if err := resRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(deployed) > 0 {
+		return nil, ErrClusterWorkloads{Names: deployed}
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM clusters WHERE id = $1`, clusterID); err != nil {

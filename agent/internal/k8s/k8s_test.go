@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
 )
 
@@ -299,6 +302,57 @@ error: timed out waiting for the condition`), errors.New("exit status 1")
 	}
 	if err := d.applyWorkload(context.Background(), dsd.Op{ID: "res:res_1", Kind: KindK8sApply, Spec: raw}); err != nil {
 		t.Fatalf("a completed rollout must apply cleanly: %v", err)
+	}
+}
+
+// SIGMA-312: a deleted cluster resource (or a deleted cluster) tears its
+// workloads down through a typed op of its own.
+//
+// Pruning only ever happened as a side effect of applying a workload, so a
+// resource with no apply op left — which is exactly what a deletion produces —
+// kept its Deployment, Service and Ingress running in k3s with nothing in the
+// product describing them. The op goes through the apply registry like every
+// other kind, because a kind registered nowhere is rejected by Apply and would
+// leave the control plane rendering a teardown no agent performs.
+func TestK8sRemoveDeletesTheWorkloadManifests(t *testing.T) {
+	d, cap, _ := reportingDriver(t)
+	cap.files["/manifests/sigmahub-res-1-web.yaml"] = []byte("web")
+	cap.files["/manifests/sigmahub-res-1-worker.yaml"] = []byte("worker")
+	// Another resource's manifest must survive a teardown that does not name it.
+	cap.files["/manifests/sigmahub-res-2-web.yaml"] = []byte("other resource")
+
+	raw, err := json.Marshal(map[string]any{
+		"resourceId": "res_1",
+		"workloads":  []string{"sigmahub-res-1-web", "sigmahub-res-1-worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := apply.NewRegistry()
+	d.Register(reg)
+	j, err := apply.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+
+	doc := dsd.Document{Version: 3, ServerID: "srv_cp", Ops: []dsd.Op{
+		{ID: "k8srm:pdo_1", Kind: KindK8sRemove, Spec: raw},
+	}}
+	results, err := reg.Apply(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), j, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := results["k8srm:pdo_1"]; res.State != "applied" {
+		t.Fatalf("op state = %q (%s), want applied", res.State, res.Err)
+	}
+	for _, gone := range []string{"/manifests/sigmahub-res-1-web.yaml", "/manifests/sigmahub-res-1-worker.yaml"} {
+		if _, still := cap.files[gone]; still {
+			t.Fatalf("%s survived the teardown: the workload keeps running", gone)
+		}
+	}
+	if _, ok := cap.files["/manifests/sigmahub-res-2-web.yaml"]; !ok {
+		t.Fatal("a teardown removed a manifest it does not name")
 	}
 }
 

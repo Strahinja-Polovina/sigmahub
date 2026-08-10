@@ -278,6 +278,74 @@ func (s *Store) CreateBucketKey(ctx context.Context, orgID, resourceID, name, ac
 	return accessKey, serverID, tx.Commit(ctx)
 }
 
+// BucketKey is a revealed per-bucket credential. It is returned only by
+// RevealBucketKey (Project Admin+, audited) — never by ListBuckets, which stays
+// metadata-only for every member.
+type BucketKey struct {
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"accessKey"`
+	SecretKey string `json:"secretKey"`
+}
+
+// RevealBucketKey decrypts a bucket's scoped secret for a human operator,
+// mirroring RevealS3Connection for the root credential. Audited.
+//
+// SIGMA-313: CreateBucketKey seals the secret under the org DEK and hands back
+// only the access key id, and until now the ONLY reader of that ciphertext was
+// the executing agent's per-op credential release. That made the whole feature
+// a dead end: the operator who pressed the button got an access key with no
+// secret, no reveal control, no re-mint, and no route to ask for either — so
+// the least-privilege credential was unusable and the only way to ship was the
+// root credential the per-bucket key exists to avoid. The secret is at rest
+// either way; what was missing was an audited way for its owner to read it.
+//
+// A bucket with no key minted yet is ErrNotFound rather than an empty success,
+// so a caller cannot mistake "never minted" for "the secret is the empty
+// string".
+func (s *Store) RevealBucketKey(ctx context.Context, orgID, resourceID, name, actor string) (BucketKey, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return BucketKey{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var accessKey string
+	var ct, nonce []byte
+	var dekID *string
+	err = tx.QueryRow(ctx, `
+		SELECT access_key, key_ciphertext, key_nonce, key_dek_id
+		  FROM s3_buckets WHERE org_id = $1 AND resource_id = $2 AND name = $3`,
+		orgID, resourceID, name).Scan(&accessKey, &ct, &nonce, &dekID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BucketKey{}, ErrNotFound
+	}
+	if err != nil {
+		return BucketKey{}, err
+	}
+	if accessKey == "" || len(ct) == 0 || dekID == nil {
+		return BucketKey{}, ErrNotFound
+	}
+
+	dek, err := s.dekPlaintext(ctx, tx, *dekID)
+	if err != nil {
+		return BucketKey{}, err
+	}
+	// Same AAD as the seal in CreateBucketKey: the ciphertext is bound to the
+	// resource, so a row moved to another resource fails to open rather than
+	// decrypting into someone else's bucket.
+	plaintext, err := gcmOpen(dek, s3AAD(orgID, resourceID), nonce, ct)
+	if err != nil {
+		return BucketKey{}, fmt.Errorf("decrypt s3 bucket secret: %w", err)
+	}
+	if err := auditTx(ctx, tx, orgID, actor, "S3 bucket key revealed", resourceID+" "+name+" "+accessKey); err != nil {
+		return BucketKey{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return BucketKey{}, err
+	}
+	return BucketKey{Bucket: name, AccessKey: accessKey, SecretKey: string(plaintext)}, nil
+}
+
 // PendingS3OpsForServer returns a server's open s3 ops the reconciler renders,
 // oldest first for deterministic op ordering. Ops on a server with no mesh_ip
 // yet are skipped (the endpoint is unrenderable until enrollment completes).

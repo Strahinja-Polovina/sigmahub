@@ -1,6 +1,8 @@
 package store
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestIsApexDomain(t *testing.T) {
 	// The distinction matters: a CNAME is illegal at the apex, so getting this

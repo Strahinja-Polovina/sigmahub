@@ -8,8 +8,10 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 // asks what a control ON THE PAGE actually does, so the boundary is stubbed and
 // the component is rendered for real.
 const refresh = vi.fn();
+let searchParams = new URLSearchParams();
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh, push: vi.fn(), replace: vi.fn() }),
+  useSearchParams: () => searchParams,
 }));
 vi.mock("sonner", () => {
   const toast = Object.assign(vi.fn(), {
@@ -117,6 +119,7 @@ function dangerZone(): HTMLElement {
 
 afterEach(() => {
   cleanup();
+  searchParams = new URLSearchParams();
   vi.clearAllMocks();
 });
 
@@ -293,5 +296,129 @@ describe("ResourceDetail host health", () => {
       ),
     });
     expect(screen.getByText(/being disconnected/i)).toBeTruthy();
+  });
+});
+
+// Overview's per-resource menu links to /dashboard/resources/<id>?tab=logs
+// (SIGMA-310). The page rendered <Tabs defaultValue="overview"> and nothing
+// read searchParams, so an operator triaging a red resource from the overview
+// landed on Overview, assumed they mis-clicked, went back and clicked again.
+// The settings page has honoured ?tab since the org switcher started
+// deep-linking into it; the two surfaces disagreed about whether it means
+// anything.
+describe("ResourceDetail honors ?tab", () => {
+  function activeTab(): string {
+    const tab = screen
+      .getAllByRole("tab")
+      .find(
+        (t) =>
+          t.getAttribute("data-selected") !== null || t.getAttribute("aria-selected") === "true"
+      );
+    return tab?.textContent?.trim() ?? "";
+  }
+
+  it("?tab=logs opens the Logs tab", () => {
+    searchParams = new URLSearchParams("tab=logs");
+    renderCp();
+    expect(activeTab()).toBe("Logs");
+  });
+
+  it("falls back to Overview for a tab id that does not exist", () => {
+    searchParams = new URLSearchParams("tab=nonsense");
+    renderCp();
+    expect(activeTab()).toBe("Overview");
+  });
+
+  it("opens Overview when nothing was asked for", () => {
+    renderCp();
+    expect(activeTab()).toBe("Overview");
+  });
+});
+
+describe("ResourceDetail LLM endpoint", () => {
+  const llmInfo = {
+    engine: "vllm",
+    model: "meta-llama/Llama-3.1-8B-Instruct",
+    image: "vllm/vllm-openai:v0.6.3",
+    host: "10.8.0.37",
+    port: 15002,
+    endpoint: "http://10.8.0.37:15002/v1",
+  };
+
+  it("an llm resource renders its endpoint URL and port", () => {
+    renderCp({
+      detail: makeDetail({ kind: "llm", name: "llama", repo: null, domain: null }),
+      llm: llmInfo,
+    });
+
+    // The port is allocated by the control plane from MESH_PORT_BASE upward, so
+    // a user cannot guess it; without this panel a successfully deployed model
+    // was unreachable through any path the product offers (SIGMA-303).
+    expect(screen.getByText("http://10.8.0.37:15002/v1")).toBeTruthy();
+    expect(screen.getByText("meta-llama/Llama-3.1-8B-Instruct")).toBeTruthy();
+    expect(screen.getByText("15002")).toBeTruthy();
+    expect(screen.getByText("10.8.0.37")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Copy Endpoint/i })).toBeTruthy();
+  });
+
+  it("a resource with no llm payload renders no endpoint panel", () => {
+    renderCp();
+    expect(screen.queryByText(/OpenAI-compatible/i)).toBeNull();
+  });
+
+  // SIGMA-302: the weights sit on the customer's own disk under terms they were
+  // never shown. The control plane stores the model id and not the licence, so
+  // the route offered is the model card itself — the page the terms are stated
+  // on and, for a gated repo, accepted on.
+  it("the panel links to the model card where the licence is stated", () => {
+    renderCp({
+      detail: makeDetail({ kind: "llm", name: "llama", repo: null, domain: null }),
+      llm: llmInfo,
+    });
+    const link = screen.getByRole("link", { name: /licence/i });
+    expect(link.getAttribute("href")).toBe(
+      "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"
+    );
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
+});
+
+describe("ResourceDetail controls a Developer may not use", () => {
+  // SIGMA-308. deployResource and the volume-delete flow both require an
+  // effective Project Admin on the resource's project, and both controls
+  // rendered for everyone. A Developer who pressed Deploy during a bad release
+  // got "Deploy failed — An error occurred in the Server Components render…",
+  // because the gate throws before the try/catch that exists to keep CP
+  // refusals readable and Next.js redacts thrown server-action messages in
+  // production. Nothing said they lacked the role or who had it, so they
+  // pressed it again and escalated — mid-incident, to ask a question the page
+  // could have answered by not offering the button. Delete already knew this
+  // (it is wrapped in {canManage && …}); its two siblings did not.
+
+  it("a Developer sees no Deploy or volume-delete control", () => {
+    renderCp({ detail: makeDetail({}, { canManage: false }) });
+
+    expect(screen.queryByRole("button", { name: /^Deploy$/ })).toBeNull();
+
+    openTab("Settings");
+    const labels = within(dangerZone())
+      .queryAllByRole("button")
+      .map((b) => (b.textContent ?? "").trim());
+    expect(labels).not.toContain("Delete a data volume");
+    // The whole danger zone is inert for them — Delete was already gated.
+    expect(labels).not.toContain("Delete");
+    // And it says why, instead of showing a card of irreversible actions with
+    // nothing in it.
+    expect(within(dangerZone()).getByText(/Project Admin role/i)).toBeTruthy();
+  });
+
+  it("a Project Admin still gets both", () => {
+    renderCp();
+    expect(screen.getByRole("button", { name: /^Deploy$/ })).toBeTruthy();
+    openTab("Settings");
+    const labels = within(dangerZone())
+      .queryAllByRole("button")
+      .map((b) => (b.textContent ?? "").trim());
+    expect(labels.sort()).toEqual(["Delete", "Delete a data volume"].sort());
   });
 });

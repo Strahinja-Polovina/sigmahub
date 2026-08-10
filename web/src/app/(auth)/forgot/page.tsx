@@ -2,11 +2,12 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowLeft, Loader2, MailCheck } from "lucide-react";
+import { ArrowLeft, Loader2, MailCheck, ServerCog } from "lucide-react";
 
 import { authClient } from "@/lib/auth-client";
 import { Button } from "@/components/ui/button";
 import { AuthField } from "@/components/auth/auth-field";
+import { useMailDelivery } from "@/components/auth/mail-delivery";
 import { validateEmail } from "@/components/auth/validators";
 
 export default function ForgotPasswordPage() {
@@ -14,6 +15,13 @@ export default function ForgotPasswordPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [submitting, setSubmitting] = React.useState(false);
   const [sent, setSent] = React.useState(false);
+  // SIGMA-307: whether this deployment can deliver the mail we just asked for.
+  // No SMTP transport is bundled, so on a self-hosted install the reset link
+  // goes to the web container's stdout — a place the locked-out user has no
+  // reason to look at and probably no access to. Telling them to check their
+  // inbox, and then their spam folder, is the difference between "ask your
+  // admin for the link" and a day of searching for mail that was never sent.
+  const mailDelivered = useMailDelivery();
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -22,9 +30,10 @@ export default function ForgotPasswordPage() {
     if (emailError) return;
 
     setSubmitting(true);
-    // Best-effort dispatch. We always show the same success state so the form
-    // never reveals whether an account exists. (Dev has no mail transport;
-    // prod sends via GCP.)
+    // Best-effort dispatch. We always show the same confirmation regardless of
+    // the outcome so the form never reveals whether an account exists — what
+    // the confirmation SAYS depends only on the deployment's mail transport,
+    // which is not a fact about this email address.
     try {
       await authClient.requestPasswordReset({ email, redirectTo: "/login" });
     } catch {
@@ -38,16 +47,25 @@ export default function ForgotPasswordPage() {
     return (
       <div>
         <div className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary">
-          <MailCheck className="size-5" />
+          {mailDelivered ? <MailCheck className="size-5" /> : <ServerCog className="size-5" />}
         </div>
         <h1 className="mt-5 text-xl font-semibold tracking-tight text-foreground">
-          Check your inbox
+          {mailDelivered ? "Check your inbox" : "Email delivery isn’t configured"}
         </h1>
-        <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-          If an account exists for{" "}
-          <span className="font-medium text-foreground">{email}</span>, we&apos;ve
-          sent a link to reset your password. It may take a minute to arrive.
-        </p>
+        {mailDelivered ? (
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            If an account exists for{" "}
+            <span className="font-medium text-foreground">{email}</span>, we&apos;ve
+            sent a link to reset your password. It may take a minute to arrive.
+          </p>
+        ) : (
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            This deployment has no mail transport, so no email was sent. The reset
+            link for{" "}
+            <span className="font-medium text-foreground">{email}</span> was written
+            to the dashboard server&apos;s log — ask your administrator for it.
+          </p>
+        )}
 
         <div className="mt-7 grid gap-2">
           <Button
@@ -71,7 +89,9 @@ export default function ForgotPasswordPage() {
         </div>
 
         <p className="mt-6 text-center text-xs text-muted-foreground">
-          Didn&apos;t get the email? Check your spam folder or try again.
+          {mailDelivered
+            ? "Didn’t get the email? Check your spam folder or try again."
+            : "An administrator can wire a mail transport so these links are sent automatically."}
         </p>
       </div>
     );
@@ -83,8 +103,9 @@ export default function ForgotPasswordPage() {
         Reset your password
       </h1>
       <p className="mt-1.5 text-sm text-muted-foreground">
-        Enter the email tied to your account and we&apos;ll send you a reset
-        link.
+        {mailDelivered
+          ? "Enter the email tied to your account and we’ll send you a reset link."
+          : "Enter the email tied to your account. This deployment sends no mail, so the link is written to the dashboard server’s log for an administrator to relay."}
       </p>
 
       <form className="mt-7 grid gap-4" onSubmit={submit} noValidate>

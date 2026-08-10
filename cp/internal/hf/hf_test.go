@@ -27,7 +27,8 @@ const (
 		"gated": "manual",
 		"pipeline_tag": "text-generation",
 		"library_name": "transformers",
-		"tags": ["transformers","safetensors","llama","text-generation","conversational"],
+		"tags": ["transformers","safetensors","llama","text-generation","conversational","license:llama3.1"],
+		"cardData": {"license": "llama3.1"},
 		"config": {
 			"architectures": ["LlamaForCausalLM"],
 			"model_type": "llama",
@@ -84,7 +85,7 @@ const (
 		"gated": false,
 		"pipeline_tag": "text-generation",
 		"library_name": "gguf",
-		"tags": ["gguf","llama","text-generation"]
+		"tags": ["gguf","llama","text-generation","license:llama2"]
 	}`
 
 	// The model the unfiltered picker offered and no runtime here can load. It
@@ -970,5 +971,73 @@ func TestTheSearchLimitIsClampedToSomethingAPickerCanRender(t *testing.T) {
 				t.Fatalf("limit sent = %q, want %q", seen, tc.want)
 			}
 		})
+	}
+}
+
+// SIGMA-302. Weights are pulled onto the customer's own host under a licence
+// somebody accepted on the Hub, and the card — the whole wire contract between
+// the control plane and the model picker — carried no trace of which one. A
+// customer picking meta-llama/Llama-3.1-70B-Instruct was never shown the Llama
+// Community Licence, its acceptable-use policy, its attribution requirement or
+// its 700M-MAU clause, in the wizard or afterwards on the resource.
+//
+// The Hub states it in two places and the card has to be readable from both: a
+// search row carries it as a "license:<id>" tag, the single-model record carries
+// cardData.license. And the model-card URL travels regardless of either, because
+// for a GATED repository read without a token there is no metadata at all — the
+// link to huggingface.co is then the only way the terms are reachable, and it is
+// derivable from the id alone.
+func TestModelCardCarriesLicense(t *testing.T) {
+	hub := &stubHub{models: map[string]string{
+		"meta-llama/Llama-3.1-8B-Instruct": llama8B,
+		"TheBloke/Llama-2-7B-Chat-GGUF":    llama7BGGUF,
+	}}
+	c := newClient(t, hub, "")
+	ctx := context.Background()
+
+	// Resolve: cardData.license is the authoritative statement.
+	resolved, err := c.Resolve(ctx, "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.License != "llama3.1" {
+		t.Errorf("license = %q, want llama3.1 from cardData.license", resolved.License)
+	}
+	if resolved.URL != "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct" {
+		t.Errorf("url = %q, want the model card page", resolved.URL)
+	}
+
+	// Search: the rows carry it as a license:* tag instead.
+	cards, err := c.Search(ctx, "llama", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]ModelCard{}
+	for _, card := range cards {
+		byID[card.ID] = card
+	}
+	if got := byID["TheBloke/Llama-2-7B-Chat-GGUF"].License; got != "llama2" {
+		t.Errorf("license = %q, want llama2 read off the license: tag", got)
+	}
+	if got := byID["TheBloke/Llama-2-7B-Chat-GGUF"].URL; got != "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF" {
+		t.Errorf("url = %q, want the model card page on the search path too", got)
+	}
+
+	// A gated repository read without a token: no licence can be known, but the
+	// link to the page that states it must still be there — that page is where
+	// the terms are accepted, so it is the most useful thing on the card.
+	gatedHub := &stubHub{
+		models: map[string]string{"meta-llama/Llama-3.1-8B-Instruct": llama8B},
+		gated:  map[string]bool{"meta-llama/Llama-3.1-8B-Instruct": true},
+	}
+	gated, err := newClient(t, gatedHub, "").Resolve(ctx, "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gated.License != "" {
+		t.Errorf("license = %q on a 401 that carries no metadata — an invented licence is worse than none", gated.License)
+	}
+	if gated.URL != "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct" {
+		t.Errorf("url = %q, want the model card page derived from the id alone", gated.URL)
 	}
 }

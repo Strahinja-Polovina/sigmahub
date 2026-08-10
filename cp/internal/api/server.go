@@ -41,6 +41,10 @@ type StoreAPI interface {
 	DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error)
 	AdvanceDeploymentForResource(ctx context.Context, serverID, resourceID, phase string, ok bool, detail string, reportVersion int64) error
 	AdvanceDeploymentService(ctx context.Context, serverID, resourceID, service, phase string, ok bool, detail string, reportVersion int64) error
+	// FailDeploymentFromPrereqOp routes a phase-less pipeline op failure
+	// (image.pull, volume.ensure, per-resource network.ensure) into the deploy log
+	// and the deployment's terminal detail (SIGMA-301).
+	FailDeploymentFromPrereqOp(ctx context.Context, serverID, resourceID, opID, errText string, reportVersion int64) error
 	// DeployPeersForResource lists the other servers whose documents are gated
 	// on this resource's deployment status, so a multi-machine pipeline advances
 	// on the report rather than on the next resync.
@@ -423,6 +427,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}", s.requireService(store.RoleProjectAdmin, s.handleDeleteBucket))
 	s.mux.HandleFunc("PUT /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/quota", s.requireService(store.RoleProjectAdmin, s.handleSetBucketQuota))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/key", s.requireService(store.RoleProjectAdmin, s.handleCreateBucketKey))
+	// The scoped secret's reveal sits at the same role as the root credential's
+	// (SIGMA-313): without it the minted key could never be used.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/resources/{resourceId}/buckets/{bucket}/key", s.requireService(store.RoleProjectAdmin, s.handleRevealBucketKey))
 
 	// Backups (P1-11). Target metadata + run history + the verify-day feed are
 	// member-visible; target lifecycle, policy edits and the fire-drill restore

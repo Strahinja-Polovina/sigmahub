@@ -396,6 +396,53 @@ func TestSameHostBuildNeedsNoRegistry(t *testing.T) {
 	}
 }
 
+// SIGMA-312: deleting a cluster-deployed resource must tear its manifests down.
+//
+// The ONLY cleanup path a cluster workload had was pruneManifests, which runs
+// inside the k8s.apply handler and is driven by that op's Workloads list.
+// Deleting the resource stops ResourceSpecsForCluster returning it, so no
+// k8s.apply op is rendered at all — nothing ever asks the node to prune, and the
+// Deployment, Service and Ingress keep serving on the attached domain (still
+// holding the org's registry pull secret) forever. The teardown therefore has to
+// be its own op, recorded as a pending destructive op against the control-plane
+// node exactly as a volume removal is recorded against a server.
+func TestDeletedClusterResourceRendersK8sRemoveOp(t *testing.T) {
+	pending := []store.PendingDestructiveOp{{
+		ID:     "pdo_1",
+		OpKind: "k8s.remove",
+		Target: "sigmahub-res-0a1b2c3d4e5f6071-web,sigmahub-res-0a1b2c3d4e5f6071-worker",
+	}}
+	ops, _ := renderOps("srv_cp", nil, pending, nil, store.HostHardening{MeshIP: "10.8.0.2"},
+		nil, nil, nil, nil, nil, nil, nil, ACMEConfig{},
+		clusterRender{member: true, membership: controlPlane()}, registryRender{}, "")
+
+	op, ok := opByID(ops, "k8srm:pdo_1")
+	if !ok {
+		var ids []string
+		for _, o := range ops {
+			ids = append(ids, o.ID+"/"+o.Kind)
+		}
+		t.Fatalf("no teardown op for the deleted cluster resource; rendered %v", ids)
+	}
+	if op.Kind != "k8s.remove" {
+		t.Fatalf("teardown op kind = %q, want k8s.remove", op.Kind)
+	}
+	var spec struct {
+		Workloads []string `json:"workloads"`
+	}
+	if err := json.Unmarshal(op.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sigmahub-res-0a1b2c3d4e5f6071-web",
+		"sigmahub-res-0a1b2c3d4e5f6071-worker",
+	} {
+		if !contains(spec.Workloads, want) {
+			t.Fatalf("teardown op does not name workload %q: %+v", want, spec.Workloads)
+		}
+	}
+}
+
 func contains(list []string, want string) bool {
 	for _, v := range list {
 		if v == want {

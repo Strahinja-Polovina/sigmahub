@@ -22,6 +22,7 @@
 package hf
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -111,6 +112,24 @@ type ModelCard struct {
 	// operator can do least about it.
 	PipelineTag string `json:"pipelineTag"`
 	Library     string `json:"library"`
+	// License is the Hub's licence identifier for the repository ("llama3.1",
+	// "apache-2.0", "gemma"…) and URL is its model-card page.
+	//
+	// Both are on the card because of what a deploy actually does (SIGMA-302):
+	// the weights land on the CUSTOMER's own machine, under terms the customer
+	// was never shown. The Llama Community Licence is the clearest case — an
+	// acceptable-use policy, an attribution requirement and a 700M-MAU clause,
+	// all of which bind the party running the model — and the product used to
+	// pull those weights without naming the licence anywhere in the wizard or on
+	// the resource afterwards.
+	//
+	// Empty License means the Hub did not say, which is the ordinary answer for a
+	// gated repository read without a token (see gatedCard): unknown, never
+	// "unlicensed". URL is derived from the id and is therefore ALWAYS present —
+	// for exactly the gated case where nothing else is, it is the only route to
+	// the page the terms are stated and accepted on.
+	License string `json:"license"`
+	URL     string `json:"url"`
 	// Engine is the runtime the control plane would render for this model. The
 	// wizard used to ask; the metadata already knows (see EngineForModel).
 	Engine string `json:"engine"`
@@ -359,7 +378,11 @@ func (c *Client) contextCeiling(ctx context.Context, id string, segments []strin
 // PipelineTag is empty here and cannot be otherwise: a 401 carries no metadata.
 // Empty is unknown, and unknown is not a refusal.
 func gatedCard(id string) ModelCard {
-	card := ModelCard{ID: id, Name: displayName(id), Gated: true}
+	// URL, and only URL, survives a 401: it is built from the id rather than read
+	// from a body there isn't one of. That matters more here than anywhere else
+	// (SIGMA-302) — a gated repository is precisely the one whose terms someone
+	// has to go and accept, and this is the link to the page that states them.
+	card := ModelCard{ID: id, Name: displayName(id), Gated: true, URL: modelCardURL(id)}
 	// A 401 carries no tags and no dtype either, so the format is whatever the
 	// id itself spells out — "…-AWQ" is still AWQ when the Hub will not say so.
 	applyRuntime(&card, nil, "")
@@ -382,6 +405,16 @@ type apiModel struct {
 	PipelineTag string          `json:"pipeline_tag"`
 	LibraryName string          `json:"library_name"`
 	Tags        []string        `json:"tags"`
+	// CardData is the repository's README front-matter as the Hub parsed it. Its
+	// `license` key is the authoritative statement, and it arrives as a STRING
+	// or as an ARRAY of strings (a repository may be dual-licensed), which is
+	// why it is raw here — decoding into either shape errors on the other, and
+	// the mistake would silently drop the licence on whichever kind of repo it
+	// was not written for. Search rows carry no cardData at all; they carry the
+	// same fact as a "license:<id>" tag, which licenseOf falls back to.
+	CardData struct {
+		License json.RawMessage `json:"license"`
+	} `json:"cardData"`
 	Safetensors struct {
 		// Parameters is element counts per dtype, e.g. {"BF16": 8030261248}.
 		Parameters map[string]uint64 `json:"parameters"`
@@ -520,9 +553,57 @@ func cardFromAPI(m apiModel) (ModelCard, bool) {
 		Likes:       m.Likes,
 		PipelineTag: m.PipelineTag,
 		Library:     m.LibraryName,
+		License:     licenseOf(m),
+		URL:         modelCardURL(id),
 	}
 	applySizing(&card, m.Tags, dominantDType(m.Safetensors.Parameters), m.Safetensors.Total)
 	return card, true
+}
+
+// modelCardURL is the repository's page on huggingface.co — the canonical place
+// its licence is stated and, for a gated repo, accepted. Derived from the id
+// because the Hub's records carry no such field and because it must be present
+// even when the record could not be read at all.
+func modelCardURL(id string) string {
+	if id == "" {
+		return ""
+	}
+	return "https://huggingface.co/" + id
+}
+
+// licenseOf reads the repository's licence identifier from whichever of the
+// Hub's two statements of it this record carries.
+//
+// cardData.license is the README front-matter and wins: it is the repository's
+// own declaration, and it is what the single-model record returns. Search rows
+// carry no cardData, so they are read from the "license:<id>" tag the Hub adds
+// to the tag list from that same front matter — the two agree by construction.
+//
+// A dual-licensed repository states an ARRAY, and the first entry is taken:
+// this string is shown to a person next to a link to the full text, not parsed
+// by anything, and "apache-2.0" with a link beats an empty field.
+func licenseOf(m apiModel) string {
+	raw := bytes.TrimSpace(m.CardData.License)
+	if len(raw) > 0 {
+		var one string
+		if json.Unmarshal(raw, &one) == nil && one != "" {
+			return one
+		}
+		var many []string
+		if json.Unmarshal(raw, &many) == nil {
+			for _, s := range many {
+				if s != "" {
+					return s
+				}
+			}
+		}
+	}
+	for _, tag := range m.Tags {
+		if rest, ok := strings.CutPrefix(tag, "license:"); ok && rest != "" {
+			return rest
+		}
+	}
+	return ""
 }
 
 func gatedFlag(raw json.RawMessage) bool {

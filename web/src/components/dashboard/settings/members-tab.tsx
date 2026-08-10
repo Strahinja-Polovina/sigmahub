@@ -27,6 +27,15 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -53,6 +62,13 @@ function initials(name: string) {
 
 const msg = (err: unknown) => (err instanceof Error ? err.message : "Please try again.");
 
+/** The grants a removal takes with it, in words. Zero is spelled out rather
+ *  than rendered as "0 project grants", which reads like a defect. */
+function grantPhrase(n: number): string {
+  if (n <= 0) return "no project grants";
+  return n === 1 ? "1 project grant" : `${n} project grants`;
+}
+
 function MemberActions({
   orgId,
   member,
@@ -63,6 +79,14 @@ function MemberActions({
   isSelf: boolean;
 }) {
   const [pending, startTransition] = React.useTransition();
+  // SIGMA-311: "Remove from org" sits one divider below the role list in a
+  // compact menu, and removing a member deletes their org membership AND every
+  // per-project grant they held (server/actions/members.ts). Re-inviting brings
+  // back the membership but not the grants, and nothing records what they were,
+  // so a mis-click here costs work that cannot be undone from any record. The
+  // menu item now only opens this dialog; the destruction needs a second,
+  // deliberate click against a sentence that names what goes.
+  const [confirming, setConfirming] = React.useState(false);
 
   function setRole(role: string) {
     if (role === member.role) return;
@@ -80,6 +104,7 @@ function MemberActions({
     startTransition(async () => {
       try {
         await removeMember({ orgId, userId: member.id });
+        setConfirming(false);
         toast.success(`${member.name} removed`);
       } catch (err) {
         toast.error("Couldn’t remove member", { description: msg(err) });
@@ -99,53 +124,83 @@ function MemberActions({
   }
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button variant="ghost" size="icon-sm" aria-label={`Manage ${member.name}`} disabled={pending}>
-            {pending ? <Loader2 className="size-4 animate-spin" /> : <MoreHorizontal className="size-4" />}
-          </Button>
-        }
-      />
-      <DropdownMenuContent align="end" className="w-48">
-        <DropdownMenuLabel className="flex items-center gap-2 text-xs">
-          <UserCog className="size-3.5 text-muted-foreground" />
-          Change role
-        </DropdownMenuLabel>
-        {ROLES.map((r) => (
-          <DropdownMenuItem
-            key={r}
-            className="gap-2"
-            disabled={r === member.role}
-            onClick={() => setRole(r)}
-          >
-            {r}
-            {r === member.role && <span className="ml-auto text-xs text-muted-foreground">current</span>}
-          </DropdownMenuItem>
-        ))}
-        {member.scoped && (
-          <>
-            <DropdownMenuSeparator />
-            {/* SIGMA-167: the ONLY path that widens a scoped member back to
-                org-wide — explicit, admin-initiated, audited. */}
-            <DropdownMenuItem className="gap-2" onClick={unscope}>
-              <UserCog className="size-4" />
-              Restore org-wide access
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button variant="ghost" size="icon-sm" aria-label={`Manage ${member.name}`} disabled={pending}>
+              {pending ? <Loader2 className="size-4 animate-spin" /> : <MoreHorizontal className="size-4" />}
+            </Button>
+          }
+        />
+        <DropdownMenuContent align="end" className="w-48">
+          <DropdownMenuLabel className="flex items-center gap-2 text-xs">
+            <UserCog className="size-3.5 text-muted-foreground" />
+            Change role
+          </DropdownMenuLabel>
+          {ROLES.map((r) => (
+            <DropdownMenuItem
+              key={r}
+              className="gap-2"
+              disabled={r === member.role}
+              onClick={() => setRole(r)}
+            >
+              {r}
+              {r === member.role && <span className="ml-auto text-xs text-muted-foreground">current</span>}
             </DropdownMenuItem>
-          </>
-        )}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          variant="destructive"
-          className="gap-2"
-          disabled={isSelf}
-          onClick={remove}
-        >
-          <Trash2 className="size-4" />
-          {isSelf ? "Can’t remove yourself" : "Remove from org"}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+          ))}
+          {member.scoped && (
+            <>
+              <DropdownMenuSeparator />
+              {/* SIGMA-167: the ONLY path that widens a scoped member back to
+                  org-wide — explicit, admin-initiated, audited. */}
+              <DropdownMenuItem className="gap-2" onClick={unscope}>
+                <UserCog className="size-4" />
+                Restore org-wide access
+              </DropdownMenuItem>
+            </>
+          )}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            variant="destructive"
+            className="gap-2"
+            disabled={isSelf}
+            onClick={() => setConfirming(true)}
+          >
+            <Trash2 className="size-4" />
+            {isSelf ? "Can’t remove yourself" : "Remove from org"}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <Dialog
+        open={confirming}
+        onOpenChange={(next) => {
+          if (pending) return;
+          setConfirming(next);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove {member.name} from this organization?</DialogTitle>
+            <DialogDescription>
+              This deletes their membership and {grantPhrase(member.grantCount)}. Re-inviting
+              them restores the membership but not the grants — there is no record of which
+              projects they were on, so each one has to be granted again by hand.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" type="button" disabled={pending} />}>
+              Cancel
+            </DialogClose>
+            <Button variant="destructive" onClick={remove} disabled={pending}>
+              {pending && <Loader2 className="size-4 animate-spin" />}
+              Remove member
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

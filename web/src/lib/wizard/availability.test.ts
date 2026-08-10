@@ -60,6 +60,8 @@ function modelCard(over: Partial<ModelCard> = {}): ModelCard {
     vramBytesRequired: 188_143_217_323,
     vramText: "~189 GB",
     sizingBasis: "safetensors",
+    license: "llama3.1",
+    url: "https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct",
     ...over,
   };
 }
@@ -111,6 +113,42 @@ describe("a kind with zero compatible targets says so on step one", () => {
   it("does not count a server the enrollment gate refused", () => {
     const inv = buildInventory(projectWith(["gpu"], "incompatible"));
     expect(kindAvailability("llm", inv).available).toBe(false);
+  });
+
+  // The most likely first-run experience in the product: a user connects their
+  // first host, watches it go green on the Servers page, opens New Resource and
+  // is told no server is connected — with a link back to the page they just
+  // came from. The missing step is attaching it to an environment, which
+  // nothing on that screen mentioned (SIGMA-309).
+  it('an unattached compatible server produces the attach reason, not "no server is connected"', () => {
+    // Attachment tree: one project with a General server. Fleet: that host AND
+    // a Storage host nobody attached to anything.
+    const fleet = [
+      { id: "srv_0", name: "host-0", type: "general" },
+      { id: "srv_9", name: "objects-1", type: "storage" },
+    ];
+    const inv = buildInventory(projectWith(["general"]), [], [], null, fleet);
+    const verdict = kindAvailability("s3", inv);
+    expect(verdict.available).toBe(false);
+    expect(verdict.reason).not.toContain("No Storage server is connected");
+    expect(verdict.reason).toContain("attach");
+    expect(verdict.action?.href).toBe("/dashboard/projects");
+  });
+
+  it("still says connect a server when the fleet genuinely lacks the type", () => {
+    const fleet = [{ id: "srv_0", name: "host-0", type: "general" }];
+    const inv = buildInventory(projectWith(["general"]), [], [], null, fleet);
+    const verdict = kindAvailability("s3", inv);
+    expect(verdict.reason).toContain("No Storage server is connected");
+    expect(verdict.action?.href).toBe("/dashboard/servers");
+  });
+
+  it("does not count an unattached server the enrollment gate refused", () => {
+    const fleet = [{ id: "srv_9", name: "gpu-1", type: "gpu", status: "incompatible" }];
+    const inv = buildInventory(projectWith(["general"]), [], [], null, fleet);
+    const verdict = kindAvailability("llm", inv);
+    expect(verdict.reason).toContain("No GPU server is connected");
+    expect(verdict.action?.href).toBe("/dashboard/servers");
   });
 
   it("does not count a server on its way out", () => {

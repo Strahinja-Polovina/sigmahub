@@ -123,6 +123,9 @@ func (f *fakeStore) AdvanceDeploymentForResource(context.Context, string, string
 func (f *fakeStore) AdvanceDeploymentService(context.Context, string, string, string, string, bool, string, int64) error {
 	return nil
 }
+func (f *fakeStore) FailDeploymentFromPrereqOp(context.Context, string, string, string, string, int64) error {
+	return nil
+}
 func (f *fakeStore) DeployPeersForResource(context.Context, string, string) ([]store.ServerRef, error) {
 	return nil, nil
 }
@@ -364,6 +367,9 @@ func (f *fakeDomain) SetBucketQuota(_ context.Context, _, _, _ string, _ int64, 
 }
 func (f *fakeDomain) CreateBucketKey(_ context.Context, _, _, _, _ string) (string, string, error) {
 	return "", "", store.ErrNotFound
+}
+func (f *fakeDomain) RevealBucketKey(_ context.Context, _, _, _, _ string) (store.BucketKey, error) {
+	return store.BucketKey{}, store.ErrNotFound
 }
 func (f *fakeDomain) CreateBackupTarget(_ context.Context, _, _ string, _ store.CreateBackupTargetInput) (store.BackupTarget, error) {
 	return store.BackupTarget{ID: "bkt_1"}, nil

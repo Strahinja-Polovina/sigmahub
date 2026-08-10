@@ -104,6 +104,10 @@ type DomainAPI interface {
 	DeleteBucket(ctx context.Context, orgID, resourceID, name, actor string) (string, error)
 	SetBucketQuota(ctx context.Context, orgID, resourceID, name string, quotaBytes int64, actor string) (string, error)
 	CreateBucketKey(ctx context.Context, orgID, resourceID, name, actor string) (accessKey, serverID string, err error)
+	// RevealBucketKey opens the scoped secret for the operator who minted it —
+	// Project Admin+ and audited, exactly like RevealS3Connection. Without it
+	// the mint button produced a credential nobody could ever use (SIGMA-313).
+	RevealBucketKey(ctx context.Context, orgID, resourceID, name, actor string) (store.BucketKey, error)
 	// Backups (P1-11): S3-compatible targets, per-resource policy, run history,
 	// the per-day verify feed and the fire-drill restore.
 	CreateBackupTarget(ctx context.Context, orgID, actor string, in store.CreateBackupTargetInput) (store.BackupTarget, error)

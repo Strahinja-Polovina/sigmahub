@@ -146,6 +146,46 @@ func TestGitCloneNoCredentialForPublicRepo(t *testing.T) {
 	}
 }
 
+// TestGitCloneRejectsTraversingResourceID is the SIGMA-341 assertion: the
+// resource id is the OUTER path segment of the build context, and opGitClone
+// os.RemoveAll's that path as root before it does anything else. filepath.Join
+// cleans, so an id containing ".." escapes the build root entirely — a control
+// plane that emits {"resourceId":"../../../../etc"} would have every agent in
+// the fleet delete /etc before the op could even be reported failed. Refuse it,
+// and refuse it BEFORE any filesystem call.
+func TestGitCloneRejectsTraversingResourceID(t *testing.T) {
+	b, cmds := newTestBuilder(t, &fakeImageBuilder{}, nil)
+	// A directory OUTSIDE the build root, standing in for /etc.
+	victim := filepath.Join(filepath.Dir(b.workRoot), "victim")
+	if err := os.MkdirAll(filepath.Join(victim, "keepme"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"../victim", "../../victim", "..", "res_a/../../victim", "/etc", ""} {
+		if err := b.opGitClone(context.Background(), op(t, KindGitClone, GitCloneSpec{
+			ResourceID: id, RepoFullName: "acme/app", SHA: "abcdef1",
+		})); err == nil {
+			t.Errorf("resourceId %q was accepted; it must be refused", id)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keepme")); err != nil {
+		t.Fatalf("a traversing resourceId destroyed a directory outside the build root: %v", err)
+	}
+	if len(*cmds) != 0 {
+		t.Fatalf("refused clone still ran commands: %+v", *cmds)
+	}
+}
+
+// The same guard on the build half: opBuildImage joins the id into the context
+// path it hands to the daemon (and, for nixpacks, to a subprocess's cwd).
+func TestBuildImageRejectsTraversingResourceID(t *testing.T) {
+	b, _ := newTestBuilder(t, &fakeImageBuilder{}, nil)
+	if err := b.opBuildImage(context.Background(), op(t, KindImageBuild, BuildImageSpec{
+		ResourceID: "../../etc", ImageTag: "t",
+	})); err == nil {
+		t.Fatal("traversing resourceId accepted by image.build")
+	}
+}
+
 func TestGitCloneRejectsBadInput(t *testing.T) {
 	b, _ := newTestBuilder(t, &fakeImageBuilder{}, nil)
 	for _, tc := range []GitCloneSpec{

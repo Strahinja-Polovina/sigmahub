@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -79,6 +79,7 @@ import { ResourceDomainsPanel, type DomainRow } from "./resource-domains-panel";
 import { DeploymentsPanel, type DeploymentRow } from "./deployments-panel";
 import { DatabasePanel } from "./database-panel";
 import { S3Panel } from "./s3-panel";
+import { LlmPanel } from "./llm-panel";
 import { ComposeServicesPanel, type PlacementServer } from "./compose-services-panel";
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
@@ -86,6 +87,7 @@ import type {
   CpHealthCheck,
   CpDatabaseInfo,
   CpS3Info,
+  CpLLMInfo,
   CpComposeServices,
   CpBackupTarget,
   CpBackupRun,
@@ -147,6 +149,10 @@ type Detail = {
     type: string;
     status?: string;
     lastSeenAt?: string | Date | null;
+    /** Whether the host carries the proxy/edge role. Only the control plane
+     *  knows it, so it is optional: the domains panel treats "unknown" as no
+     *  warning and only speaks up on an explicit false (SIGMA-316). */
+    proxyRole?: boolean;
   } | null;
   /** The other kind of deploy target. Exactly one of server and cluster is set;
    *  a workload in a cluster has no server because the scheduler picks its
@@ -408,6 +414,22 @@ function hostAlert(
   }
 }
 
+/** The tab ids this page renders, in the order the strip shows them.
+ *
+ *  Written down so `?tab=` can be VALIDATED rather than trusted: the parameter
+ *  comes off the URL, and handing Tabs a value no TabsContent answers to would
+ *  render a page with a strip and no panel — worse than the Overview it opens
+ *  on today. Every id here has a TabsTrigger and a TabsContent below
+ *  (SIGMA-310). */
+const RESOURCE_TAB_IDS = [
+  "overview",
+  "logs",
+  "metrics",
+  "environment",
+  "deployments",
+  "settings",
+];
+
 export function ResourceDetail({
   detail,
   orgId,
@@ -418,6 +440,7 @@ export function ResourceDetail({
   deploymentsEnabled = false,
   database = null,
   s3 = null,
+  llm = null,
   compose = null,
   placementServers = [],
   backupTargets = [],
@@ -454,6 +477,11 @@ export function ResourceDetail({
   database?: CpDatabaseInfo | null;
   /** P2-1 S3 endpoint metadata (CP mode, s3 kind only). */
   s3?: CpS3Info | null;
+  /** A deployed model's inference endpoint (CP mode, llm kind only). Without it
+   *  the page showed a Running badge and nothing else — no host, no port, no
+   *  model id, no URL — for a model whose port the control plane allocates, so
+   *  it could not even be guessed (SIGMA-303). */
+  llm?: CpLLMInfo | null;
   /** Compose service graph + placement (CP mode, multi-service apps only). */
   compose?: CpComposeServices | null;
   /** Servers a compose service may be placed on. */
@@ -498,6 +526,18 @@ export function ResourceDetail({
 
   // Why this resource may be going nowhere through no fault of its own.
   const host = hostAlert(server);
+
+  // Deep-linkable tabs, the same way the settings page has done it since the
+  // org switcher started linking into it. The overview's per-resource menu
+  // links to /dashboard/resources/<id>?tab=logs — an operator triaging a red
+  // resource during an incident — and this page ignored the parameter and
+  // opened on Overview, so the link read as broken (SIGMA-310). Validated
+  // against the ids actually rendered below; anything else falls back rather
+  // than leaving Tabs with a value no panel answers to.
+  const searchParams = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const initialTab =
+    requestedTab && RESOURCE_TAB_IDS.includes(requestedTab) ? requestedTab : "overview";
 
   const showDomains = Boolean(domainsEnabled && orgId && resource.kind === "app");
   const showCpDeployments = Boolean(deploymentsEnabled && orgId);
@@ -630,7 +670,13 @@ export function ResourceDetail({
                 Open
               </Button>
             )}
-            <RedeployButton resourceId={resource.id} />
+            {/* Deploy needs an effective Project Admin on this project. It
+                used to render for Developers, whose press produced a redacted
+                server-action digest ("An error occurred in the Server
+                Components render…") instead of a sentence — mid-incident, on a
+                button they were never allowed to use. Gated like the sibling
+                Delete (SIGMA-308). */}
+            {canManage && <RedeployButton resourceId={resource.id} />}
           </div>
         </div>
       </div>
@@ -713,7 +759,7 @@ export function ResourceDetail({
         )
       )}
 
-      <Tabs defaultValue="overview">
+      <Tabs defaultValue={initialTab}>
         <TabsList variant="line" className="w-full justify-start overflow-x-auto">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="logs">Logs</TabsTrigger>
@@ -803,6 +849,7 @@ export function ResourceDetail({
                   simulated={!isCp}
                 />
               )}
+              {llm && <LlmPanel info={llm} />}
               {s3 && orgId && (
                 <S3Panel
                   orgId={orgId}
@@ -1094,6 +1141,7 @@ export function ResourceDetail({
                 resourceId={resource.id}
                 domains={domains}
                 canManage={canManage}
+                server={server}
               />
             )}
             {/* Not hidden any more. A custom domain is a certificate issued by
@@ -1131,7 +1179,10 @@ export function ResourceDetail({
                   dropdown's fake Deploy/Restart items already got (SIGMA-234,
                   SIGMA-162). */}
               <CardContent className="flex flex-col gap-4 pt-4">
-                {resource.kind === "app" && resource.serverId && (
+                {/* Same gate as the Delete below it: the volume-delete flow is
+                    Project-Admin-only in the CP, and offering it to a Developer
+                    only buys them a redacted error (SIGMA-308). */}
+                {canManage && resource.kind === "app" && resource.serverId && (
                   <>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
@@ -1163,6 +1214,16 @@ export function ResourceDetail({
                     />
                   )}
                 </div>
+                {/* With every control in here gated, a Developer would
+                    otherwise read a card describing irreversible actions and
+                    find nothing at all — say why, so the missing buttons are an
+                    answer rather than a bug (SIGMA-308). */}
+                {!canManage && (
+                  <p className="text-xs text-muted-foreground">
+                    Deploying and these destructive actions need the Project Admin role
+                    on this project — ask a project admin in your organization.
+                  </p>
+                )}
               </CardContent>
             </Card>
           </div>

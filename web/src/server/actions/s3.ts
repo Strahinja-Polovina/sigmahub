@@ -18,6 +18,7 @@ import {
   cpDeleteBucket,
   cpSetBucketQuota,
   cpCreateBucketKey,
+  cpRevealBucketKey,
   type CpBucket,
   type CpS3Connection,
   type CpS3Info,
@@ -159,8 +160,10 @@ export async function setBucketQuota(input: {
   revalidatePath(`/dashboard/resources/${input.resourceId}`);
 }
 
-/** Returns ONLY the new access key id — the secret is provisioned on the engine
- *  over the audited agent path and never returned to the browser. */
+/** Returns ONLY the new access key id: at this point the op that programs the
+ *  key into the engine has not run yet, so there is no active credential to
+ *  hand over. The secret becomes readable through revealBucketKey once the key
+ *  is recorded (SIGMA-313). */
 export async function createBucketKey(input: {
   orgId: string;
   resourceId: string;
@@ -172,4 +175,32 @@ export async function createBucketKey(input: {
   await writeAudit({ orgId: input.orgId, actor: user.name, action: "S3 bucket key created", target: `${input.bucket} · ${out.accessKey}` });
   revalidatePath(`/dashboard/resources/${input.resourceId}`);
   return out;
+}
+
+/** Opens a bucket's scoped secret for a Project Admin+, audited on both sides.
+ *
+ *  SIGMA-313: minting a per-bucket key used to be a one-way door. The CP sealed
+ *  the secret under the org DEK and released it only to the executing agent, the
+ *  create response carried the access key alone, and the panel's Key button
+ *  disappeared as soon as the key was recorded — no reveal, no re-mint, no
+ *  route. The operator was left holding an access key with no secret and the
+ *  only way to ship was the root credential this feature exists to avoid. */
+export async function revealBucketKey(input: {
+  orgId: string;
+  resourceId: string;
+  bucket: string;
+}): Promise<{ bucket: string; accessKey: string; secretKey: string }> {
+  ensureCp();
+  const { user, role } = await requireProjectAdminForResource(input.orgId, input.resourceId);
+  const key = await cpRevealBucketKey(input.orgId, input.resourceId, input.bucket, {
+    name: user.name,
+    role,
+  });
+  await writeAudit({
+    orgId: input.orgId,
+    actor: user.name,
+    action: "S3 bucket key revealed",
+    target: `${input.bucket} · ${key.accessKey}`,
+  });
+  return key;
 }

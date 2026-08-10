@@ -1343,6 +1343,60 @@ func (s *Store) AdvanceDeploymentForResource(ctx context.Context, serverID, reso
 	return err
 }
 
+// FailDeploymentFromPrereqOp records a deploy-pipeline PREREQUISITE op failure
+// (image.pull, volume.ensure, the per-resource network.ensure) against the
+// in-flight deployment for (server, resource): one line into the deploy log,
+// then the terminal failure carrying the op's OWN error as the detail.
+//
+// These ops carry no deploy phase — there is no status to advance to when a
+// volume is created — so before SIGMA-301 their failure reached no deployment at
+// all. What the operator got was the dependent rollout's skip, and nothing else:
+// the deploy view said "failed" with a build-log pane that was empty because the
+// failure was not a build, and the registry 401 / volume collision / ENOSPC
+// existed nowhere in the control plane. The log line matters as much as the
+// status: the deploy view's log pane is where an operator looks for the cause,
+// and a deploy that dies before the build starts otherwise leaves it blank.
+//
+// A no-op when there is no in-flight deployment, so it is safe to call for the
+// volume ops of a database or an LLM endpoint, which never deploy.
+func (s *Store) FailDeploymentFromPrereqOp(ctx context.Context, serverID, resourceID, opID, errText string, reportVersion int64) error {
+	var depID string
+	var depVersion int64
+	err := s.Pool.QueryRow(ctx, `
+		SELECT d.id, d.dsd_version
+		  FROM deployments d
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.resource_id = $2 AND d.status IN ('queued','building','deploying')
+		   AND`+deploymentReporterClause+`
+		 ORDER BY d.created_at DESC LIMIT 1`, serverID, resourceID).Scan(&depID, &depVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// Same staleness guard as AdvanceDeploymentForResource (SIGMA-134): a report
+	// from an older DSD version describes a superseded deployment's ops and must
+	// not fail the one now in flight.
+	if reportVersion > 0 && depVersion > 0 && reportVersion < depVersion {
+		return nil
+	}
+	detail := opID + " failed"
+	if errText != "" {
+		detail = opID + " failed: " + errText
+	}
+	// The log line goes in first and unconditionally: even when the status write
+	// loses to a concurrent terminal transition, the cause stays readable.
+	if err := s.AppendDeployLog(ctx, serverID, depID, "deploy", detail); err != nil {
+		return err
+	}
+	err = s.SetDeploymentStatus(ctx, depID, DeploymentStatusUpdate{Status: "failed", Detail: detail, MarkFinished: true})
+	if errors.Is(err, ErrConflict) {
+		return nil // already terminal — a concurrent report won
+	}
+	return err
+}
+
 // AdvanceDeploymentService tracks one Compose service's status on the in-flight
 // deployment and rolls the OVERALL status up from the per-service map: the
 // deployment is 'failed' the moment any service fails, 'success' once every

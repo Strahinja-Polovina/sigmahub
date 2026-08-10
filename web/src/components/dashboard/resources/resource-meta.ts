@@ -28,6 +28,44 @@ export type DeployTarget = {
   }[];
 };
 
+/** The ONE place a server row becomes a wizard deploy target.
+ *
+ *  There are two builders — getDeployTargets for the Resources page and the
+ *  project page's own per-environment target — and they drifted: the project
+ *  page's inline mapping carried id/name/type/provider/region/status and not
+ *  `gpu`, so the SIGMA-214 VRAM fit check read every target opened from a
+ *  project as UNKNOWN and warned about nothing. The user picked a 70B model
+ *  onto a 24 GB box, the control plane's create-time checkModelFits refused it
+ *  with a 422, and the wizard's failure path threw away six steps of input
+ *  (SIGMA-304). Both builders call this now so the shapes cannot diverge again.
+ *
+ *  Only the fields a TARGET decision needs are copied — the rest of a host's
+ *  facts (kernel, disks, docker version) is weight on a payload nothing reads. */
+export function toDeployTargetServer(sv: {
+  id: string;
+  name: string;
+  type: string;
+  provider?: string | null;
+  region?: string | null;
+  status?: string | null;
+  facts?: HostFacts | null;
+}): DeployTargetServer {
+  return {
+    id: sv.id,
+    name: sv.name,
+    type: sv.type,
+    provider: sv.provider ?? "",
+    region: sv.region ?? "",
+    // The enrollment gate's verdict, so the wizard can refuse a host the
+    // control plane already refused instead of letting create say no first
+    // (SIGMA-203).
+    status: sv.status ?? undefined,
+    // Undefined when the agent reported no inventory, which the fit check
+    // reads as UNKNOWN and never as "no GPU".
+    gpu: sv.facts?.gpu ?? undefined,
+  };
+}
+
 // Labels come from the control plane's catalog (generated, SIGMA-198). This
 // module used to keep its own copy — one of four that had to be edited in
 // lockstep to add a resource kind, and the reason MongoDB was labelled under two

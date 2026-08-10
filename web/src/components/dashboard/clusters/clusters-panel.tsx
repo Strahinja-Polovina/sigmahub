@@ -422,9 +422,9 @@ function DeleteClusterButton({
           <DialogHeader>
             <DialogTitle>Delete {name}?</DialogTitle>
             <DialogDescription>
-              Kubernetes is torn down on every node. Apps deployed into this cluster are
-              not deleted — they lose their target and stop running until you point them
-              at a server or another cluster.
+              Kubernetes is torn down on every node. Delete the apps deployed into this
+              cluster first — the cluster is where they run, so it cannot go while they
+              are still running on it.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

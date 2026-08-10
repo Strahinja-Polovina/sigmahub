@@ -13,6 +13,7 @@ import {
   summarizeUnits,
   billableUnits,
 } from "@/lib/billing-units";
+import { toDeployTargetServer } from "@/components/dashboard/resources/resource-meta";
 
 // Pricing lives in lib/billing-units (mirrored from the CP weight table);
 // re-exported here so existing importers keep working.
@@ -79,7 +80,7 @@ export async function getResource(id: string) {
   return (await db.select().from(s.resources).where(eq(s.resources.id, id)))[0];
 }
 export async function getMembers(orgId: string) {
-  return db
+  const rows = await db
     .select({
       id: user.id,
       name: user.name,
@@ -90,6 +91,22 @@ export async function getMembers(orgId: string) {
     .from(s.memberships)
     .innerJoin(user, eq(s.memberships.userId, user.id))
     .where(eq(s.memberships.orgId, orgId));
+
+  // SIGMA-311: removing a member also deletes every project grant they hold in
+  // this org (removeMember, for the resurrect-on-re-invite reason in SIGMA-148)
+  // and nothing anywhere records what those grants were — re-inviting restores
+  // the membership but not the access. The confirmation dialog therefore has to
+  // be able to say how many grants are about to be destroyed, so the count is
+  // carried alongside the member rather than left for the operator to remember.
+  const grants = await db
+    .select({ userId: s.projectMemberships.userId })
+    .from(s.projectMemberships)
+    .innerJoin(s.projects, eq(s.projectMemberships.projectId, s.projects.id))
+    .where(eq(s.projects.orgId, orgId));
+  const perUser = new Map<string, number>();
+  for (const g of grants) perUser.set(g.userId, (perUser.get(g.userId) ?? 0) + 1);
+
+  return rows.map((r) => ({ ...r, grantCount: perUser.get(r.id) ?? 0 }));
 }
 
 /** Server count per org, for the org switcher (id → count). */
@@ -245,6 +262,10 @@ export type ProjectSummary = {
   serverCount: number;
   resourceCount: number;
   statusCounts: Record<string, number>;
+  /** SIGMA-314: what a project delete cascades away, by name and kind. The card
+   *  already counted these rows; the delete dialog has to be able to show them,
+   *  because a count alone can't tell an operator they picked the wrong card. */
+  resources: { id: string; name: string; kind: string; envName: string }[];
 };
 
 /** One card per project: env/server/resource counts + resource-status breakdown. */
@@ -256,12 +277,19 @@ export async function getProjectSummaries(
   return Promise.all(
     projs.map(async (project) => {
       const envs = await db
-        .select({ id: s.environments.id })
+        .select({ id: s.environments.id, name: s.environments.name })
         .from(s.environments)
         .where(eq(s.environments.projectId, project.id));
       const envIds = envs.map((e) => e.id);
+      const envNames = new Map(envs.map((e) => [e.id, e.name]));
       const resources = await db
-        .select({ status: s.resources.status })
+        .select({
+          id: s.resources.id,
+          name: s.resources.name,
+          kind: s.resources.kind,
+          environmentId: s.resources.environmentId,
+          status: s.resources.status,
+        })
         .from(s.resources)
         .where(eq(s.resources.projectId, project.id));
       const serverRows = envIds.length
@@ -278,6 +306,12 @@ export async function getProjectSummaries(
         serverCount: serverRows.length,
         resourceCount: resources.length,
         statusCounts,
+        resources: resources.map((r) => ({
+          id: r.id,
+          name: r.name,
+          kind: r.kind,
+          envName: envNames.get(r.environmentId) ?? "",
+        })),
       };
     })
   );
@@ -453,25 +487,11 @@ export async function getDeployTargets(orgId: string, visible?: Set<string> | nu
             servers: attached
               .map((a) => byId.get(a.serverId))
               .filter((sv): sv is NonNullable<typeof sv> => Boolean(sv))
-              .map((sv) => ({
-                id: sv.id,
-                name: sv.name,
-                type: sv.type,
-                provider: sv.provider,
-                region: sv.region,
-                // Carried so the wizard can refuse a host the enrollment gate
-                // already refused, instead of offering it and letting the
-                // create call be the first thing that says no (SIGMA-203).
-                status: sv.status,
-                // The GPU inventory, and nothing else out of the facts blob:
-                // it is what the VRAM fit check compares a model against
-                // (SIGMA-214), and the rest of a host's facts — its kernel, its
-                // disks, its docker version — is weight on every deploy-target
-                // payload for a screen that never reads it. Undefined when the
-                // agent reported no inventory, which the fit check reads as
-                // UNKNOWN and never as "no GPU".
-                gpu: sv.facts?.gpu ?? undefined,
-              })),
+              // Shared with the project page's own target builder so the two
+              // cannot carry different fields (SIGMA-304). It copies status
+              // (SIGMA-203) and the GPU inventory (SIGMA-214) and nothing else
+              // out of the facts blob.
+              .map(toDeployTargetServer),
           };
         })
       );

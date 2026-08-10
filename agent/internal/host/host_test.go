@@ -164,6 +164,83 @@ func TestNftablesCreatesRulesetDir(t *testing.T) {
 	}
 }
 
+// TestNftablesRejectsInterfaceWithQuote is SIGMA-342.
+//
+// meshInterface is a DSD-supplied free string interpolated straight into a
+// quoted nft token. A value carrying a quote and a newline closes the rule and
+// appends attacker-chosen nft statements — including an accept-everything rule
+// on the very input chain this package works to keep default-drop. The op then
+// writes that ruleset and loads it with `nft -f` as root, reports applied, and
+// the dashboard shows hardening green: the file on disk is the only place the
+// change is visible. Refuse the value instead, and refuse it before writing or
+// loading anything.
+func TestNftablesRejectsInterfaceWithQuote(t *testing.T) {
+	const injected = "sigma0\"\n\t\ttcp dport 0-65535 accept\n\t\t#"
+	for _, iface := range []string{
+		injected,
+		"sigma0\" accept\n\t\tpolicy accept;\n\t\t#",
+		"sigma0 accept",         // a space already ends the token
+		"sigma0;",               // nft statement separator
+		"eth0{}",                // brace escapes into a set/block
+		strings.Repeat("a", 16), // over IFNAMSIZ-1: nft would reject the ruleset
+		"..",                    // not an interface name
+		"veth\n",                // bare newline
+	} {
+		var wrote, loaded bool
+		d := &Driver{
+			euid:      0,
+			mkdirAll:  func(string, os.FileMode) error { return nil },
+			writeFile: func(string, []byte, os.FileMode) error { wrote = true; return nil },
+			runner: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+				if name == "nft" {
+					loaded = true
+				}
+				return nil, nil
+			},
+		}
+		spec, _ := json.Marshal(NftablesSpec{MeshInterface: iface})
+		err := d.opNftables(context.Background(), dsd.Op{Kind: KindHostNftables, Spec: spec})
+		if err == nil {
+			t.Errorf("meshInterface %q was accepted; it must be refused", iface)
+		}
+		if wrote || loaded {
+			t.Errorf("meshInterface %q: refused op still wrote (%v) / loaded (%v) a ruleset", iface, wrote, loaded)
+		}
+	}
+
+	// And the render itself must never grow the injected statements, whatever
+	// reaches it.
+	if got := RenderNftables(NftablesSpec{MeshInterface: injected}); strings.Contains(got, "tcp dport 0-65535 accept") {
+		t.Errorf("rendered ruleset carries injected statements:\n%s", got)
+	}
+}
+
+// A legitimate interface name (including the empty default) still converges —
+// the guard must not brick the firewall on every host.
+func TestNftablesAcceptsOrdinaryInterfaceNames(t *testing.T) {
+	for _, iface := range []string{"", "sigma0", "wg0", "eth0.100", "br-mesh_1"} {
+		var loaded bool
+		d := &Driver{
+			euid:      0,
+			mkdirAll:  func(string, os.FileMode) error { return nil },
+			writeFile: func(string, []byte, os.FileMode) error { return nil },
+			runner: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+				if name == "nft" {
+					loaded = true
+				}
+				return nil, nil
+			},
+		}
+		spec, _ := json.Marshal(NftablesSpec{MeshInterface: iface})
+		if err := d.opNftables(context.Background(), dsd.Op{Kind: KindHostNftables, Spec: spec}); err != nil {
+			t.Errorf("meshInterface %q rejected: %v", iface, err)
+		}
+		if !loaded {
+			t.Errorf("meshInterface %q: ruleset never loaded", iface)
+		}
+	}
+}
+
 // TestSSHDValidationRollback proves a bad sshd config is validated and rolled
 // back before reload, so a typo can't take SSH down.
 func TestSSHDValidationRollback(t *testing.T) {
