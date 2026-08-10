@@ -93,7 +93,7 @@ type MeshPeersResponse struct {
 	Peers []mesh.Peer `json:"peers"`
 }
 
-// apiError distinguishes definitive rejections (4xx: bad/used token, revoked
+// apiError distinguishes definitive rejections (bad/used token, revoked
 // credential) from transient failures worth retrying.
 type APIError struct {
 	Status int
@@ -102,7 +102,23 @@ type APIError struct {
 
 func (e *APIError) Error() string { return fmt.Sprintf("control plane: %d %s", e.Status, e.Body) }
 
-func (e *APIError) Permanent() bool { return e.Status >= 400 && e.Status < 500 }
+// CredentialRevoked reports that the control plane has definitively rejected
+// this agent's identity, so retrying with the same credential cannot succeed.
+// It is the ONE predicate both agent loops use to decide a failure is terminal
+// (SIGMA-340).
+//
+// It used to be "any 4xx" (named Permanent), which is not the same question at
+// all: an operator fronting the control plane with nginx or Cloudflare gets a
+// 408 when one 25-second long-poll trips a timeout rule, and a 429 from a rate
+// limit burst. Neither says anything about the credential, but both made the
+// DSD loop declare the error terminal and return from its goroutine — the host
+// then ignored every deploy, secret rotation, firewall change and agent upgrade
+// forever, while the heartbeat (a separate goroutine, still succeeding) kept the
+// dashboard showing the server healthy. Only 401/403 mean "this credential is
+// dead"; everything else is a transient the caller must back off and retry.
+func (e *APIError) CredentialRevoked() bool {
+	return e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden
+}
 
 func (c *Client) Register(ctx context.Context, req RegisterRequest) (RegisterResponse, error) {
 	var res RegisterResponse
