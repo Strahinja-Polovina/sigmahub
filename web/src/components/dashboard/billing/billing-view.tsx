@@ -46,8 +46,15 @@ import { serverTypeLabel } from "@/lib/server-catalog.generated";
 type Billing = {
   /** Connected SERVER count — what the fleet looks like. */
   connected: number;
-  /** Weighted total actually billed. */
+  /** Weighted total across the servers connected right now. */
   units: number;
+  /** Unit total the subscription is actually priced on: the high-water mark of
+   *  `units` over `billingWindowHours` (SIGMA-292). Higher than `units` when the
+   *  fleet shrank inside the window, and then it — not `units` — is the number
+   *  Paddle invoices, so the page has to show it and say where it came from.
+   *  Absent in demo mode, which has no meter and no subscription. */
+  billedUnits?: number;
+  billingWindowHours?: number;
   billableUnits: number;
   /** Per-server-type explanation of `units`. */
   breakdown: ServerUnitLine[];
@@ -269,10 +276,26 @@ export function BillingView({
   const provisioningCount = servers.length - connectedServers.length;
   // Everything below counts UNITS, not servers: a GPU box is four of them, so a
   // three-server fleet can still be above the free tier.
-  const freeUsed = Math.min(billing.units, freeTier);
-  const freeRemaining = Math.max(0, freeTier - billing.units);
+  //
+  // And it counts BILLED units, not live ones (SIGMA-292). The subscription is
+  // priced on the high-water mark of the fleet over the last day, so an org that
+  // shrank this morning is invoiced for what it ran, not for what is left. That
+  // number used to exist only inside the drift sweep: the page showed the live
+  // figure as "Total due", the customer approved it at checkout, and Paddle
+  // charged the other one ten minutes later. Whatever we bill has to be on
+  // screen, with the reason next to it.
+  const billedUnits = billing.billedUnits ?? billing.units;
+  const windowHours = billing.billingWindowHours ?? 0;
+  const shrank = billedUnits > billing.units;
+  const freeUsed = Math.min(billedUnits, freeTier);
+  const freeRemaining = Math.max(0, freeTier - billedUnits);
   const billableCount = billing.billableUnits;
-  const invoiceTotal = billing.units * unitPrice;
+  const invoiceTotal = billedUnits * unitPrice;
+  // An active subscription cannot go below one unit (Paddle rejects a
+  // zero-quantity item), so a fleet that drops into the free tier still bills a
+  // one-unit minimum. Saying "nothing due" while that line is invoiced is the
+  // other half of SIGMA-292.
+  const minimumUnits = Math.max(0, billableCount - Math.max(0, billedUnits - freeTier));
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -308,7 +331,7 @@ export function BillingView({
               </Badge>
             ) : (
               <p className="text-sm text-muted-foreground tabular-nums">
-                {billing.units} {billing.units === 1 ? "unit" : "units"} × {fc(unitPrice)},{" "}
+                {billedUnits} {billedUnits === 1 ? "unit" : "units"} × {fc(unitPrice)},{" "}
                 {freeTier} free
               </p>
             )}
@@ -318,15 +341,33 @@ export function BillingView({
                   Free while your fleet is {freeTier} units or fewer. An ordinary server
                   is 1 unit, a Kubernetes node 2, a GPU server 4.
                 </>
+              ) : minimumUnits > 0 ? (
+                <>
+                  Your fleet ({billedUnits} {billedUnits === 1 ? "unit" : "units"}) is inside
+                  the {freeTier}-unit free tier, but an active subscription bills a{" "}
+                  <span className="font-medium text-foreground">
+                    {minimumUnits}-unit minimum
+                  </span>{" "}
+                  = {fc(billing.amount)} / month. Cancel it in the customer portal to stop
+                  the charge.
+                </>
               ) : (
                 <>
-                  ({billing.units} {billing.units === 1 ? "unit" : "units"} − {freeTier} free) ×{" "}
+                  ({billedUnits} {billedUnits === 1 ? "unit" : "units"} − {freeTier} free) ×{" "}
                   {fc(unitPrice)} ={" "}
                   <span className="font-medium text-foreground">{fc(billing.amount)}</span>{" "}
                   / month
                 </>
               )}
             </div>
+            {shrank && (
+              <p className="text-xs text-muted-foreground">
+                Billed on {billedUnits} {billedUnits === 1 ? "unit" : "units"} — the most your
+                fleet ran in the last {windowHours} hours — not the {billing.units} connected
+                right now. A scale-down takes effect a day later so a network blip can’t
+                re-price your subscription twice in an hour; a scale-up is immediate.
+              </p>
+            )}
           </CardContent>
         </Card>
 
@@ -345,7 +386,7 @@ export function BillingView({
               ) : (
                 <>
                   {billableCount} <span className="text-muted-foreground">of</span>{" "}
-                  {billing.units}{" "}
+                  {billedUnits}{" "}
                   <span className="text-base font-normal text-muted-foreground">units billed</span>
                 </>
               )}
@@ -516,13 +557,19 @@ export function BillingView({
                 <TableCell colSpan={3} className="pl-4 text-muted-foreground">
                   {connectedServers.length}{" "}
                   {connectedServers.length === 1 ? "server" : "servers"} ={" "}
-                  {billing.units} {billing.units === 1 ? "unit" : "units"} × {fc(unitPrice)}
+                  {billedUnits} {billedUnits === 1 ? "unit" : "units"} × {fc(unitPrice)}
+                  {shrank && (
+                    <span className="text-muted-foreground/70">
+                      {" "}
+                      · peak of the last {windowHours}h, not the {billing.units} connected now
+                    </span>
+                  )}
                   {billing.isFree && (
                     <span className="text-muted-foreground/70"> · free tier applied</span>
                   )}
                 </TableCell>
                 <TableCell className="text-right text-muted-foreground tabular-nums">
-                  {billing.units}
+                  {billedUnits}
                 </TableCell>
                 <TableCell className="pr-4 text-right font-medium tabular-nums">
                   {fc(invoiceTotal, true)}
@@ -535,6 +582,18 @@ export function BillingView({
                   </TableCell>
                   <TableCell className="pr-4 text-right text-muted-foreground tabular-nums">
                     −{fc(freeUsed * unitPrice, true)}
+                  </TableCell>
+                </TableRow>
+              )}
+              {minimumUnits > 0 && (
+                <TableRow>
+                  <TableCell colSpan={4} className="pl-4 text-muted-foreground">
+                    Subscription minimum ({minimumUnits} × {fc(unitPrice)}) — an active
+                    subscription cannot bill zero units; cancel it in the portal to stop
+                    this line
+                  </TableCell>
+                  <TableCell className="pr-4 text-right text-muted-foreground tabular-nums">
+                    {fc(minimumUnits * unitPrice, true)}
                   </TableCell>
                 </TableRow>
               )}

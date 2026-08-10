@@ -58,6 +58,8 @@ export default async function BillingPage() {
       summary = {
         connected: b.connected,
         units: b.units,
+        billedUnits: b.billedUnits,
+        billingWindowHours: b.billingWindowHours,
         billableUnits: b.billableUnits,
         breakdown: b.breakdown,
         freeTier: b.freeTier,

@@ -108,9 +108,18 @@ type BillingSummary struct {
 	// Connected is the point-in-time connected-server count right now. It stays
 	// a SERVER count (what the fleet looks like); Units is what it bills as.
 	Connected int `json:"connected"`
-	// Units is the weighted total across connected servers.
+	// Units is the weighted total across the servers connected RIGHT NOW — what
+	// Breakdown explains. It is not necessarily what is billed: see BilledUnits.
 	Units int `json:"units"`
-	// BillableUnits = max(0, units - free tier) — the Paddle quantity.
+	// BilledUnits is the unit total the subscription is priced on — the
+	// high-water mark of Units over the last BillingWindowHours (SIGMA-292).
+	// It is >= Units whenever the fleet shrank inside the window, and it is the
+	// ONLY number the invoice is derived from, so the page must show it.
+	BilledUnits int `json:"billedUnits"`
+	// BillingWindowHours is the width of that high-water window, published so
+	// the dashboard can explain the number rather than assert it.
+	BillingWindowHours int `json:"billingWindowHours"`
+	// BillableUnits is the Paddle quantity — BillableQuantity(BilledUnits, …).
 	BillableUnits int `json:"billableUnits"`
 	// Breakdown explains Units per server type so the dashboard can show why a
 	// fleet of N servers bills as M units instead of asserting a number.
@@ -160,14 +169,19 @@ func (s *Store) GetBillingStatus(ctx context.Context, orgID string) (BillingStat
 
 // BillingSummaryForOrg computes the current usage + charge readout. configured
 // reflects whether Paddle is wired (passed in by the handler from config).
+//
+// BillableUnits here IS the checkout quantity and IS what the drift sweep will
+// push to Paddle: all three go through BilledUnitsForOrg + BillableQuantity
+// (SIGMA-292). Before that they were three formulas over two windows with two
+// floors, and the number on the invoice appeared in no UI.
 func (s *Store) BillingSummaryForOrg(ctx context.Context, orgID string, now time.Time, configured bool) (BillingSummary, error) {
 	breakdown, connected, units, err := s.ConnectedServerUnits(ctx, orgID)
 	if err != nil {
 		return BillingSummary{}, err
 	}
-	billable := units - BillingFreeTier
-	if billable < 0 {
-		billable = 0
+	billedUnits, err := s.BilledUnitsForOrg(ctx, orgID, now)
+	if err != nil {
+		return BillingSummary{}, err
 	}
 	monthStart := time.Date(now.UTC().Year(), now.UTC().Month(), 1, 0, 0, 0, 0, time.UTC)
 	var hours int
@@ -180,10 +194,13 @@ func (s *Store) BillingSummaryForOrg(ctx context.Context, orgID string, now time
 	if err != nil {
 		return BillingSummary{}, err
 	}
+	billable := BillableQuantity(billedUnits, SubscriptionHoldsMinimum(sub))
 	return BillingSummary{
 		Configured:           configured,
 		Connected:            connected,
 		Units:                units,
+		BilledUnits:          billedUnits,
+		BillingWindowHours:   int(quantitySyncWindow / time.Hour),
 		BillableUnits:        billable,
 		Breakdown:            breakdown,
 		FreeTier:             BillingFreeTier,
@@ -328,6 +345,87 @@ const quantitySyncDebounce = 30 * time.Minute
 // later, never a scale-up.
 const quantitySyncWindow = 24 * time.Hour
 
+// SubscriptionMinQuantity is the smallest quantity an EXISTING subscription can
+// carry. Paddle rejects a zero-quantity item, and auto-cancelling a subscription
+// from a sweep because an org's servers went quiet would be a far worse failure
+// than one month's minimum line — dropping to the free tier stays a deliberate
+// act through the customer portal.
+//
+// It is a floor on the invoice, so it is also a floor on what the dashboard and
+// the checkout show. Before SIGMA-292 only the sweep knew about it: an org that
+// shrank below the free tier saw "0 billable units · nothing due" on the Billing
+// page while Paddle kept invoicing one unit every month.
+const SubscriptionMinQuantity = 1
+
+// BillableQuantity is THE definition of the quantity Paddle bills for a weighted
+// unit total. Every site that answers "how many units does this org owe for" —
+// the Billing summary, the checkout transaction and the drift sweep — resolves
+// through this function (the sweep through billableQuantitySQL, which renders
+// the same arithmetic from the same constants).
+//
+// hasSubscription is true when the org already has a live subscription the sweep
+// will hold at SubscriptionMinQuantity; without one, a fleet inside the free tier
+// genuinely owes nothing and checkout must refuse rather than sell a minimum.
+func BillableQuantity(units int, hasSubscription bool) int {
+	q := units - BillingFreeTier
+	if q < 0 {
+		q = 0
+	}
+	if hasSubscription && q < SubscriptionMinQuantity {
+		q = SubscriptionMinQuantity
+	}
+	return q
+}
+
+// SubscriptionHoldsMinimum reports whether this subscription is one the quantity
+// sweep will keep alive at SubscriptionMinQuantity. It must match the WHERE
+// clause of SubscriptionsNeedingQuantitySync exactly, or the summary and the
+// sweep disagree about the floor again.
+func SubscriptionHoldsMinimum(sub BillingStatus) bool {
+	return sub.Status == "active" && sub.SubscriptionID != ""
+}
+
+// billedUnitsSQL renders the org's BILLED unit total — the high-water mark of
+// weighted units over quantitySyncWindow — as a scalar SQL expression. orgExpr
+// is the org id (a correlated column in the sweep, a bind parameter for a single
+// org) and sinceExpr the start of the window.
+//
+// Some of this arithmetic has to happen in the database (the sweep runs over
+// every org in one statement), so it cannot literally be Go code; rendering the
+// expression once from the weight table keeps the summary and the sweep reading
+// the same definition instead of two hand-copied ones that drift (SIGMA-292).
+func billedUnitsSQL(orgExpr, sinceExpr string) string {
+	return fmt.Sprintf(`GREATEST(
+		         (SELECT COALESCE(SUM(%[1]s), 0) FROM servers sv
+		           WHERE sv.org_id = %[3]s AND sv.deleted_at IS NULL AND sv.status = 'running'),
+		         (SELECT COALESCE(SUM(%[2]s), 0)
+		            FROM (SELECT DISTINCT sh.server_id FROM server_hours sh
+		                   WHERE sh.org_id = %[3]s AND sh.hour >= %[4]s) d
+		            JOIN servers sv2 ON sv2.id = d.server_id)
+		       )`, unitWeightSQL("sv.type"), unitWeightSQL("sv2.type"), orgExpr, sinceExpr)
+}
+
+// billableQuantitySQL is BillableQuantity(unitsExpr, true) in SQL — the sweep
+// only ever looks at orgs that already have a live subscription, so the
+// SubscriptionMinQuantity floor always applies there.
+func billableQuantitySQL(unitsExpr string) string {
+	return fmt.Sprintf("GREATEST(%d, %s - %d)", SubscriptionMinQuantity, unitsExpr, BillingFreeTier)
+}
+
+// BilledUnitsForOrg returns the unit total the org's subscription is priced on:
+// the high-water mark of weighted connected units over quantitySyncWindow. This
+// is the input to BillableQuantity for the summary and the checkout, and the
+// same expression the sweep evaluates per org.
+func (s *Store) BilledUnitsForOrg(ctx context.Context, orgID string, now time.Time) (int, error) {
+	var units int
+	err := s.Pool.QueryRow(ctx, `SELECT `+billedUnitsSQL("$1::text", "$2::timestamptz"),
+		orgID, now.UTC().Add(-quantitySyncWindow)).Scan(&units)
+	if err != nil {
+		return 0, err
+	}
+	return units, nil
+}
+
 // SubscriptionDrift is one org whose Paddle subscription is billing a quantity
 // that no longer matches its connected-server count.
 type SubscriptionDrift struct {
@@ -346,10 +444,10 @@ type SubscriptionDrift struct {
 // canceled or past_due subscription must not be silently re-priced, and an org
 // that never checked out has nothing to update.
 //
-// Want is floored at 1. Paddle rejects a zero-quantity item, and auto-cancelling
-// a subscription from a sweep because an org's servers went quiet would be a far
-// worse failure than one month's minimum line — dropping to the free tier stays
-// a deliberate act through the customer portal.
+// Want is floored at SubscriptionMinQuantity and computed by the same
+// billedUnitsSQL/billableQuantitySQL pair BillingSummaryForOrg goes through, so
+// the quantity this sweep PATCHes is the quantity the customer saw at checkout
+// and sees on the Billing page (SIGMA-292).
 func (s *Store) SubscriptionsNeedingQuantitySync(ctx context.Context, now time.Time) ([]SubscriptionDrift, error) {
 	// Both branches of the high-water mark are weighted by server type, so a
 	// fleet that swaps a general server for a GPU one drifts and re-syncs even
@@ -361,28 +459,21 @@ func (s *Store) SubscriptionsNeedingQuantitySync(ctx context.Context, now time.T
 			       b.quantity,
 			       b.synced_quantity,
 			       b.quantity_synced_at,
-			       GREATEST(
-			         (SELECT COALESCE(SUM(%[1]s), 0) FROM servers sv
-			           WHERE sv.org_id = b.org_id AND sv.deleted_at IS NULL AND sv.status = 'running'),
-			         (SELECT COALESCE(SUM(%[2]s), 0)
-			            FROM (SELECT DISTINCT sh.server_id FROM server_hours sh
-			                   WHERE sh.org_id = b.org_id AND sh.hour >= $1) d
-			            JOIN servers sv2 ON sv2.id = d.server_id)
-			       ) AS units
+			       %[1]s AS units
 			  FROM org_billing b
 			 WHERE b.status = 'active' AND b.paddle_subscription_id <> ''
 		)
 		SELECT org_id, paddle_subscription_id, quantity,
-		       GREATEST(1, units - $2) AS want
+		       %[2]s AS want
 		  FROM counts
-		 WHERE GREATEST(1, units - $2) <> quantity
+		 WHERE %[2]s <> quantity
 		   AND (quantity_synced_at IS NULL
-		        OR quantity_synced_at < $3
-		        OR synced_quantity IS DISTINCT FROM GREATEST(1, units - $2))`,
-		unitWeightSQL("sv.type"), unitWeightSQL("sv2.type"))
+		        OR quantity_synced_at < $2
+		        OR synced_quantity IS DISTINCT FROM %[2]s)`,
+		billedUnitsSQL("b.org_id", "$1"), billableQuantitySQL("units"))
 
 	rows, err := s.Pool.Query(ctx, query,
-		now.UTC().Add(-quantitySyncWindow), BillingFreeTier, now.UTC().Add(-quantitySyncDebounce))
+		now.UTC().Add(-quantitySyncWindow), now.UTC().Add(-quantitySyncDebounce))
 	if err != nil {
 		return nil, err
 	}

@@ -1372,8 +1372,13 @@ export type CpBillingSummary = {
   configured: boolean;
   /** Connected SERVER count (what the fleet looks like). */
   connected: number;
-  /** Weighted total the subscription actually bills. */
+  /** Weighted total across the servers connected RIGHT NOW (what `breakdown` explains). */
   units: number;
+  /** Unit total the subscription is priced on: the high-water mark of `units`
+   *  over the last `billingWindowHours` (SIGMA-292). >= `units` after a shrink. */
+  billedUnits: number;
+  /** Width of that high-water window, so the page can explain the number. */
+  billingWindowHours: number;
   billableUnits: number;
   /** Per-server-type explanation of `units`. */
   breakdown: { type: string; count: number; weight: number; units: number }[];

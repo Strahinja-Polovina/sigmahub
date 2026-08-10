@@ -7,6 +7,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -310,5 +311,102 @@ func TestIdempotencyClaimSemantics(t *testing.T) {
 	}
 	if c, _, _ := st.IdempotencyClaim(ctx, org2, key2, hashA); !c {
 		t.Fatal("after release a retry must be able to re-claim")
+	}
+}
+
+// TestBillableQuantityAgreesAcrossSummaryAndSync is the SIGMA-292 guard: the
+// number the Billing page shows, the number handleBillingCheckout puts on the
+// Paddle transaction and the number the drift sweep PATCHes onto the
+// subscription must be the SAME number. They used to be computed by two
+// different formulas over two different windows with two different floors, so
+// an org that shrank in the morning approved one quantity at checkout and was
+// invoiced another within ten minutes.
+func TestBillableQuantityAgreesAcrossSummaryAndSync(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// (a) A fleet that shrank this morning. 20 general servers ran overnight and
+	// were metered; 15 were deleted before the org subscribed in the afternoon.
+	orgID := "org_shrunk"
+	var ids []string
+	for i := 0; i < 20; i++ {
+		ids = append(ids, connectServer(t, st, orgID, fmt.Sprintf("shrunk-%d", i)))
+	}
+	if _, err := st.SweepServerHours(ctx, now.Add(-6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids[:15] {
+		if err := st.DeleteServer(ctx, orgID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := st.BillingSummaryForOrg(ctx, orgID, now, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The customer subscribes at exactly the quantity checkout showed them.
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_shrunk", SubscriptionID: "sub_shrunk",
+		Status: "active", Quantity: summary.BillableUnits,
+	}, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+
+	drift, err := st.SubscriptionsNeedingQuantitySync(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range drift {
+		if d.OrgID != orgID {
+			continue
+		}
+		t.Fatalf("sweep wants to re-price a subscription the customer just approved: "+
+			"summary/checkout showed %d billable units, sweep wants %d",
+			summary.BillableUnits, d.Want)
+	}
+
+	// (b) An org that shrank BELOW the free tier. The page must not say "nothing
+	// due" while the sweep keeps the subscription at a quantity Paddle invoices.
+	small := "org_shrunk_small"
+	smallIDs := []string{
+		connectServer(t, st, small, "small-1"),
+		connectServer(t, st, small, "small-2"),
+		connectServer(t, st, small, "small-3"),
+		connectServer(t, st, small, "small-4"),
+	}
+	if _, err := st.SweepServerHours(ctx, now.Add(-30*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range smallIDs[:3] {
+		if err := st.DeleteServer(ctx, small, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertSubscription(ctx, small, store.BillingStatus{
+		OrgID: small, CustomerID: "ctm_small", SubscriptionID: "sub_small",
+		Status: "active", Quantity: 1,
+	}, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	smallSummary, err := st.BillingSummaryForOrg(ctx, small, now, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallDrift, err := st.SubscriptionsNeedingQuantitySync(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 1 // nothing drifted → Paddle keeps invoicing the stored quantity
+	for _, d := range smallDrift {
+		if d.OrgID == small {
+			want = d.Want
+		}
+	}
+	if smallSummary.BillableUnits != want {
+		t.Fatalf("below the free tier the page shows %d billable units (%d %s due) "+
+			"while the subscription is billed for %d",
+			smallSummary.BillableUnits, smallSummary.Amount, smallSummary.Currency, want)
 	}
 }
