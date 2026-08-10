@@ -45,7 +45,10 @@ type StoreAPI interface {
 	// on this resource's deployment status, so a multi-machine pipeline advances
 	// on the report rather than on the next resync.
 	DeployPeersForResource(ctx context.Context, resourceID, excludeServerID string) ([]store.ServerRef, error)
-	AppendDeployLog(ctx context.Context, serverID, deploymentID, stream, line string) error
+	// AppendDeployLogs takes the whole batch the agent posted and writes it in
+	// one statement — one INSERT per line was thousands of statements per build
+	// (SIGMA-252).
+	AppendDeployLogs(ctx context.Context, serverID, deploymentID, stream string, lines []string) error
 	// Backups (P1-11): the audited per-run credential release and the agent's
 	// terminal result report, plus the op-status failure fallback.
 	BackupCredentialForRun(ctx context.Context, serverID, runID string) (store.BackupCredential, error)

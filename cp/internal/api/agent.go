@@ -172,14 +172,15 @@ func (s *Server) handleAgentBuildLog(w http.ResponseWriter, r *http.Request) {
 		req.Stream = "build"
 	}
 	srv := serverFrom(r)
-	for _, line := range req.Lines {
-		// Scoped to the servers that RUN this deployment — the deploy target, its
-		// build server, a cluster node, a Compose placement host. A server with no
-		// part in it can't forge into another deployment's log.
-		if err := s.store.AppendDeployLog(r.Context(), srv.ID, req.DeploymentID, req.Stream, line); err != nil {
-			s.log.Error("append deploy log", "err", err)
-			break
-		}
+	// Scoped to the servers that RUN this deployment — the deploy target, its
+	// build server, a cluster node, a Compose placement host. A server with no
+	// part in it can't forge into another deployment's log.
+	//
+	// One call for the whole batch: this used to loop, and with the agent posting
+	// a line at a time that made a 2,000-line build 2,000 requests AND 2,000
+	// statements (SIGMA-252).
+	if err := s.store.AppendDeployLogs(r.Context(), srv.ID, req.DeploymentID, req.Stream, req.Lines); err != nil {
+		s.log.Error("append deploy log", "err", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

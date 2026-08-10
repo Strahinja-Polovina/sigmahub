@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/apply"
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
@@ -49,9 +51,14 @@ type RegistryAuth struct {
 // plane. Nil on a host that never pushes.
 type RegistryFetcher func(ctx context.Context) (RegistryAuth, error)
 
-// LogSink streams a build/orchestration log line (to the control plane). Nil-safe
-// via Builder.stream.
-type LogSink func(ctx context.Context, deploymentID, stream, line string)
+// LogSink ships a BATCH of build/orchestration log lines (to the control plane).
+// Nil-safe via Builder.stream.
+//
+// It takes a slice, not a line, because the sink is a blocking HTTPS POST and a
+// build emits thousands of lines: one call per line is one round trip per line
+// on the goroutine draining Docker's output pipe (SIGMA-252). lineWriter does
+// the buffering; the sink just ships what it is handed.
+type LogSink func(ctx context.Context, deploymentID, stream string, lines []string)
 
 // Builder registers the git.clone and image.build ops.
 type Builder struct {
@@ -233,7 +240,10 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 			return fmt.Errorf("build context %q escapes the clone root", spec.ContextSubdir)
 		}
 	}
-	logs := &lineWriter{ctx: ctx, sink: b.sink, deploymentID: spec.DeploymentID}
+	logs := newLineWriter(ctx, b.sink, spec.DeploymentID)
+	// Ships the tail on every exit path — including the failure paths, whose last
+	// buffered lines are exactly the ones explaining the failure.
+	defer func() { _ = logs.Close() }()
 	switch spec.Builder {
 	case "", BuilderDockerfile:
 		if _, err := os.Stat(filepath.Join(dir, dockerfile)); err != nil {
@@ -289,7 +299,10 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 				auth.Host = spec.RegistryHost
 			}
 		}
-		b.stream(ctx, spec.DeploymentID, "build", "pushing "+spec.ImageTag+" for the deploy target")
+		// Through the log writer, not b.stream: the build output ahead of this is
+		// still buffered, and a direct sink call would land in the deploy view
+		// BEFORE the build lines it is supposed to follow.
+		_, _ = logs.Write([]byte("pushing " + spec.ImageTag + " for the deploy target\n"))
 		if err := b.docker.ImagePush(ctx, spec.ImageTag, auth, logs); err != nil {
 			return fmt.Errorf("push image %s: %w", spec.ImageTag, err)
 		}
@@ -299,22 +312,105 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 
 func (b *Builder) stream(ctx context.Context, deploymentID, streamName, line string) {
 	if b.sink != nil {
-		b.sink(ctx, deploymentID, streamName, line)
+		b.sink(ctx, deploymentID, streamName, []string{line})
 	}
 }
 
-// lineWriter turns a build-output stream into per-line log-sink calls.
+const (
+	// logBatchSize is how many buffered lines trigger an immediate ship. A
+	// typical Node or Python Dockerfile emits a few thousand lines, so this
+	// turns a build into a couple of dozen requests instead of a couple of
+	// thousand.
+	logBatchSize = 200
+	// logFlushInterval bounds how long a partial batch waits. A build that
+	// prints one line every few seconds must still show up in the deploy view
+	// promptly — batching may not turn the live log into a slideshow.
+	logFlushInterval = 500 * time.Millisecond
+	// logBufferCap bounds the unshipped backlog. Docker's output pipe
+	// back-pressures whenever this writer blocks, so a control plane that
+	// cannot keep up must cost dropped log lines, never a stalled build.
+	logBufferCap = 20000
+	// logShipMax is the largest batch handed to the sink in one call. It mirrors
+	// the control plane's per-request cap on /v1/agent/build-logs, which
+	// TRUNCATES anything longer — a backlog flushed in one go (or the final
+	// flush of a fast build) would otherwise lose everything past the cap
+	// silently, which is worse than the per-line shipping this replaced.
+	logShipMax = 500
+)
+
+// lineWriter turns a build-output stream into BATCHED log-sink calls.
+//
+// It used to call the sink once per line, and the sink is one blocking HTTPS
+// POST to the control plane plus one INSERT there (SIGMA-252). On the goroutine
+// draining Docker's output pipe that meant a full agent→CP round trip of added
+// latency per line: a 2,000-line build 40ms from the CP spent ~160 seconds of
+// pure network wait on top of a build Docker had finished, with Docker's pipe
+// back-pressuring the whole time, while the CP absorbed 2,000 authenticated
+// requests and 2,000 indexed inserts for one build.
+//
+// So Write now only parses lines and appends them to a bounded buffer — it
+// never touches the network — and a background goroutine ships whole batches on
+// size or on a timer. Overflow is dropped and COUNTED (and the count is
+// reported into the log itself), the same bargain the telemetry shipper makes:
+// losing log lines is recoverable, wedging the build is not.
+//
+// Callers MUST Close the writer: the trailing partial line and the last partial
+// batch are shipped there.
 type lineWriter struct {
 	ctx          context.Context
 	sink         LogSink
 	deploymentID string
-	buf          []byte
+
+	mu      sync.Mutex
+	buf     []byte   // carry-over for a line split across Writes
+	pending []string // parsed, unshipped lines
+	dropped int
+
+	wake     chan struct{} // size-triggered flush signal (non-blocking, cap 1)
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func newLineWriter(ctx context.Context, sink LogSink, deploymentID string) *lineWriter {
+	w := &lineWriter{
+		ctx: ctx, sink: sink, deploymentID: deploymentID,
+		wake: make(chan struct{}, 1),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	if sink == nil {
+		close(w.done) // nothing to ship; Close must not block on a goroutine that never ran
+		return w
+	}
+	go w.run()
+	return w
+}
+
+// run is the shipping loop: everything that touches the sink happens here, off
+// the Write path.
+func (w *lineWriter) run() {
+	defer close(w.done)
+	t := time.NewTicker(logFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-w.ctx.Done():
+			return
+		case <-t.C:
+		case <-w.wake:
+		}
+		w.flush()
+	}
 }
 
 func (w *lineWriter) Write(p []byte) (int, error) {
 	if w.sink == nil {
 		return len(p), nil
 	}
+	w.mu.Lock()
 	w.buf = append(w.buf, p...)
 	for {
 		i := indexByte(w.buf, '\n')
@@ -324,7 +420,7 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		line := strings.TrimRight(string(w.buf[:i]), "\r")
 		w.buf = w.buf[i+1:]
 		if line != "" {
-			w.sink(w.ctx, w.deploymentID, "build", line)
+			w.enqueueLocked(line)
 		}
 	}
 	// Backstop: a very long line with no newline (a hostile/broken Dockerfile can
@@ -332,11 +428,64 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	// bound and OOM-ing the agent — mirrors logLineSplitter (SIGMA-98).
 	if len(w.buf) > 64*1024 {
 		if line := strings.TrimRight(string(w.buf), "\r"); line != "" {
-			w.sink(w.ctx, w.deploymentID, "build", line)
+			w.enqueueLocked(line)
 		}
 		w.buf = nil
 	}
+	full := len(w.pending) >= logBatchSize
+	w.mu.Unlock()
+	if full {
+		select {
+		case w.wake <- struct{}{}:
+		default: // a ship is already pending; it will pick these up
+		}
+	}
 	return len(p), nil
+}
+
+// enqueueLocked buffers one line, dropping (and counting) on overflow. Caller
+// holds w.mu.
+func (w *lineWriter) enqueueLocked(line string) {
+	if len(w.pending) >= logBufferCap {
+		w.dropped++
+		return
+	}
+	w.pending = append(w.pending, line)
+}
+
+// flush ships whatever is buffered as ONE sink call. Only ever called from run
+// (which is single-threaded) or from Close after run has exited, so the sink is
+// never entered concurrently and line order is preserved.
+func (w *lineWriter) flush() {
+	w.mu.Lock()
+	lines, dropped := w.pending, w.dropped
+	w.pending, w.dropped = nil, 0
+	w.mu.Unlock()
+	if dropped > 0 {
+		// Say so in the log rather than silently showing a build with holes in it.
+		lines = append(lines, fmt.Sprintf("… %d build log line(s) dropped — the control plane could not keep up", dropped))
+	}
+	for len(lines) > 0 {
+		n := min(len(lines), logShipMax)
+		w.sink(w.ctx, w.deploymentID, "build", lines[:n])
+		lines = lines[n:]
+	}
+}
+
+// Close stops the shipping loop and ships the tail. Safe to call more than once.
+func (w *lineWriter) Close() error {
+	w.stopOnce.Do(func() { close(w.stop) })
+	<-w.done
+	w.mu.Lock()
+	// A build whose last line has no trailing newline still has to reach the log —
+	// that line is very often the one naming the failure.
+	if line := strings.TrimRight(string(w.buf), "\r"); line != "" {
+		w.enqueueLocked(line)
+	}
+	w.buf = nil
+	w.mu.Unlock()
+	w.flush()
+	return nil
 }
 
 // lastLines is the TAIL of a build's output, for the error message. A failed

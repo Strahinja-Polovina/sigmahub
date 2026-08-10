@@ -247,11 +247,14 @@ func run() error {
 		},
 		buildRoot,
 		log,
-		func(ctx context.Context, deploymentID, stream, line string) {
-			if deploymentID == "" {
+		// One POST per BATCH. The builder buffers lines and hands them over in
+		// groups, so a 2,000-line build costs a couple of dozen round trips
+		// rather than 2,000 (SIGMA-252).
+		func(ctx context.Context, deploymentID, stream string, lines []string) {
+			if deploymentID == "" || len(lines) == 0 {
 				return
 			}
-			if err := c.PostBuildLog(ctx, st.AgentToken, deploymentID, stream, []string{line}); err != nil {
+			if err := c.PostBuildLog(ctx, st.AgentToken, deploymentID, stream, lines); err != nil {
 				log.Warn("build log post failed", "err", err)
 			}
 		},
