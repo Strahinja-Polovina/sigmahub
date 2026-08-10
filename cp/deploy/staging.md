@@ -116,7 +116,10 @@ cp/deploy/smoke.sh
 6. Read models reflect the writes.
 
 Exit 0 = the control plane is healthy and the core provisioning path works. It
-provisions a uniquely-named throwaway org each run.
+provisions a uniquely-named throwaway org each run, and revokes every Org Admin
+token it minted on the way out — including on a failed or interrupted run
+(SIGMA-267). The empty orgs stay (there is no org teardown API in v1); the
+authority over them does not, and no credential is left on disk.
 
 **This is the same check CI runs.** `.github/workflows/deploy-staging.yml` runs
 `smoke.sh` on the box at the end of every rollout and fails the deploy on a
