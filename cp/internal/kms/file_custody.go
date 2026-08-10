@@ -113,7 +113,7 @@ func (c *FileCustody) Unwrap(ctx context.Context, purpose string, envelope []byt
 
 	ev := AuditEvent{Action: "kms.unwrap", Purpose: purpose}
 	c.mu.Lock()
-	c.audit = append(c.audit, ev)
+	c.audit = appendAudit(c.audit, ev)
 	c.mu.Unlock()
 	if c.sink != nil {
 		if err := c.sink(ctx, ev); err != nil {

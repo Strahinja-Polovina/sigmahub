@@ -7,6 +7,7 @@ package store
 // workers. Databases are deliberately excluded — see ClusterKindAllowed.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -526,13 +527,63 @@ func (s *Store) ClusterMembershipForServer(ctx context.Context, serverID string)
 		return ClusterMembership{}, false, err
 	}
 	if len(wrapped) > 0 {
-		plain, uerr := s.custody.Unwrap(ctx, clusterTokenPurpose(orgID), wrapped)
+		token, uerr := s.clusterJoinToken(ctx, m.ClusterID, orgID, wrapped)
 		if uerr != nil {
 			return ClusterMembership{}, false, fmt.Errorf("unwrap cluster token: %w", uerr)
 		}
-		m.JoinToken = string(plain)
+		m.JoinToken = token
 	}
 	return m, true, nil
+}
+
+// clusterJoinToken returns the cluster's join token in the clear, unwrapping it
+// through custody only when it is not already memoised for this exact envelope.
+//
+// This function exists because ClusterMembershipForServer sits on the reconcile
+// path (SIGMA-319). The reconciler re-renders EVERY server every 60 seconds, and
+// the unwrap it used to do unconditionally is, under Vault custody, an HTTP
+// round trip to transit plus an audit event that becomes a cp_audit_log insert.
+// A 50-node cluster therefore spent ~1.5s of network wait per resync pass and
+// wrote 72,000 identical "Key unwrapped" rows a day — for a value that is minted
+// once at CreateCluster and never updated afterwards. The audit trail exists to
+// make key ACCESS legible; drowning it in a machine's own idle loop destroys
+// exactly that.
+//
+// The memo is keyed by cluster id and validated against the wrapped envelope the
+// caller already read in the same query, so it cannot serve a stale token: if
+// join_token_wrapped ever changes (a rotation, or the same server rejoining a
+// recreated cluster inside one process lifetime) the bytes differ and the next
+// read unwraps afresh. That is why the envelope, not a timestamp, is the
+// validity key — there is no window in which the cache can be wrong.
+//
+// A deleted cluster leaves its entry behind. That is deliberate rather than
+// overlooked: cluster ids are never reused, so the entry can only ever be dead
+// weight, and one map entry per cluster ever created in a process is nothing
+// next to the per-second leak this replaces.
+func (s *Store) clusterJoinToken(ctx context.Context, clusterID, orgID string, wrapped []byte) (string, error) {
+	s.clusterTokenMu.Lock()
+	if hit, ok := s.clusterTokenCache[clusterID]; ok && bytes.Equal(hit.wrapped, wrapped) {
+		s.clusterTokenMu.Unlock()
+		return hit.token, nil
+	}
+	s.clusterTokenMu.Unlock()
+
+	plain, err := s.custody.Unwrap(ctx, clusterTokenPurpose(orgID), wrapped)
+	if err != nil {
+		return "", err
+	}
+	token := string(plain)
+
+	s.clusterTokenMu.Lock()
+	if s.clusterTokenCache == nil {
+		s.clusterTokenCache = map[string]cachedClusterToken{}
+	}
+	// Copy the envelope: it is scanned into a slice pgx owns and may reuse.
+	env := make([]byte, len(wrapped))
+	copy(env, wrapped)
+	s.clusterTokenCache[clusterID] = cachedClusterToken{wrapped: env, token: token}
+	s.clusterTokenMu.Unlock()
+	return token, nil
 }
 
 // Node-report states. A node is 'pending' from the moment it is told to join
