@@ -282,3 +282,62 @@ func TestPushedContainerImagesAreSignedAndCarryAnSBOM(t *testing.T) {
 		}
 	}
 }
+
+// no_secrets_in_ssh_argv: a credential may never ride in an ssh command string
+// (SIGMA-277).
+//
+// Everything after the destination is the REMOTE COMMAND. sshd hands it to the
+// login shell as `$SHELL -c "<the whole string>"`, so `GHCR_TOKEN=… bash -s`
+// puts the token in the argv of a process on the staging box — a box that by
+// design also runs design-partner workloads, where any local user's `ps auxww`,
+// any container that can read the host's /proc, and any execve-logging agent
+// sees it. The window is short (bash replaces itself with the piped shell
+// almost immediately) but perfectly predictable: it is exactly when a deploy
+// runs, and deploys are announced by every push to main. Sampling /proc in a
+// loop while the sshd-shaped command runs catches the token on every attempt.
+//
+// The script body was never the problem — it already arrives on the stdin
+// heredoc, which no other process can read. The credentials were the one part
+// that did not, so they go the same way.
+//
+// The rule is written over `${{ secrets.* }}` AND over shell variables whose
+// names say credential, because moving the expression up into the step's `env:`
+// and interpolating `$GHCR_TOKEN` into the same argv is the identical leak with
+// a tidier diff.
+func TestNoSecretsInSSHArgv(t *testing.T) {
+	workflows, err := filepath.Glob("../../.github/workflows/*.yml")
+	if err != nil || len(workflows) == 0 {
+		t.Fatalf("no workflows found to lint: %v", err)
+	}
+	sshCall := regexp.MustCompile(`(^|\s)ssh\s`)
+	credVar := regexp.MustCompile(`\$\{?[A-Za-z_]*(TOKEN|SECRET|PASSWORD|KEY)\b`)
+
+	for _, path := range workflows {
+		lines := strings.Split(readFileForTest(t, path), "\n")
+		for i := 0; i < len(lines); i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(trimmed, "#") || !sshCall.MatchString(lines[i]) {
+				continue
+			}
+			// Follow backslash continuations: the whole logical command is the
+			// remote command string, however it is wrapped for readability.
+			cmd := lines[i]
+			for j := i; strings.HasSuffix(strings.TrimSpace(lines[j]), `\`) && j+1 < len(lines); j++ {
+				cmd += "\n" + lines[j+1]
+				i = j + 1
+			}
+			// Only what comes AFTER the ssh destination is the remote command.
+			// `ssh -i <key>` before it is a runner-side file path, not a leak.
+			loc := sshCall.FindStringIndex(cmd)
+			after := cmd[loc[1]:]
+			if strings.Contains(after, "${{ secrets.") {
+				t.Errorf("%s: a `${{ secrets.* }}` expression sits in an ssh command string, so it "+
+					"lands in the argv of the shell sshd spawns on the remote host:\n%s", path, cmd)
+			}
+			if credVar.MatchString(after) {
+				t.Errorf("%s: a credential-shaped shell variable sits in an ssh command string, which "+
+					"is the same leak as an inline secret expression:\n%s", path, cmd)
+			}
+		}
+	}
+}

@@ -3,8 +3,9 @@ name: Deploy staging
 # Build in CI, run on the box: cp + web images build on GitHub runners and
 # push to GHCR; the staging server only pulls the pinned sha tags and starts
 # them (a 4GB host must never compile the stack itself). GHCR auth on the
-# server uses this run's GITHUB_TOKEN over SSH, so private packages work with
-# zero server-side setup.
+# server uses this run's GITHUB_TOKEN, delivered over the rollout's stdin
+# (never in the ssh command string — see SIGMA-277 below), so private packages
+# work with zero server-side setup.
 #
 # Required repo secret:
 #   STAGING_SSH_KEY — private half of the dedicated CI deploy key installed
@@ -153,11 +154,33 @@ jobs:
             ./ "$STAGING_USER@$STAGING_HOST:$STAGING_DIR/"
 
       - name: Pull pinned images & roll out
+        env:
+          # Into the step's environment, not into a command line: the runner
+          # expands these where only this process can see them.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          ssh "$STAGING_USER@$STAGING_HOST" \
-            GHCR_TOKEN='${{ secrets.GITHUB_TOKEN }}' GHCR_USER='${{ github.actor }}' \
-            CP_IMAGE="$CP_IMAGE_REPO:$GITHUB_SHA" WEB_IMAGE="$WEB_IMAGE_REPO:$GITHUB_SHA" \
-            bash -s <<'EOS'
+          set -euo pipefail
+          # The GHCR credentials travel on STDIN with the script (SIGMA-277).
+          #
+          # Everything after the destination is the remote command, and sshd
+          # hands that whole string to the login shell as `$SHELL -c "…"` — so
+          # `GHCR_TOKEN=… bash -s` put a token with packages:read on the org's
+          # private images into the argv of a process on the staging box, where
+          # any local user's `ps`, any container that can read the host's /proc,
+          # and any execve-logging agent could take it. Sampling /proc while
+          # that command runs catches it every time. The box by design also runs
+          # design-partner workloads, and the exposure window is the one moment
+          # anybody would know to watch for: a push to main.
+          #
+          # The script body was never exposed — it already arrived on the
+          # heredoc — so the credentials now go the same way, as two assignment
+          # lines prepended to the stream. printf %q quotes them for the remote
+          # bash; printf is a builtin, so they never reach an argv here either.
+          # CP_IMAGE/WEB_IMAGE stay in the command string: they are public tags.
+          {
+            printf 'GHCR_TOKEN=%q\nGHCR_USER=%q\n' "$GHCR_TOKEN" "$GHCR_USER"
+            cat <<'EOS'
           set -euo pipefail
           cd /home/deploy/sigmahub/cp/deploy
           # Pin the freshly-built images in .env so ANY later `compose up`
@@ -220,3 +243,6 @@ jobs:
           export CP_PROVISION_TOKEN
           bash cp/deploy/smoke.sh
           EOS
+          } | ssh "$STAGING_USER@$STAGING_HOST" \
+                CP_IMAGE="$CP_IMAGE_REPO:$GITHUB_SHA" WEB_IMAGE="$WEB_IMAGE_REPO:$GITHUB_SHA" \
+                bash -s
