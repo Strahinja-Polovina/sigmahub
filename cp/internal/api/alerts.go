@@ -43,7 +43,7 @@ func (s *Server) handleListAlertChannels(w http.ResponseWriter, r *http.Request)
 		s.writeStoreErr(w, err, "list alert channels")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"channels": channels, "events": store.AlertEvents})
+	writeJSON(w, http.StatusOK, map[string]any{"channels": jsonList(channels), "events": store.AlertEvents})
 }
 
 func (s *Server) handleDeleteAlertChannel(w http.ResponseWriter, r *http.Request) {

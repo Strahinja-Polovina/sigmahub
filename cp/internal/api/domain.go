@@ -207,7 +207,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list projects")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
+	writeJSON(w, http.StatusOK, map[string]any{"projects": jsonList(projects)})
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +280,7 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request) 
 		s.writeStoreErr(w, err, "list environments")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"environments": envs})
+	writeJSON(w, http.StatusOK, map[string]any{"environments": jsonList(envs)})
 }
 
 // handleUpdateEnvironment edits an environment's production flag (SIGMA-190 —
@@ -351,7 +351,7 @@ func (s *Server) handleEnvServers(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "env servers")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"serverIds": ids})
+	writeJSON(w, http.StatusOK, map[string]any{"serverIds": jsonList(ids)})
 }
 
 // ── Resources ───────────────────────────────────────────────────────────────
@@ -445,7 +445,7 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list resources")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"resources": resources})
+	writeJSON(w, http.StatusOK, map[string]any{"resources": jsonList(resources)})
 }
 
 func (s *Server) handleDeleteResource(w http.ResponseWriter, r *http.Request) {
@@ -522,7 +522,7 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list domains")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"domains": domains})
+	writeJSON(w, http.StatusOK, map[string]any{"domains": jsonList(domains)})
 }
 
 func (s *Server) handleDetachDomain(w http.ResponseWriter, r *http.Request) {
@@ -585,7 +585,7 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list audit")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+	writeJSON(w, http.StatusOK, map[string]any{"entries": jsonList(entries)})
 }
 
 // ── Org provisioning ────────────────────────────────────────────────────────

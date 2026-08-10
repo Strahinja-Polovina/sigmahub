@@ -665,6 +665,28 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// jsonList makes a collection safe to put on the wire: a nil Go slice marshals
+// to `null`, and every consumer of this API treats a list key as an array it can
+// map over and read .length on. `null` is not an empty list to them, it is a
+// thrown TypeError on a page that was rendering fine.
+//
+// Until now that contract was upheld by a convention in the store — every List*
+// method declaring `out := []T{}` — with nothing asserting it at either end.
+// Changing one of those to `var out []T`, an idiomatic tidy-up, silently turns a
+// brand-new org's empty dashboard into a broken one, and the whole Go suite
+// stays green (SIGMA-337). Wrapping at the point where the bytes are written
+// means the handler no longer depends on how the store happened to build its
+// slice. It is a typed one-liner rather than reflection inside writeJSON on
+// purpose: json.RawMessage is itself a nil-able slice whose `null` is correct
+// and load-bearing, and a blanket coercion would corrupt every spec and status
+// document this API serves.
+func jsonList[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
+
 // maxBodyBytes caps request bodies. The register endpoint is unauthenticated,
 // so an unbounded decode is a pre-auth memory-exhaustion vector.
 const maxBodyBytes = 1 << 20 // 1 MiB

@@ -19,7 +19,7 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list buckets")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
+	writeJSON(w, http.StatusOK, map[string]any{"buckets": jsonList(buckets)})
 }
 
 func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request) {

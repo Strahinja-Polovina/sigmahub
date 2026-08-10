@@ -79,7 +79,7 @@ func (s *Server) handleListClusters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"clusters": list,
+		"clusters": jsonList(list),
 		// Published so the dashboard explains the rule instead of keeping its
 		// own copy of which kinds a cluster refuses.
 		"excludedKinds": store.ClusterExcludedKinds(),

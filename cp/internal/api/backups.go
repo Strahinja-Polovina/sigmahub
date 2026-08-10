@@ -52,7 +52,7 @@ func (s *Server) handleListBackupTargets(w http.ResponseWriter, r *http.Request)
 		s.writeStoreErr(w, err, "list backup targets")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"targets": targets})
+	writeJSON(w, http.StatusOK, map[string]any{"targets": jsonList(targets)})
 }
 
 func (s *Server) handleDeleteBackupTarget(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +103,7 @@ func (s *Server) handleListBackupRuns(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "list backup runs")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+	writeJSON(w, http.StatusOK, map[string]any{"runs": jsonList(runs)})
 }
 
 func (s *Server) handleVerifyDays(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +333,7 @@ func (s *Server) handleListArchivedRepoKeys(w http.ResponseWriter, r *http.Reque
 		s.writeStoreErr(w, err, "list archived repo keys")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+	writeJSON(w, http.StatusOK, map[string]any{"keys": jsonList(keys)})
 }
 
 // handleExportRepoKey returns the plaintext restic repository password for a
