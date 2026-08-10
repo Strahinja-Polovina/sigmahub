@@ -13,6 +13,7 @@ import {
   summarizeUnits,
   billableUnits,
 } from "@/lib/billing-units";
+import { toDeployTargetServer } from "@/components/dashboard/resources/resource-meta";
 
 // Pricing lives in lib/billing-units (mirrored from the CP weight table);
 // re-exported here so existing importers keep working.
@@ -453,25 +454,11 @@ export async function getDeployTargets(orgId: string, visible?: Set<string> | nu
             servers: attached
               .map((a) => byId.get(a.serverId))
               .filter((sv): sv is NonNullable<typeof sv> => Boolean(sv))
-              .map((sv) => ({
-                id: sv.id,
-                name: sv.name,
-                type: sv.type,
-                provider: sv.provider,
-                region: sv.region,
-                // Carried so the wizard can refuse a host the enrollment gate
-                // already refused, instead of offering it and letting the
-                // create call be the first thing that says no (SIGMA-203).
-                status: sv.status,
-                // The GPU inventory, and nothing else out of the facts blob:
-                // it is what the VRAM fit check compares a model against
-                // (SIGMA-214), and the rest of a host's facts — its kernel, its
-                // disks, its docker version — is weight on every deploy-target
-                // payload for a screen that never reads it. Undefined when the
-                // agent reported no inventory, which the fit check reads as
-                // UNKNOWN and never as "no GPU".
-                gpu: sv.facts?.gpu ?? undefined,
-              })),
+              // Shared with the project page's own target builder so the two
+              // cannot carry different fields (SIGMA-304). It copies status
+              // (SIGMA-203) and the GPU inventory (SIGMA-214) and nothing else
+              // out of the facts blob.
+              .map(toDeployTargetServer),
           };
         })
       );

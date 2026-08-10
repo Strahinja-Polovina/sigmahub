@@ -24,7 +24,10 @@ import {
 } from "@/components/ui/breadcrumb";
 import { Button } from "@/components/ui/button";
 import { DeployWizard } from "@/components/dashboard/resources/deploy-wizard";
-import type { DeployTarget } from "@/components/dashboard/resources/resource-meta";
+import {
+  toDeployTargetServer,
+  type DeployTarget,
+} from "@/components/dashboard/resources/resource-meta";
 import type { WizardCluster } from "@/lib/wizard/availability";
 import { WIZARD_RESUME_KEY, decodeWizardDraft } from "@/lib/wizard/resume";
 import {
@@ -547,14 +550,14 @@ export function ProjectDetailView({
             .map((p) => ({
               id: p.env.id,
               name: p.env.name,
-              servers: p.servers.map((sv) => ({
-                id: sv.id,
-                name: sv.name,
-                type: sv.type,
-                provider: sv.provider ?? "",
-                region: sv.region ?? "",
-                status: sv.status,
-              })),
+              // Built by the SAME helper getDeployTargets uses. This mapping
+              // used to be spelled out here and had lost `gpu`, so a wizard
+              // opened from a project saw every target as UNKNOWN and the
+              // SIGMA-214 VRAM fit check warned about nothing — the 70B model
+              // was offered onto the 24 GB box and only the control plane's
+              // create-time check said no, by which point the wizard had
+              // nowhere to go back to (SIGMA-304).
+              servers: p.servers.map(toDeployTargetServer),
             })),
         },
       ]
