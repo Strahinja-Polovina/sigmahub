@@ -70,7 +70,14 @@ services:
       CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
       # CP's own public base URL (e.g. https://cp.example.com). With the
       # webhook secret set, connecting a repo auto-registers its push webhook.
-      CP_PUBLIC_URL: ${CP_PUBLIC_URL:-}
+      #
+      # It falls back to SIGMAHUB_CP_PUBLIC_URL, which is required below,
+      # because the two are the same fact — the address this control plane
+      # answers on from outside — under two names, and only one of them is
+      # mandatory. Left independently empty, the control plane does not know its
+      # own scheme, and so cannot notice that the installer it is about to hand
+      # a host would travel in the clear (SIGMA-266).
+      CP_PUBLIC_URL: ${CP_PUBLIC_URL:-${SIGMAHUB_CP_PUBLIC_URL}}
       # The agent installer the control plane serves (SIGMA-217). The host being
       # onboarded fetches install.sh and every release asset from the CP, which
       # fetches them from GitHub with the token below — so a PRIVATE release
@@ -138,8 +145,16 @@ services:
       - cp-data:/data
       # GitHub App key import (set CP_GITHUB_APP_PRIVATE_KEY_FILE=/data/github-app.pem):
       # - ./github-app.pem:/data/github-app.pem:ro
+    # LOOPBACK ONLY (SIGMA-266). Everything from outside the box arrives through
+    # the `proxy` service below, which terminates TLS; this binding exists so the
+    # operator (and the staging rollout's post-deploy poll) can curl /readyz from
+    # the host itself without going through DNS and a certificate. Published on
+    # 0.0.0.0 it was the plaintext endpoint an operator inevitably named in
+    # SIGMAHUB_CP_PUBLIC_URL to make the runbook work, which is how the install
+    # command stops being a signed-artifact story and starts being an
+    # unauthenticated script piped into `sudo bash`.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   web:
     build:
@@ -171,8 +186,51 @@ services:
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+    # Loopback only, for the same reason as cp above: the dashboard is reached
+    # through the proxy, and this binding is for on-box checks.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+
+  # ── TLS terminator (SIGMA-266) ─────────────────────────────────────────────
+  # The one thing published to the world, and the reason the https URLs the rest
+  # of this file requires actually answer.
+  #
+  # This stack used to publish 8080 and 3000 in plaintext with nothing in front
+  # of them, while .env.example told the operator that SIGMAHUB_CP_PUBLIC_URL
+  # MUST be https — so either the documented URL connected to nothing, or the
+  # operator named the http one and every onboarded host executed a script
+  # fetched in the clear, with a one-time bootstrap token in the query string.
+  # install.sh is the single artifact cosign cannot cover (it is what runs
+  # cosign), so that was not a hardening nicety: it was the product's stated
+  # trust boundary, removed to make the runbook work.
+  #
+  # Caddy provisions and renews certificates over ACME by itself, keyed on the
+  # site addresses in ./Caddyfile — which are the SIGMAHUB_CP_PUBLIC_URL and
+  # WEB_PUBLIC_URL already in .env rather than two more hostname settings to
+  # keep in step. Ports 80 and 443 must both be reachable: 80 is the HTTP-01
+  # challenge and the redirect to https.
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - cp
+      - web
+    environment:
+      SIGMAHUB_CP_PUBLIC_URL: ${SIGMAHUB_CP_PUBLIC_URL:?set SIGMAHUB_CP_PUBLIC_URL in .env}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+      CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Issued certificates and ACME account keys. BACK THIS UP or at least do
+      # not wipe it casually: a `down -v` throws away the account and every
+      # certificate, and a rebuild re-issues from the CA — which has per-domain
+      # issuance limits an operator can exhaust by cycling the stack.
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
 
   # ── Telemetry sinks (optional; enable with COMPOSE_PROFILES=telemetry) ──────
   # Gives the dashboard real resource logs (Loki) and metrics (VictoriaMetrics
@@ -220,5 +278,7 @@ services:
 volumes:
   db-data:
   cp-data:
+  caddy-data:
+  caddy-config:
   loki-data:
   vm-data:

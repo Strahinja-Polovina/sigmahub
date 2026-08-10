@@ -91,6 +91,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -300,6 +301,25 @@ func (rs ReleaseSource) normalized() ReleaseSource {
 // setting to change, and it is what the dashboard shows when it cannot render a
 // command, so the sentence is written once here rather than paraphrased there.
 func (s *Server) installerRelease() (version, refusal string) {
+	// The scheme this control plane is reachable on is part of the answer
+	// (SIGMA-266), because install.sh is the ONE artifact cosign does not cover
+	// — it is what runs cosign — so its integrity is exactly the TLS it arrived
+	// over. Served over plaintext, the command an operator pastes is a remote
+	// code execution primitive for anyone on the path between the host and here,
+	// with a one-time bootstrap token in the clear alongside it.
+	//
+	// This is refused here, in the shared answer, rather than only in
+	// handleInstallScript, so the operator finds out at the WIZARD — which
+	// renders this sentence — instead of on the host, after the bootstrap key
+	// has already been dropped into authorized_keys and spent. The dashboard has
+	// its own https check on SIGMAHUB_CP_PUBLIC_URL, but that is a second
+	// spelling of this URL on the other side of the boundary: it cannot see a
+	// control plane whose own public address is plaintext.
+	if insecurePublicURL(s.publicURL) {
+		return "", fmt.Sprintf(
+			"this control plane's public URL is %q, which is not https. The install command pipes /install.sh into `sudo bash`, and that script is the one artifact cosign cannot cover — it is what runs cosign — so serving it over plaintext would put root on every onboarded host in reach of anyone on the network. Put the control plane behind a TLS terminator (the `proxy` service in cp/deploy/docker-compose.yml) and set CP_PUBLIC_URL, and the dashboard's SIGMAHUB_CP_PUBLIC_URL, to its https address.",
+			s.publicURL)
+	}
 	if s.release.Repo == "" {
 		return "", "this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to the owner/name of the repository whose releases publish sigmad."
 	}
@@ -312,6 +332,41 @@ func (s *Server) installerRelease() (version, refusal string) {
 			s.release.Version)
 	}
 	return s.release.Version, ""
+}
+
+// insecurePublicURL reports whether the control plane's own public base URL is
+// one the installer must not be served over.
+//
+// Empty is NOT insecure, and that is deliberate: CP_PUBLIC_URL is optional (it
+// exists so a connected repo's push webhook can be registered against it), so a
+// deployment that never set it has made no claim about its own scheme and there
+// is nothing here to contradict. Refusing on empty would take onboarding away
+// from every deployment that reaches its control plane by an address the control
+// plane itself was never told.
+//
+// A loopback address is not insecure either: `http://localhost:8080` is how this
+// stack comes up on a developer's machine, and there is no network for anyone to
+// be on the path of.
+func insecurePublicURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		// Anything that is not parseable-and-http is left alone: this check
+		// exists to catch the one misconfiguration that is dangerous, not to
+		// become a second validator of a setting nothing else validates.
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
 }
 
 // handleInstallScript serves the installer for the version this control plane is

@@ -1,0 +1,39 @@
+# TLS terminator for the self-hosted stack (SIGMA-266).
+#
+# The stack used to publish 8080 (control plane) and 3000 (dashboard) in
+# plaintext and ship nothing in front of them, while .env.example insisted that
+# SIGMAHUB_CP_PUBLIC_URL "MUST be https" — because the install command pipes
+# /install.sh into `sudo bash`, and that script is the one artifact cosign
+# cannot cover (it is what RUNS cosign). So the documented configuration named a
+# URL nothing was listening on, and the only way to make the runbook work was to
+# name the http one, which removes the product's stated trust boundary. This
+# file is the missing half: the https name in .env now answers.
+#
+# The site addresses are the SAME two settings the rest of the stack already
+# uses, rather than a third and fourth spelling of the same hostnames — Caddy
+# accepts a full `https://host` as a site address, so SIGMAHUB_CP_PUBLIC_URL and
+# WEB_PUBLIC_URL are read here verbatim. Set them to https names and Caddy
+# provisions certificates over ACME on first request; set them to an http name
+# (an IP-only staging box, say) and Caddy serves that plaintext instead, which
+# the control plane then refuses to serve /install.sh over — see
+# installerRelease in cp/internal/api/installer.go. One name, one behaviour, and
+# the failure is loud on the side that can explain it.
+{
+	# ACME account contact. Caddy renews on its own, so this is only where the
+	# CA sends expiry and policy notices; it is the same contact the control
+	# plane uses for managed tenant domains.
+	email {$CP_ACME_EMAIL:ops@example.com}
+}
+
+# The control plane. Hosts being onboarded fetch install.sh and every release
+# asset from here, and agents long-poll it, so the proxy must not buffer or
+# time out the stream: Caddy streams reverse_proxy responses by default and has
+# no response timeout unless one is configured, which is what we want.
+{$SIGMAHUB_CP_PUBLIC_URL:http://localhost} {
+	reverse_proxy cp:8080
+}
+
+# The dashboard.
+{$WEB_PUBLIC_URL:http://localhost:3000} {
+	reverse_proxy web:3000
+}

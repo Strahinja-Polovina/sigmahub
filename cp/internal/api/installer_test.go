@@ -931,3 +931,64 @@ func TestAnExplicitAgentVersionIsCheckedAgainstTheInstallerRoutesOwnPattern(t *t
 		}
 	}
 }
+
+// GET /install.sh is the one artifact cosign cannot cover, because it is what
+// runs cosign — its integrity rests entirely on the TLS the host fetches it
+// over. The dashboard already refuses to RENDER a command whose endpoint is not
+// https (web/src/server/actions/servers.ts), but the route itself served the
+// script to anyone who asked, over whatever the control plane was reachable on.
+//
+// So a control plane that knows its own public URL is plaintext knows the
+// command an operator is about to paste pipes cleartext into `sudo bash`, and
+// answering it is worse than refusing: the operator finds out on the host, after
+// the bootstrap key has been dropped, or never.
+//
+// Empty is NOT a refusal (CP_PUBLIC_URL is optional — it exists for the GitHub
+// webhook, and a deployment that never set it is not making a claim about its
+// own scheme), and neither is a loopback address, which is how the stack is
+// brought up on a developer's own machine and is not on a network anyone is
+// on-path of.
+func TestInstallScriptRefusedOverPlaintextPublicURL(t *testing.T) {
+	for _, tc := range []struct {
+		publicURL string
+		want      int
+	}{
+		{"http://cp.example.com", http.StatusServiceUnavailable},
+		{"http://cp.example.com:8080", http.StatusServiceUnavailable},
+		{"HTTP://CP.EXAMPLE.COM", http.StatusServiceUnavailable},
+		{"https://cp.example.com", http.StatusOK},
+		{"", http.StatusOK},
+		{"http://localhost:8080", http.StatusOK},
+		{"http://127.0.0.1:8080", http.StatusOK},
+	} {
+		t.Run(tc.publicURL, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			upstream := httptest.NewServer(gh)
+			t.Cleanup(upstream.Close)
+			s := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+				DevServiceToken: testServiceToken,
+				PublicURL:       tc.publicURL,
+				Release: ReleaseSource{
+					Repo:         testReleaseRepo,
+					Version:      testReleaseVersion,
+					DownloadBase: upstream.URL,
+					APIBase:      upstream.URL,
+				},
+			})
+
+			rec := get(t, s, "/install.sh")
+			if rec.Code != tc.want {
+				t.Fatalf("GET /install.sh with CP_PUBLIC_URL=%q = %d, want %d; body: %s",
+					tc.publicURL, rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.want != http.StatusOK {
+				if !strings.Contains(rec.Body.String(), "CP_PUBLIC_URL") {
+					t.Errorf("the refusal does not name the setting to fix:\n%s", rec.Body.String())
+				}
+				if seen := gh.seen(); len(seen) != 0 {
+					t.Errorf("a control plane that refused to serve the installer still asked GitHub: %+v", seen)
+				}
+			}
+		})
+	}
+}
