@@ -33,6 +33,13 @@ type Config struct {
 	// unbounded by design — verify rows wait for their backup's sha and the
 	// agent applies ops serially (SIGMA-163) — so this is deliberately generous.
 	QueueTimeout time.Duration
+	// Heartbeat, when set, is called once per sweep with that sweep's outcome
+	// (SIGMA-248). This loop is the one that most needs it: when
+	// CreateDueBackupRuns starts erroring, no run is created for any tenant, and
+	// `backup_failed` cannot fire because it needs a run to exist before it can
+	// fail. Backups go off fleet-wide and the only trace is a log line. nil is
+	// fine — the loop behaves identically without it.
+	Heartbeat func(error)
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run in a goroutine.
@@ -53,17 +60,28 @@ func Run(ctx context.Context, log *slog.Logger, st Store, rec Reconciler, cfg Co
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// passErr keeps the FIRST failure of the pass so the heartbeat reports
+			// a half-done sweep as failed: a tick that timed out stale runs but
+			// enqueued none of the due ones has not scheduled anybody's backups.
+			var passErr error
 			servers, err := st.CreateDueBackupRuns(ctx, time.Now())
 			if err != nil {
 				log.Error("backup scheduler: enqueue", "err", err)
+				passErr = err
 			}
 			for _, sv := range servers {
 				rec.ReconcileAsync(sv.OrgID, sv.ServerID)
 			}
 			if n, err := st.TimeoutStaleBackupRuns(ctx, cfg.RunTimeout, cfg.QueueTimeout); err != nil {
 				log.Error("backup scheduler: timeout sweep", "err", err)
+				if passErr == nil {
+					passErr = err
+				}
 			} else if n > 0 {
 				log.Warn("backup scheduler: timed out stale runs", "count", n)
+			}
+			if cfg.Heartbeat != nil {
+				cfg.Heartbeat(passErr)
 			}
 		}
 	}

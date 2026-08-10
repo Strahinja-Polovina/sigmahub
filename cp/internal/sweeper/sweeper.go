@@ -40,6 +40,19 @@ type Config struct {
 	// stops containers with a grace period and the agent may be mid-long-poll —
 	// but bounded, because the operator is watching.
 	DecommissionTimeout time.Duration
+	// Heartbeat, when set, is called once per sweep with that sweep's outcome
+	// (SIGMA-248). It is what makes "the sweeper is running" distinguishable
+	// from "the sweeper is erroring on every tick": the loop's only previous
+	// reaction to a failure was a log line on a stdout nothing ships anywhere.
+	// nil is fine — the loop behaves identically without it.
+	Heartbeat func(error)
+}
+
+// beat reports a pass's outcome when a heartbeat is configured.
+func (c Config) beat(err error) {
+	if c.Heartbeat != nil {
+		c.Heartbeat(err)
+	}
 }
 
 // Run sweeps until ctx is cancelled. Blocks; run it in a goroutine.
@@ -51,19 +64,34 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// passErr is the sweep's verdict: the FIRST failure of any step, kept
+			// so the heartbeat below reports a partial sweep as a failure. A pass
+			// that pruned metrics but could not flip stale servers has not done
+			// its job, and reporting success for it would put a fresh timestamp on
+			// a loop that is half broken — precisely the reading this is meant to
+			// prevent.
+			var passErr error
+			fail := func(err error) {
+				if passErr == nil {
+					passErr = err
+				}
+			}
 			if n, err := st.MarkStaleUnreachable(ctx, cfg.StaleAfter); err != nil {
 				log.Error("sweeper: mark unreachable", "err", err)
+				fail(err)
 			} else if n > 0 {
 				log.Info("sweeper: servers marked unreachable", "count", n)
 			}
 			if n, err := st.PruneMetrics(ctx, cfg.Retention); err != nil {
 				log.Error("sweeper: prune metrics", "err", err)
+				fail(err)
 			} else if n > 0 {
 				log.Info("sweeper: metrics pruned", "count", n)
 			}
 			if cfg.DeployTimeout > 0 {
 				if n, err := st.TimeoutStaleDeployments(ctx, cfg.DeployTimeout); err != nil {
 					log.Error("sweeper: timeout stale deployments", "err", err)
+					fail(err)
 				} else if n > 0 {
 					log.Info("sweeper: deployments timed out", "count", n)
 				}
@@ -71,6 +99,7 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 			if cfg.DecommissionTimeout > 0 {
 				if timedOut, err := st.TimeoutStaleDecommissions(ctx, cfg.DecommissionTimeout); err != nil {
 					log.Error("sweeper: timeout stale decommissions", "err", err)
+					fail(err)
 				} else {
 					for _, d := range timedOut {
 						// Per-server, at warn: the machine still has our binary,
@@ -88,6 +117,7 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 					}
 				}
 			}
+			cfg.beat(passErr)
 		}
 	}
 }

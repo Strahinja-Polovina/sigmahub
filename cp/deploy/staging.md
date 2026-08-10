@@ -121,6 +121,45 @@ Enabling backups (step 5) begins the automated daily restore-verify. Record the
 start date; the launch gate is 30 consecutive green days on the verify feed.
 Nothing else to do — the CP schedules it; just don't let the streak break.
 
+## 7. Watch the control plane's own loops (SIGMA-248)
+
+`GET /metrics` (unauthenticated, Prometheus text format, no tenant data in any
+label) reports the control plane's own health. The series that matters is:
+
+```
+sigmahub_cp_loop_last_success_seconds{loop="..."}
+```
+
+one per background loop — `reconciler_resync`, `deploy_drain`,
+`backup_scheduler`, `alert_dispatcher`, `sweeper`, `usage_sweep`. It is the
+unix time of that loop's last pass that did **all** of its work; `0` means it
+has never completed one. A loop that is erroring on every tick keeps logging
+and keeps ticking, so from outside "running" and "working" are otherwise the
+same observation — and the failure that motivates this is silent by
+construction: when `CreateDueBackupRuns` starts erroring, no backup run is
+created for any tenant, and `backup_failed` cannot fire because it needs a run
+to exist before it can fail.
+
+Alert on staleness, generously relative to each loop's interval (the resync
+runs every 60s, the usage sweep every 10 minutes):
+
+```
+- alert: SigmahubCPLoopStalled
+  expr: time() - sigmahub_cp_loop_last_success_seconds > 1800
+  for: 10m
+```
+
+Include `== 0` in the same alert: a loop that never started must page, and a
+zero timestamp is how that looks. `sigmahub_cp_loop_errors_total` distinguishes
+"spinning and failing" from "not running at all", and
+`sigmahub_cp_db_pool_connections{state="acquired"}` at the ceiling is a control
+plane about to stall every loop at once.
+
+This is the CP's own health, deliberately separate from the tenant-facing
+telemetry pipeline: the alert path for customer events is the per-org outbox,
+which is itself one of these loops, so a control plane in trouble cannot be
+relied on to report that it is in trouble. Scrape this from outside.
+
 ## Teardown
 
 ```

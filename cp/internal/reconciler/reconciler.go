@@ -57,10 +57,24 @@ type Reconciler struct {
 
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // serverID -> notify channels
+
+	// Observability hooks (SIGMA-248), both optional and both nil in tests.
+	// onResync reports each fleet-resync pass's outcome so a wedged resync is
+	// visible from outside the process; onRender times a single server's render,
+	// which sits on the agent's poll path and is therefore fleet-wide latency
+	// rather than one server's.
+	onResync func(error)
+	onRender func(time.Duration)
 }
 
 func New(log *slog.Logger, st Store, priv ed25519.PrivateKey) *Reconciler {
 	return &Reconciler{log: log, st: st, priv: priv, waiters: map[string][]chan struct{}{}}
+}
+
+// SetObservers installs the resync heartbeat and the render timer (SIGMA-248).
+// Called at boot before Run; either may be nil.
+func (r *Reconciler) SetObservers(onResync func(error), onRender func(time.Duration)) {
+	r.onResync, r.onRender = onResync, onRender
 }
 
 // SetACMEConfig installs the ACME issuance config rendered into proxy.traefik
@@ -385,7 +399,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 	if err != nil {
 		return err
 	}
+	renderStart := time.Now()
 	ops, hash := renderOps(serverID, specs, pending, secretRefs, hardening, domains, deployTargets, dbTargets, s3Targets, llmTargets, backupRuns, s3Ops, r.acme, cluster, registry)
+	if r.onRender != nil {
+		r.onRender(time.Since(renderStart))
+	}
 	signed, changed, err := r.st.StoreDSD(ctx, orgID, serverID, ops, hash, r.priv)
 	if err != nil {
 		return err
@@ -434,14 +452,30 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 			servers, err := r.st.AllServerIDs(ctx)
 			if err != nil {
 				r.log.Error("resync: list servers", "err", err)
+				r.reportResync(err)
 				continue
 			}
+			// The pass's verdict for the heartbeat (SIGMA-248): the first server
+			// that failed to reconcile. A resync that could not converge some of
+			// the fleet has not done its job, and dating it as a success would
+			// hide exactly the state worth alerting on.
+			var passErr error
 			for _, sv := range servers {
 				if err := r.Reconcile(ctx, sv.OrgID, sv.ServerID); err != nil {
 					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)
+					if passErr == nil {
+						passErr = err
+					}
 				}
 			}
+			r.reportResync(passErr)
 		}
+	}
+}
+
+func (r *Reconciler) reportResync(err error) {
+	if r.onResync != nil {
+		r.onResync(err)
 	}
 }
 

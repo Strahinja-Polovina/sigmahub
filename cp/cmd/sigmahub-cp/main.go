@@ -20,6 +20,7 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/backup"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/billingsync"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/config"
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/cpmetrics"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/githubapp"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/kms"
@@ -220,7 +221,7 @@ func (h hubSizer) SizeModel(ctx context.Context, repoID string) (store.ModelSize
 // runDeployDrain periodically drains queued deploy_requests into deployments and
 // nudges the reconciler for each affected server, so a git push produces a
 // rendered clone→build→rollout pipeline within a few seconds.
-func runDeployDrain(ctx context.Context, log *slog.Logger, st *store.Store, rec *reconciler.Reconciler) {
+func runDeployDrain(ctx context.Context, log *slog.Logger, st *store.Store, rec *reconciler.Reconciler, beat *cpmetrics.Loop) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -231,11 +232,13 @@ func runDeployDrain(ctx context.Context, log *slog.Logger, st *store.Store, rec 
 			refs, err := st.DrainDeployRequests(ctx)
 			if err != nil {
 				log.Error("deploy drain", "err", err)
+				beat.Report(err)
 				continue
 			}
 			for _, r := range refs {
 				rec.ReconcileAsync(r.OrgID, r.ServerID)
 			}
+			beat.Report(nil)
 		}
 	}
 }
@@ -323,13 +326,29 @@ func run() error {
 	st.SetHuggingFaceToken(cfg.HuggingFaceToken)
 	log.Info("model catalog configured", "hubTokenConfigured", hubClient.TokenConfigured())
 
+	// The control plane's report on itself (SIGMA-248). Every background loop
+	// below reports the outcome of each pass through this registry, and GET
+	// /metrics exposes the last-success timestamps — so a loop that is erroring
+	// on every tick stops being indistinguishable from one that is working.
+	// Registered up front, before any `go`, so a loop that never starts is
+	// reported as "never succeeded" rather than being absent.
+	metrics := cpmetrics.New()
+	metrics.SetPoolSource(func() cpmetrics.PoolStats {
+		s := st.Pool.Stat()
+		return cpmetrics.PoolStats{
+			Acquired: s.AcquiredConns(), Idle: s.IdleConns(),
+			Total: s.TotalConns(), Max: s.MaxConns(),
+		}
+	})
+
 	rec := reconciler.New(log, st, dsdKey)
 	rec.SetACMEConfig(reconciler.ACMEConfig{Email: cfg.ACMEEmail, CADirURL: cfg.ACMECADirURL})
+	rec.SetObservers(metrics.Loop(cpmetrics.LoopReconcilerResync).Report, metrics.ObserveDSDRender)
 	go rec.Run(ctx, 60*time.Second)
 
 	// Deploy-request drain (P1-9): turn queued git deploy_requests into
 	// deployments and re-render the affected servers so the pipeline runs.
-	go runDeployDrain(ctx, log, st, rec)
+	go runDeployDrain(ctx, log, st, rec, metrics.Loop(cpmetrics.LoopDeployDrain))
 
 	// Backup scheduler (P1-11): the wall-clock primitive that turns policies
 	// into due backup/verify runs and fails runs that stopped making progress.
@@ -340,12 +359,15 @@ func run() error {
 		// Queue budget, from enqueue — verify rows legitimately wait for their
 		// backup's sha, and the agent applies ops serially (SIGMA-163).
 		QueueTimeout: 6 * time.Hour,
+		Heartbeat:    metrics.Loop(cpmetrics.LoopBackupScheduler).Report,
 	})
 
 	// Alert dispatcher (P2-6): drains the alert outbox that state-change
 	// producers fill, with retry/backoff per delivery.
 	alertSender := alerts.NewSender()
-	go alerts.Run(ctx, log, st, alertSender, alerts.Config{})
+	go alerts.Run(ctx, log, st, alertSender, alerts.Config{
+		Heartbeat: metrics.Loop(cpmetrics.LoopAlertDispatcher).Report,
+	})
 
 	// Background maintenance: flip silent servers to unreachable, prune old
 	// metrics, and fail deployments whose agent stopped reporting. StaleAfter ≈
@@ -363,6 +385,7 @@ func run() error {
 		Retention:           24 * time.Hour,
 		DeployTimeout:       45 * time.Minute,
 		DecommissionTimeout: 10 * time.Minute,
+		Heartbeat:           metrics.Loop(cpmetrics.LoopSweeper).Report,
 	})
 
 	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates
@@ -390,6 +413,7 @@ func run() error {
 	quantitySync := &billingsync.Syncer{
 		Store: st, Paddle: paddleQuantity, PriceID: cfg.PaddlePriceID, Log: log,
 	}
+	usageBeat := metrics.Loop(cpmetrics.LoopUsageSweep)
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -398,25 +422,39 @@ func run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// The pass's verdict for the heartbeat: the first step that failed.
+				// All four steps meter or bill, so a pass that ran three of them is
+				// a pass that under-reported somebody's usage.
+				var passErr error
+				fail := func(err error) {
+					if passErr == nil {
+						passErr = err
+					}
+				}
 				if _, err := st.SweepUsageHours(ctx, time.Now()); err != nil {
 					log.Error("usage sweep", "err", err)
+					fail(err)
 				}
 				// P2-4: the time-integrated connected-server meter billing reads.
 				if _, err := st.SweepServerHours(ctx, time.Now()); err != nil {
 					log.Error("server-hours sweep", "err", err)
+					fail(err)
 				}
 				// SIGMA-65: enqueue a daily per-bucket storage measurement so the
 				// object-storage meter stays current.
 				if _, err := st.SweepS3Measure(ctx, time.Now()); err != nil {
 					log.Error("s3 measure sweep", "err", err)
+					fail(err)
 				}
 				// SIGMA-171: turn the meter into an invoice — push the current
 				// billable-server count to any subscription that has drifted.
 				if n, err := quantitySync.Sync(ctx, time.Now()); err != nil {
 					log.Error("billing quantity sync", "err", err)
+					fail(err)
 				} else if n > 0 {
 					log.Info("billing quantity synced", "subscriptions", n)
 				}
+				usageBeat.Report(passErr)
 			}
 		}
 	}()
@@ -475,6 +513,7 @@ func run() error {
 				Version: agentVersion,
 				Token:   cfg.ReleaseToken,
 			},
+			Metrics: metrics,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

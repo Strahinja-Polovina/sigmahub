@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/cpmetrics"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/paddle"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/telemetry"
@@ -119,6 +120,11 @@ type Server struct {
 	// and the only place the release credential lives. Zero value (no Repo) =
 	// both routes answer 503 naming the setting. See installer.go.
 	release ReleaseSource
+	// metrics is the control plane's own health registry (SIGMA-248). Always
+	// non-nil after New — a *cpmetrics.Registry with no reporters still names
+	// every loop, and an endpoint that exists unconditionally is worth more than
+	// one that quietly disappears in the deployments that forgot to wire it.
+	metrics *cpmetrics.Registry
 	mux     *http.ServeMux
 }
 
@@ -202,6 +208,12 @@ type Options struct {
 	// repository onboardable. Zero value = the routes answer 503 rather than
 	// guessing a repository. See installer.go for the whole security argument.
 	Release ReleaseSource
+	// Metrics is the control plane's own health registry, exposed at GET
+	// /metrics (SIGMA-248). Nil is fine and is what handler unit tests pass: the
+	// route still exists and still lists every background loop, all of them at
+	// "never succeeded", which is the honest reading for a process that is not
+	// running them.
+	Metrics *cpmetrics.Registry
 }
 
 // New builds the HTTP surface.
@@ -238,7 +250,11 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		paddlePriceID:       opts.PaddlePriceID,
 		requireActor:        opts.RequireActor,
 		release:             opts.Release.normalized(),
+		metrics:             opts.Metrics,
 		mux:                 http.NewServeMux(),
+	}
+	if s.metrics == nil {
+		s.metrics = cpmetrics.New()
 	}
 	s.routes()
 	return s
@@ -247,6 +263,14 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+	// The control plane's own health (SIGMA-248). Unauthenticated, like the two
+	// probes above, and for the same reason: whatever scrapes it runs outside
+	// this process and often before any credential exists. It is safe to leave
+	// open because it carries no tenant data — the series are loop names,
+	// counters, timings and pool gauges, with no org, server or resource
+	// identifier in any label. Anything org-scoped belongs on the tenant
+	// telemetry routes, which are authenticated.
+	s.mux.HandleFunc("GET /metrics", s.metrics.ServeHTTP)
 
 	// Agent onboarding downloads. UNAUTHENTICATED by necessity — the host being
 	// onboarded holds no credential yet, and the bootstrap token in the rendered

@@ -34,6 +34,16 @@ type Config struct {
 	CertScanEvery time.Duration
 	// CertExpiryWindow is how far ahead expiring certs alert.
 	CertExpiryWindow time.Duration
+	// Heartbeat, when set, is called once per drain with that drain's outcome
+	// (SIGMA-248). "Outcome" means whether the DISPATCHER worked, not whether
+	// every delivery landed: a webhook whose endpoint is down is a per-channel
+	// failure the outbox already retries and the UI already shows, and folding
+	// it in here would leave this loop permanently reporting failure while it is
+	// doing exactly its job. What counts is the dispatcher being unable to read
+	// the outbox or record a result — at which point the control plane can no
+	// longer report anything at all, including that it is in trouble. nil is
+	// fine.
+	Heartbeat func(error)
 }
 
 func (c *Config) defaults() {
@@ -69,26 +79,37 @@ func Run(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Confi
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			var passErr error
 			if time.Since(lastCertScan) >= cfg.CertScanEvery {
 				lastCertScan = time.Now()
 				if err := st.EnqueueCertExpiringAlerts(ctx, cfg.CertExpiryWindow); err != nil {
 					log.Error("alerts: cert expiry scan", "err", err)
+					passErr = err
 				}
 			}
-			drain(ctx, log, st, snd, cfg)
+			if err := drain(ctx, log, st, snd, cfg); err != nil && passErr == nil {
+				passErr = err
+			}
+			if cfg.Heartbeat != nil {
+				cfg.Heartbeat(passErr)
+			}
 		}
 	}
 }
 
-func drain(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Config) {
+// drain sends one batch. The returned error is the DISPATCHER's own failure —
+// unable to claim rows, unable to write a result back — and never a transport
+// failure of an individual channel, which is the delivery row's business.
+func drain(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Config) error {
 	due, err := st.DueAlertDeliveries(ctx, cfg.BatchSize)
 	if err != nil {
 		log.Error("alerts: list due deliveries", "err", err)
-		return
+		return err
 	}
+	var drainErr error
 	for _, d := range due {
 		if ctx.Err() != nil {
-			return
+			return drainErr
 		}
 		var sendErr error
 		ch, err := st.AlertChannelForSend(ctx, d.OrgID, d.ChannelID)
@@ -121,6 +142,10 @@ func drain(ctx context.Context, log *slog.Logger, st Store, snd *Sender, cfg Con
 		}
 		if err := st.SetAlertDeliveryResult(ctx, d.ID, ok, errText, cfg.MaxAttempts); err != nil {
 			log.Error("alerts: record delivery result", "delivery", d.ID, "err", err)
+			if drainErr == nil {
+				drainErr = err
+			}
 		}
 	}
+	return drainErr
 }
