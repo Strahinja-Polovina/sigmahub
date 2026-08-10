@@ -57,22 +57,28 @@ import {
  *  authenticity and the transport is only reachability. A control plane that
  *  served a tampered asset would fail that verification exactly as a tampered
  *  github.com would. */
-function installCommand(token: string, release: CpInstallerRelease): string {
+/** The half of installCommand's refusal that depends on nothing but process env.
+ *
+ *  install.sh is the ONE artifact cosign does not cover, because install.sh is
+ *  what runs cosign. Its integrity has always rested on TLS: the old command
+ *  hard-coded https://github.com/…, and moving the fetch to the control plane
+ *  moved that trust to TLS against the control plane without moving the
+ *  requirement with it. The deployment guide shipped
+ *  SIGMAHUB_CP_PUBLIC_URL=http://your-host:8080 and the control plane
+ *  terminates no TLS of its own, so the documented default piped plaintext
+ *  into `sudo bash` — an on-path attacker goes from reading a bootstrap token
+ *  to root on every host being onboarded.
+ *
+ *  Refused rather than warned about, and for the same reason the missing
+ *  release is: the alternative is a command that looks fine, works, and is a
+ *  remote code execution primitive on the network between the operator and
+ *  their control plane.
+ *
+ *  It is its own function so that a caller about to MUTATE the control plane
+ *  can ask the question first (SIGMA-300). The answer reads only cpPublicUrl(),
+ *  so it is exactly as true before the mutation as after it. */
+function assertInstallTransportIsTls(): void {
   const ep = cpPublicUrl();
-  // install.sh is the ONE artifact cosign does not cover, because install.sh is
-  // what runs cosign. Its integrity has always rested on TLS: the old command
-  // hard-coded https://github.com/…, and moving the fetch to the control plane
-  // moved that trust to TLS against the control plane without moving the
-  // requirement with it. The deployment guide shipped
-  // SIGMAHUB_CP_PUBLIC_URL=http://your-host:8080 and the control plane
-  // terminates no TLS of its own, so the documented default piped plaintext
-  // into `sudo bash` — an on-path attacker goes from reading a bootstrap token
-  // to root on every host being onboarded.
-  //
-  // Refused here rather than warned about, and for the same reason the missing
-  // release below is: the alternative is a command that looks fine, works, and
-  // is a remote code execution primitive on the network between the operator
-  // and their control plane.
   if (!ep.startsWith("https://")) {
     throw new Error(
       `The install command pipes a script from ${ep || "the control plane"} straight into sudo bash, so it ` +
@@ -80,6 +86,11 @@ function installCommand(token: string, release: CpInstallerRelease): string {
         "behind the TLS terminator you already run, and use its address here."
     );
   }
+}
+
+function installCommand(token: string, release: CpInstallerRelease): string {
+  const ep = cpPublicUrl();
+  assertInstallTransportIsTls();
   // The version comes back with the token, from the control plane that is going
   // to serve every URL in this line. The dashboard used to read its own
   // SIGMAHUB_AGENT_VERSION here, which meant the /dl/{version} paths and the
@@ -357,6 +368,22 @@ export async function provisionServer(input: {
     return { mode: "sim", id };
   }
 
+  // SIGMA-300. Everything below this line creates something: cpProvisionServer
+  // pre-creates the server row and mints a bootstrap keypair + one-time token.
+  // The install command this action exists to hand back can still REFUSE to
+  // render at the end of all that, and the refusal used to arrive with the
+  // server already created — so an operator running the deployment guide's own
+  // http:// public URL saw a red TLS toast, assumed they had mistyped the
+  // address, and pressed Connect again. Three attempts, three identical rows
+  // stuck in Provisioning with three burned bootstrap tokens, and nothing in
+  // the toast saying a server had been created at all.
+  //
+  // The transport refusal reads only SIGMAHUB_CP_PUBLIC_URL, so it is asked
+  // here, before anything exists to leak. The release refusal cannot be: the
+  // version comes back WITH the token, so that one is undone rather than
+  // pre-empted, below.
+  assertInstallTransportIsTls();
+
   const actor = { name: user.name, role };
   const res = await cpProvisionServer(
     input.orgId,
@@ -371,6 +398,27 @@ export async function provisionServer(input: {
     },
     actor
   );
+  // Rendered before the hardening call and before the audit row, because it is
+  // the step that can still refuse (SIGMA-300): a control plane pinned to no
+  // release answers with an empty agentVersion, and there is no honest command
+  // to hand over. A server the operator will never be able to install an agent
+  // on is not a server they provisioned — so it is taken back out, and the
+  // audit trail records neither the provision nor the rollback.
+  let command: string;
+  try {
+    command = installCommand(res.token, res);
+  } catch (err) {
+    try {
+      await cpDeleteServer(input.orgId, res.serverId, actor);
+    } catch {
+      // The rollback failing leaves the ghost row this exists to prevent, but
+      // the render's own error is the one that names the setting an operator
+      // has to change — so it is the one that reaches them. The orphan is
+      // visible on the servers page and disconnectable by hand; a swallowed
+      // "set CP_AGENT_VERSION" would not be.
+    }
+    throw err;
+  }
   // The opt-out (keep public SSH) is a hardening-config change on the new server.
   if (input.keepPublicSsh) {
     await cpSetHardening(input.orgId, res.serverId, { keepPublicSsh: true, cisEnabled: true }, actor);
@@ -385,7 +433,7 @@ export async function provisionServer(input: {
   return {
     mode: "cp",
     serverId: res.serverId,
-    command: installCommand(res.token, res),
+    command,
     bootstrapPubkey: res.bootstrapPubkey,
     expiresAt: res.expiresAt,
   };

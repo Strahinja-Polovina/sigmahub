@@ -13,7 +13,7 @@
 // Runs against a real migrated PGlite database (see @/server/testing/demo-db),
 // because what broke was never a helper — it was the wiring.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 import { DECOMMISSION_TIMEOUT_MS } from "@/lib/decommission";
@@ -60,7 +60,7 @@ vi.mock("@/server/cp", () => {
   };
 });
 
-import { decommissionServer, simulateDecommission } from "./servers";
+import { decommissionServer, provisionServer, simulateDecommission } from "./servers";
 import { db } from "@/server/db";
 
 const database = db as unknown as DemoDb;
@@ -227,5 +227,72 @@ describe("what counts as bound to a demo host", () => {
     const res = await decommissionServer({ serverId: FIXTURE.k8sHostIds[2] });
     expect(res.ok).toBe(true);
     expect((await serverRow(FIXTURE.k8sHostIds[2])).status).toBe(SERVER_STATUS.decommissioning);
+  });
+});
+
+// SIGMA-300. provisionServer's CP branch is a mutation followed by a render,
+// and the render can refuse: the install command will not be built over a
+// plaintext public URL, nor for a control plane pinned to no release. Both
+// refusals used to arrive AFTER cpProvisionServer had already pre-created the
+// server and burned a bootstrap keypair, so the operator saw only a red toast,
+// assumed a typo, and pressed Connect again — leaving a column of identical
+// hosts stuck in Provisioning, each of which has to be disconnected by hand.
+//
+// The invariant is stated as an outcome rather than as a call order, because
+// there are two honest ways to hold it: refuse before the mutation, or undo the
+// mutation on the way out. What must never happen is a server row surviving a
+// throw.
+describe("provisioning a server whose install command cannot be rendered", () => {
+  const PROVISIONED = {
+    serverId: "srv_ghost",
+    token: "sbt_ghost",
+    expiresAt: new Date(Date.now() + 900_000).toISOString(),
+    bootstrapPubkey: "ssh-ed25519 AAAA sigmahub-bootstrap",
+    agentVersion: "v0.3.0",
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("leaves no server behind when the control plane's public URL is plaintext", async () => {
+    const mod = await import("@/server/cp");
+    vi.spyOn(mod, "cpEnabled").mockReturnValue(true);
+    // The address the deployment guide itself documented.
+    vi.spyOn(mod, "cpPublicUrl").mockReturnValue("http://cp:8080");
+    const provision = vi.spyOn(mod, "cpProvisionServer").mockResolvedValue(PROVISIONED);
+    const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
+
+    await expect(
+      provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" })
+    ).rejects.toThrow(/https/i);
+
+    // Either the refusal came first and nothing was created, or something was
+    // created and taken back. A server that outlives the throw is the defect.
+    expect(
+      provision.mock.calls.length > 0 && remove.mock.calls.length === 0,
+      "the TLS refusal left a provisioned server behind — the operator sees only a red toast, " +
+        "presses Connect again, and collects a column of Provisioning rows with burned tokens"
+    ).toBe(false);
+  });
+
+  it("leaves no server behind when the control plane is pinned to no release", async () => {
+    // This one genuinely cannot be known before the call — the version comes
+    // back with the token — so the only way to hold the invariant is to undo.
+    const mod = await import("@/server/cp");
+    vi.spyOn(mod, "cpEnabled").mockReturnValue(true);
+    vi.spyOn(mod, "cpPublicUrl").mockReturnValue("https://cp.example.com");
+    vi.spyOn(mod, "cpProvisionServer").mockResolvedValue({
+      ...PROVISIONED,
+      agentVersion: "",
+      agentVersionError: "CP_AGENT_VERSION is not a released tag",
+    });
+    const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
+
+    await expect(
+      provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" })
+    ).rejects.toThrow(/CP_AGENT_VERSION/);
+
+    expect(remove).toHaveBeenCalledWith(FIXTURE.orgId, PROVISIONED.serverId, expect.anything());
   });
 });
