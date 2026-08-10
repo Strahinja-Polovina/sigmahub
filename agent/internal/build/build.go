@@ -102,9 +102,46 @@ var (
 	shaRe  = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 )
 
-// ContextDir is the per-resource build context path.
+// ContextDir is the per-resource build context path. Callers that act on the
+// path (opGitClone, opBuildImage) must resolve it through checkedContextDir
+// instead — see the note there.
 func (b *Builder) ContextDir(resourceID string) string {
 	return filepath.Join(b.workRoot, resourceID)
+}
+
+// checkedContextDir resolves the per-resource build context and refuses any
+// resource id that is not a single path segment inside workRoot (SIGMA-341).
+//
+// The resource id is the OUTER path segment of the context directory, and
+// opGitClone os.RemoveAll's that directory as root before it does anything
+// else. filepath.Join CLEANS its result, so an id containing ".." silently
+// escapes workRoot: a resourceId of "../../../../etc" resolves to /etc and the
+// clone deletes it. Every neighbouring input on this path is already checked —
+// repoRe, shaRe, the provider host allow-list, and the ContextSubdir escape
+// check in opBuildImage below — but the id, the one segment with the most
+// destructive reach, was not.
+//
+// The threat model is the same one the container policy is written against: a
+// compromised or buggy control plane whose DSD still signs correctly. Today ids
+// are CP-generated ("res_<hex>") so this is a missing guard rather than a live
+// exploit; one store or API bug that lets a caller influence a resource id would
+// turn it into fleet-wide destruction. The check is deliberately a confinement
+// check rather than a match against the CP's current id spelling — agent and
+// control plane are separate modules, and a future id scheme must not brick
+// every agent's builds, but no id may ever step outside the build root.
+func (b *Builder) checkedContextDir(resourceID string) (string, error) {
+	if resourceID == "" {
+		return "", fmt.Errorf("invalid resourceId: empty")
+	}
+	if strings.ContainsAny(resourceID, `/\`) || resourceID != filepath.Clean(resourceID) || resourceID == "." || resourceID == ".." {
+		return "", fmt.Errorf("invalid resourceId %q: must be a single path segment", resourceID)
+	}
+	dir := b.ContextDir(resourceID)
+	rel, err := filepath.Rel(b.workRoot, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("invalid resourceId %q: escapes the build root", resourceID)
+	}
+	return dir, nil
 }
 
 // providerHost maps a provider to its clone host. Only known providers are
@@ -161,6 +198,12 @@ func (b *Builder) opGitClone(ctx context.Context, op dsd.Op) error {
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
 		return fmt.Errorf("decode git.clone spec: %w", err)
 	}
+	// Validate the id BEFORE any filesystem call: the very next thing this op
+	// does is RemoveAll the path built from it, as root (SIGMA-341).
+	dir, err := b.checkedContextDir(spec.ResourceID)
+	if err != nil {
+		return err
+	}
 	if !repoRe.MatchString(spec.RepoFullName) {
 		return fmt.Errorf("invalid repo %q", spec.RepoFullName)
 	}
@@ -172,7 +215,6 @@ func (b *Builder) opGitClone(ctx context.Context, op dsd.Op) error {
 		return err
 	}
 
-	dir := b.ContextDir(spec.ResourceID)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("clean context dir: %w", err)
 	}
@@ -229,13 +271,19 @@ func (b *Builder) opBuildImage(ctx context.Context, op dsd.Op) error {
 	if dockerfile == "" {
 		dockerfile = "Dockerfile"
 	}
-	dir := b.ContextDir(spec.ResourceID)
+	// The id is the outer segment of the same path the subdir check below
+	// confines against — an unchecked one makes that check meaningless, because
+	// the "root" it measures against has itself already escaped (SIGMA-341).
+	root, err := b.checkedContextDir(spec.ResourceID)
+	if err != nil {
+		return err
+	}
+	dir := root
 	// A Compose service builds from a subdir of the clone. Confine it to the clone
 	// so a crafted spec can't escape the build root (path traversal).
 	if spec.ContextSubdir != "" {
 		sub := filepath.Clean("/" + spec.ContextSubdir)[1:] // strip leading .. / abs
 		dir = filepath.Join(dir, sub)
-		root := b.ContextDir(spec.ResourceID)
 		if rel, err := filepath.Rel(root, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("build context %q escapes the clone root", spec.ContextSubdir)
 		}
