@@ -56,6 +56,10 @@ vi.mock("@/server/cp", () => {
   const at = "2026-01-01T00:00:00.000Z";
   return {
     cpEnabled: () => true,
+    // SIGMA-331 added a cluster mirror to the same pass these tests drive. An
+    // unmocked export fails every test here at import, with a message about the
+    // mock rather than about the tenant scoping under test.
+    cpListClusters: async () => ({ clusters: [] }),
     cpListServers: async (orgId: string) => cp.servers.filter((x) => x.orgId === orgId),
     cpListProjects: async (orgId: string) =>
       cp.projects

@@ -415,7 +415,7 @@ func TestResourceClusterIDRoundTrip(t *testing.T) {
 		t.Fatalf("CreateResource returned ClusterID = %q, want %q", app.ClusterID, cluster.ID)
 	}
 
-	list, err := st.ListResources(ctx, orgID, envID)
+	list, err := st.ListResources(ctx, orgID, envID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestResourceClusterIDRoundTrip(t *testing.T) {
 	if srv.ClusterID != "" {
 		t.Fatalf("server-bound resource ClusterID = %q, want empty", srv.ClusterID)
 	}
-	after, err := st.ListResources(ctx, orgID, envID)
+	after, err := st.ListResources(ctx, orgID, envID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

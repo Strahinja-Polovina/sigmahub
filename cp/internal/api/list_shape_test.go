@@ -48,7 +48,7 @@ func (nilLists) ListEnvironments(context.Context, string, string) ([]store.Envir
 	return nil, nil
 }
 func (nilLists) EnvServerIDs(context.Context, string, string) ([]string, error) { return nil, nil }
-func (nilLists) ListResources(context.Context, string, string) ([]store.Resource, error) {
+func (nilLists) ListResources(context.Context, string, string, string) ([]store.Resource, error) {
 	return nil, nil
 }
 func (nilLists) ListAudit(context.Context, string, int) ([]store.AuditEntry, error) {
