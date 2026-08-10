@@ -220,11 +220,29 @@ export async function getCommandIndex(
   };
 }
 
-export async function getDeployments(resourceId: string) {
+/** How many releases a resource page is allowed to load (SIGMA-329).
+ *
+ *  The control plane already caps release history — ListDeployments
+ *  (cp/internal/store/deployments.go) defaults to 20 and refuses more than 100 —
+ *  and the CP-mode page path respects that. The demo/mirror path had no bound
+ *  at all, so the same page showed 20 releases against a control plane and
+ *  every row ever written without one. Both modes now bound the same way. */
+export const DEPLOYMENT_HISTORY_LIMIT = 25;
+
+/** A resource's recent deployments, newest first.
+ *
+ *  Both the order and the bound are load-bearing. Without ORDER BY, "recent
+ *  deployments" was whatever order Postgres happened to return, and without a
+ *  LIMIT a resource deployed on every push hands its caller thousands of rows —
+ *  which, in a server component, are serialised into the RSC payload sent to
+ *  the browser. */
+export async function getDeployments(resourceId: string, limit = DEPLOYMENT_HISTORY_LIMIT) {
   return db
     .select()
     .from(s.deployments)
-    .where(eq(s.deployments.resourceId, resourceId));
+    .where(eq(s.deployments.resourceId, resourceId))
+    .orderBy(desc(s.deployments.startedAt))
+    .limit(limit);
 }
 export async function getBillingSummary(orgId: string) {
   const all = await getServers(orgId).catch(() => []);
@@ -548,11 +566,18 @@ export async function getResourceDetail(resourceId: string) {
       .where(eq(s.clusters.id, row.resource.clusterId));
     cluster = c ?? null;
   }
+  // Bounded, newest first (SIGMA-329). This runs in a server component, so an
+  // unbounded select does not merely cost a big query — every row it returns is
+  // serialised into the RSC payload and sent to the browser to render a panel
+  // that shows a couple of dozen releases. The cap matches the control plane's
+  // own release-history cap so both modes agree about how much history a
+  // resource has.
   const deployments = await db
     .select()
     .from(s.deployments)
     .where(eq(s.deployments.resourceId, resourceId))
-    .orderBy(desc(s.deployments.startedAt));
+    .orderBy(desc(s.deployments.startedAt))
+    .limit(DEPLOYMENT_HISTORY_LIMIT);
 
   return {
     resource: row.resource,
