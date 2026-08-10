@@ -31,7 +31,7 @@ func TestAlertingEndToEnd(t *testing.T) {
 
 	// Channel CRUD: secret sealed under the org DEK, every event on by default.
 	ch, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.slack example/T000/secret",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/secret",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +45,22 @@ func TestAlertingEndToEnd(t *testing.T) {
 	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{Kind: "telegram", Name: "tg", Secret: "tok", Config: json.RawMessage(`{}`)}); err == nil {
 		t.Fatal("telegram channel without chatId must be rejected")
 	}
+	// SIGMA-259: an alert channel is the only egress destination a tenant picks,
+	// and the CP runs inside the operator's private network. Creating one that
+	// points at the cloud metadata service or at the CP's own loopback is the
+	// whole request-forgery attack, so it is refused at create time.
+	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
+		Kind: "slack", Name: "ssrf",
+		Secret: "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+	}); err == nil {
+		t.Fatal("a slack channel pointed at the cloud metadata service must be rejected")
+	}
+	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
+		Kind: "webhook", Name: "ssrf-hook",
+		Config: json.RawMessage(`{"url":"http://127.0.0.1:9200/_cat/indices"}`),
+	}); err == nil {
+		t.Fatal("a webhook channel pointed at the CP's own loopback must be rejected")
+	}
 
 	listed, err := st.ListAlertChannels(ctx, orgID)
 	if err != nil {
@@ -57,7 +73,7 @@ func TestAlertingEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if send.Secret != "https://hooks.slack example/T000/secret" {
+	if send.Secret != "https://hooks.slack.com/services/T000/secret" {
 		t.Fatalf("secret round-trip = %q", send.Secret)
 	}
 	if _, err := st.AlertChannelForSend(ctx, "org_other", ch.ID); err == nil {

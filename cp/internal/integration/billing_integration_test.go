@@ -163,7 +163,7 @@ func TestBillingSubscriptionWebhookFlow(t *testing.T) {
 
 	// A payment-failed alert channel to prove the past_due enqueue.
 	ch, err := st.CreateAlertChannel(ctx, orgID, "admin", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.example/x",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/x",
 	})
 	if err != nil {
 		t.Fatal(err)

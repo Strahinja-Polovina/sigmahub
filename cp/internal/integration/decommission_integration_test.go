@@ -849,7 +849,7 @@ func TestTimeoutStaleDecommissions_EnqueuesAlert(t *testing.T) {
 	orgID := "org_decom_alert"
 
 	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.example/T000/secret",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/secret",
 	}); err != nil {
 		t.Fatal(err)
 	}

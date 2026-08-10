@@ -117,7 +117,7 @@ func TestDrain_DeliversConcurrently(t *testing.T) {
 	cfg.defaults()
 
 	start := time.Now()
-	drain(context.Background(), slog.New(slog.DiscardHandler), st, NewSender(), cfg)
+	drain(context.Background(), slog.New(slog.DiscardHandler), st, testSender(), cfg)
 	elapsed := time.Since(start)
 
 	if len(st.results) != n {
@@ -163,7 +163,7 @@ func TestDrain_SkipsWhenLeaseLost(t *testing.T) {
 	}
 	cfg := Config{}
 	cfg.defaults()
-	drain(context.Background(), slog.New(slog.DiscardHandler), st, NewSender(), cfg)
+	drain(context.Background(), slog.New(slog.DiscardHandler), st, testSender(), cfg)
 
 	mu.Lock()
 	gotHits := hits

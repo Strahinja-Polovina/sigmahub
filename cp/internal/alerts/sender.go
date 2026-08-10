@@ -41,15 +41,46 @@ type Sender struct {
 	telegramBase string
 	// sendMail is swapped in tests; production uses a timeout-bounded SMTP send.
 	sendMail func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
+	// allowInternalDestinations disables the SSRF guard below. It exists for
+	// tests ONLY — an httptest server lives on 127.0.0.1, which is exactly the
+	// address the guard is there to refuse. Nothing outside this package can
+	// set it, so no production path can turn the guard off.
+	allowInternalDestinations bool
 }
 
 // NewSender returns a Sender with bounded transports.
 func NewSender() *Sender {
-	return &Sender{
-		HTTP:         &http.Client{Timeout: 10 * time.Second},
+	s := &Sender{
 		telegramBase: TelegramAPIBase,
 		sendMail:     sendMailTimeout(emailSendTimeout),
 	}
+	s.HTTP = &http.Client{
+		Timeout: 10 * time.Second,
+		// A validated destination that answers 302 http://169.254.169.254/ would
+		// otherwise walk the CP straight into the network the create-time check
+		// was protecting (SIGMA-259). Every hop is re-checked under the same
+		// rule, and the redirect chain is bounded so a loop cannot pin a
+		// dispatcher goroutine.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after %d redirects", len(via))
+			}
+			return s.checkDestination(req.URL.String())
+		},
+	}
+	return s
+}
+
+// checkDestination re-applies the create-time destination rule at send time.
+//
+// Create-time validation is not enough on its own: channels created before that
+// check existed are still in the table, and DNS answers change between the two
+// moments. One rule, one implementation — see store.ValidateAlertDestination.
+func (s *Sender) checkDestination(raw string) error {
+	if s.allowInternalDestinations {
+		return nil
+	}
+	return store.ValidateAlertDestination(raw)
 }
 
 // sendMailTimeout mirrors net/smtp.SendMail but dials with a deadline and sets a
@@ -121,8 +152,13 @@ func (s *Sender) Send(ctx context.Context, ch store.AlertChannelSend, event, tit
 	}
 }
 
-// post sends JSON and demands a 2xx, returning a truncated body on failure.
-func (s *Sender) post(ctx context.Context, url string, payload any) error {
+// post sends JSON and demands a 2xx. echoBody controls whether the upstream
+// response is quoted in the error: it may be for Telegram, whose destination is
+// a fixed public API and whose error bodies are the only useful diagnosis, and
+// must NOT be for a destination the tenant chose — that would turn the delivery
+// error the dashboard renders into a read-back channel for whatever the CP was
+// pointed at (SIGMA-259).
+func (s *Sender) post(ctx context.Context, url string, payload any, echoBody bool) error {
 	buf, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -138,6 +174,9 @@ func (s *Sender) post(ctx context.Context, url string, payload any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if !echoBody {
+			return fmt.Errorf("status %s", resp.Status)
+		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
@@ -149,9 +188,17 @@ func (s *Sender) sendSlack(ctx context.Context, ch store.AlertChannelSend, title
 	if ch.Secret == "" {
 		return fmt.Errorf("slack channel has no webhook URL configured")
 	}
+	// The destination is re-checked here, not just at create time: this row may
+	// predate the check, and its host may resolve somewhere else now. The check
+	// is the address rule, not the hooks.slack.com pin the store applies to NEW
+	// channels — an existing channel pointed at a public relay keeps working;
+	// what it may never do is reach into the operator's network.
+	if err := s.checkDestination(ch.Secret); err != nil {
+		return fmt.Errorf("slack webhook: %s", scrub(err.Error(), ch.Secret))
+	}
 	if err := s.post(ctx, ch.Secret, map[string]string{
 		"text": "*" + title + "*\n" + body,
-	}); err != nil {
+	}, false); err != nil {
 		// The webhook URL is the secret — make sure it can't ride an error.
 		return fmt.Errorf("slack webhook: %s", scrub(err.Error(), ch.Secret))
 	}
@@ -177,7 +224,7 @@ func (s *Sender) sendTelegram(ctx context.Context, ch store.AlertChannelSend, ti
 	if err := s.post(ctx, u, map[string]string{
 		"chat_id": cfg.ChatID,
 		"text":    title + "\n" + body,
-	}); err != nil {
+	}, true); err != nil {
 		return fmt.Errorf("telegram: %s", scrub(err.Error(), ch.Secret))
 	}
 	return nil
@@ -204,6 +251,11 @@ func (s *Sender) sendWebhook(ctx context.Context, ch store.AlertChannelSend, eve
 	if cfg.URL == "" {
 		return fmt.Errorf("webhook channel has no url configured")
 	}
+	// Same re-check as slack: create-time validation cannot speak for a row that
+	// predates it or for a name that resolves somewhere new.
+	if err := s.checkDestination(cfg.URL); err != nil {
+		return fmt.Errorf("webhook: %s", err)
+	}
 	buf, err := json.Marshal(WebhookPayload{Event: event, Title: title, Body: body, At: time.Now().UTC()})
 	if err != nil {
 		return err
@@ -224,8 +276,10 @@ func (s *Sender) sendWebhook(ctx context.Context, ch store.AlertChannelSend, eve
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("webhook: status %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		// Status only. The receiver is tenant-chosen, so quoting its body here
+		// would print whatever the CP was pointed at into a tenant-visible
+		// delivery error (SIGMA-259).
+		return fmt.Errorf("webhook: status %s", resp.Status)
 	}
 	return nil
 }
