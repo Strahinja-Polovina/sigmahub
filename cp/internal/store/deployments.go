@@ -925,6 +925,41 @@ func (s *Store) RecordBuildResult(ctx context.Context, orgID, resourceID, server
 // ServerRef identifies a server to reconcile after a mutation.
 type ServerRef struct{ ServerID, OrgID string }
 
+// drainBatchLimit caps one drain pass, as a SQL literal so the query below stays
+// a compile-time constant that EXPLAIN can take without parameters. The loop
+// ticks every 3s, so a backlog still clears at 200 requests per tick; the cap
+// only stops a single pass from claiming an unbounded batch — holding row locks
+// on all of it, inside one transaction, while it creates a deployment per app
+// resource for each.
+const drainBatchLimit = "200"
+
+// DrainDeployRequestsQuery is the driving query of DrainDeployRequests. It is
+// exported so the query-plan regression test in internal/integration can EXPLAIN
+// the REAL query rather than a copy that drifts (SIGMA-317): the whole point of
+// deploy_requests_queued_idx is a property of the plan, not of the result.
+//
+// The branch map carries the optional dedicated build server, so a deployment
+// records where its build should run at the moment it is created (rather than
+// re-reading a mapping that may change mid-flight).
+//
+// The WHERE clause is written to match deploy_requests_queued_idx exactly —
+// `kind = 'deploy' AND status = 'queued'`, the index's own predicate — because
+// that partial index is the only thing keeping this query's cost proportional to
+// the work outstanding instead of to the install's entire push history. It runs
+// 28,800 times a day and on a healthy install finds nothing every single time.
+const DrainDeployRequestsQuery = `
+		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id,
+		       COALESCE((SELECT bm.build_server_id FROM git_branch_map bm
+		                  WHERE bm.connection_id = dr.connection_id
+		                    AND bm.environment_id = dr.environment_id
+		                  LIMIT 1), '')
+		  FROM deploy_requests dr
+		  JOIN git_connections c ON c.id = dr.connection_id
+		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
+		 ORDER BY dr.created_at
+		 LIMIT ` + drainBatchLimit + `
+		 FOR UPDATE OF dr SKIP LOCKED`
+
 // DrainDeployRequests turns queued git deploy_requests (P1-7) into queued
 // deployment rows: each request resolves to the app resources in its target
 // environment, and one deployment is created per resource. Returns the distinct
@@ -937,20 +972,7 @@ func (s *Store) DrainDeployRequests(ctx context.Context) ([]ServerRef, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// The branch map carries the optional dedicated build server, so a
-	// deployment records where its build should run at the moment it is created
-	// (rather than re-reading a mapping that may change mid-flight).
-	rows, err := tx.Query(ctx, `
-		SELECT dr.id, dr.org_id, dr.connection_id, dr.environment_id, dr.ref, dr.sha, c.project_id,
-		       COALESCE((SELECT bm.build_server_id FROM git_branch_map bm
-		                  WHERE bm.connection_id = dr.connection_id
-		                    AND bm.environment_id = dr.environment_id
-		                  LIMIT 1), '')
-		  FROM deploy_requests dr
-		  JOIN git_connections c ON c.id = dr.connection_id
-		 WHERE dr.kind = 'deploy' AND dr.status = 'queued'
-		 ORDER BY dr.created_at
-		 FOR UPDATE OF dr SKIP LOCKED`)
+	rows, err := tx.Query(ctx, DrainDeployRequestsQuery)
 	if err != nil {
 		return nil, err
 	}
