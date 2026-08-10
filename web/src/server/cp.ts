@@ -2044,15 +2044,28 @@ export async function cpListClusters(
   return cpFetch(`${org(orgId)}/clusters${q}`, undefined, { orgId });
 }
 
+/** `requestId` identifies the SUBMISSION, not the call: the wizard mints one
+ *  and reuses it while the operator retries the same form, and mints a new one
+ *  once the form's content changes or the create succeeds (SIGMA-253).
+ *
+ *  The key used to be `cluster:${environmentId}:${name}` — derived from the
+ *  content, and therefore stable for the entire lifetime of that (environment,
+ *  name) pair. Delete a cluster whose k3s install failed and build it again
+ *  under the same name and the control plane does exactly what it promised:
+ *  same key, same request hash, replay the stored 201 — carrying the DELETED
+ *  cluster's id. No cluster is created, no node is enrolled, the dashboard
+ *  navigates to something that no longer exists, and every retry replays the
+ *  same dead response. */
 export async function cpCreateCluster(
   orgId: string,
   input: { environmentId: string; name: string; controlPlaneId: string },
-  actor: CpActor
+  actor: CpActor,
+  requestId: string
 ): Promise<CpCluster> {
   return cpFetch(
     `${org(orgId)}/clusters`,
     { method: "POST", body: JSON.stringify(input) },
-    { orgId, actor, idempotencyKey: `cluster:${input.environmentId}:${input.name}` }
+    { orgId, actor, idempotencyKey: `cluster:${requestId}` }
   );
 }
 

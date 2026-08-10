@@ -26,6 +26,7 @@ import {
 } from "../active-org";
 import { writeAudit } from "../audit";
 import { CLUSTER_EXCLUDED_KINDS } from "@/lib/server-catalog.generated";
+import { newRequestId } from "@/lib/request-id";
 import {
   CLUSTER_STATUS,
   NODE_ROLE_CONTROL_PLANE,
@@ -190,6 +191,12 @@ export async function createCluster(input: {
   environmentId: string;
   name: string;
   controlPlaneId: string;
+  /** Identifies this SUBMISSION, so a retry of it is deduplicated by the
+   *  control plane and a later, genuinely new one is not (SIGMA-253). The
+   *  dialog mints it; omitting it degrades to a unique key per call — no
+   *  deduplication, but never a replay of a stale response, which is the
+   *  failure that navigated the dashboard to a deleted cluster. */
+  requestId?: string;
 }): Promise<CpCluster> {
   await requireEnvironmentVisible(input.orgId, input.environmentId);
   const { user, role } = await requireProjectAdmin(input.orgId);
@@ -204,7 +211,8 @@ export async function createCluster(input: {
         name,
         controlPlaneId: input.controlPlaneId,
       },
-      { name: user.name, role }
+      { name: user.name, role },
+      input.requestId ?? newRequestId()
     );
     await writeAudit({
       orgId: input.orgId,
