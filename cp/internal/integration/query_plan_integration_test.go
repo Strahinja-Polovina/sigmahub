@@ -20,6 +20,8 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -194,7 +196,7 @@ func TestLatestPerResourceQueryUsesIndex(t *testing.T) {
 	if err := st.AttachServer(ctx, orgID, env.ID, reg.Server.ID, "test"); err != nil {
 		t.Fatal(err)
 	}
-	// 300 resources with a couple of years of releases behind them. Inserted
+	// Resources with a couple of years of releases behind them. Inserted
 	// directly: going through the store's constructors would be correct but far
 	// too slow, and this test is about the plan, not about how rows get written.
 	if _, err := st.Pool.Exec(ctx, `
@@ -263,4 +265,241 @@ func TestLatestPerResourceQueryUsesIndex(t *testing.T) {
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestDeployTargetsForServerUsesPartialIndex is SIGMA-332. Migration 0039 added
+// deployments_server_target_idx (server_id, resource_id, created_at DESC) WHERE
+// status IN (...) and says in its own comment that it makes "the render cost
+// proportional to the resources on that server instead of to the install's total
+// deploy history". A later commit added a third OR arm to the same WHERE — the
+// Compose-placement check reading r.spec from the JOINED resources table — and
+// because the disjunction was no longer a restriction on `deployments` alone,
+// the partial index stopped being usable. The index still existed; it was just
+// never chosen again, and nothing failed.
+//
+// This query runs once per server on the 60s fleet resync, once per push, once
+// per resource mutation and once per deploy status report, so on a 200-server
+// install the regression is worth millions of joined rows a minute.
+func TestDeployTargetsForServerUsesPartialIndex(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_plan_targets"
+
+	// A fleet, not a pair: one server's share of the history has to be a small
+	// enough slice that an index scan is unambiguously the cheaper plan. That is
+	// the shape SIGMA-188's index was added for and the shape the ticket
+	// describes (200 servers), and it is the only shape in which the planner's
+	// choice is evidence of anything — on a two-server install a seq scan
+	// genuinely IS cheaper and the plan says nothing.
+	const servers, resourcesPerServer, releasesEach = 40, 5, 50
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, created_by)
+		VALUES ('gc_targets', $1, $2, 'github', 'inst', 'acme/targets', 'test')`, orgID, proj.ID); err != nil {
+		t.Fatal(err)
+	}
+	serverIDs := make([]string, 0, servers)
+	for i := 0; i < servers; i++ {
+		bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AttachServer(ctx, orgID, env.ID, reg.Server.ID, "test"); err != nil {
+			t.Fatal(err)
+		}
+		serverIDs = append(serverIDs, reg.Server.ID)
+	}
+	// Every other server's resources are Compose apps that place a service on
+	// the NEXT server in the ring, so the placement arm of the disjunction is
+	// exercised rather than trivially empty.
+	for i, srv := range serverIDs {
+		spec := `{"image":"nginx"}`
+		if i%2 == 1 {
+			spec = `{"compose":{"services":[{"name":"web"},` +
+				`{"name":"worker","serverId":"` + serverIDs[(i+1)%len(serverIDs)] + `"}]}}`
+		}
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec)
+			SELECT 'res_tgt_'||$5||'_'||j, $1, $2, $3, $4, 'app'||$5||'_'||j, 'app', $6::jsonb
+			  FROM generate_series(1, $7) j`,
+			orgID, proj.ID, env.ID, srv, strconv.Itoa(i), spec, resourcesPerServer); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id,
+			                         trigger, git_sha, config_hash, status, created_by, created_at)
+			SELECT 'dep_tgt_'||$4||'_'||j||'_'||k, $1, 'res_tgt_'||$4||'_'||j, $2, $3, 'gc_targets',
+			       'git', md5(k::text), 'cfg', 'success', 'test', now() - (k||' hours')::interval
+			  FROM generate_series(1, $5) j, generate_series(1, $6) k`,
+			orgID, env.ID, srv, strconv.Itoa(i), resourcesPerServer, releasesEach); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The resources above were written with raw SQL, which skips
+	// syncServicePlacementsTx; project their placements the way migration 0062's
+	// backfill does. (TestComposePlacementsStayProjected covers the store paths
+	// that maintain the table for real.)
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO resource_service_placements (resource_id, service, server_id)
+		SELECT r.id, COALESCE(svc->>'name', ''), svc->>'serverId'
+		  FROM resources r
+		  CROSS JOIN LATERAL jsonb_array_elements(
+		       CASE WHEN jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		            THEN r.spec->'compose'->'services' ELSE '[]'::jsonb END) svc
+		 WHERE COALESCE(svc->>'serverId', '') <> ''
+		ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range []string{"deployments", "resources", "resource_service_placements"} {
+		if _, err := st.Pool.Exec(ctx, "ANALYZE "+tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// serverIDs[0] owns its own resources outright and hosts the placed 'worker'
+	// service of the Compose resources owned by the last server in the ring.
+	target := serverIDs[0]
+	plan := explainPlan(t, st, true, store.DeployTargetsForServerQuery, target)
+	if plan.seqScanOn("deployments") {
+		t.Fatalf("DeployTargetsForServer sequentially scans deployments; plan = %s", planJSON(t, plan))
+	}
+	if !plan.usesIndex("deployments_server_target_idx") {
+		t.Fatalf("DeployTargetsForServer no longer uses deployments_server_target_idx — SIGMA-188's "+
+			"index is silently out of service; plan = %s", planJSON(t, plan))
+	}
+	// The substance: the render must read the rows this server is involved in,
+	// not the fleet's. Two servers' worth of resources reach this one — its own
+	// and the placed ones — out of forty. 2x slack for planner variation.
+	const ownRows = 2 * resourcesPerServer * releasesEach
+	if touched := plan.rowsTouched("deployments"); touched > 2*ownRows {
+		t.Fatalf("DeployTargetsForServer read %.0f deployment rows for a server involved in %d; "+
+			"cost is proportional to the fleet's deploy history. plan = %s",
+			touched, ownRows, planJSON(t, plan))
+	}
+
+	// The plan change must not change WHO renders — the four ownership rules of
+	// deploymentReporterClause depend on this staying exact.
+	targets, err := st.DeployTargetsForServer(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2*resourcesPerServer {
+		t.Fatalf("deploy targets for %s = %d resources, want %d owned + %d placed",
+			target, len(targets), resourcesPerServer, resourcesPerServer)
+	}
+	// A server that owns nothing and hosts nothing renders nothing.
+	spare, _, _, err := st.IssueBootstrapToken(ctx, orgID, "spare", "general", "", "", "test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := st.RegisterServer(ctx, spare, "spare", "0.1.0", json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := st.DeployTargetsForServer(ctx, reg.Server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("unattached server has %d deploy targets, want 0", len(empty))
+	}
+}
+
+// TestComposePlacementsStayProjected is the other half of SIGMA-332, and the
+// half that can actually break something. Moving Compose placement out of the
+// spec's jsonb and into resource_service_placements is only safe while the table
+// is a faithful projection of every spec that has ever been written: a placement
+// the table has not heard about is a service that renders in NO server's document
+// and silently never deploys, which is precisely the failure the placement arm
+// was added to prevent. So exercise the store paths that write a spec — create,
+// and the placement editor — and check the render agrees with them each time.
+func TestComposePlacementsStayProjected(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_placement_projection"
+
+	home := connectServer(t, st, orgID, "home")
+	away := connectServer(t, st, orgID, "away")
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{home, away} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Created with the placement already in the spec — the shape a repo's
+	// detected compose file arrives in, not only the shape the editor produces.
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: home, Name: "shop", Kind: "app",
+		Spec: json.RawMessage(`{"compose":{"services":[{"name":"web"},` +
+			`{"name":"worker","serverId":"` + away + `"}]}}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO git_connections (id, org_id, project_id, provider, installation_id, repo_full_name, created_by)
+		VALUES ('gc_proj', $1, $2, 'github', 'inst', 'acme/shop', 'admin')`, orgID, proj.ID); err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: home, ConnectionID: "gc_proj",
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "sha1", ConfigHash: "cfg1",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostsIt := func(server string) bool {
+		targets, err := st.DeployTargetsForServer(ctx, server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, ok := targets[app.ID]
+		return ok
+	}
+	if !hostsIt(away) {
+		t.Fatal("CreateResource did not project the spec's Compose placement: the host of " +
+			"'worker' renders nothing, so that service would never deploy")
+	}
+	// Reporting has to follow rendering, or the deploy runs and hangs forever.
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, away, dep.ID); err != nil &&
+		!errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("clone credential for the placed host: %v", err)
+	} else if errors.Is(err, store.ErrNotFound) {
+		t.Fatal("the host of a placed service may render the deploy but not report on it; " +
+			"deploymentReporterClause is no longer the mirror image of the render")
+	}
+
+	// Moving the service home must retract the projection, or `away` keeps
+	// rendering a container that no longer belongs to it.
+	if _, err := st.SetComposePlacements(ctx, orgID, app.ID, []store.ComposePlacement{
+		{Service: "worker", ServerID: home},
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if hostsIt(away) {
+		t.Fatal("SetComposePlacements moved 'worker' home but the old host still renders it")
+	}
+	if !hostsIt(home) {
+		t.Fatal("the home server lost its own deploy target")
+	}
 }

@@ -17,6 +17,39 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// syncServicePlacementsTx rewrites resource_service_placements for one resource
+// from its STORED spec. Call it in the same transaction as any write to
+// resources.spec, after the write — it reads the row back, so it cannot drift
+// from what was actually persisted.
+//
+// The table is a derived projection, not a second source of truth: the spec
+// still is (SIGMA-332). It exists because the DSD render has to ask "which
+// resources put a service on this server" as a predicate an index can drive,
+// and a jsonb_array_elements EXISTS over the joined resources table is not one —
+// it silently took deployments_server_target_idx out of service for every
+// render. The projection is a plain SQL rewrite of the same jsonb the old
+// predicate walked, so the two agree by construction, including the odd case of
+// a service that declares a placement but no name.
+//
+// Rewrite, not merge: a placement REMOVED from the spec must disappear here, or
+// a server keeps rendering a service that no longer belongs to it.
+func syncServicePlacementsTx(ctx context.Context, tx pgx.Tx, resourceID string) error {
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM resource_service_placements WHERE resource_id = $1`, resourceID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO resource_service_placements (resource_id, service, server_id)
+		SELECT r.id, COALESCE(svc->>'name', ''), svc->>'serverId'
+		  FROM resources r
+		  CROSS JOIN LATERAL jsonb_array_elements(
+		       CASE WHEN jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		            THEN r.spec->'compose'->'services' ELSE '[]'::jsonb END) svc
+		 WHERE r.id = $1 AND COALESCE(svc->>'serverId', '') <> ''
+		ON CONFLICT DO NOTHING`, resourceID)
+	return err
+}
+
 // ComposePlacement is one service's placement + environment override.
 type ComposePlacement struct {
 	Service  string            `json:"service"`
@@ -184,6 +217,9 @@ func (s *Store) SetComposePlacements(ctx context.Context, orgID, resourceID stri
 	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET spec = $3, updated_at = now() WHERE org_id = $1 AND id = $2`,
 		orgID, resourceID, newSpec); err != nil {
+		return nil, err
+	}
+	if err := syncServicePlacementsTx(ctx, tx, resourceID); err != nil {
 		return nil, err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Compose placement updated", resourceID); err != nil {

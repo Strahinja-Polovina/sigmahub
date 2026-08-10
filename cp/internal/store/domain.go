@@ -759,6 +759,12 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	if err != nil {
 		return Resource{}, fmt.Errorf("insert resource: %w", err)
 	}
+	// Project the spec's Compose placements into resource_service_placements, in
+	// the same transaction as the spec write (SIGMA-332): the DSD render asks
+	// "which resources put a service on this server" through that table now.
+	if err := syncServicePlacementsTx(ctx, tx, r.ID); err != nil {
+		return Resource{}, err
+	}
 	// P1-10: a database resource is provisioned in the same transaction —
 	// generated credentials (envelope-encrypted), mesh port allocation and the
 	// default backup-policy row — so it can never exist half-provisioned.

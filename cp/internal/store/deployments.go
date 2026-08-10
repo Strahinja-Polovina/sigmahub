@@ -1194,32 +1194,69 @@ type DeployTarget struct {
 	BuildServerID string
 }
 
+// DeployTargetsForServerQuery drives DeployTargetsForServer. Exported so the
+// query-plan regression test in internal/integration can EXPLAIN the real query
+// rather than a copy that drifts (SIGMA-332).
+//
+// A Compose app may place services on servers OTHER than the one its deployment
+// was created against, so this server is a target when it owns the deployment OR
+// hosts at least one of the app's services. Without that second condition a
+// placed service would never appear in any document and would silently never
+// deploy.
+//
+// The three ways a server is involved are UNION ALL arms rather than OR'd
+// predicates, and that shape is the whole point of this rewrite. This query runs
+// once per server on the 60s fleet resync, once per push, once per resource
+// mutation and once per deploy status report, and the only thing keeping it
+// proportional to the resources on ONE server rather than to the install's whole
+// deploy history is deployments_server_target_idx (server_id, resource_id,
+// created_at DESC) WHERE status IN (...) — plus deployments_build_server_idx and
+// deployments_resource_idx for the other two arms. An index can only drive an
+// arm that is a restriction on `deployments` by itself, so:
+//
+//   - the placement arm used to be `jsonb_typeof(r.spec->'compose'->'services')
+//     = 'array' AND EXISTS (... svc->>'serverId' = $1)`, reading r.spec from the
+//     JOINED resources table. That made the disjunction unindexable and quietly
+//     retired SIGMA-188's index — measured, the plan became a Seq Scan of every
+//     deployment row plus a jsonb function scan per row (SIGMA-332). Placement
+//     now lives in resource_service_placements, so the arm is a semi-join
+//     against a small, directly-indexed table.
+//   - even with all three arms on `deployments`, an OR forces Postgres to pick
+//     ONE access path for the whole scan; separate arms let it pick the right
+//     index for each. Duplicates between arms are free: DISTINCT ON keeps one
+//     row per resource anyway, which is why this is UNION ALL and not UNION —
+//     deduplicating full rows (service_status jsonb included) would cost more
+//     than the duplicates do.
+//
+// deploymentReporterClause must stay the mirror image of the arms below: a
+// server that RENDERS a deployment's ops has to be allowed to REPORT on them.
+const DeployTargetsForServerQuery = `
+		SELECT DISTINCT ON (d.resource_id)
+		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
+		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
+		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
+		  FROM (
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success') AND server_id = $1
+		       UNION ALL
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success') AND build_server_id = $1
+		       UNION ALL
+		       SELECT * FROM deployments
+		        WHERE status IN ('queued','building','deploying','success')
+		          AND resource_id IN (SELECT p.resource_id FROM resource_service_placements p
+		                               WHERE p.server_id = $1)
+		  ) d
+		  JOIN resources r ON r.id = d.resource_id
+		  JOIN git_connections c ON c.id = d.connection_id
+		 ORDER BY d.resource_id, d.created_at DESC`
+
 // DeployTargetsForServer returns the current deploy target per app resource on a
 // server — the latest deployment that is not failed/superseded/rolled_back. The
 // reconciler renders the deploy pipeline from these instead of a bare
 // container.apply.
 func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (map[string]DeployTarget, error) {
-	// A Compose app may place services on servers OTHER than the one its
-	// deployment was created against, so this server is a target when it owns
-	// the deployment OR hosts at least one of the app's services. Without the
-	// second clause a placed service would never appear in any document and
-	// would silently never deploy.
-	rows, err := s.Pool.Query(ctx, `
-		SELECT DISTINCT ON (d.resource_id)
-		       d.id, d.resource_id, r.project_id, d.connection_id, c.provider, c.repo_full_name,
-		       d.git_ref, d.git_sha, d.config_hash, d.image_digest, COALESCE(d.image_pin,''), d.trigger, d.status,
-		       d.created_at, d.service_status, COALESCE(d.server_id, ''), COALESCE(d.build_server_id, '')
-		  FROM deployments d
-		  JOIN resources r ON r.id = d.resource_id
-		  JOIN git_connections c ON c.id = d.connection_id
-		 WHERE d.status IN ('queued','building','deploying','success')
-		   AND (d.server_id = $1
-		        OR d.build_server_id = $1
-		        OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
-		            AND EXISTS (
-		              SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		               WHERE svc->>'serverId' = $1)))
-		 ORDER BY d.resource_id, d.created_at DESC`, serverID)
+	rows, err := s.Pool.Query(ctx, DeployTargetsForServerQuery, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -1296,16 +1333,23 @@ func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploym
 //
 // $1 is the reporting server, and the query it is spliced into must expose the
 // deployment as `d` and its resource as `r`.
+//
+// The placement arm reads resource_service_placements, exactly as the render's
+// third UNION arm does (SIGMA-332). Both used to walk r.spec's compose services
+// with jsonb_array_elements; that is what made the RENDER unindexable, and the
+// two must keep reading the same source or a placed service can render on a host
+// whose report is then refused. Every query this is spliced into looks a
+// deployment up by id, so unlike the render it is a point lookup and its cost
+// was never the issue.
 const deploymentReporterClause = `
 		   (d.server_id = $1
 		    OR d.build_server_id = $1
 		    OR (r.cluster_id IS NOT NULL AND EXISTS (
 		          SELECT 1 FROM cluster_nodes n
 		           WHERE n.cluster_id = r.cluster_id AND n.server_id = $1))
-		    OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
-		        AND EXISTS (
-		          SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		           WHERE svc->>'serverId' = $1)))`
+		    OR EXISTS (
+		          SELECT 1 FROM resource_service_placements p
+		           WHERE p.resource_id = d.resource_id AND p.server_id = $1))`
 
 // DeployPeersForResource returns the OTHER servers whose documents are gated on
 // this resource's deployment status, so they can be re-rendered the moment it
