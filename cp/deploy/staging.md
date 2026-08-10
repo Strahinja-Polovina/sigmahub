@@ -160,6 +160,25 @@ telemetry pipeline: the alert path for customer events is the per-org outbox,
 which is itself one of these loops, so a control plane in trouble cannot be
 relied on to report that it is in trouble. Scrape this from outside.
 
+## 8. Retention (SIGMA-249)
+
+The sweeper retires the append-only tables in bounded batches every 30s. The
+defaults, set in `cp/cmd/sigmahub-cp/main.go` and argued there:
+
+| table | kept | notes |
+| --- | --- | --- |
+| `server_metrics` | 24h | pre-existing |
+| `deploy_logs` | 30d after the deployment **finished** | by far the largest table; an in-flight build is never touched |
+| `cp_audit_log` | 400d | just over a year, so an annual review can look back |
+| `deploy_requests` | 30d | drained rows only; queued ones are undeployed pushes |
+| `webhook_deliveries` | 30d | redelivery dedup; providers retry for hours |
+| `alert_outbox` | 90d | `sent`/`failed` only; a pending row is an undelivered alert |
+| `idempotency_keys` | 7d | a client retry arrives in seconds |
+
+Without this the disk is the limit: a 200-server install doing 30 deploys a day
+writes ~27M `deploy_logs` rows a year, and a full disk takes Postgres
+read-only, which fails every tenant at once.
+
 ## Teardown
 
 ```

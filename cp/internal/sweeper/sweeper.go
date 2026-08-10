@@ -15,6 +15,9 @@ type Store interface {
 	PruneMetrics(ctx context.Context, retention time.Duration) (int64, error)
 	TimeoutStaleDeployments(ctx context.Context, timeout time.Duration) (int64, error)
 	TimeoutStaleDecommissions(ctx context.Context, timeout time.Duration) ([]store.DecommissionTimedOut, error)
+	// PruneRetained retires one bounded batch from each append-only growth table
+	// (SIGMA-249). Returns rows deleted per table.
+	PruneRetained(ctx context.Context, r store.Retention) (map[string]int64, error)
 }
 
 type Config struct {
@@ -23,8 +26,15 @@ type Config struct {
 	// StaleAfter marks a running server unreachable once it hasn't been seen
 	// for this long (≈ 3× the agent heartbeat interval).
 	StaleAfter time.Duration
-	// Retention keeps this much metric history.
+	// Retention keeps this much metric history (server_metrics only — the one
+	// table that had a retention sweep before SIGMA-249).
 	Retention time.Duration
+	// Retain is the per-table history budget for the append-only growth tables:
+	// deploy_logs, cp_audit_log, deploy_requests, webhook_deliveries,
+	// alert_outbox and idempotency_keys. Zero fields disable their table, so a
+	// caller that sets nothing keeps the pre-SIGMA-249 behaviour of never
+	// deleting any of it. store/retention.go argues each table's rule.
+	Retain store.Retention
 	// DeployTimeout fails a deployment that has been in flight this long without
 	// reaching a terminal state. Without it a deploy whose agent dies mid-flight
 	// stays "building" forever: nothing else ever transitions it, so no
@@ -114,6 +124,20 @@ func Run(ctx context.Context, log *slog.Logger, st Store, cfg Config) {
 						// pressed Disconnect just received.
 						log.Warn("sweeper: decommission timed out; server removed without agent confirmation",
 							"server", d.ServerID, "org", d.OrgID, "name", d.Name, "actor", d.Actor)
+					}
+				}
+			}
+			// Retention for the append-only growth tables (SIGMA-249). Last in the
+			// pass, because everything above it is fleet HEALTH and this is
+			// housekeeping: a sweep that is short on time should flip stale servers
+			// before it retires old log lines.
+			if cfg.Retain.Any() {
+				if deleted, err := st.PruneRetained(ctx, cfg.Retain); err != nil {
+					log.Error("sweeper: prune retained", "err", err)
+					fail(err)
+				} else {
+					for table, n := range deleted {
+						log.Info("sweeper: rows pruned", "table", table, "count", n)
 					}
 				}
 			}

@@ -386,6 +386,34 @@ func run() error {
 		DeployTimeout:       45 * time.Minute,
 		DecommissionTimeout: 10 * time.Minute,
 		Heartbeat:           metrics.Loop(cpmetrics.LoopSweeper).Report,
+		// Retention for the append-only growth tables (SIGMA-249). These are the
+		// product's defaults, and each is a decision rather than a round number:
+		//
+		//   - deploy_logs, 30 days after the deployment FINISHED. It is by far the
+		//     largest table (one row per streamed build-log line) and the least
+		//     read: the UI streams an in-flight build and shows the last lines of
+		//     recent ones. A month covers "what did last sprint's failing deploy
+		//     say"; a year of it is tens of gigabytes nobody opens.
+		//   - cp_audit_log, 400 days — deliberately just over a year so an annual
+		//     review can look back at the same month last year. This is the entry
+		//     with a compliance dimension, so it is chosen explicitly and long
+		//     rather than defaulted short.
+		//   - deploy_requests, 30 days, drained rows only.
+		//   - webhook_deliveries, 30 days. It only exists to make a REDELIVERED
+		//     webhook a no-op, and providers retry for hours, so this is already
+		//     two orders of magnitude past useful.
+		//   - alert_outbox, 90 days, finalized rows only — long enough that "did
+		//     we ever page anyone about this?" is answerable for a quarter.
+		//   - idempotency_keys, 7 days. A client retry arrives in seconds; a week
+		//     is the generous end of "the same request could still show up".
+		Retain: store.Retention{
+			DeployLogs:        30 * 24 * time.Hour,
+			Audit:             400 * 24 * time.Hour,
+			DeployRequests:    30 * 24 * time.Hour,
+			WebhookDeliveries: 30 * 24 * time.Hour,
+			AlertOutbox:       90 * 24 * time.Hour,
+			IdempotencyKeys:   7 * 24 * time.Hour,
+		},
 	})
 
 	// Telemetry forwarder (P1-13) + the hourly idempotent usage aggregates
