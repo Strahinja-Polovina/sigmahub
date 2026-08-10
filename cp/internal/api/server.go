@@ -145,6 +145,9 @@ type Server struct {
 type PaddleClient interface {
 	CreateCheckout(ctx context.Context, in paddle.CreateTransactionInput) (paddle.Transaction, error)
 	CustomerPortalURL(ctx context.Context, customerID string) (string, error)
+	// SetSubscriptionOrg stamps orgId into the subscription's custom_data so
+	// later events on it correlate through the primary path (SIGMA-293).
+	SetSubscriptionOrg(ctx context.Context, subscriptionID, orgID string) error
 }
 
 // Options carries the API's authn material and DSD runtime dependencies.

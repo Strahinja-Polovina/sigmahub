@@ -201,6 +201,25 @@ func TestBillingSubscriptionWebhookFlow(t *testing.T) {
 		t.Fatalf("subscription = %+v", got)
 	}
 
+	// SIGMA-293: an event with no custom_data is still correlatable — either
+	// stored Paddle id identifies the org, and an unknown id resolves to no org
+	// rather than to some other tenant's row.
+	for _, tc := range []struct{ sub, ctm, want string }{
+		{"sub_1", "", orgID},
+		{"", "ctm_1", orgID},
+		{"sub_unknown", "ctm_1", orgID}, // falls through to the customer id
+		{"sub_unknown", "ctm_unknown", ""},
+		{"", "", ""},
+	} {
+		found, err := st.OrgForPaddleIDs(ctx, tc.sub, tc.ctm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found != tc.want {
+			t.Fatalf("OrgForPaddleIDs(%q, %q) = %q, want %q", tc.sub, tc.ctm, found, tc.want)
+		}
+	}
+
 	// past_due transition enqueues a payment_failed alert exactly once.
 	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
 		OrgID: orgID, CustomerID: "ctm_1", SubscriptionID: "sub_1", Status: "past_due", Quantity: 2,

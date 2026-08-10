@@ -19,6 +19,12 @@ type fakeBilling struct {
 	applied   []store.BillingStatus
 	seen      map[string]bool
 	seenCalls int
+	// orgByPaddleID stands in for the org_billing rows the webhook receiver
+	// falls back to when an event carries no custom_data (SIGMA-293), keyed by
+	// paddle subscription id and by paddle customer id.
+	orgByPaddleID map[string]string
+	// appliedOrgs records the org each apply was correlated to.
+	appliedOrgs []string
 }
 
 func (f *fakeBilling) BillingSummaryForOrg(_ context.Context, orgID string, _ time.Time, configured bool) (store.BillingSummary, error) {
@@ -44,7 +50,7 @@ func (f *fakeBilling) WebhookSeen(_ context.Context, deliveryID, _, _ string) (b
 	f.seen[deliveryID] = true
 	return false, nil
 }
-func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, _ string, in store.BillingStatus, _ string, _ time.Time) (bool, error) {
+func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, orgID string, in store.BillingStatus, _ string, _ time.Time) (bool, error) {
 	f.seenCalls++
 	if f.seen == nil {
 		f.seen = map[string]bool{}
@@ -54,7 +60,17 @@ func (f *fakeBilling) ApplyPaddleWebhook(_ context.Context, deliveryID, _, _, _ 
 	}
 	f.seen[deliveryID] = true
 	f.applied = append(f.applied, in)
+	f.appliedOrgs = append(f.appliedOrgs, orgID)
 	return true, nil
+}
+func (f *fakeBilling) OrgForPaddleIDs(_ context.Context, subscriptionID, customerID string) (string, error) {
+	if org, ok := f.orgByPaddleID[subscriptionID]; ok && subscriptionID != "" {
+		return org, nil
+	}
+	if org, ok := f.orgByPaddleID[customerID]; ok && customerID != "" {
+		return org, nil
+	}
+	return "", nil
 }
 
 func billingServer(t *testing.T, fb *fakeBilling, secret string) *Server {
@@ -183,6 +199,89 @@ func TestPaddleTransactionEventUsesSubscriptionID(t *testing.T) {
 	}
 	if fb.applied[0].Status != "past_due" {
 		t.Fatalf("status = %q, want past_due", fb.applied[0].Status)
+	}
+}
+
+// TestPaddleWebhook_CorrelatesBySubscriptionID covers SIGMA-293: a RENEWAL
+// transaction carries no custom_data — orgId was attached to the original
+// checkout transaction, not to this one — so correlating solely through
+// custom_data.orgId dropped the event with a 200 and no log line. The customer's
+// card expired, org_billing stayed 'active', no payment_failed alert was
+// enqueued, the Billing page kept saying "Active", and Paddle did not retry
+// because it got a 200. org_billing already stores the subscription and customer
+// ids the event carries; either identifies the org.
+func TestPaddleWebhook_CorrelatesBySubscriptionID(t *testing.T) {
+	const secret = "pdl_secret"
+	fb := &fakeBilling{orgByPaddleID: map[string]string{"sub_9": "org_1"}}
+	s := billingServer(t, fb, secret)
+	body := []byte(`{"event_id":"evt_renewal","event_type":"transaction.payment_failed","data":{"id":"txn_778","customer_id":"ctm_9","subscription_id":"sub_9"}}`)
+	r := httptest.NewRequest("POST", "/v1/webhooks/paddle", strings.NewReader(string(body)))
+	r.Header.Set("Paddle-Signature", paddleSig(secret, time.Now().Unix(), body))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d body %s", w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "ignored") {
+		t.Fatalf("renewal payment_failed dropped as uncorrelated: %s", w.Body)
+	}
+	if len(fb.applied) != 1 {
+		t.Fatalf("applied = %d, want 1 (the event must reach org_billing)", len(fb.applied))
+	}
+	if fb.appliedOrgs[0] != "org_1" {
+		t.Fatalf("correlated to org %q, want org_1", fb.appliedOrgs[0])
+	}
+	if fb.applied[0].Status != "past_due" {
+		t.Fatalf("status = %q, want past_due", fb.applied[0].Status)
+	}
+}
+
+// TestPaddleWebhook_CorrelatesByCustomerID is the second fallback: a
+// subscription edited by support in the Paddle dashboard, or canceled through
+// the customer portal, may reach us with neither custom_data nor a subscription
+// id we recognise — but the customer id is stored too.
+func TestPaddleWebhook_CorrelatesByCustomerID(t *testing.T) {
+	const secret = "pdl_secret"
+	fb := &fakeBilling{orgByPaddleID: map[string]string{"ctm_9": "org_2"}}
+	s := billingServer(t, fb, secret)
+	body := []byte(`{"event_id":"evt_portal_cancel","event_type":"subscription.canceled","data":{"id":"sub_unknown","customer_id":"ctm_9","status":"canceled"}}`)
+	r := httptest.NewRequest("POST", "/v1/webhooks/paddle", strings.NewReader(string(body)))
+	r.Header.Set("Paddle-Signature", paddleSig(secret, time.Now().Unix(), body))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "ignored") {
+		t.Fatalf("portal cancellation dropped: %d %s", w.Code, w.Body)
+	}
+	if len(fb.appliedOrgs) != 1 || fb.appliedOrgs[0] != "org_2" {
+		t.Fatalf("correlated to %v, want [org_2]", fb.appliedOrgs)
+	}
+}
+
+// TestPaddleWebhook_UncorrelatedEventIsLogged: an event we genuinely cannot
+// place must still be acked (Paddle has customer-level events that belong to no
+// org), but it must leave a WARN line naming the event, so an operator can see
+// the drop instead of inferring it from a subscription that never changed.
+func TestPaddleWebhook_UncorrelatedEventIsLogged(t *testing.T) {
+	const secret = "pdl_secret"
+	var logged strings.Builder
+	log := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	fb := &fakeBilling{}
+	s := New(log, fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+		DevServiceToken:     testServiceToken,
+		Billing:             fb,
+		PaddleWebhookSecret: secret,
+	})
+	body := []byte(`{"event_id":"evt_orphan","event_type":"transaction.payment_failed","data":{"id":"txn_1","customer_id":"ctm_unknown","subscription_id":"sub_unknown"}}`)
+	r := httptest.NewRequest("POST", "/v1/webhooks/paddle", strings.NewReader(string(body)))
+	r.Header.Set("Paddle-Signature", paddleSig(secret, time.Now().Unix(), body))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("uncorrelated webhook = %d, want 200 ack", w.Code)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "evt_orphan") || !strings.Contains(out, "transaction.payment_failed") {
+		t.Fatalf("dropped event left no WARN naming it: %q", out)
 	}
 }
 

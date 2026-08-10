@@ -167,6 +167,40 @@ func (s *Store) GetBillingStatus(ctx context.Context, orgID string) (BillingStat
 	return st, nil
 }
 
+// OrgForPaddleIDs finds the org a Paddle event belongs to from the ids the event
+// itself carries. Returns "" (no error) when neither id is known here.
+//
+// SIGMA-293: the webhook receiver used to correlate ONLY through
+// data.custom_data.orgId, which is set once — on the checkout transaction. A
+// renewal transaction, a subscription edited by support in the Paddle dashboard,
+// and a cancellation from the customer portal all arrive without it, and every
+// one of them was acked 200 and dropped. org_billing has stored
+// paddle_subscription_id and paddle_customer_id since the first checkout, so the
+// org was always identifiable; nothing consulted them.
+//
+// The subscription id wins over the customer id when both match: a customer can
+// in principle back more than one org_billing row, and the subscription is the
+// narrower key.
+func (s *Store) OrgForPaddleIDs(ctx context.Context, subscriptionID, customerID string) (string, error) {
+	if subscriptionID == "" && customerID == "" {
+		return "", nil
+	}
+	var orgID string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT org_id FROM org_billing
+		 WHERE ($1 <> '' AND paddle_subscription_id = $1)
+		    OR ($2 <> '' AND paddle_customer_id = $2)
+		 ORDER BY (paddle_subscription_id = $1) DESC, updated_at DESC
+		 LIMIT 1`, subscriptionID, customerID).Scan(&orgID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return orgID, nil
+}
+
 // BillingSummaryForOrg computes the current usage + charge readout. configured
 // reflects whether Paddle is wired (passed in by the handler from config).
 //
