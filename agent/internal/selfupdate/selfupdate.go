@@ -36,7 +36,37 @@ const Kind = "agent.update"
 // DefaultRepo hosts the signed release artifacts.
 const DefaultRepo = "Strahinja-Polovina/sigmahub"
 
-var versionRe = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
+// versionRe is the shape an agent.update target must have before this package
+// will build an upstream URL out of it: a goreleaser tag, optionally carrying a
+// prerelease suffix.
+//
+// It is character-for-character the control plane's releaseTagPattern
+// (cp/internal/api/installer.go), and that is the whole point (SIGMA-289). The
+// two ends decide the same thing about the same string on two machines: the CP
+// decides what an operator may ask for and what its /dl proxy will serve, this
+// package decides what sigmad will actually install. When they disagreed —
+// this pattern used to be `^v\d+\.\d+\.\d+$`, with no prerelease suffix — the
+// disagreement was invisible from the control plane and permanent on the host.
+// The release workflow sets `prerelease: auto`, so `v0.4.0-rc.1` is a real tag
+// the CP serves; canarying it returned 200 "queued", stored
+// desired_agent_version, rendered the op and showed an upgrade in flight, while
+// every host failed the op with `invalid version`. Because agent_version never
+// reaches desired_agent_version the op is re-emitted on every reconcile, so the
+// hosts sit in a permanently failing state and the only escape is knowing to
+// POST a non-prerelease tag over the top.
+//
+// Widening rather than narrowing is deliberate: a prerelease is exactly what a
+// canary is, and refusing to install one would make the CP's `prerelease: auto`
+// releases unreachable through the dashboard's own upgrade path. The gate this
+// pattern is here to be does not weaken — `..`, a slash, a query string, a
+// space and an absolute URL each require a character it still does not admit.
+//
+// The two copies are held together by
+// agent/internal/selfupdate/version_vocabulary_test.go and
+// cp/internal/api/agent_version_vocabulary_test.go, which read each other's
+// module off disk (cp and agent are separate Go modules and neither can import
+// the other) and fail on the commit that changes either pattern alone.
+var versionRe = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
 
 // The architectures sigmad is published for, and the one place that list is
 // written in Go.
