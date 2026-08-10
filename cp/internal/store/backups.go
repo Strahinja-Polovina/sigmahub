@@ -472,7 +472,7 @@ func (s *Store) TimeoutStaleBackupRuns(ctx context.Context, execMaxAge, queueMax
 			SELECT f.org_id, r.channel_id,
 			       CASE WHEN f.kind = 'verify' THEN 'verify_failed' ELSE 'backup_failed' END,
 			       'bkr:' || f.id,
-			       CASE f.kind WHEN 'backup' THEN 'Backup' WHEN 'verify' THEN 'Restore-verify' ELSE 'Restore' END
+			       `+backupRunActionCaseSQL("f.kind")+`
 			         || ' timed out for ' || COALESCE(res.name, f.resource_id),
 			       CASE WHEN f.old_status = 'pending'
 			            THEN 'The run was never dispatched within its queue window and was failed by the scheduler.'
@@ -679,6 +679,53 @@ func (s *Store) BackupCredentialForRun(ctx context.Context, serverID, runID stri
 	}, nil
 }
 
+// backupRunKinds is the vocabulary of backup_runs.kind with the name each
+// operation goes by in front of a human — the audit log's Action and the title
+// of the alert that reaches Slack or an inbox.
+//
+// It is a table because the labels used to be a three-entry map literal inline
+// in SetBackupRunResult while five kinds were being inserted a few hundred lines
+// away. `basebackup` and `restore-pitr` mapped to "", so a PITR-enabled database
+// logged one row per day reading " succeeded" — a leading space and no subject —
+// and a failed base backup alerted as " failed for orders-db", which does not
+// tell on-call which of the five operations broke (SIGMA-286).
+//
+// Adding a kind means adding it here. Order is fixed so the SQL rendering below
+// is deterministic.
+var backupRunKinds = []struct{ Kind, Label string }{
+	{"backup", "Backup"},
+	{"basebackup", "Base backup"},
+	{"verify", "Restore-verify"},
+	{"restore", "Restore"},
+	{"restore-pitr", "Restore to timestamp"},
+}
+
+// backupRunAction labels a run kind for the audit log and alert titles. An
+// unknown kind falls back to the raw kind string rather than to "": a kind
+// somebody adds without touching the table above is at worst ugly, never
+// anonymous.
+func backupRunAction(kind string) string {
+	for _, k := range backupRunKinds {
+		if k.Kind == kind {
+			return k.Label
+		}
+	}
+	return kind
+}
+
+// backupRunActionCaseSQL renders the same table as a SQL CASE over col, for the
+// timeout sweep — which builds its alert titles in SQL and so cannot call
+// backupRunAction. Labels come from the static table above, never from input.
+func backupRunActionCaseSQL(col string) string {
+	var b strings.Builder
+	b.WriteString("CASE " + col)
+	for _, k := range backupRunKinds {
+		b.WriteString(" WHEN '" + k.Kind + "' THEN '" + k.Label + "'")
+	}
+	b.WriteString(" ELSE " + col + " END")
+	return b.String()
+}
+
 // SetBackupRunResult records a run's terminal outcome, reported by the
 // executing agent (BOLA-scoped to the run's server). Audited.
 func (s *Store) SetBackupRunResult(ctx context.Context, serverID, runID string, ok bool, snapshotID, dumpSha, detail string) error {
@@ -705,7 +752,7 @@ func (s *Store) SetBackupRunResult(ctx context.Context, serverID, runID string, 
 	if err != nil {
 		return err
 	}
-	action := map[string]string{"backup": "Backup", "verify": "Restore-verify", "restore": "Restore"}[kind]
+	action := backupRunAction(kind)
 	if ok {
 		action += " succeeded"
 	} else {
