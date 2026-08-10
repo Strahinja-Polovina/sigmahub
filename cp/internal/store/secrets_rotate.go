@@ -271,6 +271,7 @@ func (s *Store) ReencryptSecrets(ctx context.Context, orgID string) (int, error)
 		   -- they hold their DEK open exactly like a live policy does.
 		   AND NOT EXISTS (SELECT 1 FROM backup_repo_key_archive WHERE repo_dek_id = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM alert_channels  WHERE dek_id            = d.id)
+		   AND NOT EXISTS (SELECT 1 FROM llm_endpoints  WHERE token_dek_id      = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM s3_buckets      WHERE key_dek_id        = d.id)
 		   AND NOT EXISTS (SELECT 1 FROM pending_s3_ops  WHERE new_secret_dek_id = d.id)`, orgID); err != nil {
 		return 0, err
@@ -314,6 +315,28 @@ var dekReencTargets = []dekReencTarget{
 		func(o string, id []string) []byte { return s3AAD(o, id[1]) }},
 	{"pending_s3_ops", "id", "new_secret_ciphertext", "new_secret_nonce", "new_secret_dek_id", []string{"resource_id"},
 		func(o string, id []string) []byte { return s3AAD(o, id[1]) }},
+	// The weights credential an inference endpoint pulls its model with (0055).
+	// Missed when that migration landed, so a rotation left it on the DEK the
+	// operator had just declared compromised while reporting success, and the
+	// retirement guard below — which also did not know about it — retired that
+	// DEK out from under it (SIGMA-281). The pk is resource_id, which is also
+	// the AAD's identity.
+	{"llm_endpoints", "resource_id", "token_ciphertext", "token_nonce", "token_dek_id", nil,
+		func(o string, id []string) []byte { return hubTokenAAD(o, id[0]) }},
+}
+
+// DEKReencryptedColumns reports which (table, dek column) pairs rotation
+// actually re-encrypts. It exists so a test can hold the list above against the
+// schema — every `REFERENCES org_deks(id)` column must appear here, or the
+// operator who rotates a compromised DEK is told the job is done while some
+// ciphertext still sits under the key they just declared exposed (SIGMA-68,
+// SIGMA-281).
+func DEKReencryptedColumns() map[string][]string {
+	out := make(map[string][]string, len(dekReencTargets))
+	for _, t := range dekReencTargets {
+		out[t.table] = append(out[t.table], t.dekCol)
+	}
+	return out
 }
 
 // reencTableTx re-encrypts every row of one DEK-bearing table not already on the
