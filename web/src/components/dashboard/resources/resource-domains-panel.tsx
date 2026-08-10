@@ -1,7 +1,17 @@
 "use client";
 
 import * as React from "react";
-import { Globe, Loader2, Plus, ShieldCheck, ShieldAlert, Clock, Trash2 } from "lucide-react";
+import Link from "next/link";
+import {
+  Globe,
+  Loader2,
+  Plus,
+  ShieldCheck,
+  ShieldAlert,
+  Clock,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -45,7 +55,18 @@ function CertBadge({ status }: { status: string }) {
   );
 }
 
-function AddDomainForm({ orgId, resourceId }: { orgId: string; resourceId: string }) {
+function AddDomainForm({
+  orgId,
+  resourceId,
+  edgeRoleMissing,
+}: {
+  orgId: string;
+  resourceId: string;
+  /** True when this resource's server is known NOT to carry the proxy/edge
+   *  role. The success toast used to promise a certificate unconditionally;
+   *  on such a server that promise cannot be kept (SIGMA-316). */
+  edgeRoleMissing: boolean;
+}) {
   const [domain, setDomain] = React.useState("");
   const [pending, startTransition] = React.useTransition();
 
@@ -58,7 +79,9 @@ function AddDomainForm({ orgId, resourceId }: { orgId: string; resourceId: strin
       try {
         await attachDomain({ orgId, resourceId, domain: domain.trim() });
         toast.success(`Attached ${domain.trim()}`, {
-          description: "sigmahub will issue a certificate once the domain's DNS points here.",
+          description: edgeRoleMissing
+            ? "No certificate will be issued until this resource's server is given the Proxy / edge role."
+            : "sigmahub will issue a certificate once the domain's DNS points here.",
         });
         setDomain("");
       } catch (err) {
@@ -89,14 +112,30 @@ export function ResourceDomainsPanel({
   resourceId,
   domains,
   canManage,
+  server,
 }: {
   orgId: string;
   resourceId: string;
   domains: DomainRow[];
   canManage: boolean;
+  /** The server this resource runs on, when we know it and know its edge role.
+   *  `proxyRole` is optional on purpose: demo mode and cluster workloads reach
+   *  this panel without a role we can vouch for, and warning there would cry
+   *  wolf on every domain. */
+  server?: { id: string; name: string; proxyRole?: boolean } | null;
 }) {
   const [pending, startTransition] = React.useTransition();
   const [dnsFor, setDnsFor] = React.useState<DomainRow | null>(null);
+
+  // SIGMA-316: attaching a domain to a resource on a server with no proxy/edge
+  // role is a promise the product cannot keep. The reconciler renders Traefik —
+  // and with it the ACME client that requests the certificate — only onto
+  // proxy-role servers, so on any other host the certificate is never even
+  // requested. Nothing in the attach path used to say so: the form's toast
+  // promised issuance "once the domain's DNS points here", the operator set up
+  // DNS correctly, and the domain stayed pending forever. Explicitly `=== false`
+  // so an unknown role stays silent.
+  const edgeRoleMissing = server?.proxyRole === false;
 
   function remove(d: DomainRow) {
     startTransition(async () => {
@@ -124,6 +163,30 @@ export function ResourceDomainsPanel({
         </CardDescription>
       </CardHeader>
       <CardContent className="pt-4">
+        {edgeRoleMissing && server && (
+          <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
+            <div className="min-w-0 text-sm">
+              <p className="font-medium text-amber-700 dark:text-amber-500">
+                {server.name} is not an edge server, so no certificate will be issued for a
+                domain here
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Only a server carrying the proxy/edge role runs the proxy that answers the
+                Let&apos;s Encrypt challenge, so DNS pointing here is not enough on its own.
+                Turn on{" "}
+                <span className="font-medium text-foreground">Proxy / edge role</span> on{" "}
+                <Link
+                  href={`/dashboard/servers/${server.id}`}
+                  className="font-medium text-foreground underline underline-offset-2"
+                >
+                  {server.name}
+                </Link>
+                , or move this resource to a server that has it.
+              </p>
+            </div>
+          </div>
+        )}
         {domains.length === 0 ? (
           <p className="text-sm text-muted-foreground">No custom domains attached.</p>
         ) : (
@@ -166,7 +229,13 @@ export function ResourceDomainsPanel({
             ))}
           </ul>
         )}
-        {canManage && <AddDomainForm orgId={orgId} resourceId={resourceId} />}
+        {canManage && (
+          <AddDomainForm
+            orgId={orgId}
+            resourceId={resourceId}
+            edgeRoleMissing={edgeRoleMissing}
+          />
+        )}
       </CardContent>
 
       {dnsFor && (

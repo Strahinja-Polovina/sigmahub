@@ -149,6 +149,10 @@ type Detail = {
     type: string;
     status?: string;
     lastSeenAt?: string | Date | null;
+    /** Whether the host carries the proxy/edge role. Only the control plane
+     *  knows it, so it is optional: the domains panel treats "unknown" as no
+     *  warning and only speaks up on an explicit false (SIGMA-316). */
+    proxyRole?: boolean;
   } | null;
   /** The other kind of deploy target. Exactly one of server and cluster is set;
    *  a workload in a cluster has no server because the scheduler picks its
@@ -1131,6 +1135,7 @@ export function ResourceDetail({
                 resourceId={resource.id}
                 domains={domains}
                 canManage={canManage}
+                server={server}
               />
             )}
             {/* Not hidden any more. A custom domain is a certificate issued by

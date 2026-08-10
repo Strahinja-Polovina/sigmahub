@@ -332,6 +332,12 @@ export default async function ResourceDetailPage({
             // mirror keeps no such column. It is what lets the host banner say
             // "since 08:14" rather than a vague "is not answering" (SIGMA-251).
             lastSeenAt: sv.lastSeenAt,
+            // The edge role, which decides whether a custom domain on this
+            // host can ever get a certificate: the reconciler renders Traefik
+            // (and its ACME client) onto proxy-role servers only, so the
+            // domains panel has to be able to say so BEFORE the operator edits
+            // their DNS and waits (SIGMA-316).
+            proxyRole: sv.proxyRole ?? false,
           })),
         [] as {
           id: string;
@@ -339,6 +345,7 @@ export default async function ResourceDetailPage({
           type: string;
           status: string;
           lastSeenAt: string | null;
+          proxyRole: boolean;
         }[])
       : Promise.resolve([]),
   ]);
@@ -355,6 +362,10 @@ export default async function ResourceDetailPage({
         ...detail.server,
         status: cpHost?.status ?? detail.server.status,
         lastSeenAt: cpHost?.lastSeenAt ?? null,
+        // Left undefined when the control plane did not answer: the domains
+        // panel warns on an explicit false only, so an unknown role stays quiet
+        // rather than accusing every host of missing the edge role (SIGMA-316).
+        proxyRole: cpHost?.proxyRole,
       }
     : null;
 
