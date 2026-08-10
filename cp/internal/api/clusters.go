@@ -114,6 +114,17 @@ func (s *Server) handleCreateCluster(w http.ResponseWriter, r *http.Request) {
 	if s.reconcile != nil {
 		s.reconcile.ReconcileAsync(orgID, req.ControlPlaneID)
 	}
+	// The JSON contract is asserted here, where the bytes are written, not left
+	// to a convention in the store: a nil slice marshals to `null` and
+	// CpCluster.nodes is typed as an array the dashboard calls .length and
+	// .flatMap on, so `null` is a TypeError the moment a caller uses the created
+	// cluster the way it uses a listed one (SIGMA-336). The store also fills
+	// this in now; the coercion stays because the failure is invisible to the
+	// TypeScript compiler and only appears at runtime, right after a cluster was
+	// successfully created.
+	if c.Nodes == nil {
+		c.Nodes = []store.ClusterNode{}
+	}
 	writeJSON(w, http.StatusCreated, c)
 }
 

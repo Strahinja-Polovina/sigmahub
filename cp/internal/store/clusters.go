@@ -186,9 +186,15 @@ func (s *Store) CreateCluster(ctx context.Context, orgID string, in CreateCluste
 		return Cluster{}, err
 	}
 
+	// Nodes is set explicitly for the same reason ListClusters sets it before
+	// appending: a nil Go slice marshals to `null`, and CpCluster.nodes is typed
+	// as an array the dashboard calls .length and .flatMap on. This is the one
+	// answer guaranteed to carry no nodes yet, so it was the one answer that
+	// broke the contract every other cluster response upholds (SIGMA-336).
 	c := Cluster{
 		ID: newID("cls"), OrgID: orgID, EnvironmentID: in.EnvironmentID,
 		Name: name, Status: "provisioning", CreatedBy: actor,
+		Nodes: []ClusterNode{},
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO clusters (id, org_id, environment_id, name, status, join_token_wrapped, created_by)
