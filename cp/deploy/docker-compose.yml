@@ -136,6 +136,18 @@ services:
       CP_VAULT_ADDR: ${CP_VAULT_ADDR:-}
       CP_VAULT_TOKEN: ${CP_VAULT_TOKEN:-}
       CP_VAULT_TRANSIT_KEY: ${CP_VAULT_TRANSIT_KEY:-sigmahub-cp}
+      # Vault Enterprise namespace (empty = root). It was missing here while
+      # main.go read it (SIGMA-270), and a missing namespace does not present as
+      # "the setting had no effect": every wrap/unwrap goes to the ROOT
+      # namespace instead, so a fresh install dies on the DSD signing key and an
+      # upgrade stops unwrapping the pepper and the per-org DEKs — stored
+      # secrets unreadable, with nothing naming a namespace as the cause.
+      CP_VAULT_NAMESPACE: ${CP_VAULT_NAMESPACE:-}
+      # Make the X-Sigmahub-Actor header mandatory on org-scoped service tokens
+      # (SIGMA-82). Off by default; an operator who provisions per-role tokens
+      # turns it on to fail closed. It was in neither this file nor
+      # .env.example, which made a shipped security control undiscoverable.
+      CP_REQUIRE_ACTOR: ${CP_REQUIRE_ACTOR:-}
       # P1-13 telemetry sinks (optional; empty = pipeline off, UI shows it).
       CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
       CP_VM_READ_URL: ${CP_VM_READ_URL:-}
