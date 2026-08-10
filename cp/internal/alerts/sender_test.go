@@ -17,6 +17,16 @@ import (
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
+// testSender is NewSender with the SIGMA-259 destination guard switched off.
+// Every delivery test here posts to an httptest server, which listens on
+// 127.0.0.1 — precisely the address the guard exists to refuse. The guard
+// itself is covered by TestSenderRefusesInternalDestinations below.
+func testSender() *Sender {
+	s := NewSender()
+	s.allowInternalDestinations = true
+	return s
+}
+
 func TestSendSlack(t *testing.T) {
 	var got map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -25,7 +35,7 @@ func TestSendSlack(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewSender()
+	s := testSender()
 	ch := store.AlertChannelSend{Kind: "slack", Secret: srv.URL}
 	if err := s.Send(context.Background(), ch, "deploy_failed", "Deploy failed", "boom"); err != nil {
 		t.Fatal(err)
@@ -58,7 +68,7 @@ func TestSendWebhookSignsPayload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewSender()
+	s := testSender()
 	ch := store.AlertChannelSend{
 		Kind:   "webhook",
 		Config: []byte(`{"url":"` + srv.URL + `"}`),
@@ -93,7 +103,7 @@ func TestSendTelegram(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewSender()
+	s := testSender()
 	s.telegramBase = srv.URL
 	ch := store.AlertChannelSend{
 		Kind:   "telegram",
@@ -117,11 +127,82 @@ func TestSendTelegram(t *testing.T) {
 	}
 }
 
+// SIGMA-259: the send path enforces the same destination rule the store does at
+// create time, for both kinds whose destination the tenant chooses.
+//
+// Create-time validation alone would be a half-fix: every channel created
+// before that check existed is still in the table, and a hostname that
+// validated as public can answer with 10.0.0.5 an hour later.
+func TestSenderRefusesInternalDestinations(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+	}))
+	defer srv.Close()
+
+	// A production sender: the guard is on. srv.URL is 127.0.0.1 — stand-in for
+	// the Elasticsearch, VictoriaMetrics or metadata endpoint an attacker names.
+	s := NewSender()
+	for _, ch := range []store.AlertChannelSend{
+		{Kind: "slack", Secret: srv.URL},
+		{Kind: "webhook", Config: []byte(`{"url":"` + srv.URL + `"}`)},
+	} {
+		err := s.Send(context.Background(), ch, "deploy_failed", "t", "b")
+		if err == nil {
+			t.Fatalf("%s channel to %s was delivered", ch.Kind, srv.URL)
+		}
+		if !strings.Contains(err.Error(), "internal address") && !strings.Contains(err.Error(), "port must be") {
+			t.Fatalf("%s refusal = %v, want a destination refusal", ch.Kind, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("the control plane made %d requests to the internal endpoint", hits)
+	}
+
+	// And a redirect cannot walk past the check: the client re-applies it on
+	// every hop, so a public URL answering 302 http://169.254.169.254/ stops.
+	req, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/", nil)
+	if err := s.HTTP.CheckRedirect(req, nil); err == nil {
+		t.Fatal("a redirect to the metadata service was allowed")
+	}
+}
+
+// A non-2xx from a tenant-chosen receiver must not quote the receiver's body
+// back: that is what turned an alert channel into a read-back channel for
+// whatever the CP was pointed at.
+func TestWebhookErrorDoesNotEchoResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "AccessKeyId: AKIAIOSFODNN7EXAMPLE", http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	s := testSender()
+	err := s.Send(context.Background(), store.AlertChannelSend{
+		Kind: "webhook", Config: []byte(`{"url":"` + srv.URL + `"}`),
+	}, "deploy_failed", "t", "b")
+	if err == nil {
+		t.Fatal("a 403 must be an error")
+	}
+	if strings.Contains(err.Error(), "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("the upstream body rode the delivery error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("the status is the actionable part and must stay: %v", err)
+	}
+
+	// Same rule for slack, whose destination is equally tenant-chosen.
+	err = s.Send(context.Background(), store.AlertChannelSend{Kind: "slack", Secret: srv.URL},
+		"deploy_failed", "t", "b")
+	if err == nil || strings.Contains(err.Error(), "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("slack delivery error = %v", err)
+	}
+}
+
 func TestSendEmail(t *testing.T) {
 	var gotAddr, gotFrom string
 	var gotTo []string
 	var gotMsg []byte
-	s := NewSender()
+	s := testSender()
 	s.sendMail = func(addr string, _ smtp.Auth, from string, to []string, msg []byte) error {
 		gotAddr, gotFrom, gotTo, gotMsg = addr, from, to, msg
 		return nil

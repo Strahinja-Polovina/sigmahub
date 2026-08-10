@@ -79,6 +79,18 @@ const (
 	// check that says yes and a container that crash-loops is worse than no fit
 	// check at all.
 	UtilizationCap = 0.90
+
+	// FormatMBCeilingMB and FormatTenthCeilingGB are FormatVRAM's two band
+	// boundaries: below the first the estimate is rendered in whole megabytes,
+	// below the second in tenths of a gigabyte, and at or above it in whole
+	// gigabytes rounded up. They are named rather than written into the
+	// expression because the dashboard's demo mode renders the same string with
+	// no control plane to ask, from a generated copy of these numbers — see
+	// store.RenderTypeScript. A literal here and a literal there is the drift
+	// SIGMA-279 was: demo fixtures evaluated by hand, once, from constants that
+	// then moved underneath them.
+	FormatMBCeilingMB    = 1000
+	FormatTenthCeilingGB = 100
 )
 
 // ServedContextTokens is the context window an endpoint for this model may
@@ -295,11 +307,11 @@ func FormatVRAM(bytes uint64) string {
 	// The unit is chosen from the ROUNDED figure rather than the raw byte count:
 	// 999999999 bytes is under a gigabyte and rounds to 1000 MB, and "~1000 MB"
 	// is a gigabyte spelled the long way.
-	if mb := math.Round(float64(bytes) / 1e6); mb < 1000 {
+	if mb := math.Round(float64(bytes) / 1e6); mb < FormatMBCeilingMB {
 		return fmt.Sprintf("~%.0f MB", math.Max(1, mb))
 	}
 	gb := float64(bytes) / 1e9
-	if gb < 100 {
+	if gb < FormatTenthCeilingGB {
 		return fmt.Sprintf("~%.1f GB", gb)
 	}
 	return fmt.Sprintf("~%.0f GB", math.Ceil(gb))

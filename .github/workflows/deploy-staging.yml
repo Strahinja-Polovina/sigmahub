@@ -3,8 +3,9 @@ name: Deploy staging
 # Build in CI, run on the box: cp + web images build on GitHub runners and
 # push to GHCR; the staging server only pulls the pinned sha tags and starts
 # them (a 4GB host must never compile the stack itself). GHCR auth on the
-# server uses this run's GITHUB_TOKEN over SSH, so private packages work with
-# zero server-side setup.
+# server uses this run's GITHUB_TOKEN, delivered over the rollout's stdin
+# (never in the ssh command string — see SIGMA-277 below), so private packages
+# work with zero server-side setup.
 #
 # Required repo secret:
 #   STAGING_SSH_KEY — private half of the dedicated CI deploy key installed
@@ -32,20 +33,37 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless cosign signing of the pushed images via the ambient GitHub OIDC
+      # token (SIGMA-272) — the same Fulcio/Rekor path release.yml already uses
+      # for the archives. No long-lived keys.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # sbom/provenance on both builds (SIGMA-272). The README puts the
+      # container path FIRST for self-hosting, and then closes the section
+      # saying releases are cosign-signed with per-archive SBOMs — which was
+      # true of the goreleaser archives and of nothing a self-hoster actually
+      # runs. A design partner's security review asks for the signature and the
+      # SBOM of the artifact they will run, and the answer was "no matching
+      # signatures". `provenance: mode=max` is what ties the image back to this
+      # commit and this workflow; without it the :latest tag is an image with no
+      # stated origin.
       - name: Build & push control plane
+        id: build_cp
         uses: docker/build-push-action@v6
         with:
           context: cp
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.CP_IMAGE_REPO }}:${{ github.sha }}
             ${{ env.CP_IMAGE_REPO }}:latest
@@ -54,16 +72,58 @@ jobs:
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Build & push dashboard
+        id: build_web
         uses: docker/build-push-action@v6
         with:
           context: web
           push: true
+          sbom: true
+          provenance: mode=max
           tags: |
             ${{ env.WEB_IMAGE_REPO }}:${{ github.sha }}
             ${{ env.WEB_IMAGE_REPO }}:latest
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      # Sign the DIGESTS, not the tags: a tag is a moving pointer, and :latest
+      # in particular is repointed by the next push, so a signature over a tag
+      # says nothing about the bytes anyone pulls later.
+      - name: Sign the pushed images (keyless, GitHub OIDC)
+        env:
+          COSIGN_YES: "true"
+          CP_DIGEST: ${{ steps.build_cp.outputs.digest }}
+          WEB_DIGEST: ${{ steps.build_web.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$CP_IMAGE_REPO@$CP_DIGEST"
+          cosign sign --yes "$WEB_IMAGE_REPO@$WEB_DIGEST"
+
+      # Publishing a signature nobody checked is how a signing step rots
+      # unnoticed, so verify what was just pushed with the same command the
+      # README hands a design partner.
+      #
+      # The SBOM is read with `buildx imagetools`, NOT `cosign download sbom`:
+      # buildkit attaches it as an in-toto attestation in the image index, while
+      # `cosign download sbom` reads the older `.sbom`-tag convention and would
+      # report nothing for an image that does carry one.
+      - name: Verify the signature and SBOM we just published
+        env:
+          CP_DIGEST: ${{ steps.build_cp.outputs.digest }}
+          WEB_DIGEST: ${{ steps.build_web.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for image in "$CP_IMAGE_REPO@$CP_DIGEST" "$WEB_IMAGE_REPO@$WEB_DIGEST"; do
+            cosign verify "$image" \
+              --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/deploy-staging\.yml@" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              > /dev/null
+            sbom="$(docker buildx imagetools inspect "$image" --format '{{ json .SBOM }}')"
+            case "$sbom" in
+              ""|null|"{}") echo "no SBOM attached to $image" >&2; exit 1 ;;
+            esac
+            echo "verified $image"
+          done
 
   deploy:
     needs: build
@@ -94,11 +154,33 @@ jobs:
             ./ "$STAGING_USER@$STAGING_HOST:$STAGING_DIR/"
 
       - name: Pull pinned images & roll out
+        env:
+          # Into the step's environment, not into a command line: the runner
+          # expands these where only this process can see them.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          ssh "$STAGING_USER@$STAGING_HOST" \
-            GHCR_TOKEN='${{ secrets.GITHUB_TOKEN }}' GHCR_USER='${{ github.actor }}' \
-            CP_IMAGE="$CP_IMAGE_REPO:$GITHUB_SHA" WEB_IMAGE="$WEB_IMAGE_REPO:$GITHUB_SHA" \
-            bash -s <<'EOS'
+          set -euo pipefail
+          # The GHCR credentials travel on STDIN with the script (SIGMA-277).
+          #
+          # Everything after the destination is the remote command, and sshd
+          # hands that whole string to the login shell as `$SHELL -c "…"` — so
+          # `GHCR_TOKEN=… bash -s` put a token with packages:read on the org's
+          # private images into the argv of a process on the staging box, where
+          # any local user's `ps`, any container that can read the host's /proc,
+          # and any execve-logging agent could take it. Sampling /proc while
+          # that command runs catches it every time. The box by design also runs
+          # design-partner workloads, and the exposure window is the one moment
+          # anybody would know to watch for: a push to main.
+          #
+          # The script body was never exposed — it already arrived on the
+          # heredoc — so the credentials now go the same way, as two assignment
+          # lines prepended to the stream. printf %q quotes them for the remote
+          # bash; printf is a builtin, so they never reach an argv here either.
+          # CP_IMAGE/WEB_IMAGE stay in the command string: they are public tags.
+          {
+            printf 'GHCR_TOKEN=%q\nGHCR_USER=%q\n' "$GHCR_TOKEN" "$GHCR_USER"
+            cat <<'EOS'
           set -euo pipefail
           cd /home/deploy/sigmahub/cp/deploy
           # Pin the freshly-built images in .env so ANY later `compose up`
@@ -133,5 +215,34 @@ jobs:
             return 1
           }
           wait_for cp http://localhost:8080/readyz
-          wait_for web http://localhost:3000/
+          # NOT the marketing root (SIGMA-265). `/` renders for an anonymous
+          # curl out of static sections: it never reads SIGMAHUB_CP_URL, never
+          # mints a service token and never dials the control plane, so it
+          # answered 200 for every way the web→CP path can break — the env var
+          # renamed, SIGMAHUB_CP_URL dropped from the compose environment (which
+          # this stack has already done once, see CP_HUGGING_FACE_TOKEN in
+          # docker-compose.yml), the CP's auth middleware tightened. `?require=cp`
+          # tells the health route that a control plane is expected here, so
+          # "not configured" is a failure rather than a demo deployment.
+          wait_for web "http://localhost:3000/api/health?require=cp"
+
+          # Provisioning smoke (SIGMA-53/54, SIGMA-265). The gates above prove
+          # the processes are up and that the dashboard's credential is accepted;
+          # this proves the core path a customer arrives on still works —
+          # org → project → environment → agent-enrollment token, plus tenant
+          # isolation — against the stack that was just rolled out. It used to be
+          # a manual step in the runbook, which means it ran when someone
+          # remembered, i.e. never on the deploys that broke it.
+          #
+          # The token is read from the box's own .env rather than passed in from
+          # the workflow: it is the credential the running control plane was
+          # started with (so the check tests the deployed reality, not a second
+          # opinion), and it never appears in an argv on the runner or here.
+          export CP_URL=http://localhost:8080
+          CP_PROVISION_TOKEN="$(sed -n 's/^CP_PROVISION_TOKEN=//p' cp/deploy/.env | head -1)"
+          export CP_PROVISION_TOKEN
+          bash cp/deploy/smoke.sh
           EOS
+          } | ssh "$STAGING_USER@$STAGING_HOST" \
+                CP_IMAGE="$CP_IMAGE_REPO:$GITHUB_SHA" WEB_IMAGE="$WEB_IMAGE_REPO:$GITHUB_SHA" \
+                bash -s

@@ -128,8 +128,21 @@ type Config struct {
 	// ReleaseRepo (CP_RELEASE_REPO) is which repository's releases those are. It
 	// defaults to the upstream slug — the same default agent/packaging/install.sh
 	// and the dashboard already carry — so an unmodified deployment needs no
-	// configuration; a self-hoster running their own (private) fork points it at
-	// theirs, which is exactly the case that produced this work.
+	// configuration. What it is NOT is a fork switch: FromEnv rejects any other
+	// value with a startup error, and pointing a running control plane at a fork
+	// is therefore a boot failure, not a supported configuration.
+	//
+	// The reason is one line below in Load and worth repeating here, because
+	// this comment is what an operator reads first: install.sh carries the
+	// cosign certificate-identity it verifies against as a literal
+	// (SIGMAHUB_REPO), and the install command deliberately does not pass one —
+	// a command carrying its own trust anchor lets whoever wrote the command
+	// choose who to trust. Proxying a fork's artifacts to that script gets them
+	// downloaded and then refused on the host, after the one-time bootstrap key
+	// has been spent. Serving a fork's agent needs the anchor to move with the
+	// bytes, which is a change to the script (and a fork's own agent build), not
+	// a value in the environment. Setting this and expecting a fork to install
+	// cannot work, so it fails at boot rather than on the host.
 	//
 	// AgentVersion (CP_AGENT_VERSION) pins which release GET /install.sh serves.
 	// Empty means "the release this control plane was itself built from", which

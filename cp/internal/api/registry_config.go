@@ -96,6 +96,13 @@ func (s *Server) handleDeleteRegistry(w http.ResponseWriter, r *http.Request) {
 // handleAgentRegistryCredential releases the push/pull credential to an agent.
 // Scope comes from the agent token, never from the request body, and the store
 // audits every release.
+//
+// A valid agent token is necessary but NOT sufficient: the store also checks
+// that this particular server has something to push or pull for the org before
+// it unwraps anything (SIGMA-258), and answers ErrNotFound — the 404 below —
+// when it does not. Membership in the org is not need: the credential is a
+// registry PAT with push rights over every image the org publishes, so one
+// compromised staging host must not be able to poison the fleet's images.
 func (s *Server) handleAgentRegistryCredential(w http.ResponseWriter, r *http.Request) {
 	if s.registry == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no registry configured"})

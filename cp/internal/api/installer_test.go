@@ -3,11 +3,17 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -55,7 +61,11 @@ type fakeGitHub struct {
 	mu          sync.Mutex
 	assets      []fakeAsset // index+1 is the asset id, mirroring GitHub's numeric ids
 	forceStatus int         // when set, every request answers this instead
-	requests    []recordedRequest
+	// forceRateLimitHeader adds `X-RateLimit-Remaining: 0` to the forced
+	// response, which is how GitHub's REST API actually reports an exhausted
+	// PRIMARY rate limit: 403 plus that header, not 429.
+	forceRateLimitHeader bool
+	requests             []recordedRequest
 }
 
 func (g *fakeGitHub) add(a fakeAsset) { g.assets = append(g.assets, a) }
@@ -75,12 +85,16 @@ func (g *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		auth: r.Header.Get("Authorization"), accept: r.Header.Get("Accept"),
 	})
 	forced := g.forceStatus
+	rateLimited := g.forceRateLimitHeader
 	g.mu.Unlock()
 
 	if forced != 0 {
 		// GitHub's own error bodies are JSON; serving one here is what proves
 		// the proxy never forwards an upstream body into a root shell.
 		w.Header().Set("Content-Type", "application/json")
+		if rateLimited {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+		}
 		w.WriteHeader(forced)
 		_, _ = w.Write([]byte(`{"message":"Not Found","documentation_url":"https://docs.github.com"}`))
 		return
@@ -521,6 +535,67 @@ func TestAGitHubRateLimitIsReportedAsTemporaryAndNamesTheTokenAsTheFix(t *testin
 	}
 }
 
+// GitHub's REST API reports an exhausted PRIMARY rate limit as 403 with
+// X-RateLimit-Remaining: 0. Only the newer secondary limits answer 429, so
+// switching on the status alone routes the COMMON exhaustion path — an
+// anonymous control plane spending its 60 requests an hour, which is ten
+// onboardings — into the credential branch.
+//
+// The operator then reads "Set CP_RELEASE_TOKEN to a token with read access",
+// revokes a perfectly good PAT, re-issues it, redeploys the control plane, and
+// gets the identical message, because the limit has not reset. A rotation and a
+// restart burned mid-onboarding on a condition that clears itself in minutes.
+//
+// cp/internal/githubapp/inspect.go has known this for two call sites; this is
+// the third.
+func TestUpstreamError_RateLimited403(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		// The anonymous 60/hr budget is the one that actually runs out.
+		{"public path", ""},
+		{"authenticated path", testReleaseToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			gh.forceStatus = http.StatusForbidden
+			gh.forceRateLimitHeader = true
+			s, _ := installerServer(t, gh, ReleaseSource{Token: tc.token})
+
+			rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+			body := rec.Body.String()
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("rate-limited 403 answered %d, want 503 (retryable, like the 429 path): %s", rec.Code, body)
+			}
+			if !strings.Contains(body, "rate-limited") || !strings.Contains(body, "Retry in a few minutes") {
+				t.Errorf("an exhausted rate limit is not reported as one:\n%s", body)
+			}
+			if strings.Contains(body, "GitHub refused this control plane's release credential") {
+				t.Errorf("a spent rate limit is reported as a bad credential, which sends the operator "+
+					"to rotate a token that is fine:\n%s", body)
+			}
+		})
+	}
+}
+
+// And the header must not turn every refusal into a rate limit: a genuinely
+// bad credential still answers with X-RateLimit-Remaining above zero (or no
+// header at all), and must still name CP_RELEASE_TOKEN.
+func TestARefusedCredentialWithBudgetLeftStillNamesTheToken(t *testing.T) {
+	gh := releaseWithInstaller()
+	gh.forceStatus = http.StatusForbidden
+	s, _ := installerServer(t, gh, ReleaseSource{Token: testReleaseToken})
+
+	rec := get(t, s, "/dl/"+testReleaseVersion+"/checksums.txt")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("upstream 403 with budget left answered %d, want 502: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CP_RELEASE_TOKEN") {
+		t.Errorf("credential refusal no longer names the setting that fixes it:\n%s", rec.Body.String())
+	}
+}
+
 func TestAnAssetLargerThanTheCapIsRefusedRatherThanStreamed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -930,4 +1005,184 @@ func TestAnExplicitAgentVersionIsCheckedAgainstTheInstallerRoutesOwnPattern(t *t
 			t.Errorf("%q is accepted here but is not a tag the /dl route would serve", tc.version)
 		}
 	}
+}
+
+// GET /install.sh is the one artifact cosign cannot cover, because it is what
+// runs cosign — its integrity rests entirely on the TLS the host fetches it
+// over. The dashboard already refuses to RENDER a command whose endpoint is not
+// https (web/src/server/actions/servers.ts), but the route itself served the
+// script to anyone who asked, over whatever the control plane was reachable on.
+//
+// So a control plane that knows its own public URL is plaintext knows the
+// command an operator is about to paste pipes cleartext into `sudo bash`, and
+// answering it is worse than refusing: the operator finds out on the host, after
+// the bootstrap key has been dropped, or never.
+//
+// Empty is NOT a refusal (CP_PUBLIC_URL is optional — it exists for the GitHub
+// webhook, and a deployment that never set it is not making a claim about its
+// own scheme), and neither is a loopback address, which is how the stack is
+// brought up on a developer's own machine and is not on a network anyone is
+// on-path of.
+func TestInstallScriptRefusedOverPlaintextPublicURL(t *testing.T) {
+	for _, tc := range []struct {
+		publicURL string
+		want      int
+	}{
+		{"http://cp.example.com", http.StatusServiceUnavailable},
+		{"http://cp.example.com:8080", http.StatusServiceUnavailable},
+		{"HTTP://CP.EXAMPLE.COM", http.StatusServiceUnavailable},
+		{"https://cp.example.com", http.StatusOK},
+		{"", http.StatusOK},
+		{"http://localhost:8080", http.StatusOK},
+		{"http://127.0.0.1:8080", http.StatusOK},
+	} {
+		t.Run(tc.publicURL, func(t *testing.T) {
+			gh := releaseWithInstaller()
+			upstream := httptest.NewServer(gh)
+			t.Cleanup(upstream.Close)
+			s := New(slog.Default(), fakePinger{}, &fakeStore{}, &fakeDomain{}, Options{
+				DevServiceToken: testServiceToken,
+				PublicURL:       tc.publicURL,
+				Release: ReleaseSource{
+					Repo:         testReleaseRepo,
+					Version:      testReleaseVersion,
+					DownloadBase: upstream.URL,
+					APIBase:      upstream.URL,
+				},
+			})
+
+			rec := get(t, s, "/install.sh")
+			if rec.Code != tc.want {
+				t.Fatalf("GET /install.sh with CP_PUBLIC_URL=%q = %d, want %d; body: %s",
+					tc.publicURL, rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.want != http.StatusOK {
+				if !strings.Contains(rec.Body.String(), "CP_PUBLIC_URL") {
+					t.Errorf("the refusal does not name the setting to fix:\n%s", rec.Body.String())
+				}
+				if seen := gh.seen(); len(seen) != 0 {
+					t.Errorf("a control plane that refused to serve the installer still asked GitHub: %+v", seen)
+				}
+			}
+		})
+	}
+}
+
+// A refusal that names a setting is a promise: set THIS, and the thing you were
+// trying to do starts working. The promise is broken the moment the deploy files
+// read that setting under a different name — and it broke exactly there
+// (SIGMA-269). installerRelease says "Set CP_AGENT_VERSION to a released tag",
+// the dashboard passes that sentence through verbatim rather than paraphrasing
+// it, and the shipped compose file interpolated ${SIGMAHUB_AGENT_VERSION} into
+// it. A self-hoster on a source build (main.version = "dev") therefore hit the
+// refusal on their first connect-server attempt, put CP_AGENT_VERSION in
+// cp/deploy/.env exactly as instructed, restarted, and got the identical
+// message back.
+//
+// So this reads the sentences and the compose file, and asserts that every CP_*
+// name the installer tells an operator to set is a name the `cp` service
+// actually interpolates from the environment. Only string LITERALS are scanned:
+// prose in a comment is describing history, not making a promise.
+func TestInstallerRefusalsNameASettingTheComposeFileReads(t *testing.T) {
+	named := settingsNamedInStringLiterals(t, "installer.go")
+	if len(named) == 0 {
+		t.Fatal("found no CP_* setting named in installer.go's messages; the scan or the messages moved " +
+			"and this guard can no longer see what it is guarding")
+	}
+	env := composeServiceEnvironment(t, "cp")
+
+	for _, name := range named {
+		value, ok := env[name]
+		if !ok {
+			t.Errorf("an installer refusal tells the operator to set %s, but the cp service in "+
+				"cp/deploy/docker-compose.yml never passes it: they will set it in .env, restart, and "+
+				"get the same refusal back", name)
+			continue
+		}
+		if !strings.Contains(value, "${"+name) {
+			t.Errorf("an installer refusal tells the operator to set %s, but the cp service reads it as "+
+				"%q — the name the product asks for is not the name the deploy file reads, so setting it "+
+				"changes nothing", name, value)
+		}
+	}
+}
+
+// settingsNamedInStringLiterals returns the CP_* settings a source file names in
+// its string literals, sorted. Parsing rather than grepping is what keeps the
+// comments out: this file discusses settings at length in prose, and a comment
+// is not a promise made to an operator.
+func settingsNamedInStringLiterals(t *testing.T, file string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	// Anchored on a non-name character so SIGMAHUB_CP_PUBLIC_URL — the
+	// dashboard's own setting, on the other side of the boundary — is not read
+	// as a reference to CP_PUBLIC_URL.
+	pattern := regexp.MustCompile(`(^|[^A-Za-z0-9_])(CP_[A-Z][A-Z0-9_]*)`)
+	seen := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		s, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			s = lit.Value
+		}
+		for _, m := range pattern.FindAllStringSubmatch(s, -1) {
+			seen[m[2]] = true
+		}
+		return true
+	})
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// composeServiceEnvironment reads one service's environment block out of the
+// deploy compose file as name → raw value, interpolation intact — which is the
+// half that matters here. An indentation-aware line scan, like the compose guard
+// in cp/internal/config: enough for a file this repo owns and formats, and it
+// keeps the test dependency-free.
+func composeServiceEnvironment(t *testing.T, service string) map[string]string {
+	t.Helper()
+	path := filepath.Join("..", "..", "deploy", "docker-compose.yml")
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	out := map[string]string{}
+	inService, inEnv := false, false
+	for _, raw := range strings.Split(string(src), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		switch {
+		case indent == 2 && strings.HasPrefix(trimmed, service+":"):
+			inService, inEnv = true, false
+		case indent <= 2:
+			inService, inEnv = false, false
+		case inService && indent == 4:
+			inEnv = trimmed == "environment:"
+		case inService && inEnv && indent == 6:
+			key, value, ok := strings.Cut(trimmed, ":")
+			if ok {
+				out[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			}
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("parsed no environment entries for service %q out of %s; the file's shape moved and "+
+			"this guard can no longer see what it is guarding", service, path)
+	}
+	return out
 }

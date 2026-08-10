@@ -112,6 +112,22 @@ export function cpPublicUrl(): string {
   return (process.env.SIGMAHUB_CP_PUBLIC_URL ?? cpBase()).replace(/\/$/, "");
 }
 
+/** The credential every org's service token descends from: it is the only
+ *  thing this process holds before an org has been provisioned, and losing it
+ *  (renamed variable, missing from the compose environment) breaks every
+ *  authenticated page at once. Named here rather than read inline twice so the
+ *  health check (SIGMA-265) probes the same value getOrgToken spends. */
+export function cpProvisionToken(): string {
+  return process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+}
+
+/** Base URL of the control plane, or null when none is configured. Exported
+ *  for the health check, which must distinguish "not configured" from
+ *  "configured and unreachable" instead of throwing on the first. */
+export function cpBaseOrNull(): string | null {
+  return cpEnabled() ? cpBase() : null;
+}
+
 // ── Org credential store (P1-1) ─────────────────────────────────────────────
 
 let orgTokenTableReady = false;
@@ -137,8 +153,7 @@ async function getOrgToken(orgId: string): Promise<string> {
   );
   if (existing.rows[0]?.token) return existing.rows[0].token;
 
-  const provisionToken =
-    process.env.SIGMAHUB_CP_PROVISION_TOKEN ?? "dev-provision-token";
+  const provisionToken = cpProvisionToken();
   const res = await fetch(`${cpBase()}/v1/orgs`, {
     method: "POST",
     headers: {
@@ -1070,6 +1085,30 @@ export async function cpRevealSecret(
     { orgId, actor }
   );
   return value;
+}
+
+/** Re-seal an existing secret's value in place (SIGMA-264).
+ *
+ *  Rotation used to be delete-then-create, and because BOTH halves mint config
+ *  deployments the delete alone re-rolled every dependent app WITHOUT the
+ *  variable before the replacement existed. One PUT is one config deployment,
+ *  and the secret keeps its id so every ref that names it still resolves.
+ *
+ *  Deliberately NOT idempotency-wrapped: a value update is idempotent by
+ *  construction — replaying it writes the same ciphertext-of-the-same-plaintext
+ *  to the same row. The wrapper exists to stop a retried CREATE from minting a
+ *  second row and a second restart wave. */
+export async function cpUpdateSecretValue(
+  orgId: string,
+  secretId: string,
+  value: string,
+  actor: CpActor
+): Promise<CpSecret> {
+  return cpFetch(
+    `${org(orgId)}/secrets/${encodeURIComponent(secretId)}`,
+    { method: "PUT", body: JSON.stringify({ value }) },
+    { orgId, actor }
+  );
 }
 
 export async function cpDeleteSecret(orgId: string, secretId: string, actor: CpActor): Promise<void> {
@@ -2056,6 +2095,19 @@ export async function cpListClusters(
 ): Promise<{ clusters: CpCluster[]; excludedKinds: string[] }> {
   const q = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
   return cpFetch(`${org(orgId)}/clusters${q}`, undefined, { orgId });
+}
+
+/** Which engines THIS control plane will accept (SIGMA-268).
+ *
+ *  The generated catalog is what this codebase can provision; CP_DB_ENGINES /
+ *  CP_S3_ENGINES can cut that down per deployment, and the create call refuses
+ *  anything outside the cut with a 422. Without this the wizard offered engines
+ *  from the catalog and the operator discovered the disagreement at submit,
+ *  after the dialog had closed. */
+export type CpCapabilities = { dbEngines: string[]; s3Engines: string[] };
+
+export async function cpCapabilities(orgId: string): Promise<CpCapabilities> {
+  return cpFetch(`${org(orgId)}/capabilities`, undefined, { orgId });
 }
 
 /** `requestId` identifies the SUBMISSION, not the call: the wizard mints one

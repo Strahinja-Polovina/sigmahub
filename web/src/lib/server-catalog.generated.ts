@@ -6,7 +6,8 @@
 // catalog at cp/internal/store/server_catalog.go, together with the kinds a
 // cluster refuses (cp/internal/store/clusters.go) and the engine catalogs the
 // managed-data panels describe themselves from (cp/internal/store/db_engines.go
-// and cp/internal/store/s3_engines.go).
+// and cp/internal/store/s3_engines.go) and the alert event vocabulary the rules
+// editor labels (cp/internal/store/alerts_store.go).
 //
 // Editing this file by hand re-creates the defect SIGMA-198 removed: a
 // dashboard offering server types the API rejects. Change the Go catalog and
@@ -21,7 +22,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "10822a5ef8b927ad3044ff6eee074e9caae703a1915b6b9a6d59aba21cc8123f";
+export const CATALOG_SOURCE_SHA256 = "e766e32e01d0810589b69d5c7f9712fd6ceb41c56459298277afe180e8a434bb";
 
 export type ServerType =
   | "general"
@@ -66,6 +67,38 @@ export type DatabaseEngine =
 export type S3Engine =
   | "minio"
   | "seaweedfs";
+
+/** An inference runtime this control plane knows how to render (store.llmEngines).
+ *
+ *  Rendered rather than restated for the reason the S3 list is: the wizard kept
+ *  a two-entry copy, so renaming or replacing the default runtime on the Go
+ *  side left it sending engine "vllm" for every model whose card did not
+ *  resolve — a Hub timeout, a control plane with no Hub catalogue, a pasted repo
+ *  id the Hub does not know — and provisionLLMTx answered with a 422 at the end
+ *  of the LLM wizard while every suite stayed green (SIGMA-278). */
+export type LLMEngine =
+  | "vllm"
+  | "ollama";
+
+/** An alert event the control plane can emit (store.AlertEvents).
+ *
+ *  A union rather than a string list, because the dashboard's rules editor
+ *  labels these and its label map used to enumerate a SUBSET: payment_failed
+ *  had none, so the eighth chip rendered as raw snake_case beside seven
+ *  sentence-case ones, on a billing-enabled deployment, with every suite green
+ *  (SIGMA-274). Typed as a union, an event added on the Go side fails
+ *  tsc --noEmit at the label map that forgot it. */
+export type AlertEvent =
+  | "server_unreachable"
+  | "server_recovered"
+  | "decommission_timed_out"
+  | "dsd_apply_failed"
+  | "deploy_failed"
+  | "backup_failed"
+  | "verify_failed"
+  | "cert_failed"
+  | "cert_expiring"
+  | "payment_failed";
 
 /** One precondition a host must meet to enroll as a type. The fact field names
  *  the agent-reported datum it is checked against, so a host that never
@@ -481,12 +514,49 @@ export const S3_ENGINE_NAMES: S3Engine[] = ["minio", "seaweedfs"];
 /** What an s3 resource provisions when its spec names no engine. */
 export const DEFAULT_S3_ENGINE: S3Engine = "minio";
 
+/** The inference runtimes, in the order the picker offers them (the same
+ *  order GET /llm/engines answers with). */
+export const LLM_ENGINE_NAMES: LLMEngine[] = ["vllm", "ollama"];
+/** What an llm resource is served by when its spec names no runtime — and
+ *  therefore what the wizard must send for a model whose card did not resolve. */
+export const DEFAULT_LLM_ENGINE: LLMEngine = "vllm";
+
+/** Every alert event, in the order the control plane serves them
+ *  (GET /orgs/{id}/alert-channels answers with exactly this list). The rules
+ *  editor renders the runtime list, not this one — a dashboard talking to a
+ *  newer control plane must still show an event it has never heard of — but
+ *  this is what its label map is keyed on, so the labels cannot fall behind
+ *  the vocabulary in silence. */
+export const ALERT_EVENTS: AlertEvent[] = ["server_unreachable", "server_recovered", "decommission_timed_out", "dsd_apply_failed", "deploy_failed", "backup_failed", "verify_failed", "cert_failed", "cert_expiring", "payment_failed"];
+
 /** The first mesh-bound host port the control plane's per-server allocator
  *  hands out (store.MeshPortBase). A managed engine is reachable on an
  *  ALLOCATED port from here up — never on the engine's container port, which is
  *  what demo mode used to print. "Your Postgres is on 5432" is the one sentence
  *  a connection panel must not teach about a product that hands out 15000+. */
 export const MESH_PORT_BASE = 15000;
+
+/** The model-sizing constants, from cp/internal/hf/sizing.go.
+ *
+ *  Demo mode has no control plane to ask, so its model cards carry the VRAM
+ *  figures the control plane would have answered with. They were evaluated by
+ *  hand, once, and the demo's own tests asserted them against themselves — so
+ *  moving UtilizationCap to 0.85 or KVActivationFactor to 1.30 left every suite
+ *  green while the demo went on telling evaluators a model needs ~21.4 GB
+ *  against a product now saying ~22.7 GB (SIGMA-279). A prospect sizes a GPU
+ *  purchase from that number.
+ *
+ *  These are NOT for computing a requirement at runtime: outside demo mode the
+ *  control plane sends the byte count and the dashboard compares it, because
+ *  two implementations of one formula are two answers to one question. They
+ *  exist so the recorded fixtures can be checked against the arithmetic that
+ *  produced them. */
+export const VRAM_KV_ACTIVATION_FACTOR = 1.2;
+export const VRAM_UTILIZATION_CAP = 0.9;
+/** FormatVRAM's band boundaries: whole MB below the first, tenths of a GB
+ *  below the second, whole GB rounded up at or above it. */
+export const VRAM_FORMAT_MB_CEILING = 1000;
+export const VRAM_FORMAT_TENTH_CEILING_GB = 100;
 
 /** Whether a server type may host a resource kind. */
 export function canHost(server: ServerType, kind: ResourceKind): boolean {
@@ -585,4 +655,29 @@ export function databaseConnectionUrl(
 export function s3EndpointUrl(engine: S3Engine, host: string, port: number): string {
   if (!host) return "";
   return fillTemplate(S3_ENGINE_CATALOG[engine].endpointTemplate, { host, port });
+}
+
+/** hf.RequiredVRAMBytes: weights, plus what else lives on the card, over the
+ *  share of it vLLM will actually allocate. Zero parameters means "unsized",
+ *  which is the value that turns the fit check OFF everywhere downstream — it
+ *  is never a model that needs no memory. */
+export function requiredVramBytes(parameters: number, bytesPerParam: number): number {
+  if (parameters <= 0 || bytesPerParam <= 0) return 0;
+  const weights = parameters * bytesPerParam;
+  return Math.ceil((weights * VRAM_KV_ACTIVATION_FACTOR) / VRAM_UTILIZATION_CAP);
+}
+
+/** hf.FormatVRAM: the one string both sides show, e.g. "~21.4 GB". Decimal GB,
+ *  because the number being compared against is the one printed on the card.
+ *  Zero renders as the empty string — an unsized model has no size to show, and
+ *  "~0 GB" is a number that lies. */
+export function formatVram(bytes: number): string {
+  if (bytes <= 0) return "";
+  // The unit is chosen from the ROUNDED figure: 999999999 bytes is under a
+  // gigabyte and rounds to 1000 MB, which is a gigabyte spelled the long way.
+  const mb = Math.round(bytes / 1e6);
+  if (mb < VRAM_FORMAT_MB_CEILING) return `~${Math.max(1, mb)} MB`;
+  const gb = bytes / 1e9;
+  if (gb < VRAM_FORMAT_TENTH_CEILING_GB) return `~${gb.toFixed(1)} GB`;
+  return `~${Math.ceil(gb)} GB`;
 }

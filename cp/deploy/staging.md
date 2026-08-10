@@ -29,16 +29,16 @@ Fill in `.env` (all required unless noted):
 | `CP_DB_PASSWORD` | Postgres password (generated). |
 | `CP_PROVISION_TOKEN` | Gates org provisioning — `openssl rand -hex 32`. |
 | `BETTER_AUTH_SECRET` | Dashboard session key — `openssl rand -base64 32`. |
-| `WEB_PUBLIC_URL` | `https://staging.sigmahub.example` (cookies/redirects). |
+| `WEB_PUBLIC_URL` | `https://staging.sigmahub.example` (cookies/redirects, and the site address the bundled proxy serves the dashboard on). |
 | `SIGMAHUB_CP_PUBLIC_URL` | Public URL a BYO host dials to reach the CP (e.g. `https://cp.staging.sigmahub.example`) — the in-cluster `http://cp:8080` is not reachable from a host. Rendered into the install command. |
-| `SIGMAHUB_AGENT_VERSION` | Released agent tag the control plane installs (e.g. `v0.3.0`) — there is no asset published under `latest`. It becomes the CP's `CP_AGENT_VERSION`; the dashboard has no copy, it asks the CP. Required here because staging builds from source, which stamps no release tag. |
+| `CP_AGENT_VERSION` | Released agent tag the control plane installs (e.g. `v0.3.0`) — there is no asset published under `latest`. Spelled the way the refusal that asks for it is spelled (SIGMA-269); the dashboard has no copy, it asks the CP. Required here because staging builds from source, which stamps no release tag. |
 | `CP_RELEASE_TOKEN` | GitHub token with `contents:read` on the release repository. Required whenever that repository is **private** — the control plane proxies install.sh and the release assets with it, and a private repo answers 404 to an unauthenticated fetch, so onboarding fails at the first curl without it. Leave empty for a public release repo (the anonymous path has a higher rate limit). |
-| `CP_RELEASE_REPO` | Which repository's releases those are. Leave unset unless you run your own fork — the default is the upstream slug that `install.sh`'s pinned cosign identity already expects. |
+| `CP_RELEASE_REPO` | Which repository's releases those are. **Leave unset.** The value is fixed to the upstream slug and the control plane refuses to boot with any other — `install.sh` bakes in the cosign identity it verifies against, so a fork's artifacts would be downloaded and then rejected on the host. Serving a fork needs a forked `install.sh` and agent build, not this setting. |
 | `CP_ACME_EMAIL` | Let's Encrypt contact for managed-domain TLS. |
 | `CP_ACME_CA_DIR_URL` | Optional — point at LE staging/Pebble so repeated bring-ups don't spend the real CA's issuance budget. |
 | `CP_HUGGING_FACE_TOKEN` | Optional — the Hub account the picker searches as and the agent downloads weights as. Empty still serves public models; gated ones (Llama & co) stay invisible. |
 | `CP_KMS_BACKEND` | `file` is fine for staging; `vault` for prod custody. |
-| `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave default to exercise every engine. |
+| `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave **empty** to exercise every engine the catalog defines — the list is derived, not written down (SIGMA-268). Set one only to cut it (`CP_DB_ENGINES=postgres`). |
 | `CP_PADDLE_*` | Optional — leave empty; billing degrades to the honest usage preview. |
 | `CP_VM_WRITE_URL` / `CP_LOKI_URL` | Optional — telemetry shows not-configured until set. |
 
@@ -58,6 +58,43 @@ control plane (migrations run on boot), and the dashboard. Watch it settle:
 ```
 docker compose -f cp/deploy/docker-compose.yml logs -f cp web
 ```
+
+## 2b. TLS (SIGMA-266) — the https names above have to answer
+
+`up -d` also starts `proxy`, a Caddy terminator on ports 80 and 443. It is the
+only thing published to the world: `cp` and `web` bind to `127.0.0.1` so they
+are reachable from the host for on-box checks and from nowhere else. Nothing to
+configure — its two site addresses are `SIGMAHUB_CP_PUBLIC_URL` and
+`WEB_PUBLIC_URL` from `.env` (see `cp/deploy/Caddyfile`), and it obtains and
+renews certificates over ACME itself.
+
+Operator prerequisites, which are not optional:
+
+- **Both DNS names resolve to this host** before the first request. Caddy gets a
+  certificate on demand, so a name that does not resolve simply fails to get
+  one.
+- **80 and 443 are open** to the internet. Port 80 carries the HTTP-01
+  challenge and the redirect to https; blocking it blocks issuance.
+- The `caddy-data` volume holds the ACME account and the issued certificates.
+  `down -v` throws it away and the next bring-up re-issues, which spends the
+  CA's per-domain issuance budget — the same reason `CP_ACME_CA_DIR_URL` exists
+  for the control plane's own managed-domain TLS.
+
+Check it before moving on — the second command is the one that matters, because
+it is the artifact the trust model turns on:
+
+```
+curl -fsS https://staging.sigmahub.example/ -o /dev/null && echo dashboard ok
+curl -fsSI https://cp.staging.sigmahub.example/install.sh | head -1
+```
+
+If `SIGMAHUB_CP_PUBLIC_URL` names an **http** URL, the control plane refuses
+`/install.sh` with a message naming `CP_PUBLIC_URL`, and the connect-server
+wizard shows that sentence instead of a command. That is deliberate and is not
+a bug to work around by making the URL http: the install command pipes
+`install.sh` into `sudo bash`, and that script is the one artifact cosign cannot
+cover — it is what runs cosign — so plaintext there is root on every host being
+onboarded for anyone on the path, plus a one-time bootstrap token in the clear.
 
 ## 3. Verify with the smoke check
 
@@ -79,7 +116,19 @@ cp/deploy/smoke.sh
 6. Read models reflect the writes.
 
 Exit 0 = the control plane is healthy and the core provisioning path works. It
-provisions a uniquely-named throwaway org each run.
+provisions a uniquely-named throwaway org each run, and revokes every Org Admin
+token it minted on the way out — including on a failed or interrupted run
+(SIGMA-267). The empty orgs stay (there is no org teardown API in v1); the
+authority over them does not, and no credential is left on disk.
+
+**This is the same check CI runs.** `.github/workflows/deploy-staging.yml` runs
+`smoke.sh` on the box at the end of every rollout and fails the deploy on a
+non-zero exit, so the manual step above and the automated gate are one artifact
+rather than two that can disagree (SIGMA-265). The rollout also polls the
+dashboard's `GET /api/health?require=cp`, which round-trips to the control plane
+with the dashboard's own credential — the readiness gate used to be the
+marketing home page, which renders without ever touching the control plane and
+therefore reported success for every way the web→CP path can break.
 
 ## 4. Enroll a host (SSH onboarding)
 
@@ -89,12 +138,13 @@ the printed one-liner to install `sigmad`. Every URL in that one-liner is the
 control plane's: it serves `install.sh` and proxies that release's assets with a
 server-side GitHub credential, so a PRIVATE release repository onboards without
 the host ever talking to github.com. Which release is the control plane's answer
-alone (`SIGMAHUB_AGENT_VERSION` → `CP_AGENT_VERSION`) — it comes back with the
-bootstrap token and the dashboard renders it, so the command and the assets
-cannot name different versions. It points the agent at `SIGMAHUB_CP_PUBLIC_URL`,
-which must be `https://`: the command pipes `install.sh` into `sudo bash`, and
-that script is the one artifact cosign cannot cover, because it is what runs
-cosign.
+alone (`CP_AGENT_VERSION`, under that one name in `.env` and in the container) —
+it comes back with the bootstrap token and the dashboard renders it, so the
+command and the assets cannot name different versions. It points the agent at
+`SIGMAHUB_CP_PUBLIC_URL`, which must be `https://`: the command pipes
+`install.sh` into `sudo bash`, and that script is the one artifact cosign cannot
+cover, because it is what runs cosign. The control plane refuses to serve it
+over anything else (step 2b).
 The agent enrolls, joins the WireGuard mesh, and appears under **Servers**.
 Attach it to the `prod` environment to schedule resources on it.
 

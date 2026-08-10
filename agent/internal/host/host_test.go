@@ -3,11 +3,13 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Strahinja-Polovina/sigmahub/agent/internal/dsd"
+	"github.com/Strahinja-Polovina/sigmahub/agent/internal/mesh"
 )
 
 func TestRenderNftables(t *testing.T) {
@@ -40,6 +42,39 @@ func TestRenderNftables(t *testing.T) {
 	// Public SSH is closed by default (opt-out only).
 	if strings.Contains(got, "tcp dport 22 accept") {
 		t.Error("public SSH must be closed unless AllowPublicSSH")
+	}
+}
+
+// TestRenderNftablesOpensTheMeshListenPort is SIGMA-275.
+//
+// The firewall this package renders and the WireGuard config the mesh package
+// renders describe the same UDP port from opposite sides: mesh listens on it,
+// nftables is what lets a handshake reach the listener. They were two literal
+// 51820s with nothing linking them, so moving the mesh off the WireGuard
+// default — a port conflict on a customer host, or a deliberate change — would
+// have every agent listen on the new port while its own firewall admitted only
+// the old one. The agent would report a healthy config while the kernel
+// silently dropped every handshake, and the symptom (cross-host traffic dies
+// fleet-wide on the next reconcile) points nowhere near the cause.
+//
+// So the default is now mesh.ListenPort itself, and this is the test that fails
+// on the commit that unpicks it rather than on the outage that reveals it.
+func TestRenderNftablesOpensTheMeshListenPort(t *testing.T) {
+	// A spec with no port at all: the control plane does not send one, because
+	// the agent's own constant is the single source of truth for it.
+	got := RenderNftables(NftablesSpec{})
+	want := fmt.Sprintf("udp dport %d accept", mesh.ListenPort)
+	if !strings.Contains(got, want) {
+		t.Errorf("nft ruleset does not open the port WireGuard actually listens on (%q):\n%s", want, got)
+	}
+}
+
+// An explicit port in the spec still wins — the field is kept precisely so a
+// deployment can override the default without a rebuild.
+func TestRenderNftablesHonoursAnExplicitPort(t *testing.T) {
+	got := RenderNftables(NftablesSpec{WireguardPort: 51999})
+	if !strings.Contains(got, "udp dport 51999 accept") {
+		t.Errorf("an explicit wireguardPort must be honoured:\n%s", got)
 	}
 }
 

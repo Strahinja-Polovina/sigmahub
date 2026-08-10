@@ -27,7 +27,7 @@ func TestDSDApplyFailureAlertsAndSurfacesNonConvergence(t *testing.T) {
 	orgID := "org_conv"
 	// A channel subscribed to every event, so the outbox has somewhere to fan out to.
 	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.example/T000/secret",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/secret",
 	}); err != nil {
 		t.Fatal(err)
 	}

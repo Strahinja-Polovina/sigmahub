@@ -10,13 +10,19 @@ package integration
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/api"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
@@ -57,7 +63,45 @@ func TestImageRegistryLifecycle(t *testing.T) {
 	}, "admin"); err != nil {
 		t.Fatal(err)
 	}
+	// The credential is released on NEED, not on membership (SIGMA-258), so the
+	// reader has to be a server with something to build: an in-flight deployment
+	// naming it as the build server.
 	serverID := connectServer(t, st, orgID, "builder")
+	proj, err := st.CreateProject(ctx, orgID, "web", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AttachServer(ctx, orgID, env.ID, serverID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: serverID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: serverID,
+		ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, serverID); err != nil {
+		t.Fatal(err)
+	}
 	cred, err := st.RegistryCredentialForServer(ctx, orgID, serverID)
 	if err != nil {
 		t.Fatal(err)
@@ -1198,5 +1242,145 @@ func TestSecondClusterDeploySupersedesTheFirst(t *testing.T) {
 		// Only the still-in-flight successor may be timed out here.
 		t.Fatalf("stale sweep failed %d cluster deployments, want only the in-flight one: %+v",
 			got, statuses(app.ID))
+	}
+}
+
+// SIGMA-258: the agent registry-credential release is scoped to servers that
+// actually build or pull for the org.
+//
+// The credential is the org's registry username and password — in practice a
+// ghcr.io or Docker Hub PAT with PUSH rights to every image the org publishes.
+// The endpoint authenticated the agent token and then handed that credential to
+// ANY server in the org, because the query behind it filtered on org_id alone
+// and used the server id only to label the audit row. One compromised host —
+// a staging box with a contractor's shell on it — could read ~/.sigmad/state,
+// call this endpoint, and overwrite :latest for every image the org publishes;
+// the next deploy or restart anywhere in the fleet pulls the poisoned tag.
+//
+// Need is the gate now: the builder of an in-flight deployment (it has to push),
+// the host that deployment rolls out on (it has to pull what the builder
+// pushed), and a node of a cluster carrying workloads (same pull). Everybody
+// else gets the same 404 as an org with no registry at all.
+func TestAgentRegistryCredential_ForeignServerDenied(t *testing.T) {
+	st, dsdKey := testStore(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := api.New(log, st, st, st, api.Options{
+		DevServiceToken: "dev",
+		Registry:        st,
+		DSDPublicKey:    dsdKey.Public().(ed25519.PublicKey),
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	orgID := "org_reg_scope"
+	if _, err := st.SetImageRegistry(ctx, orgID, store.SetImageRegistryInput{
+		Host: "ghcr.io", Namespace: "acme", Username: "bot", Password: "push-token",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enrolling by hand rather than through connectServer: this test acts as the
+	// agent over HTTP, so it needs the agent TOKEN, not just the server id.
+	enroll := func(name string) (id, token string) {
+		t.Helper()
+		bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, name, "general", "", "", "admin", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, err := st.RegisterServer(ctx, bootTok, name, "0.1.0", json.RawMessage(`{}`), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reg.Server.ID, reg.AgentToken
+	}
+	runServer, runToken := enroll("run")
+	buildServer, buildToken := enroll("build")
+	strangerID, strangerToken := enroll("staging-contractor-box")
+
+	proj, err := st.CreateProject(ctx, orgID, "web", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "production", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{runServer, buildServer, strangerID} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: runServer, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: runServer,
+		ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, buildServer); err != nil {
+		t.Fatal(err)
+	}
+
+	fetch := func(token string) (int, store.RegistryCredential) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", ts.URL+"/v1/agent/registry-credential", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var cred store.RegistryCredential
+		_ = json.NewDecoder(resp.Body).Decode(&cred)
+		return resp.StatusCode, cred
+	}
+
+	// The builder must still get it: it is the machine that runs docker push.
+	if code, cred := fetch(buildToken); code != http.StatusOK || cred.Password != "push-token" {
+		t.Fatalf("build server → %d %+v, want 200 with the credential", code, cred)
+	}
+	// So must the deploy target: the image it rolls out lives in a private
+	// registry and an anonymous pull is a 401 (SIGMA-243).
+	if code, cred := fetch(runToken); code != http.StatusOK || cred.Password != "push-token" {
+		t.Fatalf("deploy target → %d %+v, want 200 with the credential", code, cred)
+	}
+	// The stranger neither builds nor pulls anything for this org.
+	code, cred := fetch(strangerToken)
+	if code != http.StatusNotFound {
+		t.Fatalf("uninvolved server → %d, want 404", code)
+	}
+	if cred.Password != "" || cred.Username != "" {
+		t.Fatalf("uninvolved server was handed the registry credential: %+v", cred)
+	}
+
+	// The refusal is still audited — a host asking for a credential it has no
+	// business holding is exactly the line an incident is reconstructed from.
+	entries, err := st.ListAudit(ctx, orgID, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := false
+	for _, e := range entries {
+		if strings.Contains(e.Action, "Registry credential") && strings.Contains(e.Actor, strangerID) {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Fatalf("the refused release left no audit trail: %+v", entries)
 	}
 }

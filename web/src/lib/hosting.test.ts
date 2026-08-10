@@ -66,6 +66,12 @@ const GENERATED = join("src", "lib", "server-catalog.generated.ts");
 // control plane — postgres:17-alpine against a pin of 16.6, minio/minio:latest
 // against an agent that refuses floating tags — and a version bump on the Go
 // side is exactly the edit this list has to make visible here.
+//
+// alerts_store.go joined when the alert event vocabulary started being rendered
+// as a union (SIGMA-274). The dashboard's rules editor labels those events and
+// its label map enumerated a subset — payment_failed rendered as raw snake_case
+// — so an event the web cannot see change is, again, the same failure wearing a
+// different hat.
 const CATALOG_SOURCES = [
   "server_catalog.go",
   "server_catalog_ts.go",
@@ -73,6 +79,13 @@ const CATALOG_SOURCES = [
   "clusters.go",
   "db_engines.go",
   "s3_engines.go",
+  "alerts_store.go",
+  "llm_engines.go",
+  // Outside the store package: the VRAM formula's constants and the bands
+  // FormatVRAM renders with (SIGMA-279), which demo mode's model cards are
+  // recorded from. The Go digest names each file by its BASE name, so the
+  // recomputation below does too.
+  "../hf/sizing.go",
 ];
 
 describe("the generated catalog tracks the control plane", () => {
@@ -84,7 +97,7 @@ describe("the generated catalog tracks the control plane", () => {
     const h = createHash("sha256");
     for (const name of CATALOG_SOURCES) {
       const src = readFileSync(join(STORE_GO, name));
-      h.update(`${name}:${src.length}\n`);
+      h.update(`${name.split("/").pop()}:${src.length}\n`);
       h.update(src);
     }
     const sha = h.digest("hex");

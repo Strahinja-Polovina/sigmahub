@@ -343,6 +343,53 @@ func TestGeneratedTypeScriptCarriesTheEngineCatalogs(t *testing.T) {
 	}
 }
 
+// The inference runtimes are published twice for the same reason the engine
+// catalogs are: GET /llm/engines answers with them at runtime, and the wizard
+// compiles them in — it has to send an engine for a model whose card did not
+// resolve, before any list has been fetched. That copy was hand-written, so
+// renaming or replacing the default runtime here left the wizard sending
+// "vllm" and provisionLLMTx answering `unknown inference runtime "vllm"` as a
+// 422 at the end of the LLM wizard, with every Go and TypeScript suite green
+// (SIGMA-278).
+//
+// The order matters as much as the membership: the names are rendered into a
+// checked-in file, so an order that came from a Go map would have made the
+// generator emit a different file on every run.
+func TestGeneratedTypeScriptCarriesTheRuntimeCatalog(t *testing.T) {
+	sha, err := CatalogSourceDigest(CatalogSourceFiles...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := string(RenderTypeScript(sha))
+
+	names := LLMEngineNames()
+	if len(names) != len(llmEngines) {
+		t.Fatalf("llmEngineOrder names %d runtimes, llmEngines holds %d — an engine "+
+			"missing from the order is invisible to the API and to the dashboard", len(names), len(llmEngines))
+	}
+	for _, fragment := range []string{
+		"export const LLM_ENGINE_NAMES: LLMEngine[] = " + tsStringArray(names) + ";",
+		"export const DEFAULT_LLM_ENGINE: LLMEngine = " + tsString(DefaultLLMEngine) + ";",
+	} {
+		if !strings.Contains(ts, fragment) {
+			t.Errorf("the generated catalog does not carry the runtime catalog;\nexpected: %s", fragment)
+		}
+	}
+	for _, name := range names {
+		if !IsLLMEngine(name) {
+			t.Errorf("runtime %q is published but IsLLMEngine refuses it", name)
+		}
+		if fragment := `  | "` + name + `"`; !strings.Contains(ts, fragment) {
+			t.Errorf("runtime %q is missing from the LLMEngine union", name)
+		}
+	}
+	// The default is the value the wizard sends when nothing else is known, so
+	// it has to be a runtime this package can actually render.
+	if !IsLLMEngine(DefaultLLMEngine) {
+		t.Fatalf("DefaultLLMEngine %q is not a runtime in the catalog", DefaultLLMEngine)
+	}
+}
+
 // Every image this control plane pins must be one the AGENT will accept:
 // agent/internal/container/policy.go refuses a bare repository and refuses the
 // floating "latest" tag ("pin a version tag or digest"), so an unpinned image

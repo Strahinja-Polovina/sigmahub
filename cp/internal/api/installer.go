@@ -91,6 +91,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -241,9 +242,15 @@ type ReleaseSource struct {
 	// /dl/{version}/{asset} carries its own version and is unaffected.
 	Version string
 	// Token is the server-side GitHub credential. Empty is a SUPPORTED
-	// configuration, not a degraded one: a public release repository — the
-	// upstream one, or a self-hoster's own public fork — is proxied
-	// unauthenticated and needs no configuration at all.
+	// configuration, not a degraded one: the upstream release repository is
+	// public, so it is proxied unauthenticated and needs no configuration at
+	// all. (A private release repository is the case the token exists for.)
+	//
+	// Repo, on the other hand, is not a fork switch — config.FromEnv refuses to
+	// boot with anything but config.DefaultReleaseRepo, because install.sh
+	// cosign-verifies against a certificate identity baked into the script. See
+	// the ReleaseRepo comment in cp/internal/config for why the anchor cannot
+	// travel in the install command.
 	//
 	// It is never written to a response, an error body or a log line. See
 	// upstreamError, which names the SETTING and never its value.
@@ -300,6 +307,25 @@ func (rs ReleaseSource) normalized() ReleaseSource {
 // setting to change, and it is what the dashboard shows when it cannot render a
 // command, so the sentence is written once here rather than paraphrased there.
 func (s *Server) installerRelease() (version, refusal string) {
+	// The scheme this control plane is reachable on is part of the answer
+	// (SIGMA-266), because install.sh is the ONE artifact cosign does not cover
+	// — it is what runs cosign — so its integrity is exactly the TLS it arrived
+	// over. Served over plaintext, the command an operator pastes is a remote
+	// code execution primitive for anyone on the path between the host and here,
+	// with a one-time bootstrap token in the clear alongside it.
+	//
+	// This is refused here, in the shared answer, rather than only in
+	// handleInstallScript, so the operator finds out at the WIZARD — which
+	// renders this sentence — instead of on the host, after the bootstrap key
+	// has already been dropped into authorized_keys and spent. The dashboard has
+	// its own https check on SIGMAHUB_CP_PUBLIC_URL, but that is a second
+	// spelling of this URL on the other side of the boundary: it cannot see a
+	// control plane whose own public address is plaintext.
+	if insecurePublicURL(s.publicURL) {
+		return "", fmt.Sprintf(
+			"this control plane's public URL is %q, which is not https. The install command pipes /install.sh into `sudo bash`, and that script is the one artifact cosign cannot cover — it is what runs cosign — so serving it over plaintext would put root on every onboarded host in reach of anyone on the network. Put the control plane behind a TLS terminator (the `proxy` service in cp/deploy/docker-compose.yml) and set CP_PUBLIC_URL, and the dashboard's SIGMAHUB_CP_PUBLIC_URL, to its https address.",
+			s.publicURL)
+	}
 	if s.release.Repo == "" {
 		return "", "this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to the owner/name of the repository whose releases publish sigmad."
 	}
@@ -312,6 +338,41 @@ func (s *Server) installerRelease() (version, refusal string) {
 			s.release.Version)
 	}
 	return s.release.Version, ""
+}
+
+// insecurePublicURL reports whether the control plane's own public base URL is
+// one the installer must not be served over.
+//
+// Empty is NOT insecure, and that is deliberate: CP_PUBLIC_URL is optional (it
+// exists so a connected repo's push webhook can be registered against it), so a
+// deployment that never set it has made no claim about its own scheme and there
+// is nothing here to contradict. Refusing on empty would take onboarding away
+// from every deployment that reaches its control plane by an address the control
+// plane itself was never told.
+//
+// A loopback address is not insecure either: `http://localhost:8080` is how this
+// stack comes up on a developer's machine, and there is no network for anyone to
+// be on the path of.
+func insecurePublicURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		// Anything that is not parseable-and-http is left alone: this check
+		// exists to catch the one misconfiguration that is dangerous, not to
+		// become a second validator of a setting nothing else validates.
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
 }
 
 // handleInstallScript serves the installer for the version this control plane is
@@ -511,7 +572,7 @@ func (rs ReleaseSource) openPublic(ctx context.Context, version, asset string) (
 	}
 	if resp.StatusCode != http.StatusOK {
 		drain(resp)
-		return nil, 0, upstreamError(resp.StatusCode, version, asset)
+		return nil, 0, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	if resp.ContentLength > rs.MaxBytes {
 		drain(resp)
@@ -547,7 +608,8 @@ func (rs ReleaseSource) openAuthenticated(ctx context.Context, version, asset st
 	if want == nil {
 		// The release exists and does not publish this asset. That is the same
 		// answer as "no such release" to the caller, and the same fixes apply.
-		return nil, 0, upstreamError(http.StatusNotFound, version, asset)
+		// Synthesized here, so there are no upstream headers to read.
+		return nil, 0, upstreamError(http.StatusNotFound, nil, version, asset)
 	}
 	// Refuse on the DECLARED size, before a byte is transferred. This is the
 	// cheap half of the cap; the stream is capped again in proxyReleaseAsset
@@ -576,7 +638,7 @@ func (rs ReleaseSource) openAuthenticated(ctx context.Context, version, asset st
 	}
 	if resp.StatusCode != http.StatusOK {
 		drain(resp)
-		return nil, 0, upstreamError(resp.StatusCode, version, asset)
+		return nil, 0, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	size := resp.ContentLength
 	if size <= 0 {
@@ -610,7 +672,7 @@ func (rs ReleaseSource) releaseAssets(ctx context.Context, version, asset string
 	}
 	defer drain(resp)
 	if resp.StatusCode != http.StatusOK {
-		return nil, upstreamError(resp.StatusCode, version, asset)
+		return nil, upstreamError(resp.StatusCode, resp.Header, version, asset)
 	}
 	var payload struct {
 		Assets []releaseAsset `json:"assets"`
@@ -637,7 +699,26 @@ func (rs ReleaseSource) authenticate(req *http.Request) {
 // and never a value: the token must not appear in a body, an error or a log,
 // and the repository slug is withheld from anonymous callers on purpose (see
 // proxyReleaseAsset).
-func upstreamError(status int, version, asset string) *releaseError {
+// hdr is the upstream response's headers, and it is not optional decoration:
+// GitHub's REST API answers an exhausted PRIMARY rate limit with 403 and
+// X-RateLimit-Remaining: 0 — 429 covers only the newer secondary limits — so
+// without the header a spent budget is indistinguishable from a bad credential
+// and gets reported as one. Pass nil only for a status this package
+// SYNTHESIZED (see openAuthenticated's asset-not-in-release 404), where there
+// is no upstream response to read.
+func upstreamError(status int, hdr http.Header, version, asset string) *releaseError {
+	// One rate-limit answer, whichever status is carrying it — and the real
+	// upstream status is kept, so the log line still says 403 when GitHub said
+	// 403. Mirrors cp/internal/githubapp/inspect.go, which has made this same
+	// header check at two call sites since before this file existed.
+	rateLimit := func() *releaseError {
+		return &releaseError{status: http.StatusServiceUnavailable, upstream: status, msg: fmt.Sprintf(
+			"GitHub rate-limited this control plane while fetching %s. Retry in a few minutes; setting CP_RELEASE_TOKEN raises the limit from 60 requests an hour to 5000.",
+			asset)}
+	}
+	if isRateLimited(status, hdr) {
+		return rateLimit()
+	}
 	switch status {
 	case http.StatusNotFound:
 		// Answered honestly as a 404: GitHub has no such asset, and neither do
@@ -654,15 +735,35 @@ func upstreamError(status int, version, asset string) *releaseError {
 		return &releaseError{status: http.StatusBadGateway, upstream: status, msg: fmt.Sprintf(
 			"GitHub refused this control plane's release credential while fetching %s. Set CP_RELEASE_TOKEN to a token with read access to the release repository's contents (a fine-grained token needs the Contents permission; a classic token needs the repo scope).",
 			asset)}
-	case http.StatusTooManyRequests:
-		return &releaseError{status: http.StatusServiceUnavailable, upstream: status, msg: fmt.Sprintf(
-			"GitHub rate-limited this control plane while fetching %s. Retry in a few minutes; setting CP_RELEASE_TOKEN raises the limit from 60 requests an hour to 5000.",
-			asset)}
 	default:
 		return &releaseError{status: http.StatusBadGateway, upstream: status, msg: fmt.Sprintf(
 			"GitHub answered %d while fetching %s. This is an upstream failure, not a configuration error; retry, and check https://www.githubstatus.com if it persists.",
 			status, asset)}
 	}
+}
+
+// isRateLimited reports whether an upstream refusal is a spent GitHub budget
+// rather than a credential problem.
+//
+// 429 is the easy half: it is what GitHub's newer SECONDARY rate limits answer
+// with. The PRIMARY limit — the one an anonymous control plane actually runs
+// out of, at 60 requests an hour against six per onboarding — answers 403 with
+// X-RateLimit-Remaining: 0. Switching on the status alone therefore lands the
+// common exhaustion in the credential branch, which tells an operator mid-
+// rollout to rotate a token that is fine; they revoke it, re-issue it, redeploy
+// the control plane, and read the identical sentence, because the limit has not
+// reset.
+//
+// A nil header is treated as "not rate-limited", which is right for the one
+// caller that synthesizes a status with no upstream response behind it.
+func isRateLimited(status int, hdr http.Header) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	return hdr.Get("X-RateLimit-Remaining") == "0"
 }
 
 func oversizedMessage(asset string, maxBytes int64) string {

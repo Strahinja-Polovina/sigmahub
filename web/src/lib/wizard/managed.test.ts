@@ -7,12 +7,15 @@ import {
   defaultManagedName,
   isDatabaseKind,
   isManagedKind,
+  llmEngineLabel,
   managedSummary,
   resourceNameError,
 } from "./managed";
 import {
   DB_ENGINE_KINDS,
+  DEFAULT_LLM_ENGINE as CATALOG_DEFAULT_LLM_ENGINE,
   DEFAULT_S3_ENGINE as CATALOG_DEFAULT_S3_ENGINE,
+  LLM_ENGINE_NAMES,
   S3_ENGINE_NAMES,
   type ResourceKind,
 } from "@/lib/server-catalog.generated";
@@ -61,13 +64,28 @@ describe("engine catalogs are enumerations, not free text", () => {
     }
   });
 
-  // The inference runtimes are still a hand-kept list. They are not generated
-  // because nothing about them reaches the web today except two names — but
-  // they are the same shape as the S3 list above was, and the same failure is
-  // available to them the moment the control plane gains a third runtime.
-  it("names the inference runtimes the control plane knows how to render", () => {
-    expect(LLM_ENGINES.map((e) => e.id)).toEqual(["vllm", "ollama"]);
-    expect(DEFAULT_LLM_ENGINE).toBe(LLM_ENGINES[0].id);
+  // The inference runtimes were the last hand-kept copy in this file, and they
+  // failed the same way the S3 list did (SIGMA-278): renaming or replacing the
+  // default runtime in store.llmEngines left the wizard sending engine "vllm"
+  // for every model whose card did not resolve — a Hub timeout, a CP with no
+  // Hub catalogue, a pasted repo id the Hub does not know — and provisionLLMTx
+  // answered `unknown inference runtime "vllm"` as a 422 at the end of the LLM
+  // wizard, with every Go and TypeScript suite green.
+  it("LLM_ENGINES matches the generated catalog", () => {
+    expect(LLM_ENGINES.map((e) => e.id)).toEqual(LLM_ENGINE_NAMES);
+    expect(DEFAULT_LLM_ENGINE).toBe(CATALOG_DEFAULT_LLM_ENGINE);
+  });
+
+  it("gives every offered runtime a sentence to choose it by", () => {
+    for (const engine of LLM_ENGINES) {
+      expect(engine.label, `${engine.id} has no label`).toBeTruthy();
+      expect(engine.detail, `${engine.id} has no detail`).toBeTruthy();
+    }
+  });
+
+  it("prints an unknown runtime as itself rather than as undefined", () => {
+    // The control plane's list can outrun this build's catalog.
+    expect(llmEngineLabel("some-future-runtime")).toBe("some-future-runtime");
   });
 });
 

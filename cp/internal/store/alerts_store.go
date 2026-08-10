@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -79,10 +81,32 @@ var alertChannelKinds = map[string]bool{"email": true, "slack": true, "telegram"
 // secretAAD/targetAAD): a moved ciphertext fails to open.
 func alertChannelAAD(orgID, channelID string) []byte { return []byte(orgID + "|alch|" + channelID) }
 
+// slackWebhookPrefix is the only host Slack ever issues an incoming webhook on.
+// A slack channel's secret IS its destination URL, so this prefix is the whole
+// validation: anything else is not a Slack channel, whatever it resolves to.
+const slackWebhookPrefix = "https://hooks.slack.com/"
+
 // validateChannelConfig rejects a channel that could never deliver, so
-// misconfiguration surfaces at create time instead of as a delivery failure.
-func validateChannelConfig(kind string, cfg json.RawMessage) error {
+// misconfiguration surfaces at create time instead of as a delivery failure —
+// and, for the two kinds whose destination the tenant chooses, rejects one that
+// could deliver somewhere it must not (SIGMA-259).
+//
+// secret is passed because for a slack channel the secret IS the destination:
+// there was no `slack` case here at all, so a slack channel's URL reached the
+// HTTP client with zero validation. The webhook case checked only an http(s)
+// prefix, which admits 127.0.0.1, 169.254.169.254 and every RFC1918 address.
+// Alert channels are the CP's only tenant-controlled egress destination and the
+// CP sits inside the operator's private network next to Postgres,
+// VictoriaMetrics and Loki, so that was a request-forgery primitive handed to
+// every self-service signup.
+func validateChannelConfig(kind string, cfg json.RawMessage, secret string) error {
 	switch kind {
+	case "slack":
+		// Not a general destination check: Slack has exactly one webhook host,
+		// and pinning it is both stricter and stable (no DNS at create time).
+		if !strings.HasPrefix(secret, slackWebhookPrefix) {
+			return ErrInvalid{Msg: "slack channels require an incoming-webhook URL starting with " + slackWebhookPrefix}
+		}
 	case "email":
 		var c struct {
 			Host string   `json:"host"`
@@ -115,6 +139,108 @@ func validateChannelConfig(kind string, cfg json.RawMessage) error {
 		if !strings.HasPrefix(c.URL, "http://") && !strings.HasPrefix(c.URL, "https://") {
 			return ErrInvalid{Msg: "webhook channels require an http(s) config.url"}
 		}
+		if err := ValidateAlertDestination(c.URL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// destinationLookupTimeout bounds the DNS resolution the destination check
+// does. It runs on an API request (create channel) and on the dispatcher's send
+// path, and neither may hang on a resolver.
+const destinationLookupTimeout = 5 * time.Second
+
+// ValidateAlertDestination refuses an alert destination the control plane must
+// not be made to POST to (SIGMA-259).
+//
+// It is exported because the same rule has to hold in two places, and checking
+// it in only one is the same as not checking it: at CREATE time, so the operator
+// is told immediately; and at SEND time in cp/internal/alerts, because rows
+// created before this existed are still in the table, DNS answers change between
+// the two moments, and a redirect can point anywhere.
+//
+// What is refused, and why each one matters on a hosted control plane whose
+// process sits inside the operator's private network:
+//
+//   - loopback — the CP's own admin surfaces and anything else on its host;
+//   - link-local (169.254.0.0/16, fe80::/10) — the cloud metadata service, i.e.
+//     169.254.169.254/latest/meta-data/iam/security-credentials/;
+//   - private (RFC1918, fc00::/7) and CGNAT — Postgres, VictoriaMetrics, Loki
+//     and every other internal service the CP can reach;
+//   - unspecified, multicast, and anything not global unicast;
+//   - ports other than 80 and 443 — an alert channel delivers over the web, and
+//     every other port on a reachable host is somebody's service (vminsert on
+//     8480, Elasticsearch on 9200).
+//
+// A hostname is RESOLVED and every address it answers with must pass, so
+// `internal.example.com` pointing at 10.0.0.5 is refused as surely as the
+// literal is. A name that does not resolve is refused too: we cannot show that
+// it is safe, and a destination that cannot be resolved cannot deliver either.
+//
+// This is not proof against DNS rebinding — the address can change between this
+// check and the dial. Closing that needs a dial-time hook on the transport;
+// what this does close is the whole self-service class of the attack, where the
+// tenant simply types the address they want the CP to fetch.
+func ValidateAlertDestination(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ErrInvalid{Msg: "destination must be a valid http(s) URL"}
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ErrInvalid{Msg: "destination must be an http(s) URL"}
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ErrInvalid{Msg: "destination must name a host"}
+	}
+	if p := u.Port(); p != "" && p != "80" && p != "443" {
+		return ErrInvalid{Msg: "destination port must be 80 or 443"}
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return checkPublicIP(host, ip)
+	}
+	// Names that never mean anything but "this machine" / "this network",
+	// checked before the resolver so a search-domain trick cannot dodge them.
+	lower := strings.ToLower(strings.TrimSuffix(host, "."))
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return ErrInvalid{Msg: "destination " + host + " is an internal address; alert channels must point at a public endpoint"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), destinationLookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return ErrInvalid{Msg: "destination host " + host + " does not resolve"}
+	}
+	for _, ip := range ips {
+		if err := checkPublicIP(host, ip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkPublicIP is the address half of ValidateAlertDestination. `shown` is what
+// the operator typed, so the message names their input rather than an address
+// they never saw.
+func checkPublicIP(shown string, ip net.IP) error {
+	internal := ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
+		!ip.IsGlobalUnicast()
+	if v4 := ip.To4(); v4 != nil && !internal {
+		switch {
+		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // 100.64.0.0/10 CGNAT
+			internal = true
+		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24 IETF protocol assignments
+			internal = true
+		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15 benchmarking
+			internal = true
+		}
+	}
+	if internal {
+		return ErrInvalid{Msg: "destination " + shown + " is an internal address; alert channels must point at a public endpoint"}
 	}
 	return nil
 }
@@ -160,7 +286,7 @@ func (s *Store) CreateAlertChannel(ctx context.Context, orgID, actor string, in 
 	if len(cfg) == 0 {
 		cfg = json.RawMessage(`{}`)
 	}
-	if err := validateChannelConfig(in.Kind, cfg); err != nil {
+	if err := validateChannelConfig(in.Kind, cfg, in.Secret); err != nil {
 		return AlertChannel{}, err
 	}
 

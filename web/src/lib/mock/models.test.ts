@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MOCK_MODELS, MOCK_TOKEN_CONFIGURED, findMockModel, searchMockModels } from "./models";
 import { servers } from "./data";
 import { gatedWarning, modelStepError, serverFitsModel, unservableReason } from "@/lib/wizard/llm";
+import { formatVram, requiredVramBytes } from "@/lib/server-catalog.generated";
 
 /** The three cards the demo fleet reports (mock/data.ts), smallest first: an
  *  A10G at 22731 MiB, an A100 at 40960 MiB and an H100 at 81559 MiB. They are
@@ -149,6 +150,27 @@ describe("every recorded card is internally consistent", () => {
   it("records each estimate the way the control plane renders it", () => {
     expect(findMockModel("meta-llama/Llama-3.1-8B-Instruct")?.vramText).toBe("~21.4 GB");
     expect(findMockModel("meta-llama/Llama-3.1-70B-Instruct")?.vramText).toBe("~189 GB");
+  });
+
+  // …and the figures themselves are the control plane's arithmetic, not numbers
+  // that were once its arithmetic (SIGMA-279).
+  //
+  // These fixtures were evaluated by hand, once, from constants that live in
+  // cp/internal/hf/sizing.go, and the assertions above compared them to
+  // themselves. Changing UtilizationCap to 0.85 or KVActivationFactor to 1.30
+  // left every suite green while demo mode went on telling evaluators that
+  // Llama-3.1-8B needs ~21.4 GB against a product now saying ~22.7 GB — a
+  // prospect sizing a GPU purchase from the demo buys the wrong card. Both
+  // constants and the formatter's bands are now rendered into the generated
+  // catalog, so the recomputation below is the control plane's own.
+  it("vramBytesRequired equals the sizing formula from the generated constants", () => {
+    for (const model of MOCK_MODELS) {
+      if (!model.parametersKnown) continue;
+      expect(model.vramBytesRequired, model.id).toBe(
+        requiredVramBytes(model.parameters, model.bytesPerParam)
+      );
+      expect(model.vramText, model.id).toBe(formatVram(model.vramBytesRequired));
+    }
   });
 });
 

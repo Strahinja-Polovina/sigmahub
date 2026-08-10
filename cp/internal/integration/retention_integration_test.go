@@ -110,7 +110,7 @@ func TestSweeperPrunesGrowthTables(t *testing.T) {
 	             ($1, 'k_new', '\x00', 200, '{}'::jsonb, now())`, orgID)
 
 	ch, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
-		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.example/T000/x",
+		Kind: "slack", Name: "ops", Secret: "https://hooks.slack.com/services/T000/x",
 	})
 	if err != nil {
 		t.Fatal(err)

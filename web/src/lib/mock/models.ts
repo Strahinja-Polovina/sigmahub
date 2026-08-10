@@ -22,7 +22,14 @@
  *   below 100 GB       "~" + (bytes ÷ 1e9) to one decimal + " GB"
  *   at or above        "~" + ceil(bytes ÷ 1e9) + " GB"
  *
- * evaluated once, by hand, at the time of writing.
+ * They WERE evaluated once, by hand, at the time of writing, and models.test.ts
+ * asserted them against themselves — so moving UtilizationCap to 0.85 or
+ * KVActivationFactor to 1.30 in sizing.go left every suite green while the demo
+ * went on quoting figures the product no longer produces, to exactly the people
+ * sizing a GPU purchase from them (SIGMA-279). Both constants and the three
+ * bands above are now rendered into server-catalog.generated.ts, and
+ * models.test.ts recomputes every figure below from them: a change on the Go
+ * side now lands here as a red test naming the models that need re-recording.
  *
  * THE TENTH OF A GIGABYTE IS NOT DECORATION, and this comment used to say the
  * figure was rounded to whole gigabytes — which is what these fixtures were

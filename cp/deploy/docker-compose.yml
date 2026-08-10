@@ -70,7 +70,14 @@ services:
       CP_GITHUB_WEBHOOK_SECRET: ${CP_GITHUB_WEBHOOK_SECRET:-}
       # CP's own public base URL (e.g. https://cp.example.com). With the
       # webhook secret set, connecting a repo auto-registers its push webhook.
-      CP_PUBLIC_URL: ${CP_PUBLIC_URL:-}
+      #
+      # It falls back to SIGMAHUB_CP_PUBLIC_URL, which is required below,
+      # because the two are the same fact — the address this control plane
+      # answers on from outside — under two names, and only one of them is
+      # mandatory. Left independently empty, the control plane does not know its
+      # own scheme, and so cannot notice that the installer it is about to hand
+      # a host would travel in the clear (SIGMA-266).
+      CP_PUBLIC_URL: ${CP_PUBLIC_URL:-${SIGMAHUB_CP_PUBLIC_URL}}
       # The agent installer the control plane serves (SIGMA-217). The host being
       # onboarded fetches install.sh and every release asset from the CP, which
       # fetches them from GitHub with the token below — so a PRIVATE release
@@ -80,8 +87,9 @@ services:
       # Both are OPTIONAL: empty repo falls through to the upstream slug, and
       # empty token means an unauthenticated fetch, which is what a public
       # release wants (GitHub's anonymous REST API allows 60 requests an hour
-      # and one onboarding costs six). A self-hoster with a private fork sets
-      # both.
+      # and one onboarding costs six). Leave the repo empty — it may only name
+      # the repository install.sh cosign-verifies against, and the control plane
+      # refuses to boot with any other value; see cp/deploy/.env.example.
       CP_RELEASE_REPO: ${CP_RELEASE_REPO:-}
       CP_RELEASE_TOKEN: ${CP_RELEASE_TOKEN:-}
       # Which release the CP installs. This is the ONLY place the version is
@@ -91,7 +99,14 @@ services:
       # control-plane binary was built from, which is already correct for a
       # released image (goreleaser stamps cp and sigmad from one tag) and is
       # "dev" for a source build — onboarding then refuses, naming this setting.
-      CP_AGENT_VERSION: ${SIGMAHUB_AGENT_VERSION:-}
+      #
+      # And it must be read from the name that refusal PRINTS (SIGMA-269). This
+      # line said ${SIGMAHUB_AGENT_VERSION:-} while the sentence the dashboard
+      # shows says "Set CP_AGENT_VERSION to a released tag such as v0.3.0", so a
+      # self-hoster on a source build did exactly what the product told them,
+      # restarted, and got the identical refusal — the fix had been applied to a
+      # key nothing read.
+      CP_AGENT_VERSION: ${CP_AGENT_VERSION:-}
       # Hugging Face account the control plane acts as (SIGMA-213/214, optional).
       # One setting doing both halves of the LLM path: it authenticates the
       # model picker's Hub calls, and it is seeded into each inference
@@ -114,14 +129,35 @@ services:
       # box, whose repeated bring-ups would otherwise spend the real CA's
       # per-domain issuance budget.
       CP_ACME_CA_DIR_URL: ${CP_ACME_CA_DIR_URL:-}
-      CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
-      # Object-storage engines (P2-2). MinIO-only build: CP_S3_ENGINES=minio.
-      CP_S3_ENGINES: ${CP_S3_ENGINES:-minio,seaweedfs}
+      # Engine allowlists (P1-10, P2-2), deliberately WITHOUT a default value
+      # (SIGMA-268). Empty means "every engine the Go catalog defines", derived
+      # in config.go from store.DBEngineKinds()/store.S3EngineNames(). Writing
+      # the names here instead pinned every deployment built from this file to
+      # the engines that existed the day the line was typed: add a fifth kind to
+      # the catalog and the wizard offers it (it reads the generated catalog)
+      # while the control plane 422s it at submit time, after the dialog has
+      # closed. Set them only to CUT the list — a Postgres-only build is
+      # CP_DB_ENGINES=postgres, a MinIO-only one CP_S3_ENGINES=minio — and a
+      # name the catalog does not know fails boot rather than disappearing.
+      CP_DB_ENGINES: ${CP_DB_ENGINES:-}
+      CP_S3_ENGINES: ${CP_S3_ENGINES:-}
       # Key custody (P0-9): file (dev default) or vault (production).
       CP_KMS_BACKEND: ${CP_KMS_BACKEND:-file}
       CP_VAULT_ADDR: ${CP_VAULT_ADDR:-}
       CP_VAULT_TOKEN: ${CP_VAULT_TOKEN:-}
       CP_VAULT_TRANSIT_KEY: ${CP_VAULT_TRANSIT_KEY:-sigmahub-cp}
+      # Vault Enterprise namespace (empty = root). It was missing here while
+      # main.go read it (SIGMA-270), and a missing namespace does not present as
+      # "the setting had no effect": every wrap/unwrap goes to the ROOT
+      # namespace instead, so a fresh install dies on the DSD signing key and an
+      # upgrade stops unwrapping the pepper and the per-org DEKs — stored
+      # secrets unreadable, with nothing naming a namespace as the cause.
+      CP_VAULT_NAMESPACE: ${CP_VAULT_NAMESPACE:-}
+      # Make the X-Sigmahub-Actor header mandatory on org-scoped service tokens
+      # (SIGMA-82). Off by default; an operator who provisions per-role tokens
+      # turns it on to fail closed. It was in neither this file nor
+      # .env.example, which made a shipped security control undiscoverable.
+      CP_REQUIRE_ACTOR: ${CP_REQUIRE_ACTOR:-}
       # P1-13 telemetry sinks (optional; empty = pipeline off, UI shows it).
       CP_VM_WRITE_URL: ${CP_VM_WRITE_URL:-}
       CP_VM_READ_URL: ${CP_VM_READ_URL:-}
@@ -138,8 +174,16 @@ services:
       - cp-data:/data
       # GitHub App key import (set CP_GITHUB_APP_PRIVATE_KEY_FILE=/data/github-app.pem):
       # - ./github-app.pem:/data/github-app.pem:ro
+    # LOOPBACK ONLY (SIGMA-266). Everything from outside the box arrives through
+    # the `proxy` service below, which terminates TLS; this binding exists so the
+    # operator (and the staging rollout's post-deploy poll) can curl /readyz from
+    # the host itself without going through DNS and a certificate. Published on
+    # 0.0.0.0 it was the plaintext endpoint an operator inevitably named in
+    # SIGMAHUB_CP_PUBLIC_URL to make the runbook work, which is how the install
+    # command stops being a signed-artifact story and starts being an
+    # unauthenticated script piped into `sudo bash`.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   web:
     build:
@@ -171,8 +215,57 @@ services:
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+      # Block sign-in until the address is verified (SIGMA-82/SIGMA-261). Off by
+      # default because no SMTP is bundled — verification links go to the web
+      # container's log — so turning it on before a transport is wired strands
+      # sign-ups. Parsed strictly on the web side: an unrecognised value fails
+      # the container's boot instead of silently leaving the control off.
+      AUTH_REQUIRE_EMAIL_VERIFICATION: ${AUTH_REQUIRE_EMAIL_VERIFICATION:-false}
+    # Loopback only, for the same reason as cp above: the dashboard is reached
+    # through the proxy, and this binding is for on-box checks.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+
+  # ── TLS terminator (SIGMA-266) ─────────────────────────────────────────────
+  # The one thing published to the world, and the reason the https URLs the rest
+  # of this file requires actually answer.
+  #
+  # This stack used to publish 8080 and 3000 in plaintext with nothing in front
+  # of them, while .env.example told the operator that SIGMAHUB_CP_PUBLIC_URL
+  # MUST be https — so either the documented URL connected to nothing, or the
+  # operator named the http one and every onboarded host executed a script
+  # fetched in the clear, with a one-time bootstrap token in the query string.
+  # install.sh is the single artifact cosign cannot cover (it is what runs
+  # cosign), so that was not a hardening nicety: it was the product's stated
+  # trust boundary, removed to make the runbook work.
+  #
+  # Caddy provisions and renews certificates over ACME by itself, keyed on the
+  # site addresses in ./Caddyfile — which are the SIGMAHUB_CP_PUBLIC_URL and
+  # WEB_PUBLIC_URL already in .env rather than two more hostname settings to
+  # keep in step. Ports 80 and 443 must both be reachable: 80 is the HTTP-01
+  # challenge and the redirect to https.
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - cp
+      - web
+    environment:
+      SIGMAHUB_CP_PUBLIC_URL: ${SIGMAHUB_CP_PUBLIC_URL:?set SIGMAHUB_CP_PUBLIC_URL in .env}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+      CP_ACME_EMAIL: ${CP_ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Issued certificates and ACME account keys. BACK THIS UP or at least do
+      # not wipe it casually: a `down -v` throws away the account and every
+      # certificate, and a rebuild re-issues from the CA — which has per-domain
+      # issuance limits an operator can exhaust by cycling the stack.
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
 
   # ── Telemetry sinks (optional; enable with COMPOSE_PROFILES=telemetry) ──────
   # Gives the dashboard real resource logs (Loki) and metrics (VictoriaMetrics
@@ -220,5 +313,7 @@ services:
 volumes:
   db-data:
   cp-data:
+  caddy-data:
+  caddy-config:
   loki-data:
   vm-data:

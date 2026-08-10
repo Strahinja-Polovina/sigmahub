@@ -10,8 +10,23 @@
 # Exit 0 = the control plane is healthy and the core provisioning path works
 # (org → project → environment → agent-enrollment token → reads). Exit 1 on the
 # first failed assertion, printing the request that failed. Safe to re-run: it
-# provisions a uniquely-named throwaway org each time and leaves it (the CP has
-# no org teardown API in v1; delete the smoke org out-of-band if desired).
+# provisions a uniquely-named throwaway org each time and leaves the ORG behind
+# (the CP has no org teardown API in v1; delete the smoke orgs out-of-band if
+# desired) — but NOT the credentials, see below.
+#
+# Credential custody (SIGMA-267). This script mints live Org Admin tokens and it
+# runs often: staging.md tells the operator to run it after every bring-up, and
+# the deploy workflow runs it on every push to main, on a box that also runs
+# design-partner workloads. So the two ways it used to hand out org-admin
+# authority are both closed here:
+#
+#   * response bodies go to a mktemp file (0600, under TMPDIR) that an EXIT trap
+#     removes, not to a fixed, world-guessable /tmp path created with the
+#     process umask and left there. The provision response is one of those
+#     bodies, and it carries an Org Admin token in plaintext.
+#   * every token minted during the run is revoked on the way out, whether the
+#     run passed, failed or was interrupted. What is left behind is an empty
+#     org, not authority over one.
 set -euo pipefail
 
 CP_URL="${CP_URL:-http://localhost:8080}"
@@ -20,6 +35,29 @@ ORG="${SMOKE_ORG:-smoke-$(date +%s)}"
 PASS=0
 FAIL=0
 
+# 0600 by construction, and under TMPDIR rather than at a name anyone can guess.
+BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/smoke.body.XXXXXXXX")"
+# "org|tokenId|token" per minted credential, revoked by the EXIT trap.
+MINTED=()
+
+# Runs on every exit path, including the failed-assertion one and Ctrl-C, which
+# are exactly the paths on which a token would otherwise survive. Nothing in
+# here may fail the script: the trap inherits `set -e`, so an unreachable
+# control plane during cleanup would REPLACE the script's real exit status with
+# curl's — turning a passing smoke check into a red deploy. Hence `|| true`.
+cleanup() {
+  rm -f "$BODY_FILE" || true
+  local entry org id tok
+  for entry in ${MINTED[@]+"${MINTED[@]}"}; do
+    IFS='|' read -r org id tok <<<"$entry"
+    [ -n "$id" ] && [ -n "$tok" ] || continue
+    curl -sS -o /dev/null -X DELETE \
+      -H "Authorization: Bearer $tok" \
+      "$CP_URL/v1/orgs/$org/service-tokens/$id" || true
+  done
+}
+trap cleanup EXIT
+
 say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓ %s\033[0m\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31m✗ %s\033[0m\n' "$*"; FAIL=$((FAIL+1)); }
@@ -27,11 +65,11 @@ bad()  { printf '  \033[31m✗ %s\033[0m\n' "$*"; FAIL=$((FAIL+1)); }
 # req METHOD PATH [AUTH] [BODY] → sets $BODY (response) and $CODE (status).
 req() {
   local method="$1" path="$2" auth="${3:-}" body="${4:-}"
-  local args=(-sS -o /tmp/smoke.body -w '%{http_code}' -X "$method" "$CP_URL$path")
+  local args=(-sS -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$CP_URL$path")
   [ -n "$auth" ] && args+=(-H "Authorization: Bearer $auth")
   [ -n "$body" ] && args+=(-H "Content-Type: application/json" -d "$body")
   CODE="$(curl "${args[@]}")"
-  BODY="$(cat /tmp/smoke.body)"
+  BODY="$(cat "$BODY_FILE")"
 }
 
 # expect EXPECTED_CODE LABEL
@@ -50,6 +88,9 @@ say "2. Provision a throwaway org ($ORG)"
 req POST /v1/orgs "$PROV" "{\"orgId\":\"$ORG\",\"name\":\"smoke $ORG\"}"
 expect 201 "POST /v1/orgs"
 TOKEN="$(jget token)"
+# Remembered before anything else can fail, so the revoke happens even if the
+# very next assertion aborts the run.
+MINTED+=("$ORG|$(jget tokenId)|$TOKEN")
 [ -n "$TOKEN" ] && ok "org-admin token minted" || bad "no token in provision response: $BODY"
 
 say "3. Unauthenticated + wrong-token are rejected"
@@ -80,6 +121,7 @@ say "7. Tenant isolation (SIGMA-54): a token can't reach another org"
 ORG2="${ORG}-b"
 req POST /v1/orgs "$PROV" "{\"orgId\":\"$ORG2\",\"name\":\"smoke $ORG2\"}"
 expect 201 "provision second org"
+MINTED+=("$ORG2|$(jget tokenId)|$(jget token)")
 req GET "/v1/orgs/$ORG2/projects" "$TOKEN"
 expect 403 "org-A token → org-B read is 403 (cross-tenant denied)"
 

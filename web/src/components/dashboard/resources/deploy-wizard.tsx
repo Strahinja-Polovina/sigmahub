@@ -44,6 +44,7 @@ import {
   buildInventory,
   kindAvailability,
   targetChoices,
+  type EngineCapabilities,
   type WizardCluster,
   type WizardProject,
 } from "@/lib/wizard/availability";
@@ -105,6 +106,7 @@ import { findMockRepo, type MockRepo } from "@/lib/mock/repos";
 import { createResource } from "@/server/actions/resources";
 import { createSecretAction } from "@/server/actions/secrets";
 import { detectRepo, getGitAppInfo, wireRepoToEnvironment } from "@/server/actions/git";
+import { getEngineCapabilities } from "@/server/actions/capabilities";
 import { revealDatabaseConnection } from "@/server/actions/databases";
 import { revealS3Connection } from "@/server/actions/s3";
 import type { DeployTarget } from "./resource-meta";
@@ -217,6 +219,11 @@ export function DeployWizard({
   const [createState, setCreateState] = React.useState<
     "idle" | "creating" | "done" | "error"
   >("idle");
+  // Which engines this control plane will accept (SIGMA-268). Null until the
+  // answer arrives, and null is "the whole catalog" — the wizard must not
+  // narrow itself on a read that has not happened yet, and a failed read leaves
+  // it exactly as wide as it was before this endpoint existed.
+  const [capabilities, setCapabilities] = React.useState<EngineCapabilities | null>(null);
   const [createdId, setCreatedId] = React.useState<string | null>(null);
   const [createError, setCreateError] = React.useState<string | null>(null);
   const [credentials, setCredentials] = React.useState<RevealedCredentials | null>(null);
@@ -224,8 +231,8 @@ export function DeployWizard({
 
   const projects = targets as WizardProject[];
   const inventory = React.useMemo(
-    () => buildInventory(projects, clusters, clusterExcludedKinds),
-    [projects, clusters, clusterExcludedKinds]
+    () => buildInventory(projects, clusters, clusterExcludedKinds, capabilities),
+    [projects, clusters, clusterExcludedKinds, capabilities]
   );
   const steps = stepsForKind(kind);
   const decision = React.useMemo(() => decideBuildMethod(detected), [detected]);
@@ -403,6 +410,26 @@ export function DeployWizard({
   React.useEffect(() => {
     if (open) createStartedRef.current = false;
   }, [open]);
+
+  // The engines this control plane has enabled. Loaded once per open, beside
+  // the App slug, because step 1 is the first screen that renders them and the
+  // alternative — finding out at create — is the whole defect (SIGMA-268).
+  // getEngineCapabilities answers the full catalog in demo mode and on a failed
+  // read, so this only ever NARROWS with an answer it actually got.
+  React.useEffect(() => {
+    if (!open || !orgId) return;
+    let cancelled = false;
+    getEngineCapabilities(orgId)
+      .then((caps) => {
+        if (!cancelled) setCapabilities(caps);
+      })
+      .catch(() => {
+        if (!cancelled) setCapabilities(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, orgId]);
 
   // The App slug drives the inline Connect GitHub link. Loaded once per open,
   // and a failure simply means the offer is not shown.
@@ -911,6 +938,7 @@ export function DeployWizard({
               onNameChange={setName}
               s3Engine={s3Engine}
               onS3EngineChange={setS3Engine}
+              enabledS3Engines={capabilities?.s3Engines ?? null}
             />
           )}
 
@@ -1043,14 +1071,38 @@ function ManagedStep({
   onNameChange,
   s3Engine,
   onS3EngineChange,
+  enabledS3Engines,
 }: {
   kind: ResourceKind;
   name: string;
   onNameChange: (v: string) => void;
   s3Engine: string;
   onS3EngineChange: (v: string) => void;
+  /** The engines this control plane accepts, or null while that is unknown —
+   *  see SIGMA-268. Null shows the catalog, which is what this picker did
+   *  before the control plane published anything. */
+  enabledS3Engines: string[] | null;
 }) {
   const summary = managedSummary(kind);
+  // Offering an engine the control plane will refuse is the defect: the
+  // operator picks SeaweedFS on a MinIO-only deployment, walks the rest of the
+  // wizard, and the create 422s after the dialog has closed. An enabled list
+  // that somehow matches nothing in the catalog falls back to the catalog
+  // rather than to an empty select — an empty picker is a dead end too.
+  const engines = React.useMemo(() => {
+    if (!enabledS3Engines) return S3_ENGINES;
+    const enabled = new Set(enabledS3Engines);
+    const offered = S3_ENGINES.filter((e) => enabled.has(e.id));
+    return offered.length > 0 ? offered : S3_ENGINES;
+  }, [enabledS3Engines]);
+
+  // Keep the selection inside what is offered: the default is the catalog's
+  // (DEFAULT_S3_ENGINE), which a deployment that disabled it would refuse.
+  React.useEffect(() => {
+    if (kind === "s3" && !engines.some((e) => e.id === s3Engine)) {
+      onS3EngineChange(engines[0].id);
+    }
+  }, [kind, engines, s3Engine, onS3EngineChange]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -1072,7 +1124,7 @@ function ManagedStep({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {S3_ENGINES.map((e) => (
+              {engines.map((e) => (
                 <SelectItem key={e.id} value={e.id}>
                   {e.label} · {e.detail}
                 </SelectItem>

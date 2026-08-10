@@ -121,6 +121,11 @@ func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 	var spec struct {
 		Version string `json:"version"`
 		Repo    string `json:"repo"`
+		// DownloadBase is the control plane's own release proxy for this exact
+		// version — "<cp public url>/dl/<version>" — and when the CP sends one
+		// it is the only place the assets are fetched from. See the comment on
+		// the base selection below for why this is not optional in practice.
+		DownloadBase string `json:"downloadBase"`
 	}
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
 		return fmt.Errorf("agent.update: bad spec: %w", err)
@@ -152,7 +157,32 @@ func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 		return fmt.Errorf("agent.update: self-update is linux-only")
 	}
 
-	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, spec.Version)
+	// Where the four assets come from (SIGMA-262).
+	//
+	// The control plane serves its own release proxy at /dl/<version>/<asset>,
+	// and when it tells us about it we use it and nothing else. That route
+	// exists because on a PRIVATE release repository the unauthenticated
+	// github.com URLs 404: SIGMA-217 moved every ONBOARDING fetch behind the
+	// proxy for exactly that reason, but self-update was left pointing at
+	// github.com. The result was a fleet that onboarded through the proxy and
+	// then could not be upgraded through it — every dashboard-driven upgrade
+	// failed with "status 404 Not Found" and the operator's only remaining
+	// path was SSH to every host, which is the thing the upgrade button exists
+	// to remove.
+	//
+	// Trust does not move with the bytes. Below, cosign still verifies
+	// checksums.txt against the RELEASE REPO's workflow OIDC identity and the
+	// archive still has to match that signed checksum, so a control plane that
+	// tampered with an asset fails verification here exactly as a tampered
+	// github.com would. What the base changes is reachability, not authenticity.
+	//
+	// Falling back to github.com when the field is absent keeps an agent
+	// working against a control plane that predates this field (and against a
+	// public release repo, which never needed the proxy).
+	base := strings.TrimRight(spec.DownloadBase, "/")
+	if base == "" {
+		base = fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, spec.Version)
+	}
 	archive := ArchiveName(spec.Version, arch)
 
 	work, err := os.MkdirTemp("", "sigmad-update-*")

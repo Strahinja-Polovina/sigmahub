@@ -60,6 +60,9 @@ const CP_URL = "http://cp.internal:8080";
 let executed: string[] = [];
 /** Every POST that reached the fake control plane, replayed or not. */
 let received: { key: string | null; replayed: boolean }[] = [];
+/** Every request the fake control plane saw, as `METHOD path`. Rotation is
+ *  judged by what CROSSES this boundary (SIGMA-264): one PUT, no DELETE. */
+let calls: string[] = [];
 
 /** A control plane with cp/internal/api/idempotency.go's rules and nothing
  *  else: claim the key up front, replay a finalized response for a matching
@@ -70,7 +73,26 @@ function fakeControlPlane() {
     const headers = new Headers(init?.headers as HeadersInit);
     const key = headers.get("Idempotency-Key");
     const body = String(init?.body ?? "");
-    if (!/\/secrets$/.test(new URL(url).pathname)) {
+    const path = new URL(url).pathname;
+    calls.push(`${init?.method ?? "GET"} ${path}`);
+    // The secret-scoped routes (PUT/DELETE /secrets/{id}) answer with the
+    // metadata the CP returns; only the collection POST is idempotency-wrapped.
+    if (/\/secrets\/[^/]+$/.test(path)) {
+      return new Response(JSON.stringify({ id: "sec_1", name: "DATABASE_URL", envVar: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    // The list route the project-binding check (SIGMA-85) goes through.
+    if (init?.method === undefined || init.method === "GET") {
+      return new Response(
+        JSON.stringify({
+          secrets: [{ id: "sec_1", projectId: "prj_1", environmentId: "env_1", name: "DATABASE_URL", envVar: true }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (!/\/secrets$/.test(path)) {
       return new Response("{}", { status: 200 });
     }
     if (key) {
@@ -104,6 +126,7 @@ function fakeControlPlane() {
 beforeEach(() => {
   executed = [];
   received = [];
+  calls = [];
   process.env.SIGMAHUB_CP_URL = CP_URL;
   vi.stubGlobal("fetch", fakeControlPlane());
 });
@@ -147,5 +170,25 @@ describe("createSecretAction", () => {
 
     expect(executed).toHaveLength(2);
     expect(received.every((r) => !r.replayed)).toBe(true);
+  });
+});
+
+// SIGMA-264. Rotating a third-party credential had no update path: the operator
+// had to DELETE the secret and CREATE it again. Both halves mint config
+// deployments, so the delete alone re-rolled every dependent app WITHOUT the
+// variable — a live checkout service restarts and starts 500ing — and the
+// create then rolled it a second time. Rotation is one intent and must cost one
+// write.
+describe("updateSecretAction", () => {
+  it("rotates a value with a single PUT and no delete", async () => {
+    const { updateSecretAction } = await import("./secrets");
+
+    await updateSecretAction({ resourceId: "res_1", secretId: "sec_1", value: "sk_live_new" });
+
+    const writes = calls.filter((c) => !c.startsWith("GET "));
+    expect(writes).toEqual(["PUT /v1/orgs/org_1/secrets/sec_1"]);
+    // Nothing was created and nothing was destroyed: the id — and every ref
+    // that names it — survives the rotation.
+    expect(executed).toHaveLength(0);
   });
 });
