@@ -382,3 +382,43 @@ describe("ResourceDetail LLM endpoint", () => {
     expect(link.getAttribute("rel")).toContain("noopener");
   });
 });
+
+describe("ResourceDetail controls a Developer may not use", () => {
+  // SIGMA-308. deployResource and the volume-delete flow both require an
+  // effective Project Admin on the resource's project, and both controls
+  // rendered for everyone. A Developer who pressed Deploy during a bad release
+  // got "Deploy failed — An error occurred in the Server Components render…",
+  // because the gate throws before the try/catch that exists to keep CP
+  // refusals readable and Next.js redacts thrown server-action messages in
+  // production. Nothing said they lacked the role or who had it, so they
+  // pressed it again and escalated — mid-incident, to ask a question the page
+  // could have answered by not offering the button. Delete already knew this
+  // (it is wrapped in {canManage && …}); its two siblings did not.
+
+  it("a Developer sees no Deploy or volume-delete control", () => {
+    renderCp({ detail: makeDetail({}, { canManage: false }) });
+
+    expect(screen.queryByRole("button", { name: /^Deploy$/ })).toBeNull();
+
+    openTab("Settings");
+    const labels = within(dangerZone())
+      .queryAllByRole("button")
+      .map((b) => (b.textContent ?? "").trim());
+    expect(labels).not.toContain("Delete a data volume");
+    // The whole danger zone is inert for them — Delete was already gated.
+    expect(labels).not.toContain("Delete");
+    // And it says why, instead of showing a card of irreversible actions with
+    // nothing in it.
+    expect(within(dangerZone()).getByText(/Project Admin role/i)).toBeTruthy();
+  });
+
+  it("a Project Admin still gets both", () => {
+    renderCp();
+    expect(screen.getByRole("button", { name: /^Deploy$/ })).toBeTruthy();
+    openTab("Settings");
+    const labels = within(dangerZone())
+      .queryAllByRole("button")
+      .map((b) => (b.textContent ?? "").trim());
+    expect(labels.sort()).toEqual(["Delete", "Delete a data volume"].sort());
+  });
+});

@@ -278,7 +278,26 @@ export async function deployResource(input: { resourceId: string }) {
   // (SIGMA-114). Previously this gate lived only inside the cpEnabled branch, so
   // the demo fall-through queued a redeploy after nothing more than an org
   // membership check — a project-scoped user with no grant could drive it.
-  const { user, role } = await requireProjectAdminForResource(orgId, input.resourceId);
+  //
+  // The refusal is RETURNED, not thrown (SIGMA-308). It used to throw here,
+  // outside the try/catch below that exists precisely so a CP refusal stays
+  // readable — and Next.js redacts a thrown server-action message in
+  // production, so a Developer pressing Deploy read "An error occurred in the
+  // Server Components render…" plus a digest. The page no longer offers them
+  // the button, but a direct invocation must still produce a sentence naming
+  // the role they need rather than an opaque digest.
+  let user: { name: string };
+  let role: string;
+  try {
+    ({ user, role } = await requireProjectAdminForResource(orgId, input.resourceId));
+  } catch (err) {
+    return {
+      error:
+        err instanceof Error
+          ? err.message
+          : "You need the Project Admin role for this project to deploy.",
+    };
+  }
   // CP mode: queue a real manual redeploy (fresh clone→build→rollout). The CP
   // drives the pipeline status, so there's no client-side simulation to advance.
   if (cpEnabled()) {

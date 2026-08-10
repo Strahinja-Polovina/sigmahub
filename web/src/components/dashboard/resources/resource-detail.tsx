@@ -670,7 +670,13 @@ export function ResourceDetail({
                 Open
               </Button>
             )}
-            <RedeployButton resourceId={resource.id} />
+            {/* Deploy needs an effective Project Admin on this project. It
+                used to render for Developers, whose press produced a redacted
+                server-action digest ("An error occurred in the Server
+                Components render…") instead of a sentence — mid-incident, on a
+                button they were never allowed to use. Gated like the sibling
+                Delete (SIGMA-308). */}
+            {canManage && <RedeployButton resourceId={resource.id} />}
           </div>
         </div>
       </div>
@@ -1173,7 +1179,10 @@ export function ResourceDetail({
                   dropdown's fake Deploy/Restart items already got (SIGMA-234,
                   SIGMA-162). */}
               <CardContent className="flex flex-col gap-4 pt-4">
-                {resource.kind === "app" && resource.serverId && (
+                {/* Same gate as the Delete below it: the volume-delete flow is
+                    Project-Admin-only in the CP, and offering it to a Developer
+                    only buys them a redacted error (SIGMA-308). */}
+                {canManage && resource.kind === "app" && resource.serverId && (
                   <>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
@@ -1205,6 +1214,16 @@ export function ResourceDetail({
                     />
                   )}
                 </div>
+                {/* With every control in here gated, a Developer would
+                    otherwise read a card describing irreversible actions and
+                    find nothing at all — say why, so the missing buttons are an
+                    answer rather than a bug (SIGMA-308). */}
+                {!canManage && (
+                  <p className="text-xs text-muted-foreground">
+                    Deploying and these destructive actions need the Project Admin role
+                    on this project — ask a project admin in your organization.
+                  </p>
+                )}
               </CardContent>
             </Card>
           </div>

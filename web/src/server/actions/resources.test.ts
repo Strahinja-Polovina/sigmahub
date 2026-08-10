@@ -31,11 +31,18 @@ vi.mock("@/server/db", async () => {
 });
 vi.mock("next/cache", () => ({ revalidatePath: () => {} }));
 vi.mock("@/server/audit", () => ({ writeAudit: async () => {} }));
+/** What the project gate does. `deny` makes requireProjectAdminForResource
+ *  throw the same message the real one throws for a Developer (SIGMA-308);
+ *  every other test leaves it null and the caller is an Org Admin. */
+const gate = vi.hoisted(() => ({ deny: null as string | null }));
 vi.mock("@/server/active-org", () => {
   const actor = { user: { id: "usr_you", name: "you" }, role: "Org Admin" };
   return {
     requireProjectRole: async () => actor,
-    requireProjectAdminForResource: async () => actor,
+    requireProjectAdminForResource: async () => {
+      if (gate.deny) throw new Error(gate.deny);
+      return actor;
+    },
     requireResourceVisible: async () => {},
   };
 });
@@ -77,7 +84,7 @@ vi.mock("@/server/cp", () => ({
 }));
 vi.mock("./domains", () => ({ attachDomain: async () => {} }));
 
-import { createResource } from "./resources";
+import { createResource, deployResource } from "./resources";
 import { getS3Info } from "./s3";
 
 const CLUSTER_ID = "cls_shop_prod";
@@ -94,6 +101,7 @@ beforeAll(async () => {
 }, 60_000);
 
 beforeEach(async () => {
+  gate.deny = null;
   await db.delete(s.deployments);
   await db.delete(s.resources);
   await db.delete(s.clusterNodes);
@@ -262,5 +270,38 @@ describe("the engine a storage resource was created with", () => {
     );
     const [row] = await db.select().from(s.resources).where(eq(s.resources.id, id));
     expect(row.engine).toBe("vllm");
+  });
+});
+
+describe("deployResource and the role it requires", () => {
+  // SIGMA-308. The Project-Admin gate throws, and it throws BEFORE the
+  // try/catch this action already has for exactly this reason: a refusal the
+  // user must be able to read. Next.js redacts a thrown server-action message
+  // in production, so a Developer's Deploy produced "An error occurred in the
+  // Server Components render…" with a digest — during an incident, on a button
+  // they were never allowed to press.
+  it("returns a readable permission error for a Developer", async () => {
+    const { id } = await createResource(intoCluster());
+    const before = (await db.select().from(s.deployments)).length;
+    gate.deny = "This action requires the Project Admin role for this project.";
+
+    const res = await deployResource({ resourceId: id });
+
+    expect(res).toHaveProperty("error");
+    const message = (res as { error: string }).error;
+    // It has to NAME the role, or it is one more sentence that doesn't say
+    // what to do next.
+    expect(message).toMatch(/Project Admin/);
+    expect(message).not.toMatch(/digest|Server Components/i);
+    // And a refused deploy is still a refused deploy: nothing was queued.
+    expect(await db.select().from(s.deployments)).toHaveLength(before);
+  });
+
+  it("still queues a deployment for someone who holds the role", async () => {
+    const { id } = await createResource(intoCluster());
+    const before = (await db.select().from(s.deployments)).length;
+    const res = await deployResource({ resourceId: id });
+    expect(res).not.toHaveProperty("error");
+    expect(await db.select().from(s.deployments)).toHaveLength(before + 1);
   });
 });
