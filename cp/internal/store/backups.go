@@ -300,6 +300,25 @@ func (s *Store) ensureRepoKeyTx(ctx context.Context, tx pgx.Tx, orgID, policyID 
 	return err
 }
 
+// runDayUTC renders THE expression that decides which UTC day a backup run
+// belongs to, optionally qualified by a table alias.
+//
+// It is a function rather than four hand-written copies because the copies
+// disagreed: the scheduler and migration 0030's partial unique index keyed a
+// run's day on created_at, while VerifyDays — the query the M1 30-day
+// green-streak gate reads — bucketed on finished_at, so every run that crossed
+// midnight landed on a different day in the calendar than in the schedule
+// (SIGMA-285). Keep the text byte-identical to the index expression in
+// migration 0030, including the 'UTC' literal's case: Postgres matches an
+// expression index by the parsed expression, and 'utc' is a different constant
+// from 'UTC'.
+func runDayUTC(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return "((" + alias + "created_at AT TIME ZONE 'UTC')::date)"
+}
+
 // CreateDueBackupRuns is the scheduler's tick: for every enabled, targeted
 // database policy it inserts (at most) one backup run per day and one verify
 // run per day (verify only once THIS day's backup has succeeded and recorded a
@@ -383,7 +402,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.backup {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'backup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'backup')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -391,7 +411,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.verify {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'verify') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'verify')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -400,7 +421,8 @@ func (s *Store) CreateDueBackupRuns(ctx context.Context, now time.Time) (servers
 		if d.base {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
-				VALUES ($1, $2, $3, $4, $5, 'basebackup') ON CONFLICT (policy_id, kind, ((created_at AT TIME ZONE 'UTC')::date)) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, 'basebackup')
+				ON CONFLICT (policy_id, kind, `+runDayUTC("")+`) WHERE kind IN ('backup', 'basebackup', 'verify') DO NOTHING`,
 				newID("run"), d.orgID, d.resourceID, d.policyID, d.serverID); err != nil {
 				return nil, err
 			}
@@ -520,7 +542,7 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 		       CASE WHEN r.kind = 'verify'
 		            THEN COALESCE((SELECT b.dump_sha256 FROM backup_runs b
 		                            WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
-		                              AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
+		                              AND `+runDayUTC("b")+` = `+runDayUTC("r")+`
 		                            ORDER BY b.finished_at DESC LIMIT 1), '')
 		            ELSE COALESCE(r.dump_sha256, '')
 		       END AS expected_sha,
@@ -770,6 +792,15 @@ type VerifyDay struct {
 
 // VerifyDays returns the org's last N days of verify outcomes, oldest first,
 // including zero-run (not green) days.
+//
+// The day a run belongs to is its CREATED day, via runDayUTC — the same
+// expression the scheduler and migration 0030's unique index use. It used to
+// bucket on finished_at here, so any run that crossed midnight was counted on
+// the wrong day: a Tuesday verify finishing 00:15 Wednesday left Tuesday reading
+// zero-run (not green) while crediting Wednesday, breaking the 30-day streak on
+// a day nothing was wrong and contradicting the run list (SIGMA-285). The
+// status filter keeps still-open runs out, which is what finished_at was really
+// providing.
 func (s *Store) VerifyDays(ctx context.Context, orgID string, days int) ([]VerifyDay, error) {
 	if days <= 0 || days > 366 {
 		days = 30
@@ -787,7 +818,7 @@ func (s *Store) VerifyDays(ctx context.Context, orgID string, days int) ([]Verif
 		  FROM span
 		  LEFT JOIN backup_runs r
 		    ON r.org_id = $1 AND r.kind = 'verify'
-		   AND (r.finished_at AT TIME ZONE 'utc')::date = span.day
+		   AND `+runDayUTC("r")+` = span.day
 		 GROUP BY span.day ORDER BY span.day`, orgID, days)
 	if err != nil {
 		return nil, err

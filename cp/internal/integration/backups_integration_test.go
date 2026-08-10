@@ -661,3 +661,81 @@ func TestCreateDueBackupRuns_NoVerifyBeforeSuccessfulBackup(t *testing.T) {
 		t.Errorf("verify rows after a successful backup = %d, want 1", n)
 	}
 }
+
+// TestVerifyDays_RunCrossingMidnightCountsOnItsCreatedDay is the SIGMA-285
+// regression. Two places decide which UTC day a backup run belongs to:
+// CreateDueBackupRuns (and the partial unique index behind it) key one run per
+// policy per day on created_at, while VerifyDays — the query the M1 30-day
+// green-streak gate reads — bucketed on finished_at. They disagree for every
+// run that crosses midnight.
+//
+// A control plane down all Tuesday recovers at 23:40, runs Tuesday's backup,
+// releases Tuesday's verify once the sha lands, and that verify finishes at
+// 00:15 Wednesday. Its created_at is Tuesday, so Wednesday's tick correctly
+// enqueues a second, separate verify — and VerifyDays reported Tuesday as a
+// zero-run (not green) day while crediting Wednesday with Tuesday's pass. The
+// streak broke on a day when nothing was wrong, and the run list contradicted
+// the calendar.
+func TestVerifyDays_RunCrossingMidnightCountsOnItsCreatedDay(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_midnight"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "orders", Kind: "postgres",
+		Spec: json.RawMessage(`{}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://minio.internal:9000", Bucket: "backups",
+		AccessKey: "AKIA123", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := target.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, res.ID, "admin",
+		store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+		t.Fatal(err)
+	}
+	var policyID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT id FROM backup_policies WHERE org_id = $1 AND resource_id = $2`,
+		orgID, res.ID).Scan(&policyID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Yesterday 23:55 UTC → today 00:15 UTC: created yesterday, finished today.
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	created := today.Add(-5 * time.Minute)
+	finished := today.Add(15 * time.Minute)
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, status,
+		                         dump_sha256, created_at, finished_at)
+		VALUES ($1, $2, $3, $4, $5, 'verify', 'success', 'deadbeef', $6, $7)`,
+		"run_midnight", orgID, res.ID, policyID, serverID, created, finished); err != nil {
+		t.Fatal(err)
+	}
+
+	days, err := st.VerifyDays(ctx, orgID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(days) != 2 {
+		t.Fatalf("verify days = %+v", days)
+	}
+	yesterday, todayRow := days[0], days[1]
+	if yesterday.Day != created.Format("2006-01-02") {
+		t.Fatalf("day rows are not [yesterday, today]: %+v", days)
+	}
+	if yesterday.Runs != 1 || yesterday.Failed != 0 || !yesterday.Green {
+		t.Errorf("the day the verify was created for reads %+v, want 1 run, 0 failed, green: "+
+			"a verify that crossed midnight was credited to the wrong day (SIGMA-285)", yesterday)
+	}
+	if todayRow.Runs != 0 {
+		t.Errorf("today reads %+v, want 0 runs — today's own verify has not run yet", todayRow)
+	}
+}
