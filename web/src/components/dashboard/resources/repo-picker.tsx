@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Lock, Globe, Search, FolderGit2, RefreshCw } from "lucide-react";
+import { Loader2, Lock, Globe, Search, FolderGit2, RefreshCw, CircleAlert } from "lucide-react";
 
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -29,17 +29,27 @@ export function RepoPicker({
   value?: string | null;
   onSelect: (repo: CpSelectableRepo) => void;
   /** Called once when the org has no usable integration, so the caller can
-   *  show the manual path instead of an empty list. */
+   *  show the manual path (and the Connect-GitHub offer) instead of an empty
+   *  list. NOT called when the control plane simply failed to answer — see the
+   *  "failed" status below. */
   onUnavailable?: () => void;
 }) {
   // One state object: the load is a single external read, so the results land
   // together and there is no window where the list is set but "loading" isn't.
+  //
+  // "failed" is a third status, not an empty "ready" (SIGMA-237). An empty list
+  // means "the control plane says you have nothing here", which the wizard
+  // answers by offering to install the GitHub App. A failed read means we do not
+  // know, and the only honest offer is to ask again — sending someone to
+  // github.com to re-run an org-wide App installation because the CP was
+  // restarting can permanently narrow that org's repository access.
   const [state, setState] = React.useState<{
-    status: "loading" | "ready";
+    status: "loading" | "ready" | "failed";
     repos: CpSelectableRepo[];
     truncated: boolean;
     unavailable: string[];
-  }>({ status: "loading", repos: [], truncated: false, unavailable: [] });
+    error: string | null;
+  }>({ status: "loading", repos: [], truncated: false, unavailable: [], error: null });
 
   const [query, setQuery] = React.useState("");
   // `reloads` is bumped by the refresh button; the fetch itself lives in the
@@ -57,20 +67,44 @@ export function RepoPicker({
     let cancelled = false;
 
     async function load() {
+      const fail = (message: string) => {
+        setState({
+          status: "failed",
+          repos: [],
+          truncated: false,
+          unavailable: [],
+          error: message,
+        });
+      };
+
       try {
         const res = await listGitRepos(orgId);
         if (cancelled) return;
+        // The action reports a control-plane failure in `error`. It is NOT an
+        // answer about the org's integration, so it must not reach
+        // onUnavailable — that switch raises the install offer.
+        if (res.error) {
+          fail(res.error);
+          return;
+        }
         setState({
           status: "ready",
           repos: res.repos,
           truncated: Boolean(res.truncated),
           unavailable: res.unavailable ?? [],
+          error: null,
         });
         if (!res.connected || res.repos.length === 0) unavailableRef.current?.();
-      } catch {
+      } catch (err) {
         if (cancelled) return;
-        setState({ status: "ready", repos: [], truncated: false, unavailable: [] });
-        unavailableRef.current?.();
+        // A throw here is transport too — in production Next.js has already
+        // redacted the message to a digest, which is exactly why we cannot
+        // pretend it means "GitHub isn't connected".
+        fail(
+          `Couldn't reach the control plane to list your repositories${
+            err instanceof Error && err.message ? `: ${err.message}` : ""
+          }.`
+        );
       }
     }
 
@@ -80,7 +114,7 @@ export function RepoPicker({
     };
   }, [orgId, reloads]);
 
-  const { status, repos, truncated, unavailable } = state;
+  const { status, repos, truncated, unavailable, error } = state;
   const loading = status === "loading";
 
   const filtered = React.useMemo(() => {
@@ -95,6 +129,47 @@ export function RepoPicker({
       <div className="flex items-center gap-2 rounded-lg border border-border p-4 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" />
         Loading your repositories…
+      </div>
+    );
+  }
+
+  // The third state (SIGMA-237): we could not ask. Say so, offer a retry, and
+  // never the install — the org's integration may well be perfectly fine.
+  if (status === "failed") {
+    return (
+      <div className="flex flex-col gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+        <div className="flex items-start gap-2">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium text-foreground">
+              Couldn’t reach the control plane to list your repositories
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {error} This says nothing about your GitHub connection — if the app is
+              installed, your repositories are still there. Try again in a moment.
+            </p>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-fit"
+          onClick={() => {
+            // Back to the spinner so the click has visible feedback and the
+            // stale error goes away; the effect below re-reads on `reloads`.
+            setState({
+              status: "loading",
+              repos: [],
+              truncated: false,
+              unavailable: [],
+              error: null,
+            });
+            setReloads((n) => n + 1);
+          }}
+        >
+          <RefreshCw className="size-4" />
+          Retry
+        </Button>
       </div>
     );
   }

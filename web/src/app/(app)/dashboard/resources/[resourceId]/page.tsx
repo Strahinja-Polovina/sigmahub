@@ -13,9 +13,9 @@ import {
   cpListServers,
   cpListBackupTargets,
   cpListBackupRuns,
-  cpQueryResourceMetrics,
-  cpQueryLogs,
+  cpListGitConnectionsWithMaps,
   type CpDatabaseInfo,
+  type CpHealthCheck,
   type CpS3Info,
   type CpBackupTarget,
   type CpBackupRun,
@@ -23,7 +23,8 @@ import {
 import { isDatabaseEngine } from "@/lib/server-catalog.generated";
 import { getDatabaseInfo } from "@/server/actions/databases";
 import { getS3Info } from "@/server/actions/s3";
-import type { CpTelemetry } from "@/components/dashboard/resources/resource-detail";
+import { loadResourceTelemetry } from "@/server/resource-telemetry";
+import type { AutoDeployPolicy } from "@/components/dashboard/resources/resource-detail";
 import { ResourceDetail } from "@/components/dashboard/resources/resource-detail";
 import type { DomainRow } from "@/components/dashboard/resources/resource-domains-panel";
 import type { DeploymentRow } from "@/components/dashboard/resources/deployments-panel";
@@ -156,38 +157,52 @@ async function loadS3(
  *  so the actionable reason lives in the CP resource's status object — surface
  *  it so an errored resource explains itself instead of showing a blank logs
  *  panel. A CP failure degrades to null. */
-async function loadStatusError(
+async function loadCpResourceFacts(
   orgId: string,
   resourceId: string,
   environmentId: string
-): Promise<string | null> {
-  if (!cpEnabled()) return null;
+): Promise<{ statusError: string | null; healthCheck: CpHealthCheck | null }> {
+  const none = { statusError: null, healthCheck: null };
+  if (!cpEnabled()) return none;
   try {
     const resources = await cpListResources(orgId, environmentId);
-    const st = resources.find((r) => r.id === resourceId)?.status;
+    const res = resources.find((r) => r.id === resourceId);
+    const st = res?.status;
     const err = st && typeof st === "object" ? (st as Record<string, unknown>).error : undefined;
-    return typeof err === "string" && err.trim() ? err : null;
+    // The probe the reconciler actually runs, as the CP stored it on the spec
+    // (createResourceBody copies gitdetect's healthCheck through). The Settings
+    // tab used to claim a constant "Enabled" here (SIGMA-240).
+    const hc = res?.spec?.healthCheck;
+    return {
+      statusError: typeof err === "string" && err.trim() ? err : null,
+      healthCheck: hc && typeof hc === "object" ? (hc as CpHealthCheck) : null,
+    };
   } catch {
-    return null;
+    return none;
   }
 }
 
-/** Load real pipeline telemetry (P1-13, CP mode only). pipeline=false renders
- *  the explicit not-configured state — CP mode never shows synthetic data. */
-async function loadTelemetry(orgId: string, resourceId: string): Promise<CpTelemetry | null> {
-  if (!cpEnabled()) return null;
+/** The branch mapping that governs whether a push deploys into this resource's
+ *  environment (SIGMA-240). CP mode + app resources only: a database has no
+ *  repository, and demo mode has no git connections. A CP failure degrades to
+ *  null, which the UI renders as "No branch mapped" — never as "Enabled". */
+async function loadAutoDeploy(
+  orgId: string,
+  projectId: string,
+  environmentId: string,
+  kind: string,
+  repo: string | null
+): Promise<AutoDeployPolicy | null> {
+  if (!cpEnabled() || kind !== "app" || !repo) return null;
   try {
-    const [metrics, logs] = await Promise.all([
-      cpQueryResourceMetrics(orgId, resourceId),
-      cpQueryLogs(orgId, { resourceId, limit: 200 }),
-    ]);
-    return {
-      pipeline: metrics !== null || logs !== null,
-      metrics: metrics ?? [],
-      logs: logs ?? [],
-    };
+    const conns = await cpListGitConnectionsWithMaps(orgId, projectId);
+    for (const { branchMaps } of conns) {
+      const map = branchMaps.find((m) => m.environmentId === environmentId);
+      if (map) return { branch: map.branch, policy: map.policy };
+    }
+    return null;
   } catch {
-    return { pipeline: true, metrics: [], logs: [] };
+    return null;
   }
 }
 
@@ -259,11 +274,21 @@ export default async function ResourceDetailPage({
   const database = await loadDatabase(loadFailures, orgId, resourceId, detail.resource.kind);
   const s3 = await loadS3(loadFailures, orgId, resourceId, detail.resource.kind);
   const backups = await loadBackups(orgId, resourceId, database !== null, loadFailures);
-  const telemetry = await loadTelemetry(orgId, resourceId);
-  const statusError = await loadStatusError(
+  // Telemetry reports its own read failure into loadFailures like every other
+  // loader here — an unreachable control plane must not render as "the pipeline
+  // is configured and nothing arrived" (SIGMA-236).
+  const telemetry = await loadResourceTelemetry(orgId, resourceId, loadFailures);
+  const { statusError, healthCheck } = await loadCpResourceFacts(
     orgId,
     resourceId,
     detail.resource.environmentId
+  );
+  const autoDeploy = await loadAutoDeploy(
+    orgId,
+    detail.resource.projectId,
+    detail.resource.environmentId,
+    detail.resource.kind,
+    detail.resource.repo
   );
 
   // Compose apps can spread their services across servers, so load the graph
@@ -275,8 +300,15 @@ export default async function ResourceDetailPage({
       : Promise.resolve(null),
     cpEnabled()
       ? attempt(loadFailures, "the server list", async () =>
-          (await cpListServers(orgId)).map((sv) => ({ id: sv.id, name: sv.name, type: sv.type })),
-        [] as { id: string; name: string; type: string }[])
+          (await cpListServers(orgId)).map((sv) => ({
+            id: sv.id,
+            name: sv.name,
+            type: sv.type,
+            // Carried so the restore dialogs can refuse a dead target
+            // (SIGMA-241) instead of queueing an op nobody will poll for.
+            status: sv.status,
+          })),
+        [] as { id: string; name: string; type: string; status: string }[])
       : Promise.resolve([]),
   ]);
 
@@ -299,6 +331,8 @@ export default async function ResourceDetailPage({
       backupRuns={backups.runs}
       environmentId={detail.resource.environmentId}
       cpTelemetry={telemetry}
+      autoDeploy={autoDeploy}
+      healthCheck={healthCheck}
     />
   );
 }

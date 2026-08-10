@@ -17,7 +17,6 @@ import {
   MemoryStick,
   Activity,
   Trash2,
-  Power,
   ScrollText,
   Loader2,
   CircleAlert,
@@ -84,6 +83,7 @@ import { ComposeServicesPanel, type PlacementServer } from "./compose-services-p
 import { DatabaseBackupsPanel } from "./database-backups-panel";
 import { ControlPlaneNote } from "@/components/dashboard/control-plane-note";
 import type {
+  CpHealthCheck,
   CpDatabaseInfo,
   CpS3Info,
   CpComposeServices,
@@ -94,9 +94,19 @@ import type {
 } from "@/server/cp";
 
 /** CP-mode telemetry payload. `pipeline` false = VictoriaMetrics/Loki are not
- *  configured — the UI shows an explicit state, never fabricated series. */
+ *  configured — the UI shows an explicit state, never fabricated series.
+ *
+ *  There are THREE states here, not two, and the page must be able to tell them
+ *  apart: not configured, configured-but-empty, and could-not-ask. The loader
+ *  used to collapse the third into the second — a failed read answered
+ *  `pipeline: true` with empty series, which is the page asserting the pipeline
+ *  is configured and the container produced no output (SIGMA-236). */
 export type CpTelemetry = {
   pipeline: boolean;
+  /** The control plane did not answer. Not "there is nothing", but "we could
+   *  not ask" — the distinction an operator acts on when a container is
+   *  crash-looping. */
+  unreadable?: boolean;
   metrics: CpTelemetryPoint[];
   logs: CpLogLine[];
 };
@@ -310,6 +320,22 @@ function DeleteResourceButton({
   );
 }
 
+/** The branch mapping that decides whether a push deploys this resource's
+ *  environment. `null` means the control plane has no mapping for it. */
+export type AutoDeployPolicy = { branch: string; policy: "auto" | "manual" };
+
+/** One line describing the probe the control plane actually runs, e.g.
+ *  "HTTP GET /healthz on :3000" or "TCP probe on :3000". Returns null when
+ *  there is no probe to describe — the caller renders "None", which is a
+ *  different statement from a badge reading "Enabled". */
+function describeHealthCheck(hc: CpHealthCheck | null | undefined): string | null {
+  if (!hc || !hc.type) return null;
+  const on = hc.port ? ` on :${hc.port}` : "";
+  if (hc.type === "http") return `HTTP GET ${hc.path || "/"}${on}`;
+  if (hc.type === "tcp") return `TCP probe${on}`;
+  return `${hc.type}${on}`;
+}
+
 /** "a, b and c" — the failed reads read as prose rather than a bare array. */
 function formatList(items: string[]): string {
   if (items.length === 1) return items[0];
@@ -334,6 +360,8 @@ export function ResourceDetail({
   cpTelemetry = null,
   statusError = null,
   loadFailures = [],
+  autoDeploy = null,
+  healthCheck = null,
 }: {
   detail: Detail;
   orgId?: string;
@@ -371,6 +399,11 @@ export function ResourceDetail({
   /** P1-13 telemetry (CP mode): real pipeline data or the explicit
    *  not-configured state. null = demo mode (labeled synthetic data). */
   cpTelemetry?: CpTelemetry | null;
+  /** The branch→environment mapping governing this resource's deploys, from the
+   *  control plane's git connection. null = no mapping (or nothing to ask). */
+  autoDeploy?: AutoDeployPolicy | null;
+  /** The health probe stored on the resource's spec. null = none. */
+  healthCheck?: CpHealthCheck | null;
 }) {
   const { resource, projectName, envName, server, cluster, deployments, secrets, canManage } =
     detail;
@@ -414,9 +447,18 @@ export function ResourceDetail({
   const metrics = isCp ? cpTelemetry.metrics : demoMetrics;
   const logs = isCp ? cpTelemetry.logs : demoLogs;
   const pipelineOff = isCp && !cpTelemetry.pipeline;
+  const telemetryUnreadable = isCp && Boolean(cpTelemetry.unreadable);
   const latest = metrics[metrics.length - 1];
 
-  const telemetryEmptyState = pipelineOff ? (
+  // Three states, three sentences. Saying "no telemetry received yet" when the
+  // read FAILED sends an operator whose container is crash-looping off to hunt
+  // on the host for output that was in fact never asked for (SIGMA-236).
+  const telemetryEmptyState = telemetryUnreadable ? (
+    <p className="py-8 text-center text-sm text-muted-foreground">
+      Couldn’t read logs and metrics — the control plane didn’t answer. This is
+      not the same as “nothing was produced”: reload once it is reachable.
+    </p>
+  ) : pipelineOff ? (
     <p className="py-8 text-center text-sm text-muted-foreground">
       Telemetry pipeline not configured — set CP_VM_WRITE_URL / CP_VM_READ_URL /
       CP_LOKI_URL on the control plane to collect metrics and logs.
@@ -460,10 +502,17 @@ export function ResourceDetail({
                 <Boxes className="size-3.5" />
                 {projectName} / {envName}
               </span>
+              {/* A real link. This was an <a href> whose onClick called
+                  preventDefault, so clicking the hostname did nothing at all —
+                  it read as broken rather than as decoration. In CP mode the
+                  domain is a real hostname with a real Let's Encrypt
+                  certificate the proxy issued, so there is somewhere to go
+                  (SIGMA-238). */}
               {resource.domain && (
                 <a
                   href={`https://${resource.domain}`}
-                  onClick={(e) => e.preventDefault()}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="inline-flex items-center gap-1.5 hover:text-foreground"
                 >
                   <Globe className="size-3.5" />
@@ -492,11 +541,21 @@ export function ResourceDetail({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {/* Likewise an anchor, not a toast. `toast("Opening https://…")`
+                is the single most-hit dead control in the product: it is the
+                very next click after attaching a domain and watching its
+                certificate go green (SIGMA-238). */}
             {resource.domain && (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => toast(`Opening https://${resource.domain}`)}
+                render={
+                  <a
+                    href={`https://${resource.domain}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  />
+                }
               >
                 <ExternalLink className="size-4" />
                 Open
@@ -686,6 +745,10 @@ export function ResourceDetail({
                   targets={backupTargets}
                   runs={backupRuns}
                   canManage={canManage}
+                  // The org's servers double as restore targets: a restore has
+                  // to be aimable somewhere other than the source's own host,
+                  // which is exactly the machine that just died (SIGMA-241).
+                  servers={placementServers ?? []}
                   engine={database.engine}
                   pitrWindow={{
                     lastWalAt: database.lastWalAt,
@@ -897,11 +960,39 @@ export function ResourceDetail({
                 <FactRow icon={Boxes} label="Name">
                   <span className="font-mono">{resource.name}</span>
                 </FactRow>
+                {/* Both of these used to be the literal
+                    `<Badge variant="secondary">Enabled</Badge>` with no data
+                    behind them. A user who mapped their branch as "Manual
+                    promote" in the Git panel read "Auto-deploy on push:
+                    Enabled" here, pushed, and waited for a rollout that was
+                    never going to happen — and the project panel's "Recent
+                    pushes" correctly saying the push deployed nothing then read
+                    as the lagging one. The same badge claimed auto-deploy and
+                    health checks for a database, which has no repository at all
+                    (SIGMA-240).
+
+                    Both now render what the control plane actually holds: the
+                    branch mapping's policy, and the probe on the resource's
+                    spec. */}
                 <FactRow icon={GitBranch} label="Auto-deploy on push">
-                  <Badge variant="secondary">Enabled</Badge>
+                  {!resource.repo ? (
+                    <span className="text-muted-foreground">Not connected to a repository</span>
+                  ) : autoDeploy ? (
+                    autoDeploy.policy === "auto" ? (
+                      <Badge variant="secondary">
+                        On push to <span className="font-mono">{autoDeploy.branch}</span>
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">Manual promote</Badge>
+                    )
+                  ) : (
+                    <span className="text-muted-foreground">No branch mapped</span>
+                  )}
                 </FactRow>
                 <FactRow icon={Activity} label="Health checks">
-                  <Badge variant="secondary">Enabled</Badge>
+                  {describeHealthCheck(healthCheck) ?? (
+                    <span className="text-muted-foreground">None</span>
+                  )}
                 </FactRow>
               </CardContent>
             </Card>
@@ -935,22 +1026,22 @@ export function ResourceDetail({
                 <CardTitle className="text-destructive">Danger zone</CardTitle>
                 <CardDescription>These actions are irreversible.</CardDescription>
               </CardHeader>
-              <CardContent className="flex flex-col gap-4 pt-0">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Stop resource</p>
-                    <p className="text-sm text-muted-foreground">
-                      Take {resource.name} offline. It can be restarted later.
-                    </p>
-                  </div>
-                  <Button variant="outline" size="sm" onClick={() => toast(`${resource.name} stopped`)}>
-                    <Power className="size-4" />
-                    Stop
-                  </Button>
-                </div>
+              {/* "Stop resource" used to live here, and its entire handler was
+                  `toast(`${resource.name} stopped`)` — a control in a card
+                  headed "These actions are irreversible" that reported an
+                  irreversible action it never performed. There is no CP stop
+                  endpoint and no desired-state change behind it: the container
+                  kept serving traffic, kept its database connections and kept
+                  being billed, while the status badge (correctly) still read
+                  Running, which an operator mid-incident reads as stale UI
+                  rather than as the truth. Removed until a real scale-to-zero /
+                  container.stop op exists that the reconciler renders and the
+                  status badge reflects — the same treatment the Overview
+                  dropdown's fake Deploy/Restart items already got (SIGMA-234,
+                  SIGMA-162). */}
+              <CardContent className="flex flex-col gap-4 pt-4">
                 {resource.kind === "app" && resource.serverId && (
                   <>
-                    <Separator />
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="text-sm font-medium text-foreground">Delete a data volume</p>
@@ -960,9 +1051,9 @@ export function ResourceDetail({
                       </div>
                       <VolumeDeleteDialog resourceId={resource.id} resourceName={resource.name} />
                     </div>
+                    <Separator />
                   </>
                 )}
-                <Separator />
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="text-sm font-medium text-foreground">Delete resource</p>

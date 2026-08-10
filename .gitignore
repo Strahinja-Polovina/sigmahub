@@ -2,6 +2,11 @@
 /.mcp.json
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+# Scratch checkouts the agent harness creates inside the repo when a task runs
+# in an isolated git worktree. They are full working copies of the repo (tens of
+# MB, and one per concurrent task), so committing them would be committing the
+# repository into itself.
+.claude/worktrees/
 .env
 .env.local
 .env*.local

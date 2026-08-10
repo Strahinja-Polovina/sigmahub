@@ -43,6 +43,10 @@ import type { CpAlertChannel } from "@/server/cp";
 const EVENT_LABELS: Record<string, string> = {
   server_unreachable: "Server unreachable",
   server_recovered: "Server recovered",
+  // SIGMA-233. Worth its own words rather than the raw event key: this is the
+  // disconnect that did NOT finish, so the host is still running everything we
+  // installed on it and somebody has to go and run the cleanup script.
+  decommission_timed_out: "Decommission timed out (host not cleaned up)",
   deploy_failed: "Deploy failed",
   backup_failed: "Backup failed",
   verify_failed: "Restore-verify failed",

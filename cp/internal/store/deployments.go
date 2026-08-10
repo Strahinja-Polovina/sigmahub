@@ -96,25 +96,45 @@ func deployInFlight(status string) bool {
 	return false
 }
 
-// supersedeInFlightTx freezes any still-in-flight deployment for a (server,
-// resource) as 'superseded' — called in the same tx that creates a newer
-// deployment, so there is at most ONE in-flight deployment per (server,resource).
-// That single-in-flight invariant is what lets the op-status path advance "the
-// in-flight deployment" unambiguously, and it makes the promised "superseded when
-// a newer deploy wins the race" state actually hold (no lingering orphan rows).
+// supersedeInFlightTx freezes any still-in-flight deployment for a resource as
+// 'superseded' — called in the same tx that creates a newer deployment, so there
+// is at most ONE in-flight deployment per resource. That single-in-flight
+// invariant is what lets the op-status path advance "the in-flight deployment"
+// unambiguously, and it makes the promised "superseded when a newer deploy wins
+// the race" state actually hold (no lingering orphan rows).
+//
+// A cluster-deployed resource has no server of its own: its rows are inserted
+// with server_id NULL. Returning early on an empty server id therefore meant the
+// invariant simply did not hold for cluster workloads (SIGMA-232) — two pushes a
+// few minutes apart left the FIRST deployment in flight forever while every
+// subsequent op status advanced the second, and 45 minutes later
+// TimeoutStaleDeployments failed the abandoned row, which enqueues a
+// deploy_failed alert. The operator got paged, and a red entry in the deploy
+// feed, for a deploy that was correctly replaced and whose successor shipped
+// fine. Every rapid push pair on every cluster app produced one, which is the
+// fastest way to teach a team to ignore deploy alerts.
+//
+// So the key is (org, resource) with the server-bound and serverless cases kept
+// apart: a server-bound deploy still supersedes only rows on ITS server (two
+// hosts running the same resource are two independent pipelines), while a
+// serverless deploy supersedes the resource's serverless rows.
 func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resourceID string) error {
-	if serverID == "" {
+	if resourceID == "" {
 		return nil
 	}
-	// Serialize concurrent creators of a new deployment for this (server,
-	// resource). Without this, a git-drain and a manual redeploy can each run
-	// their supersede BEFORE the other's insert is visible, both pass, and two
-	// in-flight deployments survive — breaking the at-most-one-in-flight
-	// invariant the op-status path relies on (SIGMA-131). The lock is
-	// transaction-scoped, released only after the caller's INSERT commits, so
-	// the next creator blocks until it can see the freshly-queued row.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-		"deploy:"+serverID+":"+resourceID); err != nil {
+	// Serialize concurrent creators of a new deployment for this key. Without
+	// this, a git-drain and a manual redeploy can each run their supersede
+	// BEFORE the other's insert is visible, both pass, and two in-flight
+	// deployments survive — breaking the at-most-one-in-flight invariant the
+	// op-status path relies on (SIGMA-131). The lock is transaction-scoped,
+	// released only after the caller's INSERT commits, so the next creator
+	// blocks until it can see the freshly-queued row. A serverless (cluster)
+	// deploy locks on the resource alone, which is its whole identity.
+	lockKey := "deploy:" + resourceID
+	if serverID != "" {
+		lockKey = "deploy:" + serverID + ":" + resourceID
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `
@@ -122,7 +142,8 @@ func supersedeInFlightTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resour
 			status = 'superseded',
 			finished_at = now(),
 			duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int)
-		 WHERE org_id = $1 AND server_id = $2 AND resource_id = $3
+		 WHERE org_id = $1 AND resource_id = $3
+		   AND (($2 = '' AND server_id IS NULL) OR server_id = NULLIF($2,''))
 		   AND status IN ('queued','building','deploying')`,
 		orgID, serverID, resourceID)
 	return err
@@ -581,13 +602,14 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 
 	var t Deployment
 	var env, srv, conn, ref, sha, digest, cfg *string
-	var srcPin string
+	var srcPin, srcBuild string
 	var srcSvcCount int
 	err = tx.QueryRow(ctx, `
 		SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
-		       COALESCE(image_pin,''), COALESCE(service_count,0), config_hash, status
+		       COALESCE(image_pin,''), COALESCE(service_count,0), config_hash, status,
+		       COALESCE(build_server_id,'')
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2 AND id = $3`,
-		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &srcPin, &srcSvcCount, &cfg, &t.Status)
+		orgID, resourceID, targetDeploymentID).Scan(&env, &srv, &conn, &ref, &sha, &digest, &srcPin, &srcSvcCount, &cfg, &t.Status, &srcBuild)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrNotFound
 	}
@@ -620,15 +642,26 @@ func (s *Store) CreateRollback(ctx context.Context, orgID, resourceID, targetDep
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// Where this resource builds travels with the row (SIGMA-231). A rollback
+	// re-ships a retained image and renders no build of its own, but it becomes
+	// the resource's newest deployment — and the next redeploy copies from the
+	// newest deployment, so dropping the column here silently loses the build
+	// server for every deploy after it.
+	buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, d.ConnectionID, d.EnvironmentID)
+	if err != nil {
+		return Deployment{}, "", err
+	}
 	// COPY the source's pin — a rollback of a rollback keeps pointing at the
 	// original build's images, however long the chain (SIGMA-173).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, rollback_of, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,$13,'queued',$14)
+		                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, rollback_of, status, created_by,
+		                         build_server_id)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'rollback',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,$13,'queued',$14,NULLIF($15,''))
 		RETURNING created_at`,
 		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID,
-		d.GitRef, d.GitSHA, d.ImageDigest, srcPin, d.ConfigHash, svcCount, targetDeploymentID, actor).Scan(&d.CreatedAt)
+		d.GitRef, d.GitSHA, d.ImageDigest, srcPin, d.ConfigHash, svcCount, targetDeploymentID, actor,
+		buildServer).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -655,10 +688,12 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var env, srv, conn, ref, sha, cfg *string
+	var srcBuild string
 	err = tx.QueryRow(ctx, `
-		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash
+		SELECT environment_id, server_id, connection_id, git_ref, git_sha, config_hash,
+		       COALESCE(build_server_id,'')
 		  FROM deployments WHERE org_id = $1 AND resource_id = $2
-		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg)
+		 ORDER BY created_at DESC LIMIT 1`, orgID, resourceID).Scan(&env, &srv, &conn, &ref, &sha, &cfg, &srcBuild)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Deployment{}, "", ErrInvalid{Msg: "nothing to redeploy — connect a repo and push first"}
 	}
@@ -680,15 +715,26 @@ func (s *Store) CreateManualRedeploy(ctx context.Context, orgID, resourceID, act
 	if err := supersedeInFlightTx(ctx, tx, orgID, d.ServerID, resourceID); err != nil {
 		return Deployment{}, "", err
 	}
+	// A redeploy is a REBUILD, so where it builds is not optional (SIGMA-231).
+	// For a cluster app this column is the only thing that renders its clone and
+	// build ops anywhere, so a redeploy that drops it produces a deployment no
+	// machine can advance — queued with an empty build log until the stale-deploy
+	// sweeper fails it 45 minutes later and blames the agent.
+	buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, d.ConnectionID, d.EnvironmentID)
+	if err != nil {
+		return Deployment{}, "", err
+	}
 	// Its own pin: the forced rebuild lands on fresh per-deployment tags instead
 	// of overwriting the prior release's (SIGMA-173 — the overwrite is what made
 	// rollback silently re-ship the current image).
 	err = tx.QueryRow(ctx, `
 		INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,''),$11,'queued',$12)
+		                         git_ref, git_sha, image_pin, config_hash, service_count, status, created_by,
+		                         build_server_id)
+		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'manual',NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,''),$11,'queued',$12,NULLIF($13,''))
 		RETURNING created_at`,
-		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, deployPin(d.ID), d.ConfigHash, svcCount, actor).Scan(&d.CreatedAt)
+		d.ID, orgID, resourceID, d.EnvironmentID, d.ServerID, d.ConnectionID, d.GitRef, d.GitSHA, deployPin(d.ID), d.ConfigHash, svcCount, actor,
+		buildServer).Scan(&d.CreatedAt)
 	if err != nil {
 		return Deployment{}, "", err
 	}
@@ -750,13 +796,13 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 	seen := map[string]ServerRef{}
 	for _, resID := range resourceIDs {
 		var env, srv, conn, ref, sha, digest, cfg *string
-		var pin, status string
+		var pin, status, srcBuild string
 		err := tx.QueryRow(ctx, `
 			SELECT environment_id, server_id, connection_id, git_ref, git_sha, image_digest,
-			       COALESCE(image_pin,''), config_hash, status
+			       COALESCE(image_pin,''), config_hash, status, COALESCE(build_server_id,'')
 			  FROM deployments WHERE org_id = $1 AND resource_id = $2
 			 ORDER BY created_at DESC LIMIT 1`, orgID, resID).
-			Scan(&env, &srv, &conn, &ref, &sha, &digest, &pin, &cfg, &status)
+			Scan(&env, &srv, &conn, &ref, &sha, &digest, &pin, &cfg, &status, &srcBuild)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
@@ -801,12 +847,28 @@ func (s *Store) CreateConfigDeployments(ctx context.Context, orgID string, resou
 				return nil, err
 			}
 		}
+		// Where this resource BUILDS travels with the row (SIGMA-231). A pinned
+		// config deploy re-ships and renders no build — but a pinless one falls
+		// back to the full clone→build→rollout below, and for a cluster app that
+		// pipeline exists only in the build server's document. Carrying it also
+		// keeps the column alive for the next redeploy, which copies from this row.
+		//
+		// Resolved AFTER the fallback above, deliberately: when the latest attempt
+		// failed and we re-ship the last successful release instead, the build
+		// server that matters is still the one configured for this resource today,
+		// not whichever host built a release months ago.
+		buildServer, err := resolveBuildServerTx(ctx, tx, srcBuild, deref(conn), deref(env))
+		if err != nil {
+			return nil, err
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deployments (id, org_id, resource_id, environment_id, server_id, connection_id, trigger,
-			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by)
-			VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'config',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,'queued',$13)`,
+			                         git_ref, git_sha, image_digest, image_pin, config_hash, service_count, status, created_by,
+			                         build_server_id)
+			VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),'config',NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),$12,'queued',$13,NULLIF($14,''))`,
 			depID, orgID, resID, deref(env), deref(srv), deref(conn),
-			deref(ref), deref(sha), deref(digest), pin, deref(cfg), svcCount, actor); err != nil {
+			deref(ref), deref(sha), deref(digest), pin, deref(cfg), svcCount, actor,
+			buildServer); err != nil {
 			return nil, err
 		}
 		if err := auditTx(ctx, tx, orgID, actor, "Config deploy queued ("+reason+")", resID); err != nil {
@@ -1102,14 +1164,26 @@ func (s *Store) DeployTargetsForServer(ctx context.Context, serverID string) (ma
 // deployment: a GitHub App installation token when the connection carries an
 // installation (SIGMA-55), else the connection's KMS-wrapped PAT (P1-6
 // envelope). Scoped to the REQUESTING server: an agent token can only fetch the
-// credential for a deployment targeting its own host (BOLA). The plaintext token
-// is returned to the agent for in-memory use and never persisted.
+// credential for a deployment its own host owns a part of (BOLA). The plaintext
+// token is returned to the agent for in-memory use and never persisted.
+//
+// "Owns a part of" is deploymentReporterClause, not `server_id` (SIGMA-228). The
+// server that asks for a clone credential is by definition the server the
+// git.clone op was RENDERED into, and that is not the deploy target whenever a
+// dedicated build server exists — the clone+build ops live in the build server's
+// document — nor for a cluster workload, whose deployment has no server_id at
+// all. Matching the deploy target alone 404s exactly the agent that has to
+// clone, so every private-repo deploy on those two shapes fails at clone with a
+// Git auth error that reads like a bad token. Release must use the same
+// predicate as render and report, or the three disagree about who owns a deploy.
 func (s *Store) DeploymentCloneCredential(ctx context.Context, serverID, deploymentID string) (token, repo, provider string, err error) {
 	var orgID, connID string
 	err = s.Pool.QueryRow(ctx, `
 		SELECT d.org_id, d.connection_id, c.repo_full_name, c.provider
-		  FROM deployments d JOIN git_connections c ON c.id = d.connection_id
-		 WHERE d.id = $1 AND d.server_id = $2`, deploymentID, serverID).Scan(&orgID, &connID, &repo, &provider)
+		  FROM deployments d
+		  JOIN git_connections c ON c.id = d.connection_id
+		  JOIN resources r ON r.id = d.resource_id
+		 WHERE d.id = $2 AND`+deploymentReporterClause, serverID, deploymentID).Scan(&orgID, &connID, &repo, &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", "", ErrNotFound
 	}
@@ -1404,6 +1478,40 @@ func composeServiceCount(spec []byte) int {
 // resourceServiceCountTx computes the CURRENT compose service count for a
 // resource — used by rollback/redeploy so the per-service denominator reflects
 // the spec that will actually be rendered, not a stale copy from a prior row.
+// resolveBuildServerTx answers "where does this deployment build?" for the
+// creators that mint a deployment from an EARLIER one instead of from a push:
+// manual redeploy, rollback and config deploy (SIGMA-231).
+//
+// Only the push path (DrainDeployRequests) and CreateHeadDeployment ever wrote
+// build_server_id, so those three minted rows with the column NULL. That is not
+// cosmetic: ClusterBuildSpecsForServer keys on it, and it is the ONLY thing that
+// puts a cluster workload's clone+build ops into any document at all — a cluster
+// app whose redeploy lost the column can be built by nobody, so it sits 'queued'
+// with an empty log until TimeoutStaleDeployments fails it 45 minutes later with
+// a message blaming the agent. clusterImageReady keys on it too. And because
+// each of these creators copies from the resource's MOST RECENT deployment, one
+// dropped column poisons every deploy after it.
+//
+// Prefer the source row (a deploy's history should explain itself), and fall
+// back to the branch map the way DrainDeployRequests resolves it — that covers a
+// release created before the operator picked a build server.
+func resolveBuildServerTx(ctx context.Context, tx pgx.Tx, srcBuildServer, connID, envID string) (string, error) {
+	if srcBuildServer != "" {
+		return srcBuildServer, nil
+	}
+	if connID == "" || envID == "" {
+		return "", nil
+	}
+	var out string
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(build_server_id,'') FROM git_branch_map
+		 WHERE connection_id = $1 AND environment_id = $2 LIMIT 1`, connID, envID).Scan(&out)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return out, err
+}
+
 func resourceServiceCountTx(ctx context.Context, tx pgx.Tx, orgID, resourceID string) (int, error) {
 	var spec []byte
 	err := tx.QueryRow(ctx, `SELECT spec FROM resources WHERE org_id = $1 AND id = $2`, orgID, resourceID).Scan(&spec)

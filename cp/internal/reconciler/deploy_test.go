@@ -592,3 +592,73 @@ func TestComposePerServiceEnvOverridesResourceEnv(t *testing.T) {
 		t.Fatalf("resource env was mutated: %+v", spec.Env)
 	}
 }
+
+// SIGMA-230. The agent's GC keep-set comes from the document it is about to
+// apply, and GC runs BEFORE the ops — so a resource whose rollout the renderer
+// deliberately holds back must still be named as something to KEEP, or the live
+// container is reaped and the app is down for the whole hold. Both hold-back
+// paths fall through to the `sync:<id>` stub, which must carry the retain list.
+func TestHeldBackRenderStillNamesContainersToRetain(t *testing.T) {
+	retainOf := func(t *testing.T, ops []dsd.Op, resourceID string) []string {
+		t.Helper()
+		stub, found := opByID(ops, "sync:"+resourceID)
+		if !found {
+			t.Fatalf("expected the resource.sync stub for %s; ops=%v", resourceID, opIDs(ops))
+		}
+		var spec struct {
+			Retain []string `json:"retain"`
+		}
+		if err := json.Unmarshal(stub.Spec, &spec); err != nil {
+			t.Fatal(err)
+		}
+		return spec.Retain
+	}
+	render := func(serverID string, rs store.ResourceSpec, target store.DeployTarget, reg registryRender) []dsd.Op {
+		ops, _ := renderOps(serverID, []store.ResourceSpec{rs}, nil, nil, store.HostHardening{}, nil,
+			map[string]store.DeployTarget{rs.ResourceID: target}, nil, nil, nil, nil, nil,
+			ACMEConfig{}, clusterRender{}, reg)
+		return ops
+	}
+
+	// A dedicated build server holds the deploy target's rollout while the
+	// deployment is queued/building.
+	single := store.ResourceSpec{
+		ResourceID: testResource, ProjectID: testProject, Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}
+	reg := registryRender{repository: "ghcr.io/acme", host: "ghcr.io"}
+	for _, status := range []string{"queued", "building"} {
+		target := store.DeployTarget{
+			DeploymentID: "dep_1", SHA: "abc1234567", ImagePin: "pin1", Status: status,
+			ServerID: "srv_web", BuildServerID: "srv_build",
+		}
+		if _, _, ok := renderDeployOps(single, nil, nil, target, "srv_web", reg); ok {
+			t.Fatalf("precondition: %s must hold the deploy target's rollout", status)
+		}
+		got := retainOf(t, render("srv_web", single, target, reg), single.ResourceID)
+		if len(got) != 1 || got[0] != "" {
+			t.Fatalf("%s: deploy target must retain its live container group, got %#v", status, got)
+		}
+		// The build server runs no container of this resource — it renders the
+		// clone + build and no stub at all — so it claims nothing to retain.
+		// Retaining there would pin a stale container on the wrong host.
+		if stub, found := opByID(render("srv_build", single, target, reg), "sync:"+single.ResourceID); found {
+			t.Fatalf("the build server must not retain this resource, got stub %s", stub.Spec)
+		}
+		if got := retainedContainerGroups(single, target, "srv_build"); len(got) != 0 {
+			t.Fatalf("the build server must retain nothing, got %#v", got)
+		}
+	}
+
+	// A cross-server Compose render where every locally-placed service is gated
+	// on a remote dependency: the gated service is still ours to keep running.
+	compose, spec := composeMultiServer()
+	target := multiServerTarget(nil)
+	if _, _, ok := renderComposeDeployOps(compose, spec, nil, nil, target, "srv_app"); ok {
+		t.Fatal("precondition: api must be gated until the remote db reports success")
+	}
+	got := retainOf(t, render("srv_app", compose, target, registryRender{}), compose.ResourceID)
+	if len(got) != 1 || got[0] != "api" {
+		t.Fatalf("the gated app server must retain its own service, got %#v", got)
+	}
+}

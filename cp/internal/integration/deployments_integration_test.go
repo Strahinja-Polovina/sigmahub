@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -447,5 +448,113 @@ func TestConfigDeployments(t *testing.T) {
 	}
 	if newPin != srcPin {
 		t.Fatalf("config deploy must re-ship the successful release's pin: want %q got %q", srcPin, newPin)
+	}
+}
+
+// TestCloneCredentialReachesEveryServerThatClones is SIGMA-228. The git.clone op
+// is not rendered into the deploy TARGET's document when a dedicated build
+// server exists — it lands in the BUILD server's — and for a cluster workload
+// there is no deploy target at all (server_id is NULL). Scoping the credential
+// release to `d.server_id = $1` therefore 404s exactly the agent that has to
+// clone, and every private-repo deploy on those two shapes dies at clone with an
+// auth-shaped error that blames the repo rather than the control plane.
+func TestCloneCredentialReachesEveryServerThatClones(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_clone_cred_scope"
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := connectServer(t, st, orgID, "srv-web")
+	builder := connectServer(t, st, orgID, "srv-build")
+	cpNode := connectServer(t, st, orgID, "srv-cp")
+	stranger := connectServer(t, st, orgID, "srv-other")
+	for _, id := range []string{target, builder, cpNode, stranger} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, RepoFullName: "acme/api", Token: "ghp_pat",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Shape 1: a server-bound app with a dedicated build server.
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: target, Name: "web", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: target, ConnectionID: conn.ID,
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "abc1234567", ConfigHash: "cfg",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, builder); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, target, dep.ID); err != nil {
+		t.Fatalf("deploy target must still resolve the credential: %v", err)
+	}
+	tok, repo, _, err := st.DeploymentCloneCredential(ctx, builder, dep.ID)
+	if err != nil {
+		t.Fatalf("the build server holds the clone op but cannot fetch its credential: %v", err)
+	}
+	if tok != "ghp_pat" || repo != "acme/api" {
+		t.Fatalf("build-server credential = %q %q", tok, repo)
+	}
+
+	// Shape 2: a cluster workload — no deploy target at all.
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: env.ID, Name: "prod", ControlPlaneID: cpNode,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capp, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cdep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: capp.ID, EnvironmentID: env.ID, ConnectionID: conn.ID,
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "def4567890", ConfigHash: "cfg",
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, cdep.ID, builder); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, builder, cdep.ID); err != nil {
+		t.Fatalf("cluster build server cannot fetch its credential: %v", err)
+	}
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, cpNode, cdep.ID); err != nil {
+		t.Fatalf("a cluster node must resolve the credential for its own workload: %v", err)
+	}
+
+	// The BOLA guard has to survive the widening: a server that owns no part of
+	// either deployment still gets nothing.
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, stranger, dep.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unrelated server got the credential: err = %v", err)
+	}
+	if _, _, _, err := st.DeploymentCloneCredential(ctx, stranger, cdep.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unrelated server got the cluster credential: err = %v", err)
 	}
 }

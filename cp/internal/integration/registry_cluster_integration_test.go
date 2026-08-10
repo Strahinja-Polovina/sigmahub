@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -924,5 +925,278 @@ func TestDeployLogsAcceptedFromEveryServerThatRunsTheDeploy(t *testing.T) {
 	after, _ := st.DeployLogsSince(ctx, dep.ID, 0, 100)
 	if len(after) != 3 {
 		t.Fatalf("an unrelated server wrote into another deployment's log: %+v", after)
+	}
+}
+
+// TestBuildServerCarriesIntoRedeployRollbackAndConfig is SIGMA-231. Only the
+// push path and CreateHeadDeployment ever wrote build_server_id, so pressing
+// Redeploy on a cluster app minted a row with a NULL build server —
+// ClusterBuildSpecsForServer, the only thing that puts a cluster workload's
+// clone+build ops into ANY document, then matched nothing and the deployment sat
+// queued until TimeoutStaleDeployments failed it 45 minutes later with a message
+// blaming the agent. Rollback and config deploys drop the column the same way,
+// and because each of these copies from the MOST RECENT row, one drop poisons
+// every redeploy after it.
+func TestBuildServerCarriesIntoRedeployRollbackAndConfig(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_buildserver_carry"
+	envID, cpServer, worker := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddClusterNode(ctx, orgID, cluster.ID, worker, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	builder := connectServer(t, st, orgID, "builder")
+
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: projectID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildServerOf := func(depID string) string {
+		t.Helper()
+		var got string
+		if err := st.Pool.QueryRow(ctx,
+			`SELECT COALESCE(build_server_id,'') FROM deployments WHERE id = $1`, depID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// The first deploy is the push path's: it records the build server and ships.
+	first, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: envID, ConnectionID: conn.ID,
+		Trigger: "git", GitRef: "refs/heads/main", GitSHA: "abc1234567", ConfigHash: "cfg1",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, first.ID, builder); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentStatus(ctx, first.ID, store.DeploymentStatusUpdate{
+		Status: "success", ImageDigest: "sha256:abc", MarkFinished: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Redeploy. Without the build server this row can be built by nobody.
+	red, _, err := st.CreateManualRedeploy(ctx, orgID, app.ID, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buildServerOf(red.ID); got != builder {
+		t.Fatalf("redeploy build_server_id = %q, want %q", got, builder)
+	}
+	specs, err := st.ClusterBuildSpecsForServer(ctx, builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || specs[0].ResourceID != app.ID {
+		t.Fatalf("nothing renders clone+build for the redeployed cluster app: %+v", specs)
+	}
+	tgt, err := st.DeployTargetForResource(ctx, app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tgt.DeploymentID != red.ID || tgt.BuildServerID != builder {
+		t.Fatalf("deploy target = %s/%q, want the redeploy on %q", tgt.DeploymentID, tgt.BuildServerID, builder)
+	}
+
+	// Rollback. It re-ships a retained image so it renders no build, but it
+	// becomes the newest row — and the next redeploy copies from the newest row,
+	// so dropping the column here loses the build server for good.
+	if err := st.SetDeploymentStatus(ctx, red.ID, store.DeploymentStatusUpdate{
+		Status: "failed", Detail: "build failed", MarkFinished: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rb, _, err := st.CreateRollback(ctx, orgID, app.ID, first.ID, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buildServerOf(rb.ID); got != builder {
+		t.Fatalf("rollback build_server_id = %q, want %q", got, builder)
+	}
+
+	// Config deploy (domain attached / secret changed) off a successful release.
+	if err := st.SetDeploymentStatus(ctx, rb.ID, store.DeploymentStatusUpdate{
+		Status: "success", MarkFinished: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateConfigDeployments(ctx, orgID, []string{app.ID}, "operator", "domain attached"); err != nil {
+		t.Fatal(err)
+	}
+	var cfgDep string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT id FROM deployments WHERE org_id = $1 AND resource_id = $2 AND trigger = 'config'
+		  ORDER BY created_at DESC LIMIT 1`, orgID, app.ID).Scan(&cfgDep); err != nil {
+		t.Fatal(err)
+	}
+	if got := buildServerOf(cfgDep); got != builder {
+		t.Fatalf("config deploy build_server_id = %q, want %q", got, builder)
+	}
+
+	// And the chain holds: a redeploy after all that still knows where to build.
+	if err := st.SetDeploymentStatus(ctx, cfgDep, store.DeploymentStatusUpdate{
+		Status: "success", MarkFinished: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	again, _, err := st.CreateManualRedeploy(ctx, orgID, app.ID, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buildServerOf(again.ID); got != builder {
+		t.Fatalf("redeploy after a rollback+config chain lost the build server: %q", got)
+	}
+}
+
+// TestSecondClusterDeploySupersedesTheFirst is SIGMA-232. supersedeInFlightTx
+// short-circuits on an empty server id, and a cluster workload HAS no server —
+// its deployments carry server_id NULL. So the at-most-one-in-flight-per-resource
+// invariant that the whole op-status advance path is documented to rely on never
+// held for cluster apps: two pushes a few minutes apart left the first row in
+// flight forever, every later op status advanced the second, and 45 minutes on
+// TimeoutStaleDeployments failed the abandoned row — paging the operator about a
+// deploy that was correctly replaced and whose successor shipped fine.
+func TestSecondClusterDeploySupersedesTheFirst(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cluster_supersede"
+	envID, cpServer, worker := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddClusterNode(ctx, orgID, cluster.ID, worker, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	var projectID string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT project_id FROM environments WHERE id = $1`, envID).Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: projectID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ClusterID: cluster.ID, Name: "api", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A server-bound app in the same environment: the push deploys both, and the
+	// server path's supersede must keep working exactly as before.
+	hostApp, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: worker, Name: "web", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":3000}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	push := func(id, sha string) {
+		t.Helper()
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO deploy_requests (id, org_id, connection_id, environment_id, kind, ref, sha, branch, status)
+			VALUES ($1,$2,$3,$4,'deploy','refs/heads/main',$5,'main','queued')`,
+			id, orgID, conn.ID, envID, sha); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DrainDeployRequests(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statuses := func(resID string) map[string]int {
+		t.Helper()
+		rows, err := st.Pool.Query(ctx,
+			`SELECT status, count(*) FROM deployments WHERE org_id = $1 AND resource_id = $2 GROUP BY status`,
+			orgID, resID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var s string
+			var n int
+			if err := rows.Scan(&s, &n); err != nil {
+				t.Fatal(err)
+			}
+			out[s] = n
+		}
+		return out
+	}
+	inFlight := func(resID string) int {
+		s := statuses(resID)
+		return s["queued"] + s["building"] + s["deploying"]
+	}
+
+	push("dpr_one", "aaaaaaa1111")
+	if n := inFlight(app.ID); n != 1 {
+		t.Fatalf("first push left %d in-flight cluster deployments, want 1", n)
+	}
+	push("dpr_two", "bbbbbbb2222")
+
+	if n := inFlight(app.ID); n != 1 {
+		t.Fatalf("a second push left %d in-flight cluster deployments — the first is an orphan "+
+			"that TimeoutStaleDeployments will fail and alert on: %+v", n, statuses(app.ID))
+	}
+	if got := statuses(app.ID)["superseded"]; got != 1 {
+		t.Fatalf("the replaced cluster deployment is not marked superseded: %+v", statuses(app.ID))
+	}
+	// The server-bound sibling is the control: its supersede already worked and
+	// must keep working through the same code path.
+	if n := inFlight(hostApp.ID); n != 1 {
+		t.Fatalf("server-bound app has %d in-flight deployments: %+v", n, statuses(hostApp.ID))
+	}
+	if got := statuses(hostApp.ID)["superseded"]; got != 1 {
+		t.Fatalf("server-bound supersede regressed: %+v", statuses(hostApp.ID))
+	}
+
+	// The superseded row is terminal, so the sweeper never touches it and no
+	// deploy_failed alert is ever enqueued for it. Age every row of this resource
+	// past the timeout: only the one still in flight may be failed.
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET created_at = now() - interval '2 hours' WHERE resource_id = $1`,
+		app.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.TimeoutStaleDeployments(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := statuses(app.ID)["failed"]; got != 1 {
+		// Only the still-in-flight successor may be timed out here.
+		t.Fatalf("stale sweep failed %d cluster deployments, want only the in-flight one: %+v",
+			got, statuses(app.ID))
 	}
 }

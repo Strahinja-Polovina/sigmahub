@@ -14,7 +14,6 @@ import {
   Boxes,
   MoreHorizontal,
   RotateCw,
-  MinusCircle,
   Unplug,
   Activity,
   Loader2,
@@ -287,24 +286,23 @@ function ServerActions({
             Rename
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem
-          className="gap-2"
-          onClick={() => toast.success(`Restarting agent on ${serverName}…`)}
-        >
-          <RotateCw className="size-4 text-muted-foreground" />
-          Restart agent
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          className="gap-2"
-          onClick={() =>
-            toast(`Cordoned ${serverName}`, {
-              description: "No new resources will be scheduled here.",
-            })
-          }
-        >
-          <MinusCircle className="size-4 text-muted-foreground" />
-          Cordon
-        </DropdownMenuItem>
+        {/* "Restart agent" and "Cordon" used to sit here. Both were toasts and
+            nothing else: no CP endpoint, no persisted state (SIGMA-235).
+            Cordon was the dangerous one — it announced "No new resources will
+            be scheduled here", a guarantee no layer of the system implements.
+            The wizard's target picker filters on `incompatible` and
+            `decommissioning` only (lib/wizard/availability.ts,
+            serverIsDeployable), so a "cordoned" host stayed in serverOptions
+            and the CP kept scheduling onto it. An operator draining a host for
+            kernel maintenance was told it was drained while a teammate's new
+            database landed on it, minutes before the reboot.
+
+            Cordon is worth having; it is not worth faking. Bringing it back
+            means a `schedulable` flag on the CP server row, exclusion in
+            serverOptions/buildInventory, and a refusal in store.CreateResource
+            — the same three places the `incompatible` gate already covers
+            (SIGMA-197). Until then this menu only offers actions that reach
+            the server. */}
         {/* A provisioning server never redeemed its one-time token — offer a
             fresh install command instead of forcing a duplicate record. */}
         {cpMode && provisioning && (

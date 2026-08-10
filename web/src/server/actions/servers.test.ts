@@ -60,7 +60,7 @@ vi.mock("@/server/cp", () => {
   };
 });
 
-import { simulateDecommission } from "./servers";
+import { decommissionServer, simulateDecommission } from "./servers";
 import { db } from "@/server/db";
 
 const database = db as unknown as DemoDb;
@@ -179,5 +179,53 @@ describe("reporting on a demo teardown", () => {
     await simulateDecommission({ serverId: FIXTURE.dbHostId, event: "ack" });
     expect(await serverRow(FIXTURE.dbHostId)).toBeDefined();
     vi.restoreAllMocks();
+  });
+});
+
+// SIGMA-229. The bound-resources guard has to ask the same question the
+// renderer asks — "what runs here?" — and a cluster workload runs on a node
+// without ever naming it: it binds to the CLUSTER, so `resources.server_id` is
+// null and the narrow check saw an empty host. Demo mode therefore offered the
+// clean graceful teardown for a node that was still running the cluster.
+describe("what counts as bound to a demo host", () => {
+  async function seedClusterWorkload() {
+    await database.insert(s.clusters).values({
+      id: "cls_prod",
+      orgId: FIXTURE.orgId,
+      environmentId: FIXTURE.prodEnvId,
+      name: "production",
+    });
+    await database.insert(s.clusterNodes).values([
+      { clusterId: "cls_prod", serverId: FIXTURE.k8sHostIds[0], role: "control-plane" },
+      { clusterId: "cls_prod", serverId: FIXTURE.k8sHostIds[1], role: "worker" },
+    ]);
+    await database.insert(s.resources).values({
+      id: "res_cluster_app",
+      projectId: FIXTURE.projectId,
+      environmentId: FIXTURE.prodEnvId,
+      clusterId: "cls_prod",
+      name: "checkout",
+      kind: "app",
+    });
+  }
+
+  it("refuses to disconnect a cluster node that still runs the cluster's workloads", async () => {
+    await seedClusterWorkload();
+    const res = await decommissionServer({ serverId: FIXTURE.k8sHostIds[1] });
+    if (res.ok) {
+      throw new Error("a node carrying cluster workloads was offered a clean teardown");
+    }
+    expect(res.boundResources).toEqual(["checkout"]);
+    // Nothing was started: the refusal is complete.
+    expect((await serverRow(FIXTURE.k8sHostIds[1])).status).toBe(SERVER_STATUS.running);
+  });
+
+  it("still lets a host with nothing on it go", async () => {
+    await seedClusterWorkload();
+    // Node 3 joined no cluster and owns no resource — the widened guard must
+    // not become a refusal that never lifts.
+    const res = await decommissionServer({ serverId: FIXTURE.k8sHostIds[2] });
+    expect(res.ok).toBe(true);
+    expect((await serverRow(FIXTURE.k8sHostIds[2])).status).toBe(SERVER_STATUS.decommissioning);
   });
 });

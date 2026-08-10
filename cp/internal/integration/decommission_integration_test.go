@@ -698,3 +698,215 @@ func TestAServerWhoseAgentNeverRegisteredIsRemovedImmediately(t *testing.T) {
 		t.Errorf("%d agent token(s) still live for a removed server", live)
 	}
 }
+
+// SIGMA-229: the bound-resources guard has to ask the SAME question the
+// renderer asks — "what does this server run?" — and the renderer's answer
+// (ResourceHostedHere) counts three things, of which the guard historically
+// knew only one.
+//
+// The hole that matters in practice is per-service Compose placement. A
+// Compose app owned by one server can have individual services dragged onto
+// another host; the spec, not the resources row, records where they went. So
+// the receiving host's `resources` rows are empty, the disconnect dialog
+// reports zero blockers, and the graceful teardown proceeds: the agent removes
+// the containers and the row is tombstoned, while the app's spec still names a
+// server that no longer exists. No other document renders those services, and
+// nothing anywhere reports an error.
+func TestDecommissionRefusesAHostOfPlacedComposeServices(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_placed_compose"
+
+	appServer := connectServer(t, st, orgID, "srv_app")
+	dataServer := connectServer(t, st, orgID, "srv_data")
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{appServer, dataServer} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: appServer, Name: "shop", Kind: "app",
+		Spec: json.RawMessage(`{"compose":{"services":[{"name":"web"},{"name":"worker"},{"name":"redis"}]}}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetComposePlacements(ctx, orgID, app.ID, []store.ComposePlacement{
+		{Service: "worker", ServerID: dataServer},
+		{Service: "redis", ServerID: dataServer},
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// srv_data has no `resources` row of its own, but it runs two containers.
+	_, err = st.BeginDecommission(ctx, orgID, dataServer, false, "operator")
+	var bound store.ErrBoundResources
+	if !errors.As(err, &bound) {
+		t.Fatalf("BeginDecommission on a host of placed Compose services returned %v; "+
+			"want a 409 naming the app whose services run here", err)
+	}
+	if len(bound.Names) != 1 || bound.Names[0] != "shop" {
+		t.Fatalf("boundResources = %v, want [shop]", bound.Names)
+	}
+	// The force path answers from the same guard.
+	if err := st.DeleteServer(ctx, orgID, dataServer, "operator"); !errors.As(err, &bound) {
+		t.Fatalf("DeleteServer on a host of placed Compose services returned %v; want the same 409", err)
+	}
+
+	// And once the services move back home, the disconnect goes through.
+	if _, err := st.SetComposePlacements(ctx, orgID, app.ID, []store.ComposePlacement{
+		{Service: "worker", ServerID: appServer},
+		{Service: "redis", ServerID: appServer},
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.BeginDecommission(ctx, orgID, dataServer, false, "operator"); err != nil {
+		t.Fatalf("BeginDecommission after re-homing the services: %v", err)
+	}
+}
+
+// SIGMA-229, the other half: a dedicated build server holds no `resources` row
+// either — the clone+build ops live in ITS document because a deployment (or a
+// branch map) names it as build_server_id. Disconnecting it mid-build tears
+// down the builder under a pipeline that then hangs with nothing to report it.
+func TestDecommissionRefusesALiveBuildServer(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_live_builder"
+
+	runServer := connectServer(t, st, orgID, "run")
+	buildServer := connectServer(t, st, orgID, "build")
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{runServer, buildServer} {
+		if err := st.AttachServer(ctx, orgID, env.ID, id, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := st.CreateGitConnection(ctx, orgID, store.CreateGitConnectionInput{
+		ProjectID: proj.ID, Provider: "github", RepoFullName: "acme/app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: env.ID, ServerID: runServer, Name: "api", Kind: "app",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(ctx, orgID, store.CreateDeploymentInput{
+		ResourceID: app.ID, EnvironmentID: env.ID, ServerID: runServer,
+		ConnectionID: conn.ID, Trigger: "manual", GitRef: "main", GitSHA: "abc1234567",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE deployments SET build_server_id = $2 WHERE id = $1`, dep.ID, buildServer); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.BeginDecommission(ctx, orgID, buildServer, false, "operator"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("BeginDecommission on a live build server returned %v; want a 409", err)
+	}
+	if err := st.DeleteServer(ctx, orgID, buildServer, "operator"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("DeleteServer on a live build server returned %v; want a 409", err)
+	}
+}
+
+// SIGMA-233: a decommission that times out has to REACH somebody.
+//
+// The timeout path tombstones the row, revokes the agent token and writes one
+// audit entry, and that was the whole of it — the only runtime signal was a
+// log.Warn on the control plane's stdout. Nothing entered the alert outbox, so
+// nothing reached the operator's channels.
+//
+// That is the one ending of the three that means the machine is still out
+// there. On the ack the host tore itself down; on a force disconnect the
+// operator chose it with the cleanup script in front of them. On the timeout
+// nobody knows anything: sigmad is still installed, Docker restarts every
+// managed container (unless-stopped) the moment the box comes back, and the
+// only record the product keeps is a row nothing lists and a line in a log
+// nobody ships.
+func TestTimeoutStaleDecommissions_EnqueuesAlert(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_decom_alert"
+
+	if _, err := st.CreateAlertChannel(ctx, orgID, "test", store.CreateAlertChannelInput{
+		Kind: "slack", Name: "ops", Secret: "https://hooks.example/T000/secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	serverID := connectServer(t, st, orgID, "powered-off")
+	if _, err := st.BeginDecommission(ctx, orgID, serverID, false, "operator"); err != nil {
+		t.Fatal(err)
+	}
+
+	timedOut, err := st.TimeoutStaleDecommissions(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(timedOut) != 1 {
+		t.Fatalf("timed out = %+v, want the one stale decommission", timedOut)
+	}
+
+	var event, title, body string
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT event, title, body FROM alert_outbox`).Scan(&event, &title, &body); err != nil {
+		t.Fatalf("no alert reached the outbox for a host that still has our software on it: %v", err)
+	}
+	if event != store.AlertDecommissionTimedOut {
+		t.Fatalf("event = %q, want %q", event, store.AlertDecommissionTimedOut)
+	}
+	// The operator has to be able to act on it: which machine, who started the
+	// teardown, and what is now the only way to finish it.
+	if !strings.Contains(title+body, "powered-off") {
+		t.Errorf("the alert does not name the server: %q / %q", title, body)
+	}
+	if !strings.Contains(body, "operator") {
+		t.Errorf("the alert does not say who started the teardown: %q", body)
+	}
+	if !strings.Contains(body, "uninstall.sh") {
+		t.Errorf("the alert does not point at the manual cleanup that is now the only way to finish: %q", body)
+	}
+}
+
+// The alert is a fan-out over subscribed channels, so an org with no channels
+// must still time out cleanly — the sweeper runs across every org at once, and
+// one silent tenant must not stop the others' rows from being settled.
+func TestTimeoutStaleDecommissionsWithNoAlertChannels(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_decom_nochannel"
+
+	serverID := connectServer(t, st, orgID, "quiet")
+	if _, err := st.BeginDecommission(ctx, orgID, serverID, false, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	timedOut, err := st.TimeoutStaleDecommissions(ctx, 0)
+	if err != nil {
+		t.Fatalf("the sweep failed for an org with no alert channels: %v", err)
+	}
+	if len(timedOut) != 1 || timedOut[0].ServerID != serverID {
+		t.Fatalf("timed out = %+v, want the one stale decommission", timedOut)
+	}
+	if _, err := st.GetServer(ctx, orgID, serverID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the row survived its timeout: err = %v", err)
+	}
+}

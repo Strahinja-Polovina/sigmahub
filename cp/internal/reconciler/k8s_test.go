@@ -324,6 +324,47 @@ func TestDedicatedBuildServerQualifiesTheImage(t *testing.T) {
 	}
 }
 
+// The other half of the same pipeline: the deploy target has to PULL what the
+// build server pushed, and the org's registry is private by default. Rendering
+// the pull with only a tag left the agent pulling anonymously, so a private
+// registry answered 401 and the deployment died at 'deploying' — the dedicated
+// build server was unusable in its default configuration (SIGMA-243).
+func TestDeployTargetPullAuthenticatesAgainstTheRegistry(t *testing.T) {
+	rs := store.ResourceSpec{
+		ResourceID: testResource, ProjectID: testProject, Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}
+	target := store.DeployTarget{
+		DeploymentID: "dep_1", SHA: "abc1234567", ImagePin: "pin1", Status: "deploying",
+		ServerID: "srv_run", BuildServerID: "srv_build",
+	}
+	reg := registryRender{repository: "ghcr.io/acme", host: "ghcr.io"}
+
+	ops, _, ok := renderDeployOps(rs, nil, nil, target, "srv_run", reg)
+	if !ok {
+		t.Fatal("the deploy target must render once the build has moved past building")
+	}
+	var pull imagePullOpSpec
+	found := false
+	for _, op := range ops {
+		if op.Kind == dsd.KindImagePull {
+			found = true
+			if err := json.Unmarshal(op.Spec, &pull); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the deploy target renders no pull for the image it does not have")
+	}
+	if pull.RegistryHost != "ghcr.io" {
+		t.Fatalf("the pull goes out anonymous and a private registry 401s it: %+v", pull)
+	}
+	if !strings.HasPrefix(pull.Image, "ghcr.io/acme/") {
+		t.Fatalf("cross-host pull tag %q would resolve to docker.io", pull.Image)
+	}
+}
+
 // A same-host build pushes nothing, so it must not be told to authenticate
 // against a registry it has no reason to touch.
 func TestSameHostBuildNeedsNoRegistry(t *testing.T) {

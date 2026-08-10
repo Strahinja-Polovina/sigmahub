@@ -28,13 +28,24 @@ const (
 	AlertCertFailed        = "cert_failed"
 	AlertCertExpiring      = "cert_expiring"
 	AlertPaymentFailed     = "payment_failed"
+	// AlertDecommissionTimedOut fires when the sweeper gives up waiting for a
+	// decommissioning agent's ack and removes the server anyway (SIGMA-233).
+	//
+	// It is the only ending of a disconnect that leaves the machine untouched
+	// without anybody choosing that: on the agent's ack the host tore itself
+	// down, and a force disconnect is an operator pressing a button with the
+	// cleanup script in front of them. On the timeout the record goes away and
+	// sigmad, its unit, its tunnel and every container are still on a box that
+	// nothing in the product describes any more — so this event is the one
+	// notice the operator gets that they now own a host by hand.
+	AlertDecommissionTimedOut = "decommission_timed_out"
 )
 
 // AlertEvents is the full vocabulary, in display order.
 var AlertEvents = []string{
-	AlertServerUnreachable, AlertServerRecovered, AlertDeployFailed,
-	AlertBackupFailed, AlertVerifyFailed, AlertCertFailed, AlertCertExpiring,
-	AlertPaymentFailed,
+	AlertServerUnreachable, AlertServerRecovered, AlertDecommissionTimedOut,
+	AlertDeployFailed, AlertBackupFailed, AlertVerifyFailed, AlertCertFailed,
+	AlertCertExpiring, AlertPaymentFailed,
 }
 
 func validAlertEvent(e string) bool {

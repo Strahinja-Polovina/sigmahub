@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"encoding/json"
+	"sort"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
@@ -63,6 +64,16 @@ type gitCloneOpSpec struct {
 	Ref           string `json:"ref"`
 	SHA           string `json:"sha"`
 	CredentialRef string `json:"credentialRef,omitempty"`
+}
+
+// imagePullOpSpec mirrors the agent's container.ImageSpec. RegistryHost is set
+// only when the image lives in the ORG's registry — an image this fleet built
+// and pushed — so the pulling agent authenticates instead of going out
+// anonymous (SIGMA-243). A public image leaves it empty and the agent never
+// asks the control plane for a credential it has no use for.
+type imagePullOpSpec struct {
+	Image        string `json:"image"`
+	RegistryHost string `json:"registryHost,omitempty"`
 }
 
 type buildImageOpSpec struct {
@@ -155,6 +166,59 @@ func reshipsRetainedImage(target store.DeployTarget, requirePin bool) bool {
 		return target.ImagePin != ""
 	}
 	return target.ImagePin != "" || target.ImageDigest != ""
+}
+
+// retainedContainerGroups names the (resource, service) container groups this
+// server is SUPPOSED to be running for a git-deployed app — independent of
+// whether this pass actually rendered their rollout ops. Empty string is the
+// single-container group (a non-Compose app has no service name); the agent
+// keys its GC protection off the same (resourceId, service) pair its containers
+// are labelled with, so a retained group covers every live generation whatever
+// its generation-suffixed name happens to be.
+//
+// SIGMA-230: the agent's GC keep-set is built from the document it is about to
+// apply, and it runs BEFORE the ops. Two shipped paths deliberately render no
+// rollout op for a resource that is very much still running — a dedicated build
+// server holds the target's rollout while the deployment is queued/building, and
+// a cross-server Compose render is held back while a remote dependency is not
+// yet successful. Both fall through to the resource.sync stub, which named no
+// containers at all, so GC saw the live generation as an orphan and reaped it:
+// the app went down for the WHOLE build (or, for a dependency that never
+// succeeds, indefinitely), defeating the never-cut invariant the rollout code
+// goes to such lengths to hold. Naming the groups to retain makes protection
+// independent of the renderer's hold-backs.
+func retainedContainerGroups(rs store.ResourceSpec, target store.DeployTarget, serverID string) []string {
+	if rs.Kind != "app" {
+		return nil
+	}
+	var spec appResourceSpec
+	if err := json.Unmarshal(rs.Spec, &spec); err != nil {
+		return nil
+	}
+	if spec.Compose != nil && len(spec.Compose.Services) > 0 {
+		// Only the services PLACED here — a service hosted on another server has
+		// no container of ours to protect, and a service deleted from the compose
+		// file is not in the list at all, so it stays collectable.
+		var out []string
+		for _, s := range spec.Compose.Services {
+			placed := s.ServerID
+			if placed == "" {
+				placed = target.ServerID
+			}
+			if placed == serverID {
+				out = append(out, s.Name)
+			}
+		}
+		sort.Strings(out) // deterministic: the stub spec feeds the document hash
+		return out
+	}
+	// A dedicated build server renders only clone + build; no container of this
+	// resource lives there, so there is nothing to retain (and pretending
+	// otherwise would pin a stale container on the wrong host forever).
+	if bs := target.BuildServerID; bs != "" && bs != target.ServerID && serverID == bs {
+		return nil
+	}
+	return []string{""}
 }
 
 // renderDeployOps expands a git-deployed app resource into its deploy pipeline:
@@ -329,9 +393,14 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		if target.Status == "queued" || target.Status == "building" {
 			return nil, "", false
 		}
-		// Pull the image the build server pushed, then roll out.
+		// Pull the image the build server pushed, then roll out. The pull carries
+		// the registry to authenticate against: this image is in the org's own
+		// registry, which is private by default (a pushed GHCR package is), so an
+		// anonymous pull is a 401 and the deployment dies at 'deploying' with a
+		// Docker-level "denied" (SIGMA-243). The push that produced it
+		// authenticated against exactly this host.
 		pullID := "pull:" + rs.ResourceID
-		pull, _ := json.Marshal(map[string]string{"image": imageTag})
+		pull, _ := json.Marshal(imagePullOpSpec{Image: imageTag, RegistryHost: registry.host})
 		ops = append(ops,
 			dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull},
 			dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: append(rolloutDeps, pullID), Spec: rolloutBytes},

@@ -4,8 +4,10 @@ import { redirect } from "next/navigation";
 import { RotateCcw, Server, ShieldCheck } from "lucide-react";
 
 import { auth } from "@/lib/auth";
+import { configuredAuthProviders } from "@/lib/auth-providers";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { AuthProvidersProvider } from "@/components/auth/auth-providers";
 
 const VALUE_BULLETS = [
   {
@@ -37,6 +39,11 @@ export default async function AuthLayout({
   // Already signed in → login/signup make no sense; go straight to the app.
   const session = await auth.api.getSession({ headers: await headers() });
   if (session) redirect("/dashboard");
+  // Read once per request, here, because /login and /signup are client
+  // components and cannot see process.env (SIGMA-246). Same helper lib/auth.ts
+  // configures better-auth from, so the button and the flow behind it can't
+  // disagree.
+  const authProviders = configuredAuthProviders();
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-2">
       {/* Left: form column */}
@@ -52,7 +59,9 @@ export default async function AuthLayout({
         </header>
 
         <main className="flex flex-1 items-center justify-center px-6 pb-16">
-          <div className="w-full max-w-sm">{children}</div>
+          <div className="w-full max-w-sm">
+            <AuthProvidersProvider value={authProviders}>{children}</AuthProvidersProvider>
+          </div>
         </main>
 
         <footer className="px-6 py-6 text-center text-xs text-muted-foreground lg:px-10 lg:text-left">

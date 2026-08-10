@@ -3,6 +3,7 @@
 import * as React from "react";
 import { toast } from "sonner";
 import {
+  AlertTriangle,
   CreditCard,
   Server as ServerIcon,
   Check,
@@ -16,6 +17,7 @@ import {
   History,
 } from "lucide-react";
 
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   Card,
   CardContent,
@@ -106,19 +108,21 @@ type Subscription = {
   orgId: string;
 };
 
-/** CP-mode subscription state + Paddle checkout/portal actions. Renders the
- *  honest not-configured banner when Paddle isn't wired. */
-function SubscriptionCard({ sub }: { sub: Subscription }) {
+/** Send the browser to Paddle — checkout to subscribe, the customer portal for
+ *  payment method, subscription state and, crucially, invoices.
+ *
+ *  Shared by the subscription card and the invoice-preview header: Paddle is the
+ *  merchant of record, so it holds the only copy of the actual invoice document
+ *  and the portal is the only place it can be fetched from. */
+function useBillingPortal() {
   const [pending, startTransition] = React.useTransition();
 
-  function go(kind: "checkout" | "portal") {
+  function go(orgId: string, kind: "checkout" | "portal") {
     startTransition(async () => {
       try {
         const { startCheckout, openBillingPortal } = await import("@/server/actions/billing");
         const res =
-          kind === "checkout"
-            ? await startCheckout(sub.orgId)
-            : await openBillingPortal(sub.orgId);
+          kind === "checkout" ? await startCheckout(orgId) : await openBillingPortal(orgId);
         const url = "checkoutUrl" in res ? res.checkoutUrl : res.portalUrl;
         window.location.href = url;
       } catch (err) {
@@ -128,6 +132,14 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
       }
     });
   }
+
+  return { pending, go };
+}
+
+/** CP-mode subscription state + Paddle checkout/portal actions. Renders the
+ *  honest not-configured banner when Paddle isn't wired. */
+function SubscriptionCard({ sub }: { sub: Subscription }) {
+  const { pending, go } = useBillingPortal();
 
   if (!sub.configured) {
     return (
@@ -173,13 +185,13 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
         </div>
         <div className="flex items-center gap-2">
           {sub.status === "active" || sub.status === "past_due" ? (
-            <Button variant="outline" size="sm" onClick={() => go("portal")} disabled={pending}>
+            <Button variant="outline" size="sm" onClick={() => go(sub.orgId, "portal")} disabled={pending}>
               Manage subscription
             </Button>
           ) : (
             <Button
               size="sm"
-              onClick={() => go("checkout")}
+              onClick={() => go(sub.orgId, "checkout")}
               disabled={pending || sub.billableUnits < 1}
             >
               {sub.billableUnits < 1 ? "Within free tier" : "Subscribe"}
@@ -196,13 +208,57 @@ export function BillingView({
   billing,
   servers,
   subscription,
+  cpBillingError,
 }: {
   orgName: string;
-  billing: Billing;
+  /** Null when the control plane could not be asked — see cpBillingError. */
+  billing: Billing | null;
   servers: ServerItem[];
   /** CP-mode Paddle state; omitted in demo mode. */
   subscription?: Subscription;
+  /** Why the control plane's billing figures are missing, when they are. */
+  cpBillingError?: string | null;
 }) {
+  // Hoisted above the early return below: React requires every hook to run in
+  // the same order on every render, and the SIGMA-242 unreachable-control-plane
+  // branch returns before this point. Called conditionally, the hook's state
+  // would shift slots the first time a failing control plane recovered — the
+  // classic "rendered fewer hooks than expected" crash, on the page a customer
+  // opens when they are already worried about their bill.
+  const { pending: portalPending, go } = useBillingPortal();
+
+  // The control plane did not answer (SIGMA-242). Everything below this point is
+  // a monetary claim, and the only numbers we could put behind those claims come
+  // from the local mirror, which describes a fleet and has never seen an
+  // invoice or a subscription status. So: no figures at all, and say why.
+  if (cpBillingError || !billing) {
+    return (
+      <div className="flex flex-col gap-6 p-4 md:p-6">
+        <div className="flex flex-col gap-1">
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">Billing</h1>
+        </div>
+        <Alert variant="destructive">
+          <AlertTriangle />
+          <AlertTitle>Couldn’t reach the control plane</AlertTitle>
+          <AlertDescription className="flex flex-col gap-2">
+            <span>
+              We can’t show {orgName}’s usage or subscription right now, so nothing on
+              this page would be your bill. Your servers keep running — this is a
+              reporting outage, not a billing change.
+            </span>
+            <span>
+              If you were expecting a payment warning here, check your email or ask an
+              operator: a past-due subscription would still be past due.
+            </span>
+            {cpBillingError && (
+              <span className="font-mono text-xs opacity-80">{cpBillingError}</span>
+            )}
+          </AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
+
   const { unitPrice, freeTier, currency } = billing;
   const fc = (a: number, cents = false) => money(a, currency, cents);
 
@@ -406,19 +462,30 @@ export function BillingView({
             <CardTitle>Invoice preview</CardTitle>
             <CardDescription>Current period · {currentPeriod()}</CardDescription>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-            onClick={() =>
-              toast.success("Invoice download started", {
-                description: `${orgName} · ${currentPeriod()}`,
-              })
-            }
-          >
-            <Download className="size-3.5" />
-            Download invoice
-          </Button>
+          {/* This used to be `toast.success("Invoice download started")` — a
+              green confirmation, beside a real Paddle subscription card, for a
+              request that was never made: there is no invoice endpoint in cp.ts
+              or in the CP API. A paying customer fetching the month's invoice
+              for their accountant got "Invoice download started · Acme · 1 Aug
+              – 31 Aug", nothing downloaded, and opened a support ticket
+              (SIGMA-239).
+
+              Paddle is the merchant of record, so it holds the actual invoice —
+              the portal is where the document lives, and this now goes there.
+              With payments unconfigured there is no portal and no invoice, so
+              the control is absent rather than dishonest. */}
+          {subscription?.configured && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1.5"
+              onClick={() => go(subscription.orgId, "portal")}
+              disabled={portalPending}
+            >
+              <Download className="size-3.5" />
+              Download invoice
+            </Button>
+          )}
         </CardHeader>
         <CardContent className="px-0">
           <Table>

@@ -756,13 +756,36 @@ async function serverOrgId(serverId: string) {
  *  as in CP mode. The control plane runs its own version of this check inside
  *  the disconnect transaction (where it is race-free against a concurrent
  *  create); this is the demo mirror of it, so the demo walks the same refusal
- *  rather than silently orphaning resources. */
+ *  rather than silently orphaning resources.
+ *
+ *  "Bound" is not just `resources.server_id` (SIGMA-229). A resource lands on a
+ *  machine three ways, and the control plane's boundResourcesTx now counts all
+ *  three (it shares the renderer's ResourceHostedHere, so the guard and the
+ *  document can never disagree):
+ *
+ *   1. the server owns it — the row below;
+ *   2. it deploys into a CLUSTER and this server is one of that cluster's
+ *      nodes, so it belongs to no server at all. That is the second query: a
+ *      k8s host whose cluster still runs workloads used to report zero blockers
+ *      here and tear down under them;
+ *   3. it is a Compose app with individual services PLACED on this host. That
+ *      one lives in the resource spec, and demo mode has neither a spec column
+ *      nor a placement editor — per-service placement requires the control
+ *      plane (see actions/compose.ts, which refuses outright without it). There
+ *      is deliberately nothing to mirror; the CP-mode path answers from the
+ *      control plane's own 409, which does count it. */
 async function boundResourceNames(serverId: string): Promise<string[]> {
-  const rows = await db
+  const own = await db
     .select({ name: s.resources.name })
     .from(s.resources)
     .where(eq(s.resources.serverId, serverId));
-  return rows.map((r) => r.name).sort();
+  const viaCluster = await db
+    .select({ name: s.resources.name })
+    .from(s.resources)
+    .innerJoin(s.clusterNodes, eq(s.clusterNodes.clusterId, s.resources.clusterId))
+    .where(eq(s.clusterNodes.serverId, serverId));
+  const names = new Set([...own, ...viaCluster].map((r) => r.name));
+  return [...names].sort();
 }
 
 /** Graceful decommission: ask the agent to remove the workloads and then

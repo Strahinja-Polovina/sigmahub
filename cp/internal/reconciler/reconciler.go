@@ -203,7 +203,23 @@ func renderOps(serverID string, specs []store.ResourceSpec, pending []store.Pend
 		// (SIGMA-172). Under its own prefix it still keeps the resource in the
 		// document (and in whole-document convergence, which reads every op
 		// regardless of prefix) without claiming anything about its state.
-		stub, _ := json.Marshal(map[string]any{"resourceId": rs.ResourceID, "kind": rs.Kind, "spec": rs.Spec})
+		//
+		// The stub also carries a `retain` list: the (resource, service) container
+		// groups this server is supposed to be running for the resource. The agent
+		// builds its GC keep-set from the document and runs GC BEFORE the ops, so a
+		// resource whose rollout the renderer deliberately held back — a dedicated
+		// build server still building, a Compose service gated on a remote
+		// dependency — had its LIVE container reaped as an orphan and the app went
+		// down for the length of the hold (SIGMA-230). Retention is stated
+		// explicitly here so it does not depend on the renderer having emitted a
+		// rollout op this pass.
+		stubSpec := map[string]any{"resourceId": rs.ResourceID, "kind": rs.Kind, "spec": rs.Spec}
+		if target, isGit := deployTargets[rs.ResourceID]; isGit {
+			if retain := retainedContainerGroups(rs, target, serverID); len(retain) > 0 {
+				stubSpec["retain"] = retain
+			}
+		}
+		stub, _ := json.Marshal(stubSpec)
 		resourceOps = append(resourceOps, dsd.Op{ID: "sync:" + rs.ResourceID, Kind: dsd.KindResourceSync, Spec: stub})
 	}
 

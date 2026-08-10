@@ -162,16 +162,26 @@ func resticForgetWAL(ctx context.Context, cred Credential, keepDays int) error {
 		"--keep-within", fmt.Sprintf("%dd", keepDays))
 }
 
-// resticDumpLatest streams the latest LOGICAL-DUMP snapshot's dump file to w.
-// The `--path /<filename>` filter constrains `latest` to snapshots that carry
-// the dump file: a PITR-enabled resource shares one repo across logical dumps,
-// base backups (tag "base") and WAL bundles (tag "wal", shipped continuously),
-// so an unfiltered `dump latest` would resolve to the newest snapshot — almost
-// always a WAL/base bundle that has no dump file — and error out, breaking
-// restore-verify and fire-drill restore for every PITR resource (SIGMA-83).
-// stdin backups record the path as "/<stdin-filename>".
-func resticDumpLatest(ctx context.Context, cred Credential, filename string, w io.Writer) error {
-	return restic(ctx, cred, nil, w, "dump", "--path", "/"+filename, "latest", filename)
+// resticDumpSnapshot streams one LOGICAL-DUMP snapshot's dump file to w.
+//
+// snapshotID empty means `latest`. The `--path /<filename>` filter constrains
+// `latest` to snapshots that carry the dump file: a PITR-enabled resource shares
+// one repo across logical dumps, base backups (tag "base") and WAL bundles (tag
+// "wal", shipped continuously), so an unfiltered `dump latest` would resolve to
+// the newest snapshot — almost always a WAL/base bundle that has no dump file —
+// and error out, breaking restore-verify and fire-drill restore for every PITR
+// resource (SIGMA-83). stdin backups record the path as "/<stdin-filename>".
+//
+// A fire-drill restore names its snapshot explicitly (SIGMA-245): the control
+// plane pinned the run to the snapshot whose digest it recorded, and `latest`
+// is not that snapshot on any day where a newer dump landed in the repo after
+// the pin. The filter stays harmless when an id is given.
+func resticDumpSnapshot(ctx context.Context, cred Credential, snapshotID, filename string, w io.Writer) error {
+	snap := snapshotID
+	if snap == "" {
+		snap = "latest"
+	}
+	return restic(ctx, cred, nil, w, "dump", "--path", "/"+filename, snap, filename)
 }
 
 // snapshotMeta is one restic snapshot's id + creation time (P2-5b PITR needs to

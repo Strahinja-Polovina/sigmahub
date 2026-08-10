@@ -89,6 +89,14 @@ func (s *Store) BeginDecommission(ctx context.Context, orgID, serverID string, p
 	if len(bound) > 0 {
 		return DecommissionState{}, ErrBoundResources{Names: bound}
 	}
+	// A dedicated build server hosts nothing of its own — the clone+build ops
+	// are in its document because a deployment or a branch map names it — so the
+	// bound-resources check above cannot see it, however widely it looks
+	// (SIGMA-229). Tearing it down mid-build leaves the pipeline with no machine
+	// that can run or report the step it is waiting on.
+	if err := refuseIfBuildServerTx(ctx, tx, orgID, serverID); err != nil {
+		return DecommissionState{}, err
+	}
 
 	// A host whose agent never registered has nothing to tear down, and nothing
 	// that could ever tell us it did.
@@ -232,6 +240,11 @@ type DecommissionTimedOut struct {
 	ServerID string
 	OrgID    string
 	Name     string
+	// Actor is whoever pressed Disconnect, or "sweeper" when the row predates
+	// the column. The person who started a teardown is the person who has to
+	// hear that it did not finish, so it travels with the record rather than
+	// staying behind in the audit row.
+	Actor string
 }
 
 // TimeoutStaleDecommissions force-completes decommissions that have been in
@@ -246,8 +259,28 @@ type DecommissionTimedOut struct {
 //
 // The cutoff is computed in SQL (now() - interval) so it stays in the DB clock
 // domain that wrote decommission_started_at.
+//
+// It also ALERTS (SIGMA-233). This is the only one of the three endings that
+// nobody chose: on the agent's ack the host tore itself down, and a force
+// disconnect is an operator pressing a button with the cleanup script in front
+// of them. Here the row disappears while sigmad, its unit, its WireGuard tunnel
+// and every managed container are still on a machine that is very likely only
+// powered off — Docker's `unless-stopped` restarts all of it the moment the box
+// comes back, so the host goes on serving traffic and holding customer data
+// with no record of it in the product. The only runtime signal used to be a
+// log.Warn on the control plane's stdout, which is shipped nowhere.
+//
+// The enqueue happens in the SAME transaction as the tombstone, per the rule at
+// the top of alerts_store.go: an alert that can be lost between commit and
+// notify is an alert about a host nobody will ever hear about again.
 func (s *Store) TimeoutStaleDecommissions(ctx context.Context, timeout time.Duration) ([]DecommissionTimedOut, error) {
-	rows, err := s.Pool.Query(ctx, `
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
 		WITH stale AS (
 			UPDATE servers
 			   SET deleted_at = now()
@@ -271,19 +304,56 @@ func (s *Store) TimeoutStaleDecommissions(ctx context.Context, timeout time.Dura
 			       name
 			  FROM stale
 		)
-		SELECT id, org_id, name FROM stale`,
+		SELECT id, org_id, name, COALESCE(NULLIF(decommission_actor, ''), 'sweeper') FROM stale`,
 		ServerStatusDecommissioning, timeout.Seconds())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []DecommissionTimedOut
 	for rows.Next() {
 		var d DecommissionTimedOut
-		if err := rows.Scan(&d.ServerID, &d.OrgID, &d.Name); err != nil {
+		if err := rows.Scan(&d.ServerID, &d.OrgID, &d.Name, &d.Actor); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Drained first: the rows above hold the transaction's only connection, and
+	// the enqueue below runs its own statements on it.
+	for _, d := range out {
+		// dedupKey is per-server with no window: a tombstoned row can never time
+		// out twice, so "at most once ever" is the honest bound and a retried
+		// sweep cannot double-notify.
+		if err := enqueueAlertTx(ctx, tx, d.OrgID, AlertDecommissionTimedOut, "decomto:"+d.ServerID, 0,
+			"Decommission timed out: "+d.Name,
+			decommissionTimeoutAlertBody(d)); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// decommissionTimeoutAlertBody says the three things an operator can act on:
+// which machine, who started the teardown, and that the host is still carrying
+// everything the platform installed on it.
+//
+// The last sentence is the important one. A reader who takes "removed" at face
+// value stops looking, and this is precisely the case where the machine is
+// still running: it never confirmed anything, so agent/packaging/uninstall.sh
+// on the host is now the only thing that finishes the job.
+func decommissionTimeoutAlertBody(d DecommissionTimedOut) string {
+	return "SigmaHub gave up waiting for " + d.Name + " (" + d.ServerID + ") to confirm the teardown " +
+		"started by " + d.Actor + ", and has removed it from the fleet.\n\n" +
+		"The host was never confirmed clean: sigmad, its systemd unit, its mesh tunnel and every " +
+		"managed container are still installed, and Docker restarts the containers on boot. " +
+		"Run agent/packaging/uninstall.sh on that machine (sudo bash uninstall.sh, or " +
+		"--purge-volumes to delete application data too) to finish removing it."
 }
