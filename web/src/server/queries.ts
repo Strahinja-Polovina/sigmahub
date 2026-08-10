@@ -618,10 +618,13 @@ export async function getResourceDetail(resourceId: string) {
   }
   // The other kind of target. A cluster workload has no server — the scheduler
   // picks the node — so a page that only ever resolved a server showed one
-  // deployed into a cluster as running nowhere (SIGMA-215). Demo-only by
-  // construction: the column is written only when there is no control plane,
-  // because in CP mode the control plane holds the target and this row is a
-  // read model of it.
+  // deployed into a cluster as running nowhere (SIGMA-215).
+  //
+  // This used to be demo-only by construction, because the control plane never
+  // returned a resource's cluster and cp-sync had nothing to write here. Both
+  // sides carry it now (SIGMA-331): the mirror gets the cluster row and the
+  // resource's cluster_id from the sync, so the fact card names the cluster in
+  // CP mode too instead of printing "Server —" for a running workload.
   let cluster: { id: string; name: string } | null = null;
   if (row.resource.clusterId) {
     const [c] = await db

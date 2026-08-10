@@ -507,6 +507,11 @@ export type CpResource = {
   projectId: string;
   environmentId: string;
   serverId: string;
+  /** The other kind of deploy target: a workload deployed INTO a cluster has no
+   *  server, because the Kubernetes scheduler picks the node. Exactly one of
+   *  serverId and clusterId is ever set. Optional here only so an older control
+   *  plane that predates SIGMA-331 still type-checks against this client. */
+  clusterId?: string;
   name: string;
   kind: string;
   spec: Record<string, unknown>;

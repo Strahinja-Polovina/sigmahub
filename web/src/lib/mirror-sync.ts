@@ -113,6 +113,12 @@ export function resourceMirrorRow(
     projectId: cp.projectId,
     environmentId: cp.environmentId,
     serverId: cp.serverId || null,
+    // The other half of "where does this run". A cluster workload is bound to
+    // no server — the scheduler picks the node — so a mirror that only carried
+    // serverId stored a running app with no target at all, and every surface
+    // that asks where a resource runs answered "nowhere" (SIGMA-331). Empty
+    // string becomes null: the column is a nullable FK to clusters.
+    clusterId: cp.clusterId || null,
     name: cp.name,
     kind: cp.kind,
     status: resourceStatusText(cp.status, existing?.status),

@@ -381,3 +381,69 @@ func TestLLMEndpointProvisioning(t *testing.T) {
 		t.Fatal("an unknown inference runtime must be refused")
 	}
 }
+
+// SIGMA-331: the write side of "where does this resource run" had two answers
+// and the read side had one. CreateResource inserted cluster_id but never
+// selected it back, and ListResources never selected it at all, so a workload
+// deployed into a cluster came back over the API with an empty ServerID and no
+// ClusterID either — the dashboard rendered a running app as if it ran nowhere.
+// Round-trip the field through both paths.
+func TestResourceClusterIDRoundTrip(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_cluster_roundtrip"
+	envID, cpServer, _ := clusterFixture(t, st, orgID)
+
+	cluster, err := st.CreateCluster(ctx, orgID, store.CreateClusterInput{
+		EnvironmentID: envID, Name: "prod", ControlPlaneID: cpServer,
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID,
+		ClusterID:     cluster.ID,
+		Name:          "api",
+		Kind:          "app",
+		Spec:          json.RawMessage(`{"image":"nginx:1.27","ports":[{"container":80}]}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.ClusterID != cluster.ID {
+		t.Fatalf("CreateResource returned ClusterID = %q, want %q", app.ClusterID, cluster.ID)
+	}
+
+	list, err := st.ListResources(ctx, orgID, envID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("resources = %+v", list)
+	}
+	if list[0].ClusterID != cluster.ID {
+		t.Fatalf("ListResources returned ClusterID = %q, want %q", list[0].ClusterID, cluster.ID)
+	}
+
+	// A server-bound resource keeps an empty ClusterID: the two targets are
+	// mutually exclusive and neither may leak the other's id.
+	srv, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: cpServer, Name: "pinned", Kind: "postgres",
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.ClusterID != "" {
+		t.Fatalf("server-bound resource ClusterID = %q, want empty", srv.ClusterID)
+	}
+	after, err := st.ListResources(ctx, orgID, envID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range after {
+		if r.ID == srv.ID && r.ClusterID != "" {
+			t.Fatalf("listed server-bound resource ClusterID = %q, want empty", r.ClusterID)
+		}
+	}
+}

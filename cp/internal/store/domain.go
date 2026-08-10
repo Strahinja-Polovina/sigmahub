@@ -43,15 +43,27 @@ type Environment struct {
 }
 
 type Resource struct {
-	ID            string          `json:"id"`
-	OrgID         string          `json:"orgId"`
-	ProjectID     string          `json:"projectId"`
-	EnvironmentID string          `json:"environmentId"`
-	ServerID      string          `json:"serverId"`
-	Name          string          `json:"name"`
-	Kind          string          `json:"kind"`
-	Spec          json.RawMessage `json:"spec"`
-	Status        json.RawMessage `json:"status"`
+	ID            string `json:"id"`
+	OrgID         string `json:"orgId"`
+	ProjectID     string `json:"projectId"`
+	EnvironmentID string `json:"environmentId"`
+	ServerID      string `json:"serverId"`
+	// ClusterID is the other half of "where does this run": a cluster workload
+	// is bound to no server at all, because the Kubernetes scheduler picks the
+	// node. Exactly one of ServerID and ClusterID is ever set (CreateResource
+	// refuses both), and empty means "not placed there".
+	//
+	// The write side has carried cluster_id since clusters shipped, but the read
+	// side did not select it back, so every API consumer saw a running cluster
+	// workload with neither target set and rendered it as running nowhere — the
+	// dashboard's fact card read "Server —", the mirror's cluster_id column
+	// stayed null, and every cluster-scoped affordance behaved as if this were
+	// an unplaced single-server resource (SIGMA-331).
+	ClusterID string          `json:"clusterId"`
+	Name      string          `json:"name"`
+	Kind      string          `json:"kind"`
+	Spec      json.RawMessage `json:"spec"`
+	Status    json.RawMessage `json:"status"`
 	// Ephemeral marks a PR-preview resource (ensurePreviewTx): torn down with
 	// its PR, not a first-class service. Surfaced so the dashboard can badge it
 	// and guard its Delete instead of presenting it as ordinary (SIGMA-194).
@@ -749,9 +761,9 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	err = tx.QueryRow(ctx, `
 		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id)
 		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''))
-		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), name, kind, spec, status, created_at, updated_at`,
+		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, created_at, updated_at`,
 		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID,
-	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.Name, &r.Kind,
+	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if isUniqueViolation(err) {
 		return Resource{}, fmt.Errorf("%w: a resource named %q already exists in %s", ErrConflict, in.Name, envName)
@@ -802,8 +814,11 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 // anywhere in the org (including in projects the viewer cannot see). Pushing
 // the predicate into the WHERE clause is one more condition here and turns that
 // page's payload into what it actually renders.
+//
+// SIGMA-331 added cluster_id to the projection: a cluster-deployed resource has
+// no server_id, so without it the dashboard cannot say where the thing runs.
 func (s *Store) ListResources(ctx context.Context, orgID, envID, serverID string) ([]Resource, error) {
-	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), name, kind, spec, status, ephemeral, created_at, updated_at
+	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, ephemeral, created_at, updated_at
 	        FROM resources WHERE org_id = $1`
 	args := []any{orgID}
 	if envID != "" {
@@ -823,7 +838,7 @@ func (s *Store) ListResources(ctx context.Context, orgID, envID, serverID string
 	out := []Resource{}
 	for rows.Next() {
 		var r Resource
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.Name, &r.Kind,
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
 			&r.Spec, &r.Status, &r.Ephemeral, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}

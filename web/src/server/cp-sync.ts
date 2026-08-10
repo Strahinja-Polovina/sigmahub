@@ -19,6 +19,7 @@ import * as s from "./db/schema";
 import {
   cpEnabled,
   cpEnvServerIds,
+  cpListClusters,
   cpListEnvironments,
   cpListOrgDeployments,
   cpListProjects,
@@ -197,6 +198,11 @@ const RESOURCE_KEYS = [
   "projectId",
   "environmentId",
   "serverId",
+  // SIGMA-331: a cluster-deployed resource has no serverId, so this is the only
+  // column that answers "where does it run". It has to be in the generic key
+  // list SIGMA-327 replaced the hand-written set clause with, or the batched
+  // upsert quietly stops mirroring it while every column beside it still works.
+  "clusterId",
   "name",
   "kind",
   "status",
@@ -212,11 +218,16 @@ const DEPLOYMENT_KEYS = ["status", "durationSec", "startedAt"] as const;
  *  first write: tombstoning from partial data would delete rows the CP still
  *  owns, so any fetch failure aborts the pass with the mirror untouched. */
 export async function syncOrgMirror(orgId: string): Promise<void> {
-  const [cpServers, cpProjects, cpResources, cpDeploys] = await Promise.all([
+  const [cpServers, cpProjects, cpResources, cpDeploys, cpClusters] = await Promise.all([
     cpListServers(orgId),
     cpListProjects(orgId),
     cpListResources(orgId),
     cpListOrgDeployments(orgId),
+    // Clusters have to be mirrored for the same reason servers are: a resource
+    // deployed into one carries its cluster_id, and that column is a FK. Before
+    // SIGMA-331 the control plane never returned the field at all, so nothing
+    // here referenced a cluster and the table could stay empty in CP mode.
+    cpListClusters(orgId).then((r) => r.clusters),
   ]);
   const cpEnvs = (
     await Promise.all(cpProjects.map((p) => cpListEnvironments(orgId, p.id)))
@@ -246,7 +257,9 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
   //
   // Every mirrored column is selected, not just the id: the diff below decides
   // whether a row needs writing at all, and it can only do that against the
-  // values the mirror currently holds (SIGMA-327).
+  // values the mirror currently holds (SIGMA-327). localClusters is the one
+  // exception — nothing diffs a cluster row, it only has to exist so a
+  // cluster-deployed resource's cluster_id has an FK target (SIGMA-331).
   const [
     localServers,
     localProjects,
@@ -254,6 +267,7 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
     localResources,
     localDeploys,
     localAttachments,
+    localClusters,
   ] = await Promise.all([
       db.select().from(s.servers).where(eq(s.servers.orgId, orgId)),
       db.select().from(s.projects).where(eq(s.projects.orgId, orgId)),
@@ -305,6 +319,7 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
             .from(s.envServers)
             .where(inArray(s.envServers.environmentId, cpEnvIds))
         : [],
+      db.select({ id: s.clusters.id }).from(s.clusters).where(eq(s.clusters.orgId, orgId)),
     ]);
 
   // 1. Servers first — resources and env_servers FK onto them.
@@ -350,6 +365,39 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
       .onConflictDoUpdate({
         target: s.environments.id,
         set: excludedSet(s.environments, ENVIRONMENT_KEYS),
+      });
+  }
+
+  // 3b. Clusters — after environments (they FK onto one) and before resources
+  // (which FK onto a cluster). A cluster-deployed resource's only answer to
+  // "where does this run" is its cluster, so the mirror has to be able to name
+  // it; without a row here the resource's cluster_id could not be written at
+  // all (SIGMA-331). Nodes are deliberately not mirrored: the clusters page
+  // reads them live from the control plane, and nothing in the mirror joins
+  // them in CP mode.
+  for (const c of cpClusters) {
+    await db
+      .insert(s.clusters)
+      .values({
+        id: c.id,
+        orgId,
+        environmentId: c.environmentId,
+        name: c.name,
+        status: c.status,
+        apiEndpoint: c.apiEndpoint ?? "",
+        kubernetesVersion: c.kubernetesVersion ?? "",
+        createdBy: c.createdBy ?? "",
+        createdAt: new Date(c.createdAt),
+      })
+      .onConflictDoUpdate({
+        target: s.clusters.id,
+        set: {
+          environmentId: c.environmentId,
+          name: c.name,
+          status: c.status,
+          apiEndpoint: c.apiEndpoint ?? "",
+          kubernetesVersion: c.kubernetesVersion ?? "",
+        },
       });
   }
 
@@ -471,6 +519,18 @@ export async function syncOrgMirror(orgId: string): Promise<void> {
   );
   if (staleResources.length) {
     await db.delete(s.resources).where(inArray(s.resources.id, staleResources));
+  }
+  // Clusters last: resources.cluster_id is ON DELETE SET NULL, so a cluster the
+  // control plane no longer owns releases the resources still pointing at it
+  // rather than taking them with it.
+  const staleClusters = staleIds(
+    localClusters.map((r) => r.id),
+    cpClusters.map((r) => r.id)
+  );
+  if (staleClusters.length) {
+    await db
+      .delete(s.clusters)
+      .where(and(eq(s.clusters.orgId, orgId), inArray(s.clusters.id, staleClusters)));
   }
 }
 
