@@ -282,6 +282,10 @@ func run() error {
 				AccessKey:  res.AccessKey,
 				SecretKey:  res.SecretKey,
 				Region:     res.Region,
+				// The target's bucket-addressing choice. Dropped here for both
+				// fetchers until SIGMA-287: the CP sent it, the agent decoded it,
+				// and the copy into the restic credential silently discarded it.
+				ForcePathStyle: res.ForcePathStyle,
 			}, nil
 		},
 		func(ctx context.Context, runID string, ok bool, snapshotID, dumpSha, detail string) {
@@ -430,6 +434,10 @@ func run() error {
 				AccessKey:  res.AccessKey,
 				SecretKey:  res.SecretKey,
 				Region:     res.Region,
+				// The target's bucket-addressing choice. Dropped here for both
+				// fetchers until SIGMA-287: the CP sent it, the agent decoded it,
+				// and the copy into the restic credential silently discarded it.
+				ForcePathStyle: res.ForcePathStyle,
 			}, nil
 		},
 		func(ctx context.Context, resourceID, lastSegment string) {

@@ -23,8 +23,16 @@ func stubRestic(t *testing.T, dir string) {
 	t.Helper()
 	script := `#!/bin/sh
 state="` + dir + `"
-cmd="$1"
 echo "$@" >> "$state/calls.log"
+# Global flags (restic's -o/--option, e.g. the S3 addressing style) come before
+# the subcommand, exactly as the real binary takes them.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+cmd="$1"
 case "$cmd" in
   init) exit 0 ;;
   backup) cat > "$state/stored.bin"; echo '{"message_type":"summary","snapshot_id":"snap123"}' ;;
@@ -540,7 +548,9 @@ func TestPITRRestoreFailsWithoutBaseBeforeTarget(t *testing.T) {
 func TestBackupRunDoesNotDeadlockWhenResticExitsEarly(t *testing.T) {
 	dir := t.TempDir()
 	// `backup` exits 1 immediately without reading stdin (the early-exit case).
-	script := "#!/bin/sh\ncase \"$1\" in\n  init) exit 0 ;;\n  backup) exit 1 ;;\n  *) exit 0 ;;\nesac\n"
+	// Skip restic's global flags (the S3 addressing option) to reach the subcommand.
+	script := "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n" +
+		"case \"$1\" in\n  init) exit 0 ;;\n  backup) exit 1 ;;\n  *) exit 0 ;;\nesac\n"
 	path := filepath.Join(dir, "restic")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -667,5 +677,82 @@ func TestWALRetentionSurvivesAnExpiredOpDeadline(t *testing.T) {
 	}
 	if !strings.Contains(string(calls), "forget --tag wal") {
 		t.Fatalf("retention was skipped because the op context was already dead:\n%s", calls)
+	}
+}
+
+// TestCredentialEnvHonoursForcePathStyle is the SIGMA-287 regression. The
+// force_path_style column has existed since migration 0020: the create API
+// accepts it, the store persists it, the target list echoes it back, both
+// credential paths read it, the web client types it and this package's client
+// deserialises it. It then stopped dead — backup.Credential had no such field,
+// so nothing the agent ran ever addressed the bucket differently.
+//
+// An operator whose S3-compatible gateway needs virtual-host addressing set
+// forcePathStyle:false, watched every surface confirm the setting, and kept
+// getting the same S3 error, with no way to discover the toggle was decorative
+// short of reading agent source.
+//
+// The control restic actually exposes is the extended option
+// `s3.bucket-lookup` (auto|dns|path) — an argv flag, not an environment
+// variable. AWS_S3_FORCE_PATH_STYLE is an AWS SDK convention that restic (which
+// uses minio-go) never reads; exporting it would have been a second inert
+// control, which is the disease this ticket treats. So the assertion is on the
+// rendered invocation.
+func TestCredentialEnvHonoursForcePathStyle(t *testing.T) {
+	s3 := "s3:https://gateway.example/bucket/sigmahub/res_db"
+
+	path := Credential{Repository: s3, ForcePathStyle: true}.opts()
+	if !containsArg(path, "--option=s3.bucket-lookup=path") {
+		t.Errorf("forcePathStyle:true rendered %v, want path-style bucket lookup", path)
+	}
+	dns := Credential{Repository: s3, ForcePathStyle: false}.opts()
+	if !containsArg(dns, "--option=s3.bucket-lookup=dns") {
+		t.Errorf("forcePathStyle:false rendered %v, want virtual-host bucket lookup — "+
+			"the setting crossed six layers and changed nothing (SIGMA-287)", dns)
+	}
+
+	// Only S3 repositories carry an S3 addressing option.
+	if got := (Credential{Repository: "/var/backups/local", ForcePathStyle: true}).opts(); len(got) != 0 {
+		t.Errorf("non-s3 repository rendered %v, want no S3 option", got)
+	}
+
+	// The credential env stays exactly what it was: secrets ride there, and
+	// nothing about addressing belongs in it.
+	env := Credential{Repository: s3, RepoKey: "k", AccessKey: "a", SecretKey: "s", ForcePathStyle: false}.env()
+	for _, e := range env {
+		if strings.HasPrefix(e, "AWS_S3_FORCE_PATH_STYLE") {
+			t.Errorf("env carries %q, which restic does not read — an inert control is what SIGMA-287 is about", e)
+		}
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestResticInvocationCarriesTheAddressingOption proves the option reaches the
+// restic process, not just the Credential method — the gap SIGMA-287 was made
+// of was precisely a value that existed everywhere except in the invocation.
+func TestResticInvocationCarriesTheAddressingOption(t *testing.T) {
+	dir := t.TempDir()
+	stubRestic(t, dir)
+	cred := Credential{
+		Repository: "s3:https://gateway.example/bucket/sigmahub/res_db",
+		RepoKey:    "k", AccessKey: "a", SecretKey: "s",
+	} // ForcePathStyle false — the operator's virtual-host gateway
+	if err := resticInit(context.Background(), cred); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(filepath.Join(dir, "calls.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "--option=s3.bucket-lookup=dns") {
+		t.Fatalf("restic was invoked without the addressing option:\n%s", calls)
 	}
 }

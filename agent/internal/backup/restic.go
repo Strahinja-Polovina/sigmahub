@@ -22,6 +22,35 @@ type Credential struct {
 	AccessKey  string
 	SecretKey  string
 	Region     string
+	// ForcePathStyle selects how the bucket is addressed on an S3-compatible
+	// endpoint: path style (https://host/bucket/key, what MinIO and most
+	// gateways want, and the column's default) versus virtual-host style
+	// (https://bucket.host/key, what some gateways require).
+	//
+	// The value has existed since migration 0020 and crossed six layers — API,
+	// store, target list, both credential fetchers, web client, agent client —
+	// before dying here: this field did not exist, so the operator who set it
+	// watched every surface confirm a control that changed nothing (SIGMA-287).
+	ForcePathStyle bool
+}
+
+// opts renders the restic global flags this credential implies — currently just
+// the S3 addressing style.
+//
+// It is an argv flag rather than an environment variable because that is the
+// only control restic exposes: `-o s3.bucket-lookup=auto|dns|path`, read by its
+// minio-go backend. AWS_S3_FORCE_PATH_STYLE is an AWS SDK convention restic
+// never reads, so exporting it would have replaced one inert control with
+// another. The long `--option=` form keeps each flag a single argv element.
+func (c Credential) opts() []string {
+	if !strings.HasPrefix(c.Repository, "s3:") {
+		return nil
+	}
+	lookup := "dns"
+	if c.ForcePathStyle {
+		lookup = "path"
+	}
+	return []string{"--option=s3.bucket-lookup=" + lookup}
 }
 
 // env renders the restic process environment. Credentials ride ONLY in the
@@ -44,7 +73,9 @@ func (c Credential) env() []string {
 // restic runs one restic command with stdin/stdout wiring and returns stderr
 // (capped) for diagnostics.
 func restic(ctx context.Context, cred Credential, stdin io.Reader, stdout io.Writer, args ...string) error {
-	cmd := exec.CommandContext(ctx, resticBin, args...)
+	// Global flags first, then the subcommand: args[0] stays the subcommand name
+	// for the error message below.
+	cmd := exec.CommandContext(ctx, resticBin, append(cred.opts(), args...)...)
 	cmd.Env = cred.env()
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
