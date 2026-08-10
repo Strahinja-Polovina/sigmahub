@@ -2058,6 +2058,19 @@ export async function cpListClusters(
   return cpFetch(`${org(orgId)}/clusters${q}`, undefined, { orgId });
 }
 
+/** Which engines THIS control plane will accept (SIGMA-268).
+ *
+ *  The generated catalog is what this codebase can provision; CP_DB_ENGINES /
+ *  CP_S3_ENGINES can cut that down per deployment, and the create call refuses
+ *  anything outside the cut with a 422. Without this the wizard offered engines
+ *  from the catalog and the operator discovered the disagreement at submit,
+ *  after the dialog had closed. */
+export type CpCapabilities = { dbEngines: string[]; s3Engines: string[] };
+
+export async function cpCapabilities(orgId: string): Promise<CpCapabilities> {
+  return cpFetch(`${org(orgId)}/capabilities`, undefined, { orgId });
+}
+
 /** `requestId` identifies the SUBMISSION, not the call: the wizard mints one
  *  and reuses it while the operator retries the same form, and mints a new one
  *  once the form's content changes or the create succeeds (SIGMA-253).

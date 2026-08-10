@@ -81,7 +81,18 @@ export type TargetInventory = {
   clusterCount: number;
   /** Kinds a cluster refuses, as the control plane publishes them. */
   clusterExcludedKinds: Set<string>;
+  /** The engines THIS control plane has enabled (SIGMA-268), as it publishes
+   *  them at /capabilities. Null means nothing has told us — every engine the
+   *  catalog defines is assumed, which is the behaviour that predates the
+   *  endpoint. Never an empty set: a control plane cannot boot with no engines,
+   *  so empty could only ever be a failed read, and narrowing on one would take
+   *  away engines a working deployment has. */
+  enabledDbEngines: Set<string> | null;
+  enabledS3Engines: Set<string> | null;
 };
+
+/** The engine sets as the control plane publishes them. */
+export type EngineCapabilities = { dbEngines: string[]; s3Engines: string[] };
 
 /**
  * A server the enrollment gate refused is NOT a place to deploy. It matches the
@@ -97,7 +108,8 @@ export function serverIsDeployable(server: WizardServer): boolean {
 export function buildInventory(
   projects: WizardProject[],
   clusters: WizardCluster[] = [],
-  clusterExcludedKinds: string[] = []
+  clusterExcludedKinds: string[] = [],
+  capabilities: EngineCapabilities | null = null
 ): TargetInventory {
   const serverTypes = new Set<string>();
   for (const project of projects) {
@@ -111,7 +123,34 @@ export function buildInventory(
     serverTypes,
     clusterCount: clusters.length,
     clusterExcludedKinds: new Set(clusterExcludedKinds),
+    enabledDbEngines: capabilities?.dbEngines.length ? new Set(capabilities.dbEngines) : null,
+    enabledS3Engines: capabilities?.s3Engines.length ? new Set(capabilities.s3Engines) : null,
   };
+}
+
+/**
+ * Whether this control plane has the engine behind a kind enabled (SIGMA-268).
+ *
+ * A database kind IS its engine — `postgres` the kind and `postgres` the engine
+ * are one name — so CP_DB_ENGINES answers directly. Object storage is one kind
+ * over several engines, so `s3` is deployable while ANY of them is enabled and
+ * the engine picker filters within it.
+ *
+ * Kinds with no engine behind them (`app`, `llm`) are never gated here: no
+ * setting turns them off, and answering "not enabled" for them would be
+ * inventing a refusal the control plane would not make.
+ */
+export function engineEnabled(kind: ResourceKind, inv: TargetInventory): boolean {
+  if (kind === "s3") return inv.enabledS3Engines === null || inv.enabledS3Engines.size > 0;
+  if (!isDatabaseEngineKind(kind)) return true;
+  return inv.enabledDbEngines === null || inv.enabledDbEngines.has(kind);
+}
+
+/** A kind whose name is a database engine name, asked of the catalog rather
+ *  than listed here — the four names are exactly what SIGMA-216 stopped
+ *  retyping. */
+function isDatabaseEngineKind(kind: ResourceKind): boolean {
+  return kindsInCategory("database").includes(kind);
 }
 
 /** Whether a kind may run INSIDE a cluster. The exclusion list is the control
@@ -147,6 +186,18 @@ function joinOr(items: string[]): string {
  * different lie than the one this replaces.
  */
 export function kindAvailability(kind: ResourceKind, inv: TargetInventory): KindAvailability {
+  // Asked FIRST, because it is the one refusal no amount of hardware fixes: a
+  // control plane running with CP_DB_ENGINES=postgres will 422 a MongoDB create
+  // however many Database servers the org has connected, and telling the
+  // operator to connect one would send them to buy a machine for nothing
+  // (SIGMA-268).
+  if (!engineEnabled(kind, inv)) {
+    const label = RESOURCE_KIND_LABELS[kind] ?? kind;
+    return {
+      available: false,
+      reason: `This control plane does not have ${label} enabled. Its engine list is a deployment setting (CP_DB_ENGINES / CP_S3_ENGINES) — an operator has to add it there before it can be created here.`,
+    };
+  }
   const allowed = (ALLOWED_SERVER_TYPES[kind] ?? []) as ServerType[];
   if (allowed.some((t) => inv.serverTypes.has(t))) return { available: true };
   if (inv.clusterCount > 0 && clusterEligible(kind, inv)) return { available: true };

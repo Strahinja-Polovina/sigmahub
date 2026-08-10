@@ -102,6 +102,12 @@ type Server struct {
 	provisionToken      string
 	githubWebhookSecret string
 	publicURL           string
+	// dbEngines/s3Engines are the enabled-engine allowlists (CP_DB_ENGINES,
+	// CP_S3_ENGINES), published by GET /v1/orgs/{orgId}/capabilities so the
+	// wizard can stop offering an engine this deployment turned off. Empty
+	// means "not restricted" — see enabledOrAll.
+	dbEngines []string
+	s3Engines []string
 	// telemetry forwards metrics/logs to VictoriaMetrics/Loki and proxies
 	// tenant-isolated queries (P1-13); tel is its store slice. Nil in handler
 	// unit tests → telemetry endpoints answer "not configured".
@@ -188,7 +194,15 @@ type Options struct {
 	// PublicURL is the CP's own public base URL (e.g. https://cp.example.com).
 	// With GitHubWebhookSecret set, connecting a repo auto-registers the
 	// push-to-deploy webhook pointing at <PublicURL>/v1/webhooks/github.
-	PublicURL    string
+	PublicURL string
+	// DBEngines/S3Engines are the enabled-engine allowlists this control plane
+	// was configured with (config.DBEngines / config.S3Engines — the same
+	// values handed to the store). Empty means unrestricted. They are
+	// PUBLISHED, at GET /v1/orgs/{orgId}/capabilities, because the dashboard's
+	// wizard is built from the generated catalog and had no way to know which
+	// engines a given control plane turned off (SIGMA-268).
+	DBEngines    []string
+	S3Engines    []string
 	DSDStore     DSDStore
 	DSDWaiter    DSDWaiter
 	Reconcile    ReconcileTrigger
@@ -255,6 +269,8 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 		provisionToken:      opts.ProvisionToken,
 		githubWebhookSecret: opts.GitHubWebhookSecret,
 		publicURL:           strings.TrimRight(opts.PublicURL, "/"),
+		dbEngines:           opts.DBEngines,
+		s3Engines:           opts.S3Engines,
 		telemetry:           opts.Telemetry,
 		tel:                 opts.TelemetryStore,
 		alertSender:         opts.AlertSender,
@@ -314,6 +330,10 @@ func (s *Server) routes() {
 	// Mutating POSTs support Idempotency-Key replay — EXCEPT token minting:
 	// replaying a mint must issue a fresh token, never store/return the
 	// one-time plaintext for later replay.
+	// What this control plane can be asked for: the engine sets a deployment
+	// has enabled, so the wizard stops offering an engine that 422s at create
+	// (SIGMA-268). See capabilities.go.
+	s.mux.HandleFunc("GET /v1/orgs/{orgId}/capabilities", s.requireService(store.RoleDeveloper, s.handleCapabilities))
 	s.mux.HandleFunc("POST /v1/orgs/{orgId}/bootstrap-tokens", s.requireService(store.RoleProjectAdmin, s.handleIssueBootstrapToken))
 	// SSH onboarding (P1-5): pre-create the server + mint a per-server bootstrap
 	// keypair. Project Admin+; like token minting, not idempotency-replayable.

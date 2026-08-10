@@ -504,3 +504,68 @@ describe("the target step is handed the model, and each target answers in its ow
     expect(empty.deadEnd).toBeNull();
   });
 });
+
+/**
+ * The engines a control plane has enabled are its own fact, and until it
+ * published them (SIGMA-268) the wizard could not know it: the cards come from
+ * the generated catalog, which is every engine this codebase can provision, and
+ * a deployment running CP_DB_ENGINES=postgres refuses the rest at create — a
+ * 422 the operator meets after the dialog has closed, with the project, the
+ * environment and the server they picked in it.
+ */
+describe("engines the control plane has enabled", () => {
+  const withDatabaseServer = projectWith(["database", "storage"]);
+
+  it("refuses a kind whose engine this control plane does not have, whatever hardware is connected", () => {
+    const inv = buildInventory(withDatabaseServer, [], [], {
+      dbEngines: ["postgres"],
+      s3Engines: ["minio"],
+    });
+
+    expect(kindAvailability("postgres", inv).available).toBe(true);
+
+    const mongo = kindAvailability("mongodb", inv);
+    expect(mongo.available).toBe(false);
+    // And the sentence must not be the hardware one: a Database server IS
+    // connected here, so "connect a Database server" would send the operator
+    // after a machine that changes nothing.
+    expect(mongo.reason).toContain("does not have");
+    expect(mongo.reason).toContain("CP_DB_ENGINES");
+    expect(mongo.action).toBeUndefined();
+  });
+
+  it("keeps object storage while any of its engines is enabled", () => {
+    const inv = buildInventory(withDatabaseServer, [], [], {
+      dbEngines: ["postgres"],
+      s3Engines: ["minio"],
+    });
+    expect(kindAvailability("s3", inv).available).toBe(true);
+  });
+
+  it("does not gate kinds that have no engine setting behind them", () => {
+    const inv = buildInventory(projectWith(["general", "gpu"]), [], [], {
+      dbEngines: ["postgres"],
+      s3Engines: ["minio"],
+    });
+    expect(kindAvailability("app", inv).available).toBe(true);
+    expect(kindAvailability("llm", inv).available).toBe(true);
+  });
+
+  it("assumes the whole catalog when nothing has published a list", () => {
+    // The pre-SIGMA-268 behaviour, and the behaviour on a failed read: the
+    // create call is still the authority, and narrowing on an answer we never
+    // got would hide engines a working deployment has.
+    const inv = buildInventory(withDatabaseServer);
+    for (const kind of RESOURCE_CATEGORY_CATALOG.database.kinds) {
+      expect(kindAvailability(kind, inv).available).toBe(true);
+    }
+  });
+
+  it("keeps the category open while one engine inside it survives", () => {
+    const inv = buildInventory(withDatabaseServer, [], [], {
+      dbEngines: ["postgres"],
+      s3Engines: ["minio"],
+    });
+    expect(categoryAvailability("database", inv).available).toBe(true);
+  });
+});

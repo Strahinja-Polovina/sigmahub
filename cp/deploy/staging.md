@@ -38,7 +38,7 @@ Fill in `.env` (all required unless noted):
 | `CP_ACME_CA_DIR_URL` | Optional — point at LE staging/Pebble so repeated bring-ups don't spend the real CA's issuance budget. |
 | `CP_HUGGING_FACE_TOKEN` | Optional — the Hub account the picker searches as and the agent downloads weights as. Empty still serves public models; gated ones (Llama & co) stay invisible. |
 | `CP_KMS_BACKEND` | `file` is fine for staging; `vault` for prod custody. |
-| `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave default to exercise every engine. |
+| `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave **empty** to exercise every engine the catalog defines — the list is derived, not written down (SIGMA-268). Set one only to cut it (`CP_DB_ENGINES=postgres`). |
 | `CP_PADDLE_*` | Optional — leave empty; billing degrades to the honest usage preview. |
 | `CP_VM_WRITE_URL` / `CP_LOKI_URL` | Optional — telemetry shows not-configured until set. |
 

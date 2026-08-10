@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Strahinja-Polovina/sigmahub/cp/internal/store"
 )
 
 // composeExcludedSettings are the CP_* names the `cp` service must NOT pass, and
@@ -149,4 +151,101 @@ func slicesContains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestDeployFilesDoNotEnumerateEngines keeps the engine allowlists derived
+// (SIGMA-268).
+//
+// parseEngineList holds no engine names on purpose: `known` comes from
+// store.DBEngineKinds()/store.S3EngineNames() and the default IS that list, so
+// adding an engine to the catalog enables it everywhere and removing one stops
+// it being accepted — the three duplicate copies SIGMA-216 deleted are not
+// allowed back.
+//
+// The deploy files reintroduced exactly that enumeration as an explicit value:
+// `CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}` shadows the
+// derived default with a list frozen on the day it was typed. Every deployment
+// built from the shipped compose file is then pinned to those names, so a fifth
+// engine added to the Go catalog — the workflow the generated catalog exists to
+// support — is offered by the wizard (which reads the generated catalog) and
+// refused at submit time with `database engine "clickhouse" is not enabled on
+// this control plane`, after the dialog has closed.
+//
+// So: the keys stay (see TestEveryCPSettingIsInTheComposeFile — a setting the
+// binary reads must be visible in the deploy files), but their values must be
+// empty, which is what makes config.go's catalog-derived default apply.
+func TestDeployFilesDoNotEnumerateEngines(t *testing.T) {
+	engines := append(store.DBEngineKinds(), store.S3EngineNames()...)
+	if len(engines) == 0 {
+		t.Fatal("the store catalog reports no engines at all; this guard cannot see what it is guarding")
+	}
+
+	for _, tc := range []struct {
+		file   string
+		values map[string]string
+	}{
+		{"docker-compose.yml", composeEngineSettings(t)},
+		{".env.example", envExampleEngineSettings(t)},
+	} {
+		for _, key := range []string{"CP_DB_ENGINES", "CP_S3_ENGINES"} {
+			value, ok := tc.values[key]
+			if !ok {
+				continue // absent is the other acceptable shape: nothing to shadow.
+			}
+			for _, engine := range engines {
+				if !strings.Contains(value, engine) {
+					continue
+				}
+				t.Errorf("cp/deploy/%s gives %s the value %q, which names the engine %q: that "+
+					"list shadows the catalog-derived default in config.go, so every deployment "+
+					"built from this file is frozen at the engines that existed when the line was "+
+					"typed, and a newly added engine dead-ends at create time. Leave the value "+
+					"empty (${%s:-}) and let the catalog decide", tc.file, key, value, engine, key)
+				break
+			}
+		}
+	}
+}
+
+func composeEngineSettings(t *testing.T) map[string]string {
+	t.Helper()
+	path := filepath.Join("..", "..", "deploy", "docker-compose.yml")
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	out := map[string]string{}
+	for _, key := range []string{"CP_DB_ENGINES", "CP_S3_ENGINES"} {
+		if v, ok := flattenYAMLScalars(src)["services.cp.environment."+key]; ok {
+			out[key] = v
+		}
+	}
+	return out
+}
+
+// envExampleEngineSettings reads the uncommented assignments only. A commented
+// line is documentation — "Postgres-only fallback build: CP_DB_ENGINES=postgres"
+// is an example of a deliberate cut, not a default anything reads.
+func envExampleEngineSettings(t *testing.T) map[string]string {
+	t.Helper()
+	path := filepath.Join("..", "..", "deploy", ".env.example")
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	out := map[string]string{}
+	for _, raw := range strings.Split(string(src), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if key = strings.TrimSpace(key); key == "CP_DB_ENGINES" || key == "CP_S3_ENGINES" {
+			out[key] = strings.TrimSpace(value)
+		}
+	}
+	return out
 }

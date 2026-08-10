@@ -539,6 +539,8 @@ func run() error {
 			GitHubAppSlug:        cfg.GitHubAppSlug,
 			GitHubWebhookSecret:  cfg.GitHubWebhookSecret,
 			PublicURL:            cfg.PublicURL,
+			DBEngines:            cfg.DBEngines,
+			S3Engines:            cfg.S3Engines,
 			DSDStore:             st,
 			DSDWaiter:            rec,
 			Reconcile:            rec,

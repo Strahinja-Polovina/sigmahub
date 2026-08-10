@@ -128,9 +128,18 @@ services:
       # box, whose repeated bring-ups would otherwise spend the real CA's
       # per-domain issuance budget.
       CP_ACME_CA_DIR_URL: ${CP_ACME_CA_DIR_URL:-}
-      CP_DB_ENGINES: ${CP_DB_ENGINES:-postgres,mysql,redis,mongodb}
-      # Object-storage engines (P2-2). MinIO-only build: CP_S3_ENGINES=minio.
-      CP_S3_ENGINES: ${CP_S3_ENGINES:-minio,seaweedfs}
+      # Engine allowlists (P1-10, P2-2), deliberately WITHOUT a default value
+      # (SIGMA-268). Empty means "every engine the Go catalog defines", derived
+      # in config.go from store.DBEngineKinds()/store.S3EngineNames(). Writing
+      # the names here instead pinned every deployment built from this file to
+      # the engines that existed the day the line was typed: add a fifth kind to
+      # the catalog and the wizard offers it (it reads the generated catalog)
+      # while the control plane 422s it at submit time, after the dialog has
+      # closed. Set them only to CUT the list — a Postgres-only build is
+      # CP_DB_ENGINES=postgres, a MinIO-only one CP_S3_ENGINES=minio — and a
+      # name the catalog does not know fails boot rather than disappearing.
+      CP_DB_ENGINES: ${CP_DB_ENGINES:-}
+      CP_S3_ENGINES: ${CP_S3_ENGINES:-}
       # Key custody (P0-9): file (dev default) or vault (production).
       CP_KMS_BACKEND: ${CP_KMS_BACKEND:-file}
       CP_VAULT_ADDR: ${CP_VAULT_ADDR:-}
