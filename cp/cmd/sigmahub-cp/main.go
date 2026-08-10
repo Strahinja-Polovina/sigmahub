@@ -412,8 +412,11 @@ func run() error {
 		//     two orders of magnitude past useful.
 		//   - alert_outbox, 90 days, finalized rows only — long enough that "did
 		//     we ever page anyone about this?" is answerable for a quarter.
-		//   - idempotency_keys, 7 days. A client retry arrives in seconds; a week
-		//     is the generous end of "the same request could still show up".
+		//   - idempotency_keys, 7 days. This one is a PROMISE, not just storage:
+		//     the Idempotency-Key header's whole contract is "a retry within this
+		//     long will not execute twice", so the window wants to be comfortably
+		//     longer than any client's retry loop and no longer. A client retry
+		//     arrives in seconds; a week is the generous end of that.
 		Retain: store.Retention{
 			DeployLogs:        30 * 24 * time.Hour,
 			Audit:             400 * 24 * time.Hour,
