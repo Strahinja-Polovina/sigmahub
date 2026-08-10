@@ -464,7 +464,11 @@ type BackupRunSpec struct {
 	KeepDaily   int
 	KeepWeekly  int
 	KeepMonthly int
-	ExpectedSha string // verify: the last successful backup's dump sha
+	ExpectedSha string // verify: this day's successful backup's dump sha; restore: the digest pinned on the run
+	// SnapshotID is the restic snapshot a restore run was pinned to when it was
+	// created (SIGMA-245). Empty for backup/verify runs, which have not produced
+	// a snapshot yet or work off `latest` by design.
+	SnapshotID string
 	// Restore runs load into this resource (fresh P1-10 database).
 	RestoreResourceID string
 	RestoreDatabase   string
@@ -480,14 +484,25 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 	rows, err := s.Pool.Query(ctx, `
 		SELECT r.id, r.kind, r.resource_id, r.server_id, dc.engine, dc.dbname, dc.username,
 		       p.keep_daily, p.keep_weekly, p.keep_monthly,
-		       -- The verify must check THIS day's backup, not the previous day's:
+		       -- A VERIFY must check THIS day's backup, not the previous day's:
 		       -- correlate the expected sha to the same UTC day's successful backup.
 		       -- Empty until that backup succeeds, which the reconciler uses to hold
 		       -- the verify until its dump exists (SIGMA-137).
-		       COALESCE((SELECT b.dump_sha256 FROM backup_runs b
-		                  WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
-		                    AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
-		                  ORDER BY b.finished_at DESC LIMIT 1), '') AS expected_sha,
+		       --
+		       -- Every other kind reads the digest recorded ON THE RUN. A restore
+		       -- pins the snapshot it will load when it is created, so it must not
+		       -- be re-derived from a calendar day here: correlating it meant a
+		       -- restore queued on a day whose backup had failed rendered with an
+		       -- empty digest, which the agent refuses outright — after the CP had
+		       -- already provisioned the target database (SIGMA-245).
+		       CASE WHEN r.kind = 'verify'
+		            THEN COALESCE((SELECT b.dump_sha256 FROM backup_runs b
+		                            WHERE b.policy_id = r.policy_id AND b.kind = 'backup' AND b.status = 'success'
+		                              AND (b.created_at AT TIME ZONE 'UTC')::date = (r.created_at AT TIME ZONE 'UTC')::date
+		                            ORDER BY b.finished_at DESC LIMIT 1), '')
+		            ELSE COALESCE(r.dump_sha256, '')
+		       END AS expected_sha,
+		       COALESCE(r.snapshot_id, ''),
 		       COALESCE(r.restore_resource_id, ''),
 		       COALESCE(rdc.dbname, ''), COALESCE(rdc.username, ''),
 		       r.recovery_target_time
@@ -507,7 +522,7 @@ func (s *Store) BackupRunsForServer(ctx context.Context, serverID string) ([]Bac
 	for rows.Next() {
 		var b BackupRunSpec
 		if err := rows.Scan(&b.RunID, &b.Kind, &b.ResourceID, &b.ServerID, &b.Engine, &b.Database, &b.Username,
-			&b.KeepDaily, &b.KeepWeekly, &b.KeepMonthly, &b.ExpectedSha,
+			&b.KeepDaily, &b.KeepWeekly, &b.KeepMonthly, &b.ExpectedSha, &b.SnapshotID,
 			&b.RestoreResourceID, &b.RestoreDatabase, &b.RestoreUsername, &b.RecoveryTargetTime); err != nil {
 			return nil, err
 		}
@@ -793,14 +808,41 @@ func (s *Store) CreateRestoreRun(ctx context.Context, orgID, sourceResourceID, n
 	if !hasKey {
 		return BackupRun{}, ErrInvalid{Msg: "source database has no backups yet"}
 	}
-	var hasSnapshot bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM backup_runs WHERE policy_id = $1 AND kind = 'backup' AND status = 'success')`,
-		policyID).Scan(&hasSnapshot); err != nil {
+	// Pin the snapshot this restore will load, HERE, at creation time.
+	//
+	// SIGMA-245: this used to be a bare "does any successful backup exist ever"
+	// EXISTS check, and the digest the agent verifies against was resolved much
+	// later by a subquery correlated to the RUN's own UTC day. That correlation
+	// belongs to verify runs (SIGMA-137 — hold today's verify until today's dump
+	// lands); a restore inherited it and so rendered with an empty digest on any
+	// day whose scheduled backup had failed. The agent hard-refuses an empty
+	// digest on a restore, but only after the CP has already provisioned and
+	// billed a fresh database — so Monday's failed backup turned Sunday's
+	// perfectly good snapshot into "restore refused: run carries no recorded
+	// checksum", on precisely the day the operator needed it.
+	//
+	// Recording the newest successful backup's snapshot id and digest on the
+	// restore row makes the two sides agree by construction: what the run says
+	// it will load is what it will load, whatever the calendar says.
+	var snapshotID, dumpSha string
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(snapshot_id, ''), COALESCE(dump_sha256, '')
+		  FROM backup_runs
+		 WHERE policy_id = $1 AND kind = 'backup' AND status = 'success'
+		 ORDER BY finished_at DESC NULLS LAST, created_at DESC
+		 LIMIT 1`, policyID).Scan(&snapshotID, &dumpSha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BackupRun{}, ErrInvalid{Msg: "source database has no successful backup to restore"}
+	}
+	if err != nil {
 		return BackupRun{}, err
 	}
-	if !hasSnapshot {
-		return BackupRun{}, ErrInvalid{Msg: "source database has no successful backup to restore"}
+	if dumpSha == "" {
+		// A success with no recorded digest cannot be checked against the bytes
+		// that come back, and an unverifiable load into a fresh database is the
+		// silent gate-skip SIGMA-78 exists to prevent. Refuse before anything is
+		// provisioned, and say which half is missing.
+		return BackupRun{}, ErrInvalid{Msg: "the newest successful backup recorded no checksum; it cannot be restored safely"}
 	}
 	var newServerID, newEngine string
 	err = tx.QueryRow(ctx, `
@@ -813,11 +855,16 @@ func (s *Store) CreateRestoreRun(ctx context.Context, orgID, sourceResourceID, n
 		return BackupRun{}, err
 	}
 
-	run := BackupRun{ID: newID("run"), ResourceID: sourceResourceID, Kind: "restore", Status: BackupRunPending, RestoreResourceID: &newResourceID}
+	run := BackupRun{
+		ID: newID("run"), ResourceID: sourceResourceID, Kind: "restore", Status: BackupRunPending,
+		SnapshotID: snapshotID, DumpSha256: dumpSha, RestoreResourceID: &newResourceID,
+	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, restore_resource_id)
-		VALUES ($1, $2, $3, $4, $5, 'restore', $6)`,
-		run.ID, orgID, sourceResourceID, policyID, newServerID, newResourceID); err != nil {
+		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind, restore_resource_id,
+		                         snapshot_id, dump_sha256)
+		VALUES ($1, $2, $3, $4, $5, 'restore', $6, $7, $8)`,
+		run.ID, orgID, sourceResourceID, policyID, newServerID, newResourceID,
+		snapshotID, dumpSha); err != nil {
 		return BackupRun{}, err
 	}
 	if err := auditTx(ctx, tx, orgID, actor, "Restore queued", sourceResourceID+" -> "+newResourceID); err != nil {

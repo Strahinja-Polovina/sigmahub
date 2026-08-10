@@ -71,6 +71,7 @@ type opSpec struct {
 	KeepWeekly      int    `json:"keepWeekly"`
 	KeepMonthly     int    `json:"keepMonthly"`
 	ExpectedSha     string `json:"expectedSha"`
+	SnapshotID      string `json:"snapshotId"`
 	TargetContainer string `json:"targetContainer"`
 	TargetDatabase  string `json:"targetDatabase"`
 	TargetUsername  string `json:"targetUsername"`
@@ -276,12 +277,17 @@ func (r *Runner) opBackupBase(ctx context.Context, op dsd.Op) error {
 	return nil
 }
 
-// dumpToWorkFile streams the latest snapshot's dump to a 0600 host work file,
-// returning its path, sha256 and size. Verify/restore need a seekable file to
-// tar into the target container; it is removed by the caller's cleanup.
+// dumpToWorkFile streams a snapshot's dump to a 0600 host work file, returning
+// its path, sha256 and size. Verify/restore need a seekable file to tar into the
+// target container; it is removed by the caller's cleanup.
 // (The backup path itself never lands on host disk — this is restore-side
 // staging, wiped immediately after the load.)
-func (r *Runner) dumpToWorkFile(ctx context.Context, cred Credential, runID, engine string) (path, sha string, size int64, err error) {
+//
+// snapshotID selects WHICH snapshot: a restore is pinned to the one the control
+// plane recorded the digest of (SIGMA-245), so "the newest snapshot in the repo"
+// and "the snapshot this run promised to load" cannot drift apart. Empty means
+// `latest`, which is what verify wants and what pre-pin runs carry.
+func (r *Runner) dumpToWorkFile(ctx context.Context, cred Credential, runID, engine, snapshotID string) (path, sha string, size int64, err error) {
 	dir := filepath.Join(r.workDir, runID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", 0, err
@@ -292,7 +298,7 @@ func (r *Runner) dumpToWorkFile(ctx context.Context, cred Credential, runID, eng
 		return "", "", 0, err
 	}
 	hasher := sha256.New()
-	err = resticDumpLatest(ctx, cred, dumpFilename(engine), io.MultiWriter(f, hasher))
+	err = resticDumpSnapshot(ctx, cred, snapshotID, dumpFilename(engine), io.MultiWriter(f, hasher))
 	cerr := f.Close()
 	if err != nil {
 		return "", "", 0, fmt.Errorf("restic dump: %w", err)
@@ -408,7 +414,8 @@ func (r *Runner) opBackupVerify(ctx context.Context, op dsd.Op) error {
 		return fmt.Errorf("fetch backup credential: %w", err)
 	}
 	defer os.RemoveAll(filepath.Join(r.workDir, spec.RunID))
-	dumpPath, sha, size, err := r.dumpToWorkFile(ctx, cred, spec.RunID, spec.Engine)
+	// A verify checks the newest dump in the repo — that is what it is for.
+	dumpPath, sha, size, err := r.dumpToWorkFile(ctx, cred, spec.RunID, spec.Engine, "")
 	if err != nil {
 		return r.fail(ctx, spec.RunID, err)
 	}
@@ -516,7 +523,10 @@ func (r *Runner) opBackupRestore(ctx context.Context, op dsd.Op) error {
 		return fmt.Errorf("fetch backup credential: %w", err)
 	}
 	defer os.RemoveAll(filepath.Join(r.workDir, spec.RunID))
-	dumpPath, sha, size, err := r.dumpToWorkFile(ctx, cred, spec.RunID, spec.Engine)
+	// A restore loads the snapshot the CP pinned the run to, not whatever is
+	// newest in the repo (SIGMA-245). Empty falls back to `latest` for runs
+	// queued before the pin existed.
+	dumpPath, sha, size, err := r.dumpToWorkFile(ctx, cred, spec.RunID, spec.Engine, spec.SnapshotID)
 	if err != nil {
 		return r.fail(ctx, spec.RunID, err)
 	}
@@ -546,7 +556,9 @@ func (r *Runner) opBackupRestore(ctx context.Context, op dsd.Op) error {
 	if probe != "" {
 		detail += "; probe=" + probe
 	}
-	r.report(ctx, spec.RunID, true, "", sha, detail)
+	// Report the snapshot back so the run's history keeps saying which one was
+	// loaded — the result write overwrites the pin the CP recorded.
+	r.report(ctx, spec.RunID, true, spec.SnapshotID, sha, detail)
 	r.log.Info("restore complete", "run", spec.RunID, "target", spec.TargetContainer)
 	return nil
 }

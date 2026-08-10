@@ -186,6 +186,113 @@ func TestBackupLifecycle(t *testing.T) {
 	}
 }
 
+// TestRestorePinsTheSnapshotNotTheCalendarDay is the SIGMA-245 regression.
+//
+// The expected digest a run carries used to be resolved by a subquery
+// correlated to the run's own UTC day. That correlation exists for VERIFY runs
+// (SIGMA-137: hold today's verify until today's dump exists) and restores
+// inherited it — so a restore queued on a day whose scheduled backup failed
+// rendered with an empty digest, and the agent hard-refuses an empty digest on
+// a restore ("restore refused: run carries no recorded checksum"). Meanwhile
+// CreateRestoreRun only asks whether ANY successful backup exists, so the CP
+// happily provisioned and billed a fresh database first. Monday's backup fails,
+// Sunday's snapshot is intact, and the operator's restore dies with an error
+// that reads like their backups are gone.
+func TestRestorePinsTheSnapshotNotTheCalendarDay(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_bk_pin"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "shop", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := st.CreateBackupTarget(ctx, orgID, "admin", store.CreateBackupTargetInput{
+		Name: "minio", Endpoint: "http://minio.internal:9000", Bucket: "backups",
+		AccessKey: "AKIA123", SecretKey: "supersecret", ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid := target.ID
+	if _, err := st.UpdateBackupPolicy(ctx, orgID, res.ID, "admin", store.UpdateBackupPolicyInput{TargetID: &tid}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sunday: the scheduled backup succeeds.
+	if _, err := st.CreateDueBackupRuns(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	open, err := st.BackupRunsForServer(ctx, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range open {
+		sha, snap := "", ""
+		if r.Kind == "backup" {
+			sha, snap = "sha-sunday", "snap-sunday"
+		}
+		if err := st.SetBackupRunResult(ctx, serverID, r.RunID, true, snap, sha, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// …and then the day turns over. Monday's backup never lands (rotated S3
+	// credentials, full disk, OOM during pg_dump) — there is simply no run for
+	// today, which is the shape of the outage.
+	if _, err := st.Pool.Exec(ctx, `
+		UPDATE backup_runs SET created_at = created_at - interval '1 day',
+		                       finished_at = finished_at - interval '1 day'
+		 WHERE org_id = $1`, orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Monday: the operator restores into a fresh database.
+	res2, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "shop-restore", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateRestoreRun(ctx, orgID, res.ID, res2.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	open, err = st.BackupRunsForServer(ctx, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "restore" {
+		t.Fatalf("open runs = %+v", open)
+	}
+	// The digest must come from the snapshot the restore will actually load —
+	// yesterday's — not from "a backup that shares this restore's calendar day".
+	if open[0].ExpectedSha != "sha-sunday" {
+		t.Fatalf("restore must pin the newest successful backup's digest, got %q", open[0].ExpectedSha)
+	}
+	if open[0].SnapshotID != "snap-sunday" {
+		t.Fatalf("restore must pin the snapshot it will load, got %q", open[0].SnapshotID)
+	}
+	// The verify path keeps its day correlation: a verify queued today with no
+	// successful backup today still renders empty, which is what holds it back.
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO backup_runs (id, org_id, resource_id, policy_id, server_id, kind)
+		SELECT 'run_v_today', $1, resource_id, policy_id, server_id, 'verify'
+		  FROM backup_runs WHERE org_id = $1 AND kind = 'restore'`, orgID); err != nil {
+		t.Fatal(err)
+	}
+	open, err = st.BackupRunsForServer(ctx, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range open {
+		if r.Kind == "verify" && r.ExpectedSha != "" {
+			t.Fatalf("a verify with no backup today must render empty, got %q", r.ExpectedSha)
+		}
+	}
+}
+
 // TestBackupSweepBudgetsSplitByDispatch is the SIGMA-163 regression: the
 // execution budget starts at DISPATCH (started_at), not enqueue, and a
 // never-dispatched pending run is only failed by the far larger queue budget.

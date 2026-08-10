@@ -30,6 +30,11 @@ type backupOpSpec struct {
 	// Verify: the last successful backup's dump sha256; the restored stream
 	// must hash to exactly this before the scratch-load probe even starts.
 	ExpectedSha string `json:"expectedSha,omitempty"`
+	// Restore: the restic snapshot the run was pinned to when it was created
+	// (SIGMA-245). The agent dumps THIS snapshot rather than `latest`, so the
+	// bytes it loads are the ones whose digest the CP recorded. Empty falls back
+	// to `latest` — older runs queued before the pin existed.
+	SnapshotID string `json:"snapshotId,omitempty"`
 	// Restore: the freshly provisioned resource the snapshot loads into.
 	TargetContainer string `json:"targetContainer,omitempty"`
 	TargetDatabase  string `json:"targetDatabase,omitempty"`
@@ -106,6 +111,7 @@ func renderBackupOps(runs []store.BackupRunSpec, rendered map[string]bool) []dsd
 		case "restore":
 			kind = dsd.KindBackupRestore
 			spec.ExpectedSha = r.ExpectedSha
+			spec.SnapshotID = r.SnapshotID
 			spec.TargetContainer = dsd.ContainerName(r.RestoreResourceID)
 			spec.TargetDatabase = r.RestoreDatabase
 			spec.TargetUsername = r.RestoreUsername
