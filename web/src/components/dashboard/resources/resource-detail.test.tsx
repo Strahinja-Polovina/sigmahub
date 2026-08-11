@@ -165,6 +165,24 @@ describe("ResourceDetail links to the running app", () => {
     renderCp({ detail: makeDetail({ domain: null }) });
     expect(screen.queryByRole("link", { name: /^Open$/ })).toBeNull();
   });
+
+  it("shows the SigmaHub URL for an app with no custom domain", () => {
+    // The whole point of SIGMA-351: a resource with no domain used to answer
+    // "where is my app" with nothing. Now it carries the routed SigmaHub host.
+    renderCp({
+      detail: makeDetail({ domain: null }),
+      publicUrl: "https://shop-1a2b3c4d.apps.example.com",
+    });
+    const link = screen.getByRole("link", { name: /shop-1a2b3c4d\.apps\.example\.com/ });
+    expect(link.getAttribute("href")).toBe("https://shop-1a2b3c4d.apps.example.com");
+    expect(link.getAttribute("target")).toBe("_blank");
+  });
+
+  it("shows the SigmaHub URL alongside a custom domain, not instead of it", () => {
+    renderCp({ publicUrl: "https://shop-1a2b3c4d.apps.example.com" });
+    expect(screen.getByRole("link", { name: /app\.example\.com/ })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /shop-1a2b3c4d\.apps\.example\.com/ })).toBeTruthy();
+  });
 });
 
 describe("ResourceDetail settings facts", () => {

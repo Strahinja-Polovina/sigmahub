@@ -12,16 +12,20 @@ import (
 
 // PreviewEnvironment is one PR's ephemeral environment record.
 type PreviewEnvironment struct {
-	ID            string     `json:"id"`
-	ConnectionID  string     `json:"connectionId"`
-	PRNumber      int        `json:"prNumber"`
-	EnvironmentID string     `json:"environmentId"`
-	ResourceID    *string    `json:"resourceId"`
-	Branch        string     `json:"branch"`
-	SHA           string     `json:"sha"`
-	Status        string     `json:"status"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	ClosedAt      *time.Time `json:"closedAt"`
+	ID            string  `json:"id"`
+	ConnectionID  string  `json:"connectionId"`
+	PRNumber      int     `json:"prNumber"`
+	EnvironmentID string  `json:"environmentId"`
+	ResourceID    *string `json:"resourceId"`
+	Branch        string  `json:"branch"`
+	SHA           string  `json:"sha"`
+	Status        string  `json:"status"`
+	// URL is the address SigmaHub routes to the preview's app (SIGMA-351) — the
+	// one thing a reviewer actually wants from a PR environment. Empty while no
+	// resource exists yet, and on deployments that can offer no reachable host.
+	URL       string     `json:"url"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ClosedAt  *time.Time `json:"closedAt"`
 }
 
 // SetConnectionPreviews flips a connection's preview flag and designates the
@@ -73,10 +77,13 @@ func (s *Store) SetConnectionPreviews(ctx context.Context, orgID, connID string,
 // newest first within status.
 func (s *Store) ListPreviewEnvironments(ctx context.Context, orgID, connID string) ([]PreviewEnvironment, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, connection_id, pr_number, environment_id, resource_id, branch, sha, status, created_at, closed_at
-		  FROM preview_environments
-		 WHERE org_id = $1 AND connection_id = $2
-		 ORDER BY (status = 'open') DESC, created_at DESC LIMIT 50`, orgID, connID)
+		SELECT p.id, p.connection_id, p.pr_number, p.environment_id, p.resource_id, p.branch, p.sha, p.status, p.created_at, p.closed_at,
+		       COALESCE(r.public_label, ''),
+		       COALESCE((SELECT sv.endpoint FROM servers sv WHERE sv.id = r.server_id), '')
+		  FROM preview_environments p
+		  LEFT JOIN resources r ON r.id = p.resource_id
+		 WHERE p.org_id = $1 AND p.connection_id = $2
+		 ORDER BY (p.status = 'open') DESC, p.created_at DESC LIMIT 50`, orgID, connID)
 	if err != nil {
 		return nil, err
 	}
@@ -84,8 +91,15 @@ func (s *Store) ListPreviewEnvironments(ctx context.Context, orgID, connID strin
 	out := []PreviewEnvironment{}
 	for rows.Next() {
 		var p PreviewEnvironment
-		if err := rows.Scan(&p.ID, &p.ConnectionID, &p.PRNumber, &p.EnvironmentID, &p.ResourceID, &p.Branch, &p.SHA, &p.Status, &p.CreatedAt, &p.ClosedAt); err != nil {
+		var label, endpoint string
+		if err := rows.Scan(&p.ID, &p.ConnectionID, &p.PRNumber, &p.EnvironmentID, &p.ResourceID, &p.Branch, &p.SHA, &p.Status, &p.CreatedAt, &p.ClosedAt,
+			&label, &endpoint); err != nil {
 			return nil, err
+		}
+		if p.Status == "open" {
+			if host := PublicHost(label, s.appsDomain, endpoint); host != "" {
+				p.URL = "https://" + host
+			}
 		}
 		out = append(out, p)
 	}

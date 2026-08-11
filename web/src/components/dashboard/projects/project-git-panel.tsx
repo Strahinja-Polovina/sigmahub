@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   AlertTriangle,
+  ExternalLink,
   GitBranch,
   GitFork,
   Loader2,
@@ -538,13 +539,27 @@ function PreviewsSection({
           ) : (
             <ul className="flex flex-col gap-1">
               {open.map((p) => (
-                <li key={p.id} className="flex items-center gap-2 text-sm">
+                <li key={p.id} className="flex flex-wrap items-center gap-2 text-sm">
                   <GitBranch className="size-3.5 text-muted-foreground" />
                   <span className="font-medium">pr-{p.prNumber}</span>
                   <span className="font-mono text-xs text-muted-foreground">
                     {p.branch}
                     {p.sha ? ` @ ${p.sha.slice(0, 7)}` : ""}
                   </span>
+                  {/* The whole point of a preview: a link a reviewer can open
+                      (SIGMA-351). Before this the environment was built,
+                      deployed and reachable by nobody. */}
+                  {p.url && (
+                    <a
+                      href={p.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                    >
+                      <ExternalLink className="size-3" />
+                      Open
+                    </a>
+                  )}
                 </li>
               ))}
             </ul>

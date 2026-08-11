@@ -239,3 +239,54 @@ func TestMeshPortsAreReclaimed(t *testing.T) {
 			"must come back, or the range climbs until it runs off the end of 65535", p2, p4)
 	}
 }
+
+// TestResourceURLIsSurfaced is the read-side half of SIGMA-351: routing shipped
+// first, but the URL was returned by no API, so a user still had no answer to
+// "where is my app". ListResources now resolves it, only for routable kinds,
+// only when the deployment can offer a reachable host.
+func TestResourceURLIsSurfaced(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_url"
+	st.SetAppsDomain("apps.example.com")
+	envID, serverID := dbTestFixture(t, st, orgID, true, "general")
+
+	// The proxy host has a public address, as the connect wizard would record.
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE servers SET endpoint = '203.0.113.7' WHERE id = $1`, serverID); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "Shop API", Kind: "app",
+		Spec: json.RawMessage(`{"image":"nginx"}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "db", Kind: "postgres",
+		Spec: json.RawMessage(`{}`),
+	}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := st.ListResources(ctx, orgID, envID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]store.Resource{}
+	for _, r := range list {
+		byID[r.ID] = r
+	}
+
+	// The app gets a URL under the configured wildcard, derived from its label.
+	if got := byID[app.ID].PublicURL; got == "" || !strings.HasPrefix(got, "https://shop-api-") || !strings.HasSuffix(got, ".apps.example.com") {
+		t.Fatalf("app PublicURL = %q, want https://shop-api-<id>.apps.example.com", got)
+	}
+	// A database is mesh-only — minting a URL for it would route nowhere.
+	if got := byID[db.ID].PublicURL; got != "" {
+		t.Fatalf("database got a PublicURL %q; managed data is mesh-only", got)
+	}
+}
