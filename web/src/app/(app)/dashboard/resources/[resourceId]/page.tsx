@@ -181,8 +181,8 @@ async function loadCpResourceFacts(
   orgId: string,
   resourceId: string,
   environmentId: string
-): Promise<{ statusError: string | null; healthCheck: CpHealthCheck | null }> {
-  const none = { statusError: null, healthCheck: null };
+): Promise<{ statusError: string | null; healthCheck: CpHealthCheck | null; publicUrl: string | null }> {
+  const none = { statusError: null, healthCheck: null, publicUrl: null };
   if (!cpEnabled()) return none;
   try {
     const resources = await cpListResources(orgId, environmentId);
@@ -196,6 +196,10 @@ async function loadCpResourceFacts(
     return {
       statusError: typeof err === "string" && err.trim() ? err : null,
       healthCheck: hc && typeof hc === "object" ? (hc as CpHealthCheck) : null,
+      // The SigmaHub URL the reconciler routes to this resource (SIGMA-351) —
+      // the answer to "where is my app" that used to exist nowhere for a
+      // resource without a custom domain.
+      publicUrl: res?.publicUrl && res.publicUrl.trim() ? res.publicUrl : null,
     };
   } catch {
     return none;
@@ -299,7 +303,7 @@ export default async function ResourceDetailPage({
   // loader here — an unreachable control plane must not render as "the pipeline
   // is configured and nothing arrived" (SIGMA-236).
   const telemetry = await loadResourceTelemetry(orgId, resourceId, loadFailures);
-  const { statusError, healthCheck } = await loadCpResourceFacts(
+  const { statusError, healthCheck, publicUrl } = await loadCpResourceFacts(
     orgId,
     resourceId,
     detail.resource.environmentId
@@ -391,6 +395,7 @@ export default async function ResourceDetailPage({
       cpTelemetry={telemetry}
       autoDeploy={autoDeploy}
       healthCheck={healthCheck}
+      publicUrl={publicUrl}
     />
   );
 }

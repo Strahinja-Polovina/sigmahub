@@ -11,6 +11,7 @@ import {
   Server as ServerIcon,
   GitBranch,
   Globe,
+  Link2,
   Tag,
   Boxes,
   Cpu,
@@ -451,6 +452,7 @@ export function ResourceDetail({
   loadFailures = [],
   autoDeploy = null,
   healthCheck = null,
+  publicUrl = null,
 }: {
   detail: Detail;
   orgId?: string;
@@ -498,6 +500,9 @@ export function ResourceDetail({
   autoDeploy?: AutoDeployPolicy | null;
   /** The health probe stored on the resource's spec. null = none. */
   healthCheck?: CpHealthCheck | null;
+  /** The address SigmaHub routes to this app without any customer DNS
+   *  (SIGMA-351). null for non-app kinds and where no host can be offered. */
+  publicUrl?: string | null;
 }) {
   const { resource, projectName, envName, server, cluster, deployments, secrets, canManage } =
     detail;
@@ -626,6 +631,22 @@ export function ResourceDetail({
                 >
                   <Globe className="size-3.5" />
                   {resource.domain}
+                </a>
+              )}
+              {/* The SigmaHub URL (SIGMA-351). Shown whether or not a custom
+                  domain is attached — it is the address that works before the
+                  customer has any DNS of their own, and it keeps working after
+                  they attach one. Without this the resource page answered
+                  "where is my app" with nothing at all. */}
+              {publicUrl && (
+                <a
+                  href={publicUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 hover:text-foreground"
+                >
+                  <Link2 className="size-3.5" />
+                  {publicUrl.replace(/^https?:\/\//, "")}
                 </a>
               )}
               {resource.version && (

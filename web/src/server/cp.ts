@@ -518,6 +518,9 @@ export type CpResource = {
   status: Record<string, unknown>;
   /** PR-preview resource, torn down with its PR (SIGMA-194). */
   ephemeral?: boolean;
+  /** The address SigmaHub routes to this resource without any customer DNS
+   *  (SIGMA-351). Only app kinds carry one; empty when nothing routes. */
+  publicUrl?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -1307,6 +1310,9 @@ export type CpPreviewEnvironment = {
   branch: string;
   sha: string;
   status: string; // open | closed
+  /** The address SigmaHub routes to the preview's app (SIGMA-351); empty until
+   *  the resource exists or when the deployment can offer no reachable host. */
+  url?: string;
   createdAt: string;
   closedAt: string | null;
 };

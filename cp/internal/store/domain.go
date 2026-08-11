@@ -67,7 +67,14 @@ type Resource struct {
 	// Ephemeral marks a PR-preview resource (ensurePreviewTx): torn down with
 	// its PR, not a first-class service. Surfaced so the dashboard can badge it
 	// and guard its Delete instead of presenting it as ordinary (SIGMA-194).
-	Ephemeral bool      `json:"ephemeral"`
+	Ephemeral bool `json:"ephemeral"`
+	// PublicURL is the address SigmaHub itself routes to this resource
+	// (SIGMA-351) — the stored label under CP_APPS_DOMAIN or the sslip.io
+	// fallback. Empty for kinds nothing routes (databases and object stores are
+	// mesh-only; cluster workloads take the Kubernetes path) and when the
+	// deployment can offer no reachable host. Resolved at read, not stored: the
+	// suffix follows deployment config and the host's current address.
+	PublicURL string    `json:"publicUrl"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -840,7 +847,9 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 // SIGMA-331 added cluster_id to the projection: a cluster-deployed resource has
 // no server_id, so without it the dashboard cannot say where the thing runs.
 func (s *Store) ListResources(ctx context.Context, orgID, envID, serverID string) ([]Resource, error) {
-	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, ephemeral, created_at, updated_at
+	q := `SELECT id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, ephemeral, created_at, updated_at,
+	               COALESCE(public_label,''),
+	               COALESCE((SELECT sv.endpoint FROM servers sv WHERE sv.id = resources.server_id), '')
 	        FROM resources WHERE org_id = $1`
 	args := []any{orgID}
 	if envID != "" {
@@ -860,9 +869,19 @@ func (s *Store) ListResources(ctx context.Context, orgID, envID, serverID string
 	out := []Resource{}
 	for rows.Next() {
 		var r Resource
+		var label, endpoint string
 		if err := rows.Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
-			&r.Spec, &r.Status, &r.Ephemeral, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.Spec, &r.Status, &r.Ephemeral, &r.CreatedAt, &r.UpdatedAt, &label, &endpoint); err != nil {
 			return nil, err
+		}
+		// Only kind "app" is Traefik-routed (databases and object stores are
+		// mesh-only, llm serves on its mesh port, cluster workloads run in k8s) —
+		// minting a URL for anything else would put an address on screen that
+		// routes nowhere, the exact defect SIGMA-351 exists to end.
+		if r.Kind == "app" && r.ClusterID == "" {
+			if host := PublicHost(label, s.appsDomain, endpoint); host != "" {
+				r.PublicURL = "https://" + host
+			}
 		}
 		out = append(out, r)
 	}
