@@ -47,9 +47,15 @@ const (
 // at stake is one server-hour; the reason to pick this side is that it is the
 // only one we could explain on an invoice.
 func (s *Store) SweepServerHours(ctx context.Context, now time.Time) (int, error) {
+	// The weight is stamped HERE, from the type the server has at the moment the
+	// hour is metered, and never read off the live row again (SIGMA-346). An hour
+	// is a fact about the past; re-deriving its price from the fleet's present
+	// shape let a type change rewrite an already-metered window in both
+	// directions. ON CONFLICT DO NOTHING keeps that immutable: re-running the
+	// sweep inside the same hour cannot restamp a row.
 	tag, err := s.Pool.Exec(ctx, `
-		INSERT INTO server_hours (org_id, server_id, hour)
-		SELECT org_id, id, date_trunc('hour', $1::timestamptz)
+		INSERT INTO server_hours (org_id, server_id, hour, unit_weight)
+		SELECT org_id, id, date_trunc('hour', $1::timestamptz), `+unitWeightSQL("type")+`
 		  FROM servers
 		 WHERE deleted_at IS NULL AND status = 'running'
 		ON CONFLICT DO NOTHING`, now.UTC())
@@ -706,15 +712,25 @@ func SubscriptionHoldsMinimum(sub BillingStatus) bool {
 // every org in one statement), so it cannot literally be Go code; rendering the
 // expression once from the weight table keeps the summary and the sweep reading
 // the same definition instead of two hand-copied ones that drift (SIGMA-292).
+// The live arm still weights from servers.type, and correctly so: it prices what
+// is running NOW. The historical arm reads the weight stamped on each metered
+// hour (SIGMA-346) rather than joining back to the live row, so a type change
+// cannot re-price hours that are already in the past. Per server it takes the
+// MAX weight seen in the window, which is what a high-water mark means: a host
+// that spent part of the window as a GPU peaked as a GPU.
+//
+// Dropping the JOIN to servers also stops a metered hour from vanishing if its
+// server row ever disappears outright — soft deletes are all production does
+// today, so this changes no figure, but the meter should not depend on it.
 func billedUnitsSQL(orgExpr, sinceExpr string) string {
 	return fmt.Sprintf(`GREATEST(
 		         (SELECT COALESCE(SUM(%[1]s), 0) FROM servers sv
-		           WHERE sv.org_id = %[3]s AND sv.deleted_at IS NULL AND sv.status = 'running'),
-		         (SELECT COALESCE(SUM(%[2]s), 0)
-		            FROM (SELECT DISTINCT sh.server_id FROM server_hours sh
-		                   WHERE sh.org_id = %[3]s AND sh.hour >= %[4]s) d
-		            JOIN servers sv2 ON sv2.id = d.server_id)
-		       )`, unitWeightSQL("sv.type"), unitWeightSQL("sv2.type"), orgExpr, sinceExpr)
+		           WHERE sv.org_id = %[2]s AND sv.deleted_at IS NULL AND sv.status = 'running'),
+		         (SELECT COALESCE(SUM(d.w), 0)
+		            FROM (SELECT MAX(sh.unit_weight) AS w FROM server_hours sh
+		                   WHERE sh.org_id = %[2]s AND sh.hour >= %[3]s
+		                   GROUP BY sh.server_id) d)
+		       )`, unitWeightSQL("sv.type"), orgExpr, sinceExpr)
 }
 
 // billableQuantitySQL is BillableQuantity(unitsExpr, true) in SQL — the sweep

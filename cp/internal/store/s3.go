@@ -73,25 +73,11 @@ type s3CredentialsJSON struct {
 // ErrNotS3 marks a resource without S3 credentials (wrong kind / wrong org).
 var ErrNotS3 = errors.New("resource is not an s3 storage")
 
-// allocateS3Port shares the per-server mesh-port space with databases: same
-// advisory lock, MAX over both tables, so an S3 resource can never collide
-// with a database port on the same host.
+// allocateS3Port shares the per-server mesh-port space with databases and
+// inference endpoints: one allocator, one advisory lock, one range — so an S3
+// resource can never collide with a database or an LLM port on the same host.
 func allocateS3Port(ctx context.Context, tx pgx.Tx, serverID string) (int, error) {
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtext('dbport:' || $1))`, serverID); err != nil {
-		return 0, fmt.Errorf("s3 port lock: %w", err)
-	}
-	var port int
-	err := tx.QueryRow(ctx, `
-		SELECT GREATEST(
-			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
-			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1),
-			COALESCE((SELECT MAX(port) FROM llm_endpoints WHERE server_id = $1), $2 - 1)
-		) + 1`, serverID, MeshPortBase).Scan(&port)
-	if err != nil {
-		return 0, fmt.Errorf("s3 port max: %w", err)
-	}
-	return port, nil
+	return allocateMeshPort(ctx, tx, serverID, "s3")
 }
 
 // provisionS3Tx generates and stores an S3 resource's root credentials and

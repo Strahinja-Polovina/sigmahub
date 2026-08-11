@@ -1174,14 +1174,26 @@ func TestReencryptSecrets_CoversEveryOrgDEKReference(t *testing.T) {
 	}
 }
 
-// TestReencryptSecrets_RewrapsHubToken is the behavioural half of SIGMA-281: an
-// endpoint's Hugging Face token is a DEK-sealed credential like any other, so a
-// rotation must move it onto the fresh DEK — and it must still open afterwards.
-func TestReencryptSecrets_RewrapsHubToken(t *testing.T) {
+// TestAnInferenceEndpointStoresNoWeightsToken is what is left of SIGMA-281's
+// hub-token half after SIGMA-302.
+//
+// This used to be TestReencryptSecrets_RewrapsHubToken: it created an `llm`
+// resource, read the sealed CP_HUGGING_FACE_TOKEN back out of llm_endpoints, and
+// checked a DEK rotation moved it onto the fresh DEK. Its subject cannot be
+// constructed any more, because the control plane no longer seals its own Hub
+// account into a tenant's row — that was one operator credential delivered into
+// containers on hosts the customers own.
+//
+// So it now pins the invariant that replaced it, at the same layer: a freshly
+// created endpoint holds NO weights credential, and a DEK rotation over an org
+// that owns one is still clean. The re-wrap branch for llm_endpoints in
+// secrets_rotate.go is kept — the column and its AAD are still the right home
+// for a per-endpoint token — but it has no writer today; if tenant-supplied
+// per-endpoint tokens ever land, the rotation assertions come back with them.
+func TestAnInferenceEndpointStoresNoWeightsToken(t *testing.T) {
 	st, _ := testStore(t)
 	ctx := context.Background()
 	orgID := "org_hubrot"
-	st.SetHuggingFaceToken("hf_secret_token")
 
 	proj, err := st.CreateProject(ctx, orgID, "ai", "", "admin")
 	if err != nil {
@@ -1202,12 +1214,19 @@ func TestReencryptSecrets_RewrapsHubToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var oldDEK string
+
+	var sealed *string
 	if err := st.Pool.QueryRow(ctx,
-		`SELECT token_dek_id FROM llm_endpoints WHERE resource_id = $1`, llm.ID).Scan(&oldDEK); err != nil {
-		t.Fatalf("endpoint has no sealed weights token to rotate: %v", err)
+		`SELECT token_dek_id FROM llm_endpoints WHERE resource_id = $1`, llm.ID).Scan(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	if sealed != nil {
+		t.Fatalf("a weights credential was sealed into the tenant's endpoint (dek %s); the control "+
+			"plane's own Hub account must never be stored against a tenant row", *sealed)
 	}
 
+	// A rotation over an org whose only credential-bearing resource is this one
+	// must still complete rather than trip over the empty columns.
 	if _, err := st.RotateDEK(ctx, orgID, "admin"); err != nil {
 		t.Fatal(err)
 	}
@@ -1215,32 +1234,15 @@ func TestReencryptSecrets_RewrapsHubToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var nowDEK string
-	var retired *time.Time
-	if err := st.Pool.QueryRow(ctx,
-		`SELECT token_dek_id FROM llm_endpoints WHERE resource_id = $1`, llm.ID).Scan(&nowDEK); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Pool.QueryRow(ctx, `SELECT retired_at FROM org_deks WHERE id = $1`, oldDEK).Scan(&retired); err != nil {
-		t.Fatal(err)
-	}
-	if nowDEK == oldDEK {
-		t.Errorf("weights token still sealed under the rotated-away DEK %s (retired_at=%v) — "+
-			"the operator was told the rotation was complete (SIGMA-281)", oldDEK, retired)
-	}
-	// And it still opens: the AAD survived the re-wrap.
+	// And nothing appears from the rotation either.
 	resolved, err := st.ResolveSecretsForResource(ctx, orgID, gpu, llm.ID, "agent")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got string
 	for _, r := range resolved {
 		if r.Name == store.HubTokenSecretName {
-			got = r.Value
+			t.Fatalf("%s appeared after a DEK rotation with value %q", store.HubTokenSecretName, r.Value)
 		}
-	}
-	if got != "hf_secret_token" {
-		t.Errorf("weights token after rotation = %q, want the original plaintext", got)
 	}
 }
 

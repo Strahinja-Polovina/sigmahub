@@ -88,15 +88,19 @@ type Config struct {
 	PaddleWebhookSecret string
 	PaddleEnv           string
 	PaddlePriceID       string
-	// HuggingFaceToken (CP_HUGGING_FACE_TOKEN) is the Hugging Face account this
-	// control plane acts as. It does BOTH jobs, and that is the whole point of
-	// there being one setting: it authenticates the model picker's Hub calls in
-	// this process, and it is seeded into each inference endpoint's
-	// HUGGING_FACE_HUB_TOKEN secret so the agent DOWNLOADS the weights as the
-	// same account (store.SetHuggingFaceToken). Those used to be two unrelated
-	// things — the picker had a token, the download referenced a secret nothing
-	// ever created — so the wizard could approve a gated model whose weights
-	// then 401'd tens of gigabytes into a pull on a GPU-billed host.
+	// HuggingFaceToken (CP_HUGGING_FACE_TOKEN) is the Hugging Face account THIS
+	// CONTROL PLANE acts as when it talks to the Hub about itself: the model
+	// picker's search and card lookups, nothing else.
+	//
+	// It used to do a second job — it was seeded into every tenant's inference
+	// endpoint as their weights credential, so the agent downloaded as this
+	// account. That put one operator-owned token, valid across every tenant and
+	// every gated repo the operator had accepted terms for, into a container's
+	// environment on a GPU host the customer owns and has a shell on. It is a
+	// tenancy boundary the setting cannot straddle, so it no longer tries
+	// (SIGMA-302): a tenant who needs gated or private weights creates their own
+	// HUGGING_FACE_HUB_TOKEN project secret, which is the credential the agent
+	// receives and the one WeightsTokenAvailable reports on.
 	//
 	// OPTIONAL, and deliberately not defaulted or required: the Hub's model API
 	// serves public repos unauthenticated and public weights download without
@@ -108,6 +112,18 @@ type Config struct {
 	// credential rather than this one, because that is the question the wizard
 	// is really asking.
 	HuggingFaceToken string
+	// AppsDomain (CP_APPS_DOMAIN) is the wildcard this install mints resource
+	// URLs under — set it to e.g. "apps.example.com" with *.apps.example.com
+	// pointed at the proxy servers, and every resource gets
+	// <label>.apps.example.com routed and certified without the customer owning
+	// a domain at all.
+	//
+	// OPTIONAL. Empty falls back to sslip.io derived from the host's public
+	// address, which needs no configuration whatsoever — that fallback is what
+	// makes a fresh self-hosted install reachable on its FIRST deploy instead of
+	// after a domain purchase. Set this for a hosted product, where clean
+	// hostnames and a certificate you control are worth the DNS record.
+	AppsDomain string
 	// Agent-installer serving (SIGMA-217). The control plane serves
 	// GET /install.sh and proxies the pinned release assets from
 	// GET /dl/{version}/{asset}, so a host being onboarded talks only to the
@@ -199,6 +215,7 @@ func FromEnv() (Config, error) {
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
 		HuggingFaceToken:        strings.TrimSpace(os.Getenv("CP_HUGGING_FACE_TOKEN")),
+		AppsDomain:              strings.TrimSpace(os.Getenv("CP_APPS_DOMAIN")),
 		ReleaseRepo:             strings.TrimSpace(getenv("CP_RELEASE_REPO", DefaultReleaseRepo)),
 		ReleaseToken:            strings.TrimSpace(os.Getenv("CP_RELEASE_TOKEN")),
 		AgentVersion:            strings.TrimSpace(os.Getenv("CP_AGENT_VERSION")),

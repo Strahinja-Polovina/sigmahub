@@ -351,6 +351,12 @@ type ResourceSpec struct {
 	// on every node of the cluster, so each node would additionally have run the
 	// workload itself, outside the scheduler that is supposed to own it.
 	ClusterID string
+	// PublicHost is the hostname SigmaHub routes to this resource without the
+	// customer configuring any DNS (SIGMA-351), or "" when this deployment can
+	// offer none — no CP_APPS_DOMAIN and a host with no reachable public address.
+	// Resolved here rather than stored, because the suffix depends on deployment
+	// config and on the host's current address; only the label is durable.
+	PublicHost string
 }
 
 // ResourceHostedHere decides whether a resource has anything to do with a given
@@ -385,7 +391,9 @@ func ResourceHostedHere(serverParam string) string {
 
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral, COALESCE(r.cluster_id, '')
+		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral, COALESCE(r.cluster_id, ''),
+		       COALESCE(r.public_label, ''),
+		       COALESCE((SELECT sv.endpoint FROM servers sv WHERE sv.id = $1), '')
 		  FROM resources r
 		 WHERE`+ResourceHostedHere("$1")+`
 		 ORDER BY r.created_at`,
@@ -397,9 +405,12 @@ func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]
 	out := []ResourceSpec{}
 	for rows.Next() {
 		var r ResourceSpec
-		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral, &r.ClusterID); err != nil {
+		var label, endpoint string
+		if err := rows.Scan(&r.ResourceID, &r.ProjectID, &r.Kind, &r.Spec, &r.Ephemeral, &r.ClusterID,
+			&label, &endpoint); err != nil {
 			return nil, err
 		}
+		r.PublicHost = PublicHost(label, s.appsDomain, endpoint)
 		out = append(out, r)
 	}
 	return out, rows.Err()

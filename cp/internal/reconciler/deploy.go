@@ -304,7 +304,10 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	}
 	health := deployHealth(spec, rs.Spec)
 	generation := deployGeneration(target.SHA, target.DeploymentID)
-	if len(domains) > 0 {
+	// Routable on either count now: an attached domain, or the SigmaHub host the
+	// resource always carries (SIGMA-351). Before, an app with no custom domain
+	// got no router at all and was reachable from nowhere.
+	if len(domains) > 0 || rs.PublicHost != "" {
 		lbPort := 0
 		if len(spec.Ports) > 0 {
 			lbPort = spec.Ports[0].Container
@@ -317,7 +320,7 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 		// half of live traffic hit the new container from the moment it started,
 		// throughout the health gate.
 		bg := blueGreenRouting{Generation: generation, Priority: generationRouterPriority(target.CreatedAt)}
-		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort, bg)
+		cs.Labels = traefikLabels(rs.ResourceID, domains, rs.PublicHost, lbPort, bg)
 		// A service-level health check on top of that, when the app declares an
 		// HTTP probe: it keeps a container that is up but not yet serving out of
 		// its own service too, so the flip after the drain is clean.
@@ -579,7 +582,7 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 		if fileMode {
 			cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
 		}
-		if s.Name == webSvc && len(domains) > 0 {
+		if s.Name == webSvc && (len(domains) > 0 || rs.PublicHost != "") {
 			lbPort := 0
 			if len(s.Ports) > 0 {
 				lbPort = s.Ports[0]
@@ -588,7 +591,7 @@ func renderComposeDeployOps(rs store.ResourceSpec, spec appResourceSpec, refs []
 			// path (SIGMA-164) — a Compose web service is blue-green too unless it
 			// opted into recreate, and a recreate service has no second generation
 			// to be confused with, so the same labels are correct either way.
-			cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort,
+			cs.Labels = traefikLabels(rs.ResourceID, domains, rs.PublicHost, lbPort,
 				blueGreenRouting{Generation: gen, Priority: generationRouterPriority(target.CreatedAt)})
 			for k, v := range traefikHealthLabels(dsd.TraefikGenerationRouterName(rs.ResourceID, gen), composeServiceHealth(s)) {
 				cs.Labels[k] = v

@@ -85,31 +85,70 @@ func dbSafeName(name string) string {
 	return out
 }
 
-// allocateDBPort hands out the next free mesh-bound host port on a server.
-// Callers run it inside the provisioning transaction; the per-server advisory
-// lock serializes concurrent creates so MAX+1 can't collide (the unique index
-// on (server_id, port) is the backstop).
-func allocateDBPort(ctx context.Context, tx pgx.Tx, serverID string) (int, error) {
+// MeshPortCeiling is the last mesh-bound port the allocator will hand out.
+//
+// Unlike MeshPortBase this is NOT rendered into the dashboard — it is an
+// internal bound on the search, and nothing a connection panel prints — so it
+// lives here beside the allocator rather than in db_engines.go, whose every
+// byte is hashed into the generated catalog's digest.
+const MeshPortCeiling = 65535
+
+// ErrNoFreePort is returned when a server has no mesh-bound port left between
+// MeshPortBase and MeshPortCeiling. It is a capacity condition, not a bad
+// request: the caller has done nothing wrong and the operator needs to know
+// which server filled up.
+var ErrNoFreePort = errors.New("no free mesh port on this server")
+
+// allocateMeshPort hands out the LOWEST free mesh-bound host port on a server,
+// shared by every kind that binds one (databases, object storage, inference
+// endpoints).
+//
+// It used to be MAX(port) + 1 across the same three tables, which never reused
+// anything (SIGMA-352). A port freed by deleting a resource was gone for the
+// life of the server, so a fleet that creates and destroys — a preview-heavy
+// project, anyone iterating in the wizard — walked the number upward with
+// nothing to stop it, and with no ceiling check it would eventually hand the
+// agent a number above 65535 that cannot bind. Reusing the lowest free port
+// keeps the range dense and the failure mode honest: you run out only when you
+// have genuinely allocated fifty thousand ports on one host.
+//
+// The per-server advisory lock serialises concurrent creates, and the unique
+// index on (server_id, port) is the backstop if it is ever bypassed. `what`
+// names the caller for the error text only.
+func allocateMeshPort(ctx context.Context, tx pgx.Tx, serverID, what string) (int, error) {
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext('dbport:' || $1))`, serverID); err != nil {
-		return 0, fmt.Errorf("db port lock: %w", err)
+		return 0, fmt.Errorf("%s port lock: %w", what, err)
 	}
-	// GREATEST over BOTH port-owning tables, symmetric with allocateS3Port: the
-	// availability matrix keeps S3 and DB engines off the same server today, but
-	// scanning only db_credentials would collide the moment that ever widens
-	// (SIGMA-81). The shared advisory lock + (server_id, port) unique index back
-	// this up.
 	var port int
+	// LIMIT 1 over an ordered series: in the ordinary case (a server with a
+	// handful of resources) this stops at the first candidate and never
+	// materialises the range.
 	err := tx.QueryRow(ctx, `
-		SELECT GREATEST(
-			COALESCE((SELECT MAX(port) FROM db_credentials WHERE server_id = $1), $2 - 1),
-			COALESCE((SELECT MAX(port) FROM s3_credentials WHERE server_id = $1), $2 - 1),
-			COALESCE((SELECT MAX(port) FROM llm_endpoints WHERE server_id = $1), $2 - 1)
-		) + 1`, serverID, MeshPortBase).Scan(&port)
+		WITH used AS (
+			SELECT port FROM db_credentials WHERE server_id = $1
+			UNION
+			SELECT port FROM s3_credentials WHERE server_id = $1
+			UNION
+			SELECT port FROM llm_endpoints  WHERE server_id = $1
+		)
+		SELECT p FROM generate_series($2::int, $3::int) AS p
+		 WHERE NOT EXISTS (SELECT 1 FROM used WHERE used.port = p)
+		 ORDER BY p
+		 LIMIT 1`, serverID, MeshPortBase, MeshPortCeiling).Scan(&port)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("%w: %s (ports %d-%d are all allocated)",
+			ErrNoFreePort, serverID, MeshPortBase, MeshPortCeiling)
+	}
 	if err != nil {
-		return 0, fmt.Errorf("db port max: %w", err)
+		return 0, fmt.Errorf("%s port allocate: %w", what, err)
 	}
 	return port, nil
+}
+
+// allocateDBPort hands out a database's mesh-bound host port.
+func allocateDBPort(ctx context.Context, tx pgx.Tx, serverID string) (int, error) {
+	return allocateMeshPort(ctx, tx, serverID, "db")
 }
 
 // provisionDatabaseTx generates and stores a new database resource's

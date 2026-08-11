@@ -1,10 +1,10 @@
 import "server-only";
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNotNull } from "drizzle-orm";
 import { auth } from "../lib/auth";
 import { effectiveProjectRole, roleAtLeast } from "../lib/rbac";
-import { db } from "./db";
+import { db, authSchema } from "./db";
 import * as s from "./db/schema";
 
 export const ORG_COOKIE = "sh_org";
@@ -62,6 +62,29 @@ export async function ensurePersonalOrg() {
     .values({ id: `mem_p_${suffix}`, orgId, userId: user.id, role: "Org Admin" })
     .onConflictDoNothing();
   return orgId;
+}
+
+/** Whether the session user has a password credential at all (SIGMA-345).
+ *
+ *  better-auth stores one account row per sign-in method; an email+password user
+ *  has `provider_id = 'credential'` with a hash, while a social-only user has
+ *  only their provider's row. changePassword refuses the latter with
+ *  CREDENTIAL_ACCOUNT_NOT_FOUND, so Settings uses this to hide a form that could
+ *  not succeed rather than offering it and failing. */
+export async function currentUserHasPassword(): Promise<boolean> {
+  const user = await getSessionUser();
+  const rows = await db
+    .select({ id: authSchema.account.id })
+    .from(authSchema.account)
+    .where(
+      and(
+        eq(authSchema.account.userId, user.id),
+        eq(authSchema.account.providerId, "credential"),
+        isNotNull(authSchema.account.password),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
 }
 
 /** Assert the session user belongs to `orgId`; returns their role and explicit

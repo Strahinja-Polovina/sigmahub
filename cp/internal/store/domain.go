@@ -503,6 +503,12 @@ type CreateResourceInput struct {
 	Name      string
 	Kind      string
 	Spec      json.RawMessage
+	// Recovery marks a resource that exists only to receive a restored backup.
+	// It exempts the create from the billing cap (SIGMA-348) — see
+	// assertBillingNotCappedTx. Set ONLY by the restore handlers; it is not
+	// reachable from any client-supplied field, because a caller who could set
+	// it would have found a way to grow a capped org for free.
+	Recovery bool
 }
 
 // buildMethodFromSpec reads spec.build.method — how the wizard decided this app
@@ -625,8 +631,18 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// SIGMA-295: same cap as server creation — an org past its billing grace
 	// period does not get to provision NEW resources. Existing resources, their
 	// deploys, certificates and backups are untouched.
-	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
-		return Resource{}, err
+	//
+	// Restore is the exception (SIGMA-348). It is restore-into-a-NEW-resource, so
+	// it lands on this path and was silently caught by the cap — which made the
+	// clause above false: backups kept being taken and verified, and the one
+	// operation that turns a backup back into data was refused. A late invoice
+	// became customer data loss. A recovery target is still a real resource and
+	// still counts toward billed units once it exists; the cap simply does not
+	// get to hold data hostage.
+	if !in.Recovery {
+		if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
+			return Resource{}, err
+		}
 	}
 
 	var projectID, envName string
@@ -758,11 +774,17 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 
 	r := Resource{ID: newID("res")}
+	// The resource's own routable label (SIGMA-351). Minted from the name at
+	// create and never rewritten afterwards: a rename must not break links the
+	// customer has already shared. Uniqueness comes from the id suffix, which is
+	// random hex, so this needs no retry loop — the partial unique index on
+	// public_label is the backstop.
+	publicLabel := PublicLabel(in.Name, in.Kind, r.ID)
 	err = tx.QueryRow(ctx, `
-		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id)
-		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''))
+		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id, public_label)
+		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''), $10)
 		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, created_at, updated_at`,
-		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID,
+		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID, publicLabel,
 	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if isUniqueViolation(err) {

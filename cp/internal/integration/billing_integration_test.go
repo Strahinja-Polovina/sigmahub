@@ -842,3 +842,123 @@ func TestSubscriptionsNeedingQuantitySync_Drift(t *testing.T) {
 		wantDrift(t, st, org, now, 1, 3)
 	})
 }
+
+// TestMeteredHoursKeepTheWeightTheyWereMeteredAt is the SIGMA-346 guard.
+//
+// server_hours stored only (org_id, server_id, hour), so the billed total's
+// historical arm joined each metered hour back to the LIVE servers row to find a
+// weight. The price of an hour therefore depended on the server's type when the
+// query ran rather than when the hour was metered — and the type is user-mutable
+// at any time, in both directions, by a Project Admin.
+func TestMeteredHoursKeepTheWeightTheyWereMeteredAt(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Underbilling: run a GPU (weight 4) for an hour, then downgrade before the
+	// sweep looks. The high-water mark exists so a fleet that shrinks inside the
+	// window still pays for its peak; that defence held for the server COUNT and
+	// was defeated for the WEIGHT.
+	down := "org_downgrade"
+	gpuID := connectTypedServer(t, st, down, "burst", "gpu")
+	if _, err := st.SweepServerHours(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetServerType(ctx, down, gpuID, "general", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	units, err := st.BilledUnitsForOrg(ctx, down, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if units != 4 {
+		t.Fatalf("billed units after a gpu→general downgrade = %d, want 4: the hour was metered as a GPU and a later type change must not re-price it", units)
+	}
+
+	// Overbilling, the mirror image: meter an hour as a general server, upgrade
+	// to GPU, then disconnect so the live arm contributes nothing. Everything
+	// left is history, and history was being re-priced upward at a weight the
+	// customer never ran during those hours.
+	up := "org_upgrade"
+	genID := connectTypedServer(t, st, up, "steady", "general")
+	if _, err := st.SweepServerHours(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetServerType(ctx, up, genID, "gpu", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE servers SET status = 'stopped' WHERE id = $1`, genID); err != nil {
+		t.Fatal(err)
+	}
+	units, err = st.BilledUnitsForOrg(ctx, up, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if units != 1 {
+		t.Fatalf("billed units after a general→gpu upgrade and disconnect = %d, want 1: those hours ran as a general server", units)
+	}
+
+	// The sweep must not restamp a row it already wrote, or the immutability
+	// above lasts only until the next tick inside the same hour.
+	if err := st.SetServerType(ctx, down, gpuID, "gpu", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.SweepServerHours(ctx, now); err != nil || n != 0 {
+		t.Fatalf("re-sweep inside the same hour wrote %d rows (err=%v), want 0", n, err)
+	}
+}
+
+// TestRestoreIsNotBlockedByTheBillingCap is the SIGMA-348 guard.
+//
+// Restore is restore-into-a-NEW-resource, so it went through CreateResource and
+// was silently caught by SIGMA-295's growth cap — while the comment on that cap
+// promised "existing resources, their deploys, certificates and backups are
+// untouched". Backups kept being taken and verified; the operation that turns
+// one back into data was refused, so a late invoice became data loss.
+func TestRestoreIsNotBlockedByTheBillingCap(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	orgID := "org_capped_restore"
+
+	// Build the fleet BEFORE the cap engages — this org was paying once.
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_r", SubscriptionID: "sub_r", Status: "past_due", Quantity: 5,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE org_billing SET status_since = $2 WHERE org_id = $1`,
+		orgID, now.Add(-store.BillingGracePeriod-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ordinary growth is still refused: this is a cap, and it still caps.
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "new-app", Kind: "postgres",
+		Spec: json.RawMessage(`{}`),
+	}, "admin"); err == nil {
+		t.Fatal("a capped org was allowed to provision an ordinary new resource")
+	} else {
+		var capped store.ErrBillingCapped
+		if !errors.As(err, &capped) {
+			t.Fatalf("refusal must stay a billing refusal, got %T: %v", err, err)
+		}
+	}
+
+	// A recovery target is not growth the customer chose; it is their own data
+	// coming back. It must land even here.
+	res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "restored", Kind: "postgres",
+		Spec: json.RawMessage(`{}`), Recovery: true,
+	}, "admin")
+	if err != nil {
+		t.Fatalf("a capped org must still be able to restore its own backup: %v", err)
+	}
+	if res.ID == "" {
+		t.Fatal("recovery target created without an id")
+	}
+}

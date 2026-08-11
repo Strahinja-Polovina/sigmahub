@@ -340,59 +340,57 @@ func TestTheServedContextIsClampedToTheModelsOwnCeilingAtCreate(t *testing.T) {
 	}
 }
 
-// The weights credential (SIGMA-213). The runtime catalog names
-// HUGGING_FACE_HUB_TOKEN as a secret reference and the agent refuses to create a
-// container the control plane will not answer that reference for, so what this
-// pins is that the value exists and that a reference is only ever declared when
-// it does.
-func TestAnInferenceEndpointGetsTheControlPlanesHuggingFaceToken(t *testing.T) {
+// The weights credential, after SIGMA-302 took the operator's account out of it.
+//
+// CP_HUGGING_FACE_TOKEN used to be sealed into every tenant's llm_endpoints row
+// at create and handed to the agent as an env-mode secret, so one operator-owned
+// Hub credential — valid across every tenant and every gated repo the operator
+// had accepted terms for — landed in a container's environment on a GPU host the
+// customer owns and has a shell on. This pins that it does not any more, at the
+// one call whose answer becomes that environment.
+func TestTheControlPlanesHuggingFaceTokenNeverReachesATenantsContainer(t *testing.T) {
 	st, _ := testStore(t)
 	ctx := context.Background()
 	orgID := "org_hub_token"
 	projectID, envID, serverID := llmFitFixture(t, st, orgID, itVRAM24GB)
-	st.SetHuggingFaceToken("hf_from_the_control_plane")
 
 	llm, err := createLLM(st, orgID, envID, serverID, "", "llama", "meta-llama/Llama-3.1-8B")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// The agent's own audited fetch is where the value has to appear: this is
-	// the call whose answer becomes the container's environment.
 	secrets, err := st.ResolveSecretsForResource(ctx, orgID, serverID, llm.ID, "sigmad")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got store.ResolvedSecret
-	for _, s := range secrets {
-		if s.Name == store.HubTokenSecretName {
-			got = s
+	for _, sec := range secrets {
+		if sec.Name == store.HubTokenSecretName {
+			t.Fatalf("%s was delivered to the tenant with value %q — the control plane's own Hub "+
+				"account must never leave this process", store.HubTokenSecretName, sec.Value)
 		}
 	}
-	if got.Value != "hf_from_the_control_plane" {
-		t.Fatalf("%s resolved to %q — the reference the runtime catalog renders has nothing behind it, "+
-			"and the agent fails the container create on exactly that", store.HubTokenSecretName, got.Value)
-	}
-	if !got.EnvVar {
-		t.Error("the token must arrive as an environment variable; the runtime reads no file")
-	}
 
+	// Nothing is stored against the endpoint either, so no reference is rendered
+	// and the agent is never asked to resolve one it cannot get.
 	targets, err := st.LLMTargetsForServer(ctx, serverID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !targets[llm.ID].WeightsToken {
-		t.Fatal("the endpoint does not declare its credential, so no reference is rendered for it")
+	if targets[llm.ID].WeightsToken {
+		t.Fatal("the endpoint still declares a stored weights credential, so the reconciler renders a reference for it")
 	}
 
-	// And the wizard is told the truth about the target BEFORE the operator
-	// picks a gated model, which is the only moment the answer is worth anything.
+	// And the wizard says so rather than promising a download it cannot make.
+	// Answering "yes" on the strength of a token the container will never see is
+	// SIGMA-213's original defect, which is why the short-circuit had to go in
+	// the same change as the seeding.
 	available, err := st.WeightsTokenAvailable(ctx, orgID, projectID, envID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !available {
-		t.Fatal("a control plane holding a token reports no weights credential to the wizard")
+	if available {
+		t.Fatal("the wizard reports a weights credential this tenant does not have, so a gated model " +
+			"will be approved and then 401 mid-pull on a GPU-billed host")
 	}
 }
 
@@ -442,11 +440,9 @@ func TestWithoutATokenNothingIsClaimedAndNothingIsReferenced(t *testing.T) {
 		t.Fatal("an org holding HUGGING_FACE_HUB_TOKEN is still told it has no weights credential")
 	}
 
-	// And theirs is the one that gets used. The database engines' generated
-	// credentials deliberately win a name collision; this one deliberately loses,
-	// because a token in the project is an operator naming the account that
-	// fetches their weights.
-	st.SetHuggingFaceToken("hf_from_the_control_plane")
+	// And theirs is the one that gets used — the only one there is, now that the
+	// control plane seeds nothing (SIGMA-302). It must still arrive exactly once:
+	// the agent injects one value per name, and two is an argument about which.
 	second, err := createLLM(st, orgID, envID, serverID, "", "qwen", "Qwen/Qwen2.5-7B")
 	if err != nil {
 		t.Fatal(err)
@@ -462,8 +458,8 @@ func TestWithoutATokenNothingIsClaimedAndNothingIsReferenced(t *testing.T) {
 		}
 		seen++
 		if s.Value != "hf_the_operators_own" {
-			t.Fatalf("%s resolved to the control plane's token, overriding the operator's own",
-				store.HubTokenSecretName)
+			t.Fatalf("%s resolved to %q rather than the operator's own secret",
+				store.HubTokenSecretName, s.Value)
 		}
 	}
 	if seen != 1 {

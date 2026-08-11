@@ -188,3 +188,54 @@ func TestDatabaseEngineGate(t *testing.T) {
 		t.Fatalf("gfs default = %+v", info.Backup)
 	}
 }
+
+// TestMeshPortsAreReclaimed is the SIGMA-352 guard.
+//
+// The allocator was MAX(port) + 1 across the three port-owning tables, so a
+// port freed by deleting a resource was gone for the life of the server. A
+// fleet that creates and destroys — a preview-heavy project, anyone iterating
+// in the wizard — walked the number upward forever, and with no ceiling check
+// it would eventually hand the agent a number above 65535 that cannot bind.
+func TestMeshPortsAreReclaimed(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_ports"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "database")
+
+	mk := func(name string) (string, int) {
+		t.Helper()
+		res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ServerID: serverID, Name: name, Kind: "postgres",
+			Spec: json.RawMessage(`{}`),
+		}, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var port int
+		if err := st.Pool.QueryRow(ctx,
+			`SELECT port FROM db_credentials WHERE resource_id = $1`, res.ID).Scan(&port); err != nil {
+			t.Fatal(err)
+		}
+		return res.ID, port
+	}
+
+	// Three in a row: the range is dense from the base.
+	_, p1 := mk("one")
+	id2, p2 := mk("two")
+	_, p3 := mk("three")
+	if p1 != store.MeshPortBase || p2 != store.MeshPortBase+1 || p3 != store.MeshPortBase+2 {
+		t.Fatalf("ports = %d, %d, %d; want %d, %d, %d",
+			p1, p2, p3, store.MeshPortBase, store.MeshPortBase+1, store.MeshPortBase+2)
+	}
+
+	// Free the middle one. The next create must take the hole, not climb past
+	// the high-water mark.
+	if _, err := st.DeleteResource(ctx, orgID, id2, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	_, p4 := mk("four")
+	if p4 != p2 {
+		t.Fatalf("after freeing port %d the next allocation took %d — a deleted resource's port "+
+			"must come back, or the range climbs until it runs off the end of 65535", p2, p4)
+	}
+}

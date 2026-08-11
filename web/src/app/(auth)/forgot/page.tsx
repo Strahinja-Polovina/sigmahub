@@ -35,7 +35,13 @@ export default function ForgotPasswordPage() {
     // the confirmation SAYS depends only on the deployment's mail transport,
     // which is not a fact about this email address.
     try {
-      await authClient.requestPasswordReset({ email, redirectTo: "/login" });
+      // redirectTo is where better-auth's own GET /reset-password/<token>
+      // bounces the browser once it has checked the token is live — it carries
+      // ?token=… (or ?error=INVALID_TOKEN) into whatever page this names, and
+      // sets no password itself. Pointing it at /login sent the user to a form
+      // that reads neither, so the link resolved to a dead end and recovery was
+      // impossible (SIGMA-344).
+      await authClient.requestPasswordReset({ email, redirectTo: "/reset-password" });
     } catch {
       // swallow — don't leak account existence
     }

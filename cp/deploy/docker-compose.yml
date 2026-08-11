@@ -107,15 +107,27 @@ services:
       # restarted, and got the identical refusal — the fix had been applied to a
       # key nothing read.
       CP_AGENT_VERSION: ${CP_AGENT_VERSION:-}
-      # Hugging Face account the control plane acts as (SIGMA-213/214, optional).
-      # One setting doing both halves of the LLM path: it authenticates the
-      # model picker's Hub calls, and it is seeded into each inference
-      # endpoint's HUGGING_FACE_HUB_TOKEN so the agent downloads weights as the
-      # same account. Empty is supported — public models search and download
-      # unauthenticated — but then a gated repo (Llama & co) is invisible to the
-      # picker. Missing here entirely was worse than empty: the key could be set
-      # in .env and never reach the process.
+      # Hugging Face account the CONTROL PLANE acts as (SIGMA-213/214, optional).
+      # It authenticates the model picker's own Hub metadata calls and nothing
+      # else: it is no longer seeded into tenants' inference endpoints, because
+      # that put one operator-owned credential into containers on hosts the
+      # customers own and can read (SIGMA-302). A tenant needing gated weights
+      # supplies their own HUGGING_FACE_HUB_TOKEN project secret. Empty is
+      # supported — public models search unauthenticated — but then a gated repo
+      # (Llama & co) is invisible to the picker. Missing here entirely was worse
+      # than empty: the key could be set in .env and never reach the process.
       CP_HUGGING_FACE_TOKEN: ${CP_HUGGING_FACE_TOKEN:-}
+      # The wildcard resource URLs are minted under (SIGMA-351, optional). Set it
+      # to e.g. apps.example.com with *.apps.example.com pointed at the proxy
+      # servers, and every resource gets <label>.apps.example.com routed and
+      # certified without the customer owning a domain at all.
+      #
+      # Empty is fully supported and falls back to sslip.io derived from each
+      # host's public address, which needs no DNS record anywhere — that is what
+      # makes a fresh install reachable on its FIRST deploy instead of after a
+      # domain purchase. Set this for a hosted product, where clean hostnames and
+      # a certificate you control are worth the record.
+      CP_APPS_DOMAIN: ${CP_APPS_DOMAIN:-}
       # GitHub App (SIGMA-55, optional): installation tokens instead of PATs.
       # Drop the downloaded PEM next to this file as github-app.pem and
       # uncomment the volume below; the key is imported into KMS custody on
