@@ -56,21 +56,7 @@ type Store struct {
 	// default — means no checks at all, which is also what every failure of a
 	// configured sizer degrades to; see llm_fit.go.
 	modelSizer ModelSizer
-	// hubToken is CP_HUGGING_FACE_TOKEN, seeded into each inference endpoint's
-	// weights credential at provision (SIGMA-213). Empty is a supported
-	// configuration — public models need no credential — and is the honest
-	// "no" behind WeightsTokenAvailable.
-	hubToken string
 }
-
-// SetHuggingFaceToken installs the control plane's Hugging Face token, the one
-// CreateResource seeds an inference endpoint's HUGGING_FACE_HUB_TOKEN from.
-//
-// It is the SAME token the model picker authenticates with, and that is the
-// point of it being one value: the account that can see a gated repository in
-// the wizard is the account that fetches its weights on the GPU host, so the
-// wizard's promise and the download's outcome cannot disagree.
-func (s *Store) SetHuggingFaceToken(token string) { s.hubToken = token }
 
 // InstallationTokenSource mints short-lived GitHub App installation access
 // tokens for connections that carry an installation id.

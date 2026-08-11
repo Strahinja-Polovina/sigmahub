@@ -388,6 +388,19 @@ func (s *Server) handleLogsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
+	// The org label decides which tenant's logs come back, and it is the only
+	// value in this selector that was interpolated unchecked while every sibling
+	// below is validated (SIGMA-349). Nothing can currently reach here with a
+	// LogQL metacharacter — requireService refuses a token/path org mismatch and
+	// orgIDPattern pins ids to [A-Za-z0-9_-] at provisioning — but that invariant
+	// is load-bearing for tenant isolation and lives in another file, on another
+	// request. Anything that widens org ids later (a vanity slug, an SSO-derived
+	// id, an import that writes org_tenants directly) would turn a naming change
+	// into cross-tenant log disclosure with nothing here to catch it.
+	if !logQLLabelValue.MatchString(orgID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid organization id"})
+		return
+	}
 	sel := []string{`org="` + orgID + `"`}
 	for _, key := range []string{"resource", "env", "server", "service"} {
 		if v := r.URL.Query().Get(key); v != "" {

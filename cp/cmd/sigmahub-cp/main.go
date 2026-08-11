@@ -365,12 +365,12 @@ func run() error {
 	// draws. Every failure of this call degrades to "no check" (llm_fit.go).
 	st.SetModelSizer(hubSizer{hub: hubClient})
 	// The SAME token, and that is the fix rather than an implementation detail:
-	// it authenticates the picker's lookups here and is seeded into each
-	// inference endpoint's HUGGING_FACE_HUB_TOKEN so the agent fetches the
-	// weights as the same account. They were two unrelated settings, one of
-	// which nothing ever populated, so the wizard's verdict about a gated model
-	// and the download's outcome were free to disagree (SIGMA-213).
-	st.SetHuggingFaceToken(cfg.HuggingFaceToken)
+	// it authenticates the PICKER's metadata lookups in this process and goes no
+	// further. It used to be seeded into every tenant's inference endpoint as
+	// their weights credential too, which put one operator-owned Hub account
+	// into containers on hosts the customers own and can read (SIGMA-302). A
+	// tenant that needs gated weights supplies their own HUGGING_FACE_HUB_TOKEN
+	// project secret, and WeightsTokenAvailable reports on THAT.
 	log.Info("model catalog configured", "hubTokenConfigured", hubClient.TokenConfigured())
 
 	// The control plane's report on itself (SIGMA-248). Every background loop

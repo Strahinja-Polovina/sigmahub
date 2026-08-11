@@ -12,7 +12,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/hf"
@@ -30,9 +29,11 @@ import (
 // from the first, so a control plane could have a perfectly good token and
 // still 401 forty gigabytes into a pull on a GPU-billed host — while an
 // operator who had set only the secret was told by the wizard to go configure
-// the variable that would not have helped. Seeding (seedHubTokenTx) and
-// reporting (WeightsTokenAvailable) both key off this constant so the three
-// cannot drift apart again.
+// the variable that would not have helped. Resolution (resolveLLMSecretsTx) and
+// reporting (WeightsTokenAvailable) both key off this constant so they cannot
+// drift apart again. The control plane no longer supplies a value for it — see
+// SIGMA-302 — so the only credential that reaches a runtime is the tenant's
+// own secret of this name.
 const HubTokenSecretName = "HUGGING_FACE_HUB_TOKEN"
 
 // LLMEngineDef is one supported inference runtime.
@@ -197,8 +198,8 @@ type LLMTarget struct {
 func hubTokenAAD(orgID, resourceID string) []byte { return []byte(orgID + "|llm|" + resourceID) }
 
 // provisionLLMTx allocates the resource's mesh-bound inference port, records
-// its runtime, model and served context window, and seeds the weights
-// credential. Runs inside CreateResource's transaction, symmetric with
+// its runtime, model and served context window. Runs inside CreateResource's
+// transaction, symmetric with
 // provisionDatabaseTx and provisionS3Tx.
 //
 // size is what the Hub said about this model a moment ago, and the only part of
@@ -217,8 +218,7 @@ func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r R
 	if engine == "" {
 		engine = DefaultLLMEngine
 	}
-	def, ok := LLMEngine(engine)
-	if !ok {
+	if _, ok := LLMEngine(engine); !ok {
 		return ErrInvalid{Msg: fmt.Sprintf("unknown inference runtime %q", engine)}
 	}
 	port, err := allocateDBPort(ctx, tx, r.ServerID)
@@ -232,7 +232,7 @@ func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r R
 		hf.ServedContextTokens(size.MaxPositionEmbeddings)); err != nil {
 		return err
 	}
-	return s.seedHubTokenTx(ctx, tx, orgID, def, r)
+	return nil
 }
 
 // operatorHubTokenClause matches an operator's own HUGGING_FACE_HUB_TOKEN
@@ -240,14 +240,13 @@ func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r R
 // is one constant because two callers ask that question at two moments and must
 // not answer it differently.
 //
-// They did. seedHubTokenTx carried the environment predicate — a secret scoped
+// They did. The seeding path carried the environment predicate — a secret scoped
 // to staging does not reach production, which is what ResolveSecretsForResource
 // enforces when the agent drains the value — and WeightsTokenAvailable had none.
 // So an org whose only Hub token was scoped to staging was told by the wizard
-// that a gated model would download, in production, where nothing resolves it:
-// the create was accepted, the control plane seeded nothing because it holds no
-// token of its own, and the pull 401'd tens of gigabytes in on a GPU-billed
-// host. That is SIGMA-213's own defect re-created by a missing WHERE clause.
+// that a gated model would download, in production, where nothing resolves it,
+// and the pull 401'd tens of gigabytes in on a GPU-billed host. That is
+// SIGMA-213's own defect re-created by a missing WHERE clause.
 //
 // $1 org, $2 project, $3 secret name, $4 environment. The query it is spliced
 // into must read from `secrets`. An EMPTY $4 matches org-wide secrets only
@@ -256,57 +255,6 @@ func (s *Store) provisionLLMTx(ctx context.Context, tx pgx.Tx, orgID string, r R
 const operatorHubTokenClause = `
 		org_id = $1 AND project_id = $2 AND lower(name) = lower($3)
 		  AND (environment_id IS NULL OR environment_id = $4)`
-
-// seedHubTokenTx stores this control plane's Hugging Face token as the
-// endpoint's weights credential, encrypted under the org DEK exactly the way
-// provisionDatabaseTx stores a generated database password.
-//
-// The reference was the whole feature and the value was nobody's job: the
-// runtime catalog rendered HUGGING_FACE_HUB_TOKEN, the agent refused to start a
-// container the control plane would not answer that reference for, and no code
-// path had ever created the secret. An operator who had made a project secret
-// of exactly that name by hand got a working deploy; everyone else got a
-// container that never started, or — for a gated model the picker's token could
-// see and the download could not — a 401 tens of gigabytes into a pull on a
-// host billed at GPU rates.
-//
-// Nothing is stored when the operator's own secret of that name already reaches
-// this resource. Theirs is a deliberate statement about which Hugging Face
-// account fetches their weights, and keeping a second copy of ours beside it
-// would leave two answers to one question; ResolveSecretsForResource holds the
-// same precedence for a secret created after this point.
-func (s *Store) seedHubTokenTx(ctx context.Context, tx pgx.Tx, orgID string, def LLMEngineDef, r Resource) error {
-	// ollama pulls from its own library and names no credential, so there is
-	// nothing here for it to need — asking the catalog rather than assuming vLLM
-	// keeps this true for the next runtime added to it.
-	if s.hubToken == "" || !slices.Contains(def.SecretEnvNames, HubTokenSecretName) {
-		return nil
-	}
-	var operatorHasOne bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM secrets WHERE`+operatorHubTokenClause+`)`,
-		orgID, r.ProjectID, HubTokenSecretName, r.EnvironmentID).Scan(&operatorHasOne); err != nil {
-		return fmt.Errorf("look up hugging face token secret: %w", err)
-	}
-	if operatorHasOne {
-		return nil
-	}
-	dekID, dek, err := s.activeDEKTx(ctx, tx, orgID)
-	if err != nil {
-		return err
-	}
-	nonce, ct, err := gcmSeal(dek, hubTokenAAD(orgID, r.ID), []byte(s.hubToken))
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE llm_endpoints
-		   SET token_ciphertext = $2, token_nonce = $3, token_dek_id = $4
-		 WHERE resource_id = $1`, r.ID, ct, nonce, dekID); err != nil {
-		return fmt.Errorf("store hugging face token: %w", err)
-	}
-	return nil
-}
 
 // resolveLLMSecretsTx appends the endpoint's weights credential as an env-mode
 // resolved secret — the same audited channel resolveDBSecretsTx uses for a
@@ -318,7 +266,7 @@ func (s *Store) seedHubTokenTx(ctx context.Context, tx pgx.Tx, orgID string, def
 // database rule (those are appended last precisely so the engine's names win),
 // and deliberately so: a HUGGING_FACE_HUB_TOKEN secret in the project is an
 // operator naming the account that fetches their weights, and quietly replacing
-// it with the control plane's token turns their own private repository into a
+// it with anything else turns their own private repository into a
 // 404 they have no way to explain.
 func (s *Store) resolveLLMSecretsTx(ctx context.Context, tx pgx.Tx, orgID, serverID, resourceID string, operatorProvided map[string]bool) ([]ResolvedSecret, error) {
 	if operatorProvided[HubTokenSecretName] {
@@ -365,21 +313,25 @@ func (s *Store) resolveLLMSecretsTx(ctx context.Context, tx pgx.Tx, orgID, serve
 // actually fetches the weights — was blocked on the model step and told to set
 // a variable that would not have changed anything.
 //
-// A control-plane token counts, because CreateResource seeds it (see
-// seedHubTokenTx). An empty projectID answers on that half alone: the caller
-// has not said which project it is asking about, and inventing one would be a
-// guess about someone's secrets.
+// A control-plane token does NOT count any more (SIGMA-302): it is never
+// delivered to a tenant's container, so answering "yes" on the strength of it
+// would re-create the very promise this function exists to keep honest. An empty
+// projectID answers no: the caller has not said which project it is asking
+// about, and inventing one would be a guess about someone's secrets.
 //
 // environmentID narrows the operator's half to the secrets that would actually
 // reach a resource created there, through operatorHubTokenClause — the SAME
-// predicate the seeding path applies, because the wizard must not promise a
+// predicate the resolution path applies, because the wizard must not promise a
 // token the create then cannot find. An empty environmentID counts only
 // org-wide secrets, for the same reason an empty projectID counts none: an
 // unstated scope is not permission to assume the widest one.
 func (s *Store) WeightsTokenAvailable(ctx context.Context, orgID, projectID, environmentID string) (bool, error) {
-	if s.hubToken != "" {
-		return true, nil
-	}
+	// There is no operator-token short-circuit here any more (SIGMA-302). It used
+	// to answer "yes, weights are reachable" on the strength of a credential the
+	// container will now never receive, which is SIGMA-213's original defect —
+	// the wizard promising a gated pull that 401s tens of gigabytes into a
+	// download on a host billed at GPU rates. The only true answer is whether
+	// THIS tenant has supplied a token that reaches this resource.
 	if projectID == "" {
 		return false, nil
 	}
