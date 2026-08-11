@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Copy, KeyRound, Loader2, Lock, ShieldCheck, ShieldOff } from "lucide-react";
+import { Copy, KeyRound, Loader2, Lock, RefreshCw, ShieldCheck, ShieldOff } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -176,12 +176,40 @@ export function SecurityTab({
       const res = await authClient.twoFactor.verifyTotp({ code });
       if (res.error) throw new Error(res.error.message);
       setEnabled(true);
+      // backupCodes deliberately survives this (SIGMA-347). The codes panel used
+      // to live inside the totpUri block, so clearing the URI here erased them
+      // on the very click that finished enrolment — the user was reading them
+      // while typing the code that made them disappear.
       setTotpUri(null);
       setPassword("");
       setCode("");
       toast.success("Two-factor authentication enabled");
     } catch (err) {
       toast.error("Code didn’t verify", { description: errMsg(err) });
+    } finally {
+      setPending(false);
+    }
+  }
+
+  /** Mint a fresh set of backup codes (SIGMA-347). Without this, a user who
+   *  lost the ten codes shown once at enrolment had no way to get more — and,
+   *  having also lost their authenticator, no way into the account at all. */
+  async function regenerate() {
+    if (!password) {
+      toast.error("Enter your password to generate new backup codes.");
+      return;
+    }
+    setPending(true);
+    try {
+      const res = await authClient.twoFactor.generateBackupCodes({ password });
+      if (res.error) throw new Error(res.error.message);
+      setBackupCodes(res.data?.backupCodes ?? []);
+      setPassword("");
+      toast.success("New backup codes generated", {
+        description: "The previous set no longer works.",
+      });
+    } catch (err) {
+      toast.error("Couldn’t generate backup codes", { description: errMsg(err) });
     } finally {
       setPending(false);
     }
@@ -246,10 +274,16 @@ export function SecurityTab({
               autoComplete="current-password"
             />
             {enabled ? (
-              <Button variant="destructive" size="sm" className="w-fit" onClick={disable} disabled={pending}>
-                {pending ? <Loader2 className="size-4 animate-spin" /> : <ShieldOff className="size-4" />}
-                Disable 2FA
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="destructive" size="sm" className="w-fit" onClick={disable} disabled={pending}>
+                  {pending ? <Loader2 className="size-4 animate-spin" /> : <ShieldOff className="size-4" />}
+                  Disable 2FA
+                </Button>
+                <Button variant="outline" size="sm" className="w-fit" onClick={regenerate} disabled={pending}>
+                  {pending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  New backup codes
+                </Button>
+              </div>
             ) : (
               <Button size="sm" className="w-fit" onClick={begin} disabled={pending}>
                 {pending ? <Loader2 className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
@@ -282,18 +316,6 @@ export function SecurityTab({
                 </Button>
               </div>
             </div>
-            {backupCodes.length > 0 && (
-              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
-                <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
-                  Backup codes — store them now; they are shown once.
-                </p>
-                <div className="mt-1 grid grid-cols-2 gap-x-4 font-mono text-xs">
-                  {backupCodes.map((c) => (
-                    <span key={c}>{c}</span>
-                  ))}
-                </div>
-              </div>
-            )}
             <div className="flex items-end gap-2">
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="sec-code">6-digit code</Label>
@@ -310,6 +332,46 @@ export function SecurityTab({
                 Confirm
               </Button>
             </div>
+          </div>
+        )}
+
+        {/* Outside the totpUri block on purpose (SIGMA-347): these used to be
+            nested inside it, so confirming enrolment — the click the user makes
+            WHILE reading them — erased them. They now persist until explicitly
+            dismissed, and can be minted again from the button above. */}
+        {backupCodes.length > 0 && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                Backup codes — each works once, and they are shown only now.
+              </p>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0"
+                aria-label="Copy backup codes"
+                onClick={() =>
+                  void navigator.clipboard
+                    .writeText(backupCodes.join("\n"))
+                    .then(() => toast.success("Backup codes copied"))
+                }
+              >
+                <Copy className="size-3.5" />
+              </Button>
+            </div>
+            <div className="mt-1 grid grid-cols-2 gap-x-4 font-mono text-xs">
+              {backupCodes.map((c) => (
+                <span key={c}>{c}</span>
+              ))}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3 w-fit"
+              onClick={() => setBackupCodes([])}
+            >
+              I’ve saved these
+            </Button>
           </div>
         )}
       </CardContent>
