@@ -58,6 +58,7 @@ export function SettingsView({
   cpMode = false,
   orgCreatedAt = null,
   twoFactorEnabled = false,
+  hasPassword = true,
   gitIntegration = null,
   registry,
 }: {
@@ -74,6 +75,9 @@ export function SettingsView({
   cpMode?: boolean;
   orgCreatedAt?: string | Date | null;
   twoFactorEnabled?: boolean;
+  /** False for a social-only account, which has no stored credential for
+   *  changePassword to verify against — the Password card is hidden there. */
+  hasPassword?: boolean;
   /** Org-level GitHub integration (CP mode); null when unavailable. */
   gitIntegration?: {
     enabled: boolean;
@@ -184,7 +188,7 @@ export function SettingsView({
           )}
         </TabsContent>
         <TabsContent value="security">
-          <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} />
+          <SecurityTab initialTwoFactorEnabled={twoFactorEnabled} hasPassword={hasPassword} />
         </TabsContent>
         {canViewAudit && (
           <TabsContent value="audit">

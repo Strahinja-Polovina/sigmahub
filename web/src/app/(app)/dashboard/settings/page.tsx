@@ -1,5 +1,10 @@
 import { redirect } from "next/navigation";
-import { getActiveOrgId, getSessionUser, hasFullOrgVisibility } from "@/server/active-org";
+import {
+  currentUserHasPassword,
+  getActiveOrgId,
+  getSessionUser,
+  hasFullOrgVisibility,
+} from "@/server/active-org";
 import { getMembers, getOrg, getPendingInvites } from "@/server/queries";
 import { getAuditLog } from "@/server/audit";
 import { cpEnabled, cpListAudit, cpGetGitIntegration } from "@/server/cp";
@@ -17,8 +22,17 @@ export default async function SettingsPage() {
   // org visibility (org admins and zero-grant legacy users) — SIGMA-97.
   const canViewAudit = await hasFullOrgVisibility(orgId);
 
-  const [org, members, pendingInvites, audit, sessionUser, cpAudit, gitIntegration, registry] =
-    await Promise.all([
+  const [
+    org,
+    members,
+    pendingInvites,
+    audit,
+    sessionUser,
+    cpAudit,
+    gitIntegration,
+    registry,
+    hasPassword,
+  ] = await Promise.all([
     getOrg(orgId),
     getMembers(orgId),
     getPendingInvites(orgId),
@@ -35,6 +49,9 @@ export default async function SettingsPage() {
       // The org's container registry — what makes an image built on one machine
       // runnable on another. Already degrades to "not configured" on failure.
       getRegistry({ orgId }),
+      // Whether to offer the Password card at all — a social-only account has no
+      // credential for changePassword to verify against (SIGMA-345).
+      currentUserHasPassword(),
     ]);
   if (!org) redirect("/login");
 
@@ -81,6 +98,7 @@ export default async function SettingsPage() {
       twoFactorEnabled={Boolean(
         (sessionUser as { twoFactorEnabled?: boolean | null }).twoFactorEnabled
       )}
+      hasPassword={hasPassword}
       gitIntegration={gitIntegration}
       registry={registry}
     />

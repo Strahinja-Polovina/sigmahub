@@ -94,6 +94,12 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     requireEmailVerification,
+    // A reset is what someone does when the old password is in the wrong hands,
+    // so the sessions opened with it must not survive it (SIGMA-344). Off by
+    // default in better-auth, which would have left an attacker's session live
+    // through the victim's recovery — and /reset-password tells the user their
+    // other sessions ended, so this is also what makes that sentence true.
+    revokeSessionsOnPasswordReset: true,
     // Reset emails: no SMTP is bundled, so the reset link goes to the server
     // log — genuinely usable in dev/self-hosted setups (the operator can
     // relay it), and honest about what happens instead of silently dropping.
