@@ -159,8 +159,15 @@ jobs:
           # expands these where only this process can see them.
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # The released agent tag the control plane should install. The staging
+          # CP image is built from source, so its own fallback version is "dev"
+          # and onboarding refuses until CP_AGENT_VERSION names a real release —
+          # resolved here (a public tag, so the argv is fine) and applied on the
+          # box only when its .env has no pin of its own.
+          AGENT_VERSION="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo "")"
           # The GHCR credentials travel on STDIN with the script (SIGMA-277).
           #
           # Everything after the destination is the remote command, and sshd
@@ -187,13 +194,32 @@ jobs:
           # (manual or CI) runs exactly this build; rollback = edit these lines.
           grep -v '^CP_IMAGE=\|^WEB_IMAGE=' .env > .env.new && mv .env.new .env
           printf 'CP_IMAGE=%s\nWEB_IMAGE=%s\n' "$CP_IMAGE" "$WEB_IMAGE" >> .env
+          # Pin the agent release the control plane installs, but only when the
+          # box holds no opinion: an operator's explicit CP_AGENT_VERSION in
+          # .env wins over the repo's latest release. Without any pin the
+          # source-built CP answers "dev" and the connect dialog refuses to
+          # render an install command at all.
+          if [ -n "$AGENT_VERSION" ] && ! grep -q '^CP_AGENT_VERSION=..*' .env; then
+            grep -v '^CP_AGENT_VERSION=' .env > .env.new && mv .env.new .env
+            printf 'CP_AGENT_VERSION=%s\n' "$AGENT_VERSION" >> .env
+          fi
           chmod 600 .env
           # This run's GITHUB_TOKEN authorizes the pull (works while the job
           # lives — exactly when the pull happens).
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           cd /home/deploy/sigmahub
           docker compose -f cp/deploy/docker-compose.yml pull cp web
-          docker compose -f cp/deploy/docker-compose.yml up -d
+          # `up -d` recreates the proxy, and the new container's :80 bind races
+          # the old container's docker-proxy releasing the port — an
+          # intermittent daemon-side failure that has flaked two real deploys
+          # (the rollout is otherwise fine and a bare rerun passes). Retry after
+          # a beat; three consecutive failures are a real error.
+          for attempt in 1 2 3; do
+            if docker compose -f cp/deploy/docker-compose.yml up -d; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "compose up failed (attempt $attempt) — retrying in 5s" >&2
+            sleep 5
+          done
           docker logout ghcr.io >/dev/null || true
           docker image prune -f >/dev/null
           # Both checks poll. The dashboard's used to be a single curl fired
@@ -245,4 +271,5 @@ jobs:
           EOS
           } | ssh "$STAGING_USER@$STAGING_HOST" \
                 CP_IMAGE="$CP_IMAGE_REPO:$GITHUB_SHA" WEB_IMAGE="$WEB_IMAGE_REPO:$GITHUB_SHA" \
+                AGENT_VERSION="$AGENT_VERSION" \
                 bash -s
