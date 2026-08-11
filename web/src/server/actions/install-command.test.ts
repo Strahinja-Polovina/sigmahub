@@ -82,10 +82,20 @@ import { connectServer, reissueInstallCommand } from "./servers";
 
 /** The rendered command. reissueInstallCommand is the leanest of the three
  *  actions that hand one out (provisionServer and connectServer's CP branch
- *  render the same helper), so it is the one driven here. */
+ *  render the same helper), so it is the one driven here. The action answers
+ *  with a result rather than a throw — a thrown server-action error is
+ *  redacted in production — so a refusal comes back as `{ ok: false }`. */
 async function renderedCommand(): Promise<string> {
-  const { command } = await reissueInstallCommand({ serverId: "srv_notlocal" });
-  return command;
+  const res = await reissueInstallCommand({ serverId: "srv_notlocal" });
+  if (!res.ok) throw new Error(res.error);
+  return res.command;
+}
+
+/** A refusal's message, asserted off the result the dialog actually renders. */
+async function refusal(): Promise<string> {
+  const res = await reissueInstallCommand({ serverId: "srv_notlocal" });
+  expect(res.ok, "expected the action to refuse, but it rendered a command").toBe(false);
+  return res.ok ? "" : res.error;
 }
 
 const installScript = readFileSync(
@@ -174,7 +184,7 @@ describe("the install command the connect wizard renders", () => {
     // installer": /install.sh would answer 503 and every /dl path would 404, so
     // the only honest thing to render is nothing.
     release = { agentVersion: "", agentVersionError: "CP_AGENT_VERSION is not a released tag" };
-    await expect(renderedCommand()).rejects.toThrow(/CP_AGENT_VERSION/);
+    expect(await refusal()).toMatch(/CP_AGENT_VERSION/);
   });
 
   it("passes the control plane's own refusal through instead of a paraphrase", async () => {
@@ -185,7 +195,7 @@ describe("the install command the connect wizard renders", () => {
       agentVersion: "",
       agentVersionError: "this control plane is not configured to serve the agent installer. Set CP_RELEASE_REPO to …",
     };
-    await expect(renderedCommand()).rejects.toThrow(/CP_RELEASE_REPO/);
+    expect(await refusal()).toMatch(/CP_RELEASE_REPO/);
   });
 });
 
@@ -233,16 +243,16 @@ describe("the install command refuses to pipe plaintext into sudo bash", () => {
     publicUrl = CP_URL;
   });
 
-  it("throws when the control plane's public URL is not https", async () => {
+  it("refuses when the control plane's public URL is not https", async () => {
     for (const url of ["http://cp.example.com", "http://10.0.0.5:8080"]) {
       publicUrl = url;
-      await expect(renderedCommand()).rejects.toThrow(/https/i);
+      expect(await refusal()).toMatch(/https/i);
     }
   });
 
   it("names the setting to change rather than the symptom", async () => {
     publicUrl = "http://cp.example.com";
-    await expect(renderedCommand()).rejects.toThrow(/SIGMAHUB_CP_PUBLIC_URL/);
+    expect(await refusal()).toMatch(/SIGMAHUB_CP_PUBLIC_URL/);
   });
 });
 
@@ -294,7 +304,11 @@ describe("the command connectServer hands out is the same command", () => {
   it("refuses to render over plaintext, and mints nothing when it refuses", async () => {
     publicUrl = "http://cp:8080";
     const issue = await issuing();
-    await expect(connect()).rejects.toThrow(/SIGMAHUB_CP_PUBLIC_URL/);
+    // The refusal is a result, not a throw: production redacts thrown
+    // server-action errors, and this message names the setting to change.
+    const res = await connect();
+    expect(res.mode).toBe("error");
+    if (res.mode === "error") expect(res.error).toMatch(/SIGMAHUB_CP_PUBLIC_URL/);
     // Same shape as SIGMA-300: a refusal that arrives after the control plane
     // has pre-created a row and burned a one-time token leaves the operator
     // retrying against a growing column of Provisioning hosts.
@@ -307,7 +321,9 @@ describe("the command connectServer hands out is the same command", () => {
     const mod = await import("@/server/cp");
     await issuing({ agentVersion: "", agentVersionError: "CP_AGENT_VERSION is not a released tag" });
     const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
-    await expect(connect()).rejects.toThrow(/CP_AGENT_VERSION/);
+    const res = await connect();
+    expect(res.mode).toBe("error");
+    if (res.mode === "error") expect(res.error).toMatch(/CP_AGENT_VERSION/);
     expect(remove).toHaveBeenCalledWith("org_demo", ISSUED.serverId, expect.anything());
   });
 });

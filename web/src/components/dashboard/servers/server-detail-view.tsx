@@ -237,14 +237,16 @@ function ServerActions({
 
   function reissue() {
     startTransition(async () => {
-      try {
-        const res = await reissueInstallCommand({ serverId });
-        setReissued(res);
-      } catch (err) {
-        toast.error("Couldn’t issue a new install command", {
-          description: err instanceof Error ? err.message : "Please try again.",
-        });
+      const res = await reissueInstallCommand({ serverId });
+      if (!res.ok) {
+        toast.error("Couldn’t issue a new install command", { description: res.error });
+        return;
       }
+      setReissued({
+        command: res.command,
+        bootstrapPubkey: res.bootstrapPubkey,
+        expiresAt: res.expiresAt,
+      });
     });
   }
 

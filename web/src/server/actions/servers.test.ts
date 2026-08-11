@@ -263,12 +263,14 @@ describe("provisioning a server whose install command cannot be rendered", () =>
     const provision = vi.spyOn(mod, "cpProvisionServer").mockResolvedValue(PROVISIONED);
     const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
 
-    await expect(
-      provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" })
-    ).rejects.toThrow(/https/i);
+    // The refusal is a returned result — production redacts thrown
+    // server-action errors, and this one names the setting to change.
+    const res = await provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" });
+    expect(res.mode).toBe("error");
+    if (res.mode === "error") expect(res.error).toMatch(/https/i);
 
     // Either the refusal came first and nothing was created, or something was
-    // created and taken back. A server that outlives the throw is the defect.
+    // created and taken back. A server that outlives the refusal is the defect.
     expect(
       provision.mock.calls.length > 0 && remove.mock.calls.length === 0,
       "the TLS refusal left a provisioned server behind — the operator sees only a red toast, " +
@@ -289,9 +291,9 @@ describe("provisioning a server whose install command cannot be rendered", () =>
     });
     const remove = vi.spyOn(mod, "cpDeleteServer").mockResolvedValue(undefined);
 
-    await expect(
-      provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" })
-    ).rejects.toThrow(/CP_AGENT_VERSION/);
+    const res = await provisionServer({ orgId: FIXTURE.orgId, type: "general", hostIp: "203.0.113.7" });
+    expect(res.mode).toBe("error");
+    if (res.mode === "error") expect(res.error).toMatch(/CP_AGENT_VERSION/);
 
     expect(remove).toHaveBeenCalledWith(FIXTURE.orgId, PROVISIONED.serverId, expect.anything());
   });

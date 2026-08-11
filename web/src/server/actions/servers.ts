@@ -221,7 +221,13 @@ export type ConnectServerResult =
       command: string;
       expiresAt: string;
     }
-  | { mode: "sim"; id: string; bootstrapToken: string };
+  | { mode: "sim"; id: string; bootstrapToken: string }
+  /** A refusal, readable in production. Thrown server-action errors are
+   *  redacted by Next in production builds — the operator gets "An error
+   *  occurred in the Server Components render…" instead of the sentence that
+   *  names the setting to change — so the refusals this flow deliberately
+   *  writes (https-only transport, unpinned release) must travel as data. */
+  | { mode: "error"; error: string };
 
 /** The placeholder a server carries until its agent reports a hostname. The
  *  address is the only handle the operator has on the box at that moment, so a
@@ -242,6 +248,21 @@ function placeholderName(hostIp: string): string {
 export async function connectServer(input: {
   orgId: string;
   type: string; // a ServerType; validated against the CP catalog server-side
+  hostIp: string;
+  provider?: string;
+  region?: string;
+  byoVpn?: boolean;
+}): Promise<ConnectServerResult> {
+  try {
+    return await connectServerInner(input);
+  } catch (err) {
+    return { mode: "error", error: err instanceof Error ? err.message : "Couldn’t connect the server." };
+  }
+}
+
+async function connectServerInner(input: {
+  orgId: string;
+  type: string;
   hostIp: string;
   provider?: string;
   region?: string;
@@ -347,7 +368,11 @@ export type ProvisionResult =
       bootstrapPubkey: string;
       expiresAt: string;
     }
-  | { mode: "sim"; id: string };
+  | { mode: "sim"; id: string }
+  /** Same contract as ConnectServerResult's error arm: the refusal has to
+   *  reach the operator with its message intact, and a throw does not survive
+   *  a production build. */
+  | { mode: "error"; error: string };
 
 /** The connect flow: pre-create the server from the two things the operator
  *  actually knows — the host's address and what they want it to be — mint the
@@ -364,6 +389,22 @@ export async function provisionServer(input: {
   type: string;
   /** The host's public address. Becomes the server's initial endpoint and its
    *  placeholder name until the agent checks in (SIGMA-187/202). */
+  hostIp: string;
+  provider?: string;
+  region?: string;
+  proxyRole?: boolean;
+  keepPublicSsh?: boolean;
+}): Promise<ProvisionResult> {
+  try {
+    return await provisionServerInner(input);
+  } catch (err) {
+    return { mode: "error", error: err instanceof Error ? err.message : "Couldn’t provision the server." };
+  }
+}
+
+async function provisionServerInner(input: {
+  orgId: string;
+  type: string;
   hostIp: string;
   provider?: string;
   region?: string;
@@ -642,35 +683,49 @@ export async function renameServer(input: {
 /** Regenerate the install command for a server stuck in `provisioning` (lost
  *  or expired bootstrap token). The CP invalidates any outstanding token,
  *  mints a fresh keypair + token bound to the SAME server record, and 409s if
- *  the server already registered. Project Admin+. */
-export async function reissueInstallCommand(input: { serverId: string }): Promise<{
-  command: string;
-  bootstrapPubkey: string;
-  expiresAt: string;
-}> {
-  if (!cpEnabled()) throw new Error("Re-issuing an install command needs a control plane.");
-  const [server] = await db
-    .select()
-    .from(s.servers)
-    .where(eq(s.servers.id, input.serverId));
-  // Same org resolution as disconnectServer: unattached CP servers have no
-  // local mirror row.
-  const orgId = server?.orgId ?? (await getActiveOrgId());
-  if (!orgId) throw new Error("No active organization.");
-  const { user, role } = await requireProjectAdmin(orgId);
-  const res = await cpReissueBootstrapToken(orgId, input.serverId, { name: user.name, role });
-  await writeAudit({
-    orgId,
-    actor: user.name,
-    action: "Re-issued install command",
-    target: server?.name ?? input.serverId,
-  });
-  revalidatePath("/dashboard", "layout");
-  return {
-    command: installCommand(res.token, res),
-    bootstrapPubkey: res.bootstrapPubkey,
-    expiresAt: res.expiresAt,
-  };
+ *  the server already registered. Project Admin+. Returns a readable result:
+ *  its refusals (no control plane, plaintext transport, unpinned release) name
+ *  the thing to change, and a thrown server-action error would replace that
+ *  sentence with a redacted digest in production. */
+export async function reissueInstallCommand(input: { serverId: string }): Promise<
+  | { ok: true; command: string; bootstrapPubkey: string; expiresAt: string }
+  | { ok: false; error: string }
+> {
+  try {
+    if (!cpEnabled()) throw new Error("Re-issuing an install command needs a control plane.");
+    const [server] = await db
+      .select()
+      .from(s.servers)
+      .where(eq(s.servers.id, input.serverId));
+    // Same org resolution as disconnectServer: unattached CP servers have no
+    // local mirror row.
+    const orgId = server?.orgId ?? (await getActiveOrgId());
+    if (!orgId) throw new Error("No active organization.");
+    const { user, role } = await requireProjectAdmin(orgId);
+    const res = await cpReissueBootstrapToken(orgId, input.serverId, { name: user.name, role });
+    // Rendered before the audit row: a control plane pinned to no release
+    // refuses here, and an audit entry for a command that was never handed out
+    // would record a re-issue that did not happen.
+    const command = installCommand(res.token, res);
+    await writeAudit({
+      orgId,
+      actor: user.name,
+      action: "Re-issued install command",
+      target: server?.name ?? input.serverId,
+    });
+    revalidatePath("/dashboard", "layout");
+    return {
+      ok: true,
+      command,
+      bootstrapPubkey: res.bootstrapPubkey,
+      expiresAt: res.expiresAt,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Couldn’t issue a new install command.",
+    };
+  }
 }
 
 /** Request a dashboard-driven agent upgrade to the platform's pinned release.

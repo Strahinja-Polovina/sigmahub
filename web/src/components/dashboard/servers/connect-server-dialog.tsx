@@ -390,6 +390,14 @@ export function ConnectServerDialog({
             proxyRole,
             keepPublicSsh,
           });
+          // The action's refusals come back as data, not as a throw: a thrown
+          // server-action error is redacted to "An error occurred in the
+          // Server Components render…" in production, and these refusals exist
+          // to name the setting the operator has to change.
+          if (res.mode === "error") {
+            toast.error("Couldn’t connect server", { description: res.error });
+            return;
+          }
           if (res.mode === "cp") {
             setIssued({
               serverId: res.serverId,
@@ -403,13 +411,17 @@ export function ConnectServerDialog({
         // Demo mode: the simulated one-liner path, on the same two-step shape
         // so the flow being demonstrated is the real one.
         const res = await connectServer({ orgId, type, hostIp: host, provider, region, byoVpn: vpn });
+        if (res.mode === "error") {
+          toast.error("Couldn’t connect server", { description: res.error });
+          return;
+        }
         if (res.mode === "sim") {
           setIssued({ serverId: res.id, command: bootstrapCommand(orgSlug) });
         }
-      } catch (err) {
-        toast.error("Couldn’t connect server", {
-          description: err instanceof Error ? err.message : "Please try again.",
-        });
+      } catch {
+        // Only transport-level failures reach here now (the action converts its
+        // own errors to results), and those carry no useful message.
+        toast.error("Couldn’t connect server", { description: "Please try again." });
       }
     });
   }
