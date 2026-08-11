@@ -36,7 +36,8 @@ Fill in `.env` (all required unless noted):
 | `CP_RELEASE_REPO` | Which repository's releases those are. **Leave unset.** The value is fixed to the upstream slug and the control plane refuses to boot with any other — `install.sh` bakes in the cosign identity it verifies against, so a fork's artifacts would be downloaded and then rejected on the host. Serving a fork needs a forked `install.sh` and agent build, not this setting. |
 | `CP_ACME_EMAIL` | Let's Encrypt contact for managed-domain TLS. |
 | `CP_ACME_CA_DIR_URL` | Optional — point at LE staging/Pebble so repeated bring-ups don't spend the real CA's issuance budget. |
-| `CP_HUGGING_FACE_TOKEN` | Optional — the Hub account the picker searches as and the agent downloads weights as. Empty still serves public models; gated ones (Llama & co) stay invisible. |
+| `CP_HUGGING_FACE_TOKEN` | Optional — the Hub account the model picker searches as. Empty still serves public models; gated ones (Llama & co) stay invisible to the picker. It is NOT delivered to tenants: a tenant needing gated weights supplies their own `HUGGING_FACE_HUB_TOKEN` project secret (SIGMA-302). |
+| `CP_APPS_DOMAIN` | Optional — the wildcard resource URLs are minted under, e.g. `apps.example.com` with `*.apps.example.com` pointed at the proxy servers. Empty falls back to sslip.io derived from each host's public address, so a resource is reachable on its first deploy with no DNS record at all (SIGMA-351). |
 | `CP_KMS_BACKEND` | `file` is fine for staging; `vault` for prod custody. |
 | `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave **empty** to exercise every engine the catalog defines — the list is derived, not written down (SIGMA-268). Set one only to cut it (`CP_DB_ENGINES=postgres`). |
 | `CP_PADDLE_*` | Optional — leave empty; billing degrades to the honest usage preview. |
