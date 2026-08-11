@@ -237,7 +237,7 @@ func mustAtoi(t *testing.T, s string) int {
 // resource-scoped name (a generation suffix would move the router — and its
 // issued certificate — on every apply).
 func TestRegistryAppKeepsStableRouter(t *testing.T) {
-	labels := traefikLabels("res_a", []store.Domain{{Domain: "app.example.com"}}, 8080, blueGreenRouting{})
+	labels := traefikLabels("res_a", []store.Domain{{Domain: "app.example.com"}}, "", 8080, blueGreenRouting{})
 	router := dsd.TraefikRouterName("res_a")
 	if _, ok := labels["traefik.http.routers."+router+".rule"]; !ok {
 		t.Fatalf("expected resource-scoped router %q: %v", router, labels)
@@ -264,5 +264,48 @@ func TestGenerationRouterPriorityMonotonic(t *testing.T) {
 	// cannot date never displaces a dated incumbent by accident.
 	if z := generationRouterPriority(time.Time{}); z < a {
 		t.Errorf("zero-time priority %d must not sort below a real one %d", z, a)
+	}
+}
+
+// TestAResourceWithNoCustomDomainIsStillRoutable is the SIGMA-351 guard.
+//
+// traefikLabels returned nil whenever a resource had no attached domain, and
+// said so in its own comment. An app therefore built, deployed, passed its
+// health gate and showed a green Running badge while no address on the internet
+// reached it — and a PR preview, which deliberately inherits no domains at all,
+// was built for a reviewer who could never open it.
+func TestAResourceWithNoCustomDomainIsStillRoutable(t *testing.T) {
+	labels := traefikLabels("res_a", nil, "shop-1a2b3c4d.apps.example.com", 8080, blueGreenRouting{})
+	router := dsd.TraefikRouterName("res_a")
+	rule, ok := labels["traefik.http.routers."+router+".rule"]
+	if !ok {
+		t.Fatalf("a resource with a SigmaHub host got no router at all: %v", labels)
+	}
+	if !strings.Contains(rule, "Host(`shop-1a2b3c4d.apps.example.com`)") {
+		t.Fatalf("rule %q does not route the SigmaHub host", rule)
+	}
+}
+
+// TestTheSigmaHubHostIsRoutedBesideCustomDomains: attaching your own domain must
+// not retire the URL you were already given. Links shared while DNS was being
+// set up would rot at the moment the customer finished setting it up.
+func TestTheSigmaHubHostIsRoutedBesideCustomDomains(t *testing.T) {
+	labels := traefikLabels("res_a",
+		[]store.Domain{{Domain: "shop.example.com"}}, "shop-1a2b3c4d.apps.example.com",
+		8080, blueGreenRouting{})
+	rule := labels["traefik.http.routers."+dsd.TraefikRouterName("res_a")+".rule"]
+	for _, want := range []string{"Host(`shop.example.com`)", "Host(`shop-1a2b3c4d.apps.example.com`)"} {
+		if !strings.Contains(rule, want) {
+			t.Errorf("rule %q is missing %s", rule, want)
+		}
+	}
+}
+
+// TestNoHostAtAllStillRendersNoRouter: the honest end of the range. With neither
+// a custom domain nor a reachable public address there is nowhere to route from,
+// and inventing a hostname would put a URL on screen that never resolves.
+func TestNoHostAtAllStillRendersNoRouter(t *testing.T) {
+	if labels := traefikLabels("res_a", nil, "", 8080, blueGreenRouting{}); labels != nil {
+		t.Fatalf("expected no router labels, got %v", labels)
 	}
 }

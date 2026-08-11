@@ -774,11 +774,17 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	}
 
 	r := Resource{ID: newID("res")}
+	// The resource's own routable label (SIGMA-351). Minted from the name at
+	// create and never rewritten afterwards: a rename must not break links the
+	// customer has already shared. Uniqueness comes from the id suffix, which is
+	// random hex, so this needs no retry loop — the partial unique index on
+	// public_label is the backstop.
+	publicLabel := PublicLabel(in.Name, in.Kind, r.ID)
 	err = tx.QueryRow(ctx, `
-		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id)
-		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''))
+		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id, public_label)
+		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''), $10)
 		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, created_at, updated_at`,
-		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID,
+		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID, publicLabel,
 	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if isUniqueViolation(err) {

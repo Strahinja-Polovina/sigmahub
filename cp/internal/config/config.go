@@ -112,6 +112,18 @@ type Config struct {
 	// credential rather than this one, because that is the question the wizard
 	// is really asking.
 	HuggingFaceToken string
+	// AppsDomain (CP_APPS_DOMAIN) is the wildcard this install mints resource
+	// URLs under — set it to e.g. "apps.example.com" with *.apps.example.com
+	// pointed at the proxy servers, and every resource gets
+	// <label>.apps.example.com routed and certified without the customer owning
+	// a domain at all.
+	//
+	// OPTIONAL. Empty falls back to sslip.io derived from the host's public
+	// address, which needs no configuration whatsoever — that fallback is what
+	// makes a fresh self-hosted install reachable on its FIRST deploy instead of
+	// after a domain purchase. Set this for a hosted product, where clean
+	// hostnames and a certificate you control are worth the DNS record.
+	AppsDomain string
 	// Agent-installer serving (SIGMA-217). The control plane serves
 	// GET /install.sh and proxies the pinned release assets from
 	// GET /dl/{version}/{asset}, so a host being onboarded talks only to the
@@ -203,6 +215,7 @@ func FromEnv() (Config, error) {
 		PaddleEnv:               getenv("CP_PADDLE_ENV", "sandbox"),
 		PaddlePriceID:           os.Getenv("CP_PADDLE_PRICE_ID"),
 		HuggingFaceToken:        strings.TrimSpace(os.Getenv("CP_HUGGING_FACE_TOKEN")),
+		AppsDomain:              strings.TrimSpace(os.Getenv("CP_APPS_DOMAIN")),
 		ReleaseRepo:             strings.TrimSpace(getenv("CP_RELEASE_REPO", DefaultReleaseRepo)),
 		ReleaseToken:            strings.TrimSpace(os.Getenv("CP_RELEASE_TOKEN")),
 		AgentVersion:            strings.TrimSpace(os.Getenv("CP_AGENT_VERSION")),

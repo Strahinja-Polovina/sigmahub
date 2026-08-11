@@ -56,7 +56,16 @@ type Store struct {
 	// default — means no checks at all, which is also what every failure of a
 	// configured sizer degrades to; see llm_fit.go.
 	modelSizer ModelSizer
+	// appsDomain is CP_APPS_DOMAIN — the wildcard the operator has pointed at
+	// their proxy servers. Empty is fully supported and falls back to sslip.io;
+	// see PublicHost.
+	appsDomain string
 }
+
+// SetAppsDomain installs the wildcard domain SigmaHub mints resource URLs under
+// (SIGMA-351). Empty means no wildcard is configured, which is not an error: the
+// sslip.io fallback keeps a fresh install reachable on its first deploy.
+func (s *Store) SetAppsDomain(domain string) { s.appsDomain = domain }
 
 // InstallationTokenSource mints short-lived GitHub App installation access
 // tokens for connections that carry an installation id.

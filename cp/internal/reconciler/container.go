@@ -211,9 +211,10 @@ func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []s
 			cs.Tmpfs = append(cs.Tmpfs, secretsMountDir)
 		}
 	}
-	// Traefik router labels for any attached domain. The port is the container
-	// port Traefik dials on the shared project network (first declared port).
-	if len(domains) > 0 {
+	// Traefik router labels for any attached domain AND for the SigmaHub host the
+	// resource always carries (SIGMA-351). The port is the container port Traefik
+	// dials on the shared project network (first declared port).
+	if len(domains) > 0 || rs.PublicHost != "" {
 		lbPort := 0
 		if len(spec.Ports) > 0 {
 			lbPort = spec.Ports[0].Container
@@ -221,7 +222,7 @@ func renderAppOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains []s
 		// No generation: a registry-image app is replaced in place, so only ever
 		// one container carries these labels and the blue-green router scoping
 		// (SIGMA-164) does not apply.
-		cs.Labels = traefikLabels(rs.ResourceID, domains, lbPort, blueGreenRouting{})
+		cs.Labels = traefikLabels(rs.ResourceID, domains, rs.PublicHost, lbPort, blueGreenRouting{})
 	}
 	csBytes, _ := json.Marshal(cs)
 	ops = append(ops, dsd.Op{ID: containerID, Kind: dsd.KindContainerApply, DependsOn: deps, Spec: csBytes})

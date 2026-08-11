@@ -152,13 +152,24 @@ func generationRouterPriority(createdAt time.Time) int {
 // a shared service name Traefik merged both generations into one weighted
 // service and started round-robining onto the new container the moment it came
 // up, well before the agent's health gate ran (SIGMA-164).
-func traefikLabels(resourceID string, domains []store.Domain, port int, bg blueGreenRouting) map[string]string {
-	if len(domains) == 0 {
+//
+// publicHost is the hostname SigmaHub gives the resource itself (SIGMA-351). It
+// is routed ALONGSIDE any custom domains, never instead of them: a customer who
+// later attaches their own domain keeps the SigmaHub URL working, so links they
+// shared while setting DNS up do not rot. It is empty only when the deployment
+// can offer none — no CP_APPS_DOMAIN and no reachable public address on the host
+// — and a resource with neither that nor a custom domain still gets no router,
+// which is the honest answer: there is nowhere to route from.
+func traefikLabels(resourceID string, domains []store.Domain, publicHost string, port int, bg blueGreenRouting) map[string]string {
+	if len(domains) == 0 && publicHost == "" {
 		return nil
 	}
-	hosts := make([]string, 0, len(domains))
+	hosts := make([]string, 0, len(domains)+1)
 	for _, d := range domains {
 		hosts = append(hosts, "Host(`"+d.Domain+"`)")
+	}
+	if publicHost != "" {
+		hosts = append(hosts, "Host(`"+publicHost+"`)")
 	}
 	sort.Strings(hosts) // deterministic rule → deterministic doc hash
 	router := dsd.TraefikGenerationRouterName(resourceID, bg.Generation)

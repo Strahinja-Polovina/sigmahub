@@ -372,6 +372,10 @@ func run() error {
 	// tenant that needs gated weights supplies their own HUGGING_FACE_HUB_TOKEN
 	// project secret, and WeightsTokenAvailable reports on THAT.
 	log.Info("model catalog configured", "hubTokenConfigured", hubClient.TokenConfigured())
+	// The wildcard resource URLs are minted under, if the operator set one. Empty
+	// is supported and falls back to sslip.io per host (SIGMA-351).
+	st.SetAppsDomain(cfg.AppsDomain)
+	log.Info("resource URLs configured", "appsDomain", cfg.AppsDomain)
 
 	// The control plane's report on itself (SIGMA-248). Every background loop
 	// below reports the outcome of each pass through this registry, and GET
