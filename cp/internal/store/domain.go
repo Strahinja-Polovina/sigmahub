@@ -503,6 +503,12 @@ type CreateResourceInput struct {
 	Name      string
 	Kind      string
 	Spec      json.RawMessage
+	// Recovery marks a resource that exists only to receive a restored backup.
+	// It exempts the create from the billing cap (SIGMA-348) — see
+	// assertBillingNotCappedTx. Set ONLY by the restore handlers; it is not
+	// reachable from any client-supplied field, because a caller who could set
+	// it would have found a way to grow a capped org for free.
+	Recovery bool
 }
 
 // buildMethodFromSpec reads spec.build.method — how the wizard decided this app
@@ -625,8 +631,18 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// SIGMA-295: same cap as server creation — an org past its billing grace
 	// period does not get to provision NEW resources. Existing resources, their
 	// deploys, certificates and backups are untouched.
-	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
-		return Resource{}, err
+	//
+	// Restore is the exception (SIGMA-348). It is restore-into-a-NEW-resource, so
+	// it lands on this path and was silently caught by the cap — which made the
+	// clause above false: backups kept being taken and verified, and the one
+	// operation that turns a backup back into data was refused. A late invoice
+	// became customer data loss. A recovery target is still a real resource and
+	// still counts toward billed units once it exists; the cap simply does not
+	// get to hold data hostage.
+	if !in.Recovery {
+		if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
+			return Resource{}, err
+		}
 	}
 
 	var projectID, envName string

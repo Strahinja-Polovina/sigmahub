@@ -151,6 +151,9 @@ func (s *Server) handleRestoreDatabase(w http.ResponseWriter, r *http.Request) {
 		Name:          strings.TrimSpace(req.Name),
 		Kind:          src.Engine,
 		Spec:          json.RawMessage(`{}`),
+		// A recovery target, so the billing cap does not stand between a
+		// delinquent org and its own verified backups (SIGMA-348).
+		Recovery: true,
 	}, actor)
 	if err != nil {
 		s.writeStoreErr(w, err, "restore: create resource")
@@ -209,6 +212,9 @@ func (s *Server) handleRestoreToTimestamp(w http.ResponseWriter, r *http.Request
 		Name:          strings.TrimSpace(req.Name),
 		Kind:          src.Engine,
 		Spec:          json.RawMessage(`{}`),
+		// A recovery target, so the billing cap does not stand between a
+		// delinquent org and its own verified backups (SIGMA-348).
+		Recovery: true,
 	}, actor)
 	if err != nil {
 		s.writeStoreErr(w, err, "restore: create resource")
