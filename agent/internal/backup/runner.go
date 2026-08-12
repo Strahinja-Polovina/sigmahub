@@ -109,7 +109,55 @@ func parseSpec(op dsd.Op) (opSpec, error) {
 	if s.RunID == "" || s.Engine == "" {
 		return s, fmt.Errorf("backup spec missing runId/engine")
 	}
+	// RunID becomes a path segment under the 0700 work dir (dump/restore scratch).
+	// A value like "../../../etc/cron.daily" would escape it and hand os.RemoveAll
+	// / os.MkdirAll an arbitrary root-owned path — the same traversal SIGMA-341
+	// closed for the build context, here on the backup path (SIGMA-360).
+	if !safePathSegment(s.RunID) {
+		return s, fmt.Errorf("backup spec has an unsafe runId %q", s.RunID)
+	}
+	// Database/Username are interpolated into in-container shell commands
+	// (mysqldump --databases, mysql "source …"). The CP sanitizes them, but the
+	// agent must not trust that (SIGMA-360): validate the identifier shape before
+	// any command is built.
+	for field, v := range map[string]string{
+		"database": s.Database, "username": s.Username,
+		"targetDatabase": s.TargetDatabase, "targetUsername": s.TargetUsername,
+	} {
+		if v != "" && !safeIdentifier(v) {
+			return s, fmt.Errorf("backup spec has an unsafe %s %q", field, v)
+		}
+	}
 	return s, nil
+}
+
+// safePathSegment permits a single path component — no separators, no dot-dot —
+// so filepath.Join(workDir, seg) cannot escape workDir.
+func safePathSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if strings.ContainsAny(s, `/\`) || strings.Contains(s, "..") {
+		return false
+	}
+	return s == filepath.Clean(s)
+}
+
+// safeIdentifier permits the SQL identifier charset the CP already emits
+// (dbSafeName: letters, digits, underscore, hyphen) — enough for a database or
+// user name, and free of every shell metacharacter.
+func safeIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // fail reports and returns a run failure in one step.

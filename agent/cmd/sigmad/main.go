@@ -75,6 +75,16 @@ func run() error {
 	defer stop()
 
 	c := client.New(*endpoint)
+	if client.EndpointIsInsecure(*endpoint) {
+		// The agent token and DSD public key are delivered over this connection
+		// (trust-on-first-use), so plaintext to a remote CP lets a network attacker
+		// substitute both from first boot (SIGMA-360). Loud warning rather than a
+		// hard refusal, to avoid breaking a fleet that terminates TLS at a trusted
+		// boundary.
+		log.Warn("control-plane endpoint is plaintext http to a remote host; the agent token "+
+			"and DSD key ride this connection — use https so they cannot be substituted in flight",
+			"endpoint", *endpoint)
+	}
 
 	// One collector for both the register and the heartbeat path (SIGMA-201).
 	// The same facts go out on EVERY check-in, not just the first: a host gains
@@ -766,6 +776,13 @@ func syncMesh(ctx context.Context, log *slog.Logger, c *client.Client, agentToke
 	if res.Self.MeshIP == nil || *res.Self.MeshIP == "" {
 		log.Warn("mesh: no mesh IP allocated yet")
 		return false, 0
+	}
+	// The mesh-peers channel is unsigned, and these values are rendered into a
+	// root wg-quick config. Refuse a set carrying an injection before it can be
+	// written or applied (SIGMA-360).
+	if err := mesh.Validate(*res.Self.MeshIP, res.Peers); err != nil {
+		log.Warn("mesh: refusing an invalid peer set", "err", err)
+		return false, len(res.Peers)
 	}
 	path, changed, err := mesh.WriteConfig(dataDir, mesh.RenderConfig(meshPriv, *res.Self.MeshIP, res.Peers))
 	if err != nil {

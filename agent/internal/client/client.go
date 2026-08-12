@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -36,6 +37,27 @@ func New(endpoint string) *Client {
 		http:     &http.Client{Timeout: 10 * time.Second},
 		poll:     &http.Client{},
 	}
+}
+
+// EndpointIsInsecure reports whether the control-plane endpoint is plaintext http
+// to a NON-local host. The DSD public key and the agent token are delivered over
+// the enrollment connection (trust-on-first-use), so plaintext to a remote CP
+// lets a network attacker on that path substitute both from first boot
+// (SIGMA-360). http to localhost is fine (dev, or a local sidecar). Callers warn
+// on true; a hard refusal (with an explicit opt-out) is a possible follow-up.
+func EndpointIsInsecure(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "https" {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1", "":
+		return false
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
 }
 
 type RegisterRequest struct {
