@@ -183,6 +183,21 @@ describe("ResourceDetail links to the running app", () => {
     expect(screen.getByRole("link", { name: /app\.example\.com/ })).toBeTruthy();
     expect(screen.getByRole("link", { name: /shop-1a2b3c4d\.apps\.example\.com/ })).toBeTruthy();
   });
+
+  it("tells the user when a host port was moved off a collision", () => {
+    // SIGMA-352: the deploy did not fail on a taken port; instead the control
+    // plane moved it, and the page must say so rather than let the app bind
+    // somewhere the user never asked for, silently.
+    renderCp({ movedPorts: [{ requested: 5432, actual: 5433 }] });
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/requested\s*5432/i);
+    expect(body).toMatch(/running on\s*5433/i);
+  });
+
+  it("shows no ports row when nothing was moved", () => {
+    renderCp({ movedPorts: [] });
+    expect(document.body.textContent ?? "").not.toMatch(/running on/i);
+  });
 });
 
 describe("ResourceDetail settings facts", () => {
@@ -438,5 +453,32 @@ describe("ResourceDetail controls a Developer may not use", () => {
       .queryAllByRole("button")
       .map((b) => (b.textContent ?? "").trim());
     expect(labels.sort()).toEqual(["Delete", "Delete a data volume"].sort());
+  });
+});
+
+describe("ResourceDetail failure banner (SIGMA-353)", () => {
+  it("names the cause and the specific fix, not a generic line", () => {
+    renderCp({
+      detail: makeDetail({ status: "error" }),
+      statusError: "pull from ghcr.io/acme/api:latest needs a registry credential and this agent has no way to fetch one",
+    });
+    const body = document.body.textContent ?? "";
+    // The classified cause and its specific remediation.
+    expect(body).toMatch(/Registry credential missing/i);
+    expect(body).toMatch(/connect the registry/i);
+    // The raw error the agent reported is still shown, nothing hidden.
+    expect(body).toMatch(/needs a registry credential/i);
+    // And NOT the old one-size line.
+    expect(body).not.toMatch(/Fix the cause, then press Deploy to re-apply/i);
+  });
+
+  it("a health-gate failure gets the health remediation, not the registry one", () => {
+    renderCp({
+      detail: makeDetail({ status: "error" }),
+      statusError: "health gate timed out after 2m0s: health check /healthz returned 502",
+    });
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/Health check never passed/i);
+    expect(body).toMatch(/listens on the declared port/i);
   });
 });
