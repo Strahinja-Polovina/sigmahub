@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge, StatusDot } from "@/components/dashboard/status-indicator";
 import { getMetrics, getLogs } from "@/lib/sample-telemetry";
+import { classifyDeployFailure } from "@/lib/deploy-failure";
 import { isDatabaseEngine } from "@/lib/server-catalog.generated";
 import type { ResourceKind, ServerType, Status } from "@/lib/mock";
 import {
@@ -772,13 +773,18 @@ export function ResourceDetail({
           <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
             <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
             <div className="min-w-0 text-sm">
-              <p className="font-medium text-destructive">This resource is failing</p>
+              {/* Name the failure and the fix, not just "it failed" (SIGMA-353).
+                  The agent's raw error stays visible below the classified cause,
+                  so nothing is hidden — the classifier only adds the "what do I
+                  do" the raw string never carried. */}
+              <p className="font-medium text-destructive">
+                {classifyDeployFailure(statusError).title}
+              </p>
               <p className="mt-0.5 break-words font-mono text-xs text-destructive/90">
                 {statusError}
               </p>
               <p className="mt-1 text-xs text-muted-foreground">
-                Fix the cause, then press Deploy to re-apply. Logs and metrics
-                stay empty until the container starts.
+                {classifyDeployFailure(statusError).remediation}
               </p>
             </div>
           </div>

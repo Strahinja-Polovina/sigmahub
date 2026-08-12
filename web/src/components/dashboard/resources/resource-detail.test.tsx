@@ -455,3 +455,30 @@ describe("ResourceDetail controls a Developer may not use", () => {
     expect(labels.sort()).toEqual(["Delete", "Delete a data volume"].sort());
   });
 });
+
+describe("ResourceDetail failure banner (SIGMA-353)", () => {
+  it("names the cause and the specific fix, not a generic line", () => {
+    renderCp({
+      detail: makeDetail({ status: "error" }),
+      statusError: "pull from ghcr.io/acme/api:latest needs a registry credential and this agent has no way to fetch one",
+    });
+    const body = document.body.textContent ?? "";
+    // The classified cause and its specific remediation.
+    expect(body).toMatch(/Registry credential missing/i);
+    expect(body).toMatch(/connect the registry/i);
+    // The raw error the agent reported is still shown, nothing hidden.
+    expect(body).toMatch(/needs a registry credential/i);
+    // And NOT the old one-size line.
+    expect(body).not.toMatch(/Fix the cause, then press Deploy to re-apply/i);
+  });
+
+  it("a health-gate failure gets the health remediation, not the registry one", () => {
+    renderCp({
+      detail: makeDetail({ status: "error" }),
+      statusError: "health gate timed out after 2m0s: health check /healthz returned 502",
+    });
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/Health check never passed/i);
+    expect(body).toMatch(/listens on the declared port/i);
+  });
+});
