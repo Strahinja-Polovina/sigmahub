@@ -74,3 +74,40 @@ func TestValidateChannelConfig_RejectsInternalDestinations(t *testing.T) {
 		t.Errorf("refusal = %#v, want an ErrInvalid naming the problem", err)
 	}
 }
+
+// SIGMA-359: the email channel skipped the destination check that webhook/slack
+// get, so config.host could name an internal SMTP relay, the metadata IP, or the
+// Postgres host and the CP would open an SMTP connection to it — reflecting the
+// connection outcome (and a non-SMTP service's greeting) back to the tenant.
+func TestValidateChannelConfig_EmailDestination(t *testing.T) {
+	emailCfg := func(host string, port int) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{
+			"host": host, "port": port, "from": "a@example.com", "to": []string{"b@example.com"},
+		})
+		return b
+	}
+	// Internal SMTP hosts are refused. Literal IPs so the test needs no DNS; the
+	// last is CGNAT (100.64/10), which the shared checkPublicIP predicate covers.
+	for _, host := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1"} {
+		if err := validateChannelConfig("email", emailCfg(host, 587), ""); err == nil {
+			t.Errorf("email channel to internal host %s was accepted — the CP would dial it over SMTP", host)
+		}
+	}
+	// A non-mail port is refused even on a public address.
+	if err := validateChannelConfig("email", emailCfg("93.184.216.34", 9200), ""); err == nil {
+		t.Error("an email channel on a non-SMTP port was accepted")
+	}
+	// The legitimate shapes work: a public host on a submission port, and port 0
+	// meaning "use the default (587)".
+	if err := validateChannelConfig("email", emailCfg("93.184.216.34", 587), ""); err != nil {
+		t.Errorf("a public SMTP submission endpoint must be accepted: %v", err)
+	}
+	if err := validateChannelConfig("email", emailCfg("93.184.216.34", 0), ""); err != nil {
+		t.Errorf("port 0 (default 587) must be accepted: %v", err)
+	}
+	// The refusal is an ErrInvalid the dashboard can render.
+	var inv ErrInvalid
+	if err := validateChannelConfig("email", emailCfg("10.0.0.1", 587), ""); !errors.As(err, &inv) {
+		t.Errorf("refusal = %#v, want an ErrInvalid", err)
+	}
+}

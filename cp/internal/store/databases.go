@@ -131,6 +131,17 @@ func allocateMeshPort(ctx context.Context, tx pgx.Tx, serverID, what string) (in
 			SELECT port FROM s3_credentials WHERE server_id = $1
 			UNION
 			SELECT port FROM llm_endpoints  WHERE server_id = $1
+			UNION
+			-- Explicit app host ports (SIGMA-355). They live in JSONB, not the mesh
+			-- tables, but they bind the SAME host and share this number range, so a
+			-- mesh port handed out blind to them collides at deploy — the exact
+			-- SIGMA-352 failure. resolveAppHostPortsTx already treats mesh ports as
+			-- taken; this is the other half, so the two allocators share one used-set.
+			SELECT (p->>'host')::int
+			  FROM resources r, jsonb_array_elements(r.spec->'ports') p
+			 WHERE r.server_id = $1 AND r.kind = 'app'
+			   AND jsonb_typeof(r.spec->'ports') = 'array'
+			   AND p->>'host' ~ '^[0-9]+$'
 		)
 		SELECT p FROM generate_series($2::int, $3::int) AS p
 		 WHERE NOT EXISTS (SELECT 1 FROM used WHERE used.port = p)

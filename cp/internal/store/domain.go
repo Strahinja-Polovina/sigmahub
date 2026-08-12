@@ -24,6 +24,40 @@ type ErrInvalid struct{ Msg string }
 
 func (e ErrInvalid) Error() string { return e.Msg }
 
+// maxSpecBytes bounds a stored resource spec. Generous — a large Compose app
+// with many services and env maps is legitimate — but finite, so a runaway
+// payload is rejected with a typed error instead of being stored.
+const maxSpecBytes = 512 << 10 // 512 KiB
+
+// normalizeSpec guarantees a stored resource spec is a JSON object and rejects
+// one that is malformed or implausibly large.
+//
+// It replaces a former, wrong reuse of normalizeFacts on this path (SIGMA-358):
+// that helper is a HOST-FACTS sanitizer — it collapses anything over 16 KB or 64
+// keys to {} and strips zero-valued fact keys. Applied to a spec, a large but
+// valid Compose app silently became {}, was stored with a 201, and then never
+// deployed (renderAppOps sees no image/ports/compose). A spec must never silently
+// vanish: an unusable one fails loudly here, and a valid one is stored
+// byte-for-byte with no key, value, or ordering rewritten.
+func normalizeSpec(spec json.RawMessage) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(spec)
+	if len(trimmed) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if len(trimmed) > maxSpecBytes {
+		return nil, ErrInvalid{Msg: fmt.Sprintf(
+			"resource spec is too large (%d bytes; limit %d)", len(trimmed), maxSpecBytes)}
+	}
+	if trimmed[0] != '{' {
+		return nil, ErrInvalid{Msg: "resource spec must be a JSON object"}
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return nil, ErrInvalid{Msg: "resource spec must be a valid JSON object"}
+	}
+	return trimmed, nil
+}
+
 type Project struct {
 	ID          string    `json:"id"`
 	OrgID       string    `json:"orgId"`
@@ -791,7 +825,10 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// port the reconciler renders is one that can actually bind on the target
 	// server (SIGMA-352). A no-op unless this is a single-container app that
 	// publishes a host port; skips cluster workloads (no single server) entirely.
-	storedSpec := normalizeFacts(in.Spec)
+	storedSpec, serr := normalizeSpec(in.Spec)
+	if serr != nil {
+		return Resource{}, serr
+	}
 	if in.Kind == "app" && in.ServerID != "" {
 		resolved, rerr := resolveAppHostPortsTx(ctx, tx, in.ServerID, r.ID, storedSpec)
 		if rerr != nil {

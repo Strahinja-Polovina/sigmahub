@@ -351,6 +351,24 @@ func renderDeployOps(rs store.ResourceSpec, refs []store.SecretRefMeta, domains 
 	// A rollback — or a config deploy re-shipping the running release
 	// (SIGMA-166) — reuses a retained image: skip clone + build.
 	if reshipsRetainedImage(target, false) {
+		// Cross-host re-ship. The build server has no build to do, so it renders
+		// nothing (it would otherwise place a stray rollout on the wrong host). The
+		// deploy target must PULL the retained image: it lives in the org registry
+		// (private by default) and the target cannot read the build host's local
+		// daemon. Without an authenticated pull op the agent is handed a
+		// registry-qualified tag it cannot fetch, so the rollback/config deploy dies
+		// at 'deploying' with a Docker "denied" — the gap SIGMA-243 closed for
+		// forward deploys, reappearing on the re-ship path (SIGMA-356). Mirror the
+		// non-re-ship cross-host split below.
+		if crossHost {
+			if serverID == target.BuildServerID {
+				return nil, "", false
+			}
+			pullID := "pull:" + rs.ResourceID
+			pull, _ := json.Marshal(imagePullOpSpec{Image: imageTag, RegistryHost: registry.host})
+			ops = append(ops, dsd.Op{ID: pullID, Kind: dsd.KindImagePull, Spec: pull})
+			rolloutDeps = append(rolloutDeps, pullID)
+		}
 		ops = append(ops, dsd.Op{ID: rolloutID, Kind: rolloutKind, DependsOn: rolloutDeps, Spec: rolloutBytes})
 		return ops, networkID, true
 	}

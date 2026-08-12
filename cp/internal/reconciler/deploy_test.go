@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Strahinja-Polovina/sigmahub/cp/internal/dsd"
@@ -431,6 +432,62 @@ func TestRenderComposeRollbackReshipsWithoutGit(t *testing.T) {
 	_ = json.Unmarshal(web.Spec, &s)
 	if want := dsd.PinnedServiceImageTag("res_cr", "web", "abcdef1234", "src222"); s.Container.Image != want {
 		t.Fatalf("web image = %q, want the source release's pinned %q", s.Container.Image, want)
+	}
+}
+
+// TestCrossHostReshipPullsFromRegistry pins SIGMA-356: a rollback / config deploy
+// that re-ships a retained image on a dedicated-build-server topology must still
+// emit an authenticated image.pull on the DEPLOY TARGET — the image lives in the
+// private org registry and the target cannot read the build host's local daemon.
+// The build server, which has no build to do on a re-ship, must render nothing.
+func TestCrossHostReshipPullsFromRegistry(t *testing.T) {
+	rs := store.ResourceSpec{
+		ResourceID: "res_rr", ProjectID: "proj_rr", Kind: "app",
+		Spec: json.RawMessage(`{"ports":[{"container":8080}]}`),
+	}
+	reg := registryRender{repository: "ghcr.io/acme", host: "ghcr.io"}
+	for _, trigger := range []string{"rollback", "config"} {
+		target := store.DeployTarget{
+			DeploymentID: "dep_50", ResourceID: "res_rr", ProjectID: "proj_rr", Provider: "github",
+			RepoFullName: "acme/app", SHA: "abcdef1234", ConfigHash: "cfg",
+			Trigger: trigger, ImagePin: "src999", ImageDigest: dsd.PinnedImageTag("res_rr", "abcdef1234", "src999"),
+			ServerID: "srv_run", BuildServerID: "srv_build", Status: "deploying",
+		}
+
+		// The deploy target: pull + rollout, and no clone/build (it re-ships).
+		ops, _, ok := renderDeployOps(rs, nil, nil, target, "srv_run", reg)
+		if !ok {
+			t.Fatalf("%s: the deploy target must render", trigger)
+		}
+		byID := map[string]dsd.Op{}
+		for _, op := range ops {
+			byID[op.ID] = op
+		}
+		if _, built := byID["build:res_rr"]; built {
+			t.Fatalf("%s: a re-ship must not build; ops=%v", trigger, opIDs(ops))
+		}
+		pull, found := byID["pull:res_rr"]
+		if !found || pull.Kind != dsd.KindImagePull {
+			t.Fatalf("%s: the deploy target must pull the retained image (SIGMA-356); ops=%v", trigger, opIDs(ops))
+		}
+		var ps imagePullOpSpec
+		_ = json.Unmarshal(pull.Spec, &ps)
+		if ps.RegistryHost != "ghcr.io" {
+			t.Fatalf("%s: the pull goes out anonymous and a private registry 401s it: %+v", trigger, ps)
+		}
+		if !strings.HasPrefix(ps.Image, "ghcr.io/acme/") {
+			t.Fatalf("%s: cross-host pull tag %q would resolve to docker.io", trigger, ps.Image)
+		}
+		rollout, ok := byID["res:res_rr"]
+		if !ok || !dependsOn(rollout, "pull:res_rr") {
+			t.Fatalf("%s: the rollout must depend on the pull: %+v", trigger, rollout.DependsOn)
+		}
+
+		// The build server has no build to do on a re-ship, so it renders nothing —
+		// a stray rollout here would place the app container on the wrong host.
+		if _, _, ok := renderDeployOps(rs, nil, nil, target, "srv_build", reg); ok {
+			t.Fatalf("%s: the build server must render nothing on a re-ship", trigger)
+		}
 	}
 }
 

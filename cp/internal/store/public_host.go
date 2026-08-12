@@ -113,9 +113,12 @@ func publicIPv4(endpoint string) string {
 	if v4 == nil {
 		return ""
 	}
-	// Loopback, link-local and RFC1918 are reachable from nowhere the customer
-	// will click a link, so they are not an answer.
-	if !v4.IsGlobalUnicast() || v4.IsPrivate() || v4.IsLoopback() || v4.IsLinkLocalUnicast() {
+	// Reachable from nowhere the customer will click a link — RFC1918, loopback,
+	// link-local, CGNAT (100.64/10, common behind carrier NAT / Starlink) and the
+	// reserved test ranges. Reuse the alert-egress predicate so the two never
+	// drift, and a NAT'd host never gets handed an sslip.io URL that silently
+	// fails to resolve (SIGMA-364).
+	if checkPublicIP(host, v4) != nil {
 		return ""
 	}
 	return v4.String()
