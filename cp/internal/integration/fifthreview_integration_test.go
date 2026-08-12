@@ -63,7 +63,7 @@ func TestManagedEngineAvoidsAppHostPort(t *testing.T) {
 }
 
 // TestPreviewEnvironmentGetsAReachableURL is SIGMA-357. ensurePreviewTx inserted
-// the ephemeral app row without a public_label, so it defaulted to '' — the
+// the ephemeral app row without a public_label, so it defaulted to ” — the
 // preview URL was always empty and the reconciler rendered no Traefik router, so
 // the preview deployed green and was reachable by nobody, the exact gap SIGMA-351
 // set out to close (left open on the one path that never went through
