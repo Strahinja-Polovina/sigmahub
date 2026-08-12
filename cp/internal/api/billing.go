@@ -294,6 +294,11 @@ func paddleSubStatus(eventType, dataStatus string) string {
 		}
 	case "subscription.paused":
 		return "paused"
+	case "subscription.past_due":
+		// Explicit, so past-due detection does not silently depend on
+		// transaction.payment_failed and subscription.updated always firing first
+		// (SIGMA-364).
+		return "past_due"
 	case "subscription.canceled":
 		return "canceled"
 	case "transaction.payment_failed":
