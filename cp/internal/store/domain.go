@@ -787,11 +787,23 @@ func (s *Store) CreateResource(ctx context.Context, orgID string, in CreateResou
 	// random hex, so this needs no retry loop — the partial unique index on
 	// public_label is the backstop.
 	publicLabel := PublicLabel(in.Name, in.Kind, r.ID)
+	// Resolve explicit host-port collisions before the spec is stored, so the
+	// port the reconciler renders is one that can actually bind on the target
+	// server (SIGMA-352). A no-op unless this is a single-container app that
+	// publishes a host port; skips cluster workloads (no single server) entirely.
+	storedSpec := normalizeFacts(in.Spec)
+	if in.Kind == "app" && in.ServerID != "" {
+		resolved, rerr := resolveAppHostPortsTx(ctx, tx, in.ServerID, r.ID, storedSpec)
+		if rerr != nil {
+			return Resource{}, rerr
+		}
+		storedSpec = resolved
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, cluster_id, public_label)
 		VALUES ($1, $2, $3, $4, NULLIF($5,''), $6, $7, $8, NULLIF($9,''), $10)
 		RETURNING id, org_id, project_id, environment_id, COALESCE(server_id,''), COALESCE(cluster_id,''), name, kind, spec, status, created_at, updated_at`,
-		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, normalizeFacts(in.Spec), in.ClusterID, publicLabel,
+		r.ID, orgID, projectID, in.EnvironmentID, in.ServerID, in.Name, in.Kind, storedSpec, in.ClusterID, publicLabel,
 	).Scan(&r.ID, &r.OrgID, &r.ProjectID, &r.EnvironmentID, &r.ServerID, &r.ClusterID, &r.Name, &r.Kind,
 		&r.Spec, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if isUniqueViolation(err) {

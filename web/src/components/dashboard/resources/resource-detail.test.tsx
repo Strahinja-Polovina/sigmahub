@@ -183,6 +183,21 @@ describe("ResourceDetail links to the running app", () => {
     expect(screen.getByRole("link", { name: /app\.example\.com/ })).toBeTruthy();
     expect(screen.getByRole("link", { name: /shop-1a2b3c4d\.apps\.example\.com/ })).toBeTruthy();
   });
+
+  it("tells the user when a host port was moved off a collision", () => {
+    // SIGMA-352: the deploy did not fail on a taken port; instead the control
+    // plane moved it, and the page must say so rather than let the app bind
+    // somewhere the user never asked for, silently.
+    renderCp({ movedPorts: [{ requested: 5432, actual: 5433 }] });
+    const body = document.body.textContent ?? "";
+    expect(body).toMatch(/requested\s*5432/i);
+    expect(body).toMatch(/running on\s*5433/i);
+  });
+
+  it("shows no ports row when nothing was moved", () => {
+    renderCp({ movedPorts: [] });
+    expect(document.body.textContent ?? "").not.toMatch(/running on/i);
+  });
 });
 
 describe("ResourceDetail settings facts", () => {

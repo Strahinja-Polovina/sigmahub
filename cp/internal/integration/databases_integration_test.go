@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -289,4 +290,74 @@ func TestResourceURLIsSurfaced(t *testing.T) {
 	if got := byID[db.ID].PublicURL; got != "" {
 		t.Fatalf("database got a PublicURL %q; managed data is mesh-only", got)
 	}
+}
+
+// TestExplicitHostPortsResolveInsteadOfColliding is the app-side half of
+// SIGMA-352. A single-container app publishes spec.ports[].host verbatim, so two
+// apps asking for 5432 on one server produced a container that started and then
+// failed to bind — after the build. The create-time resolver moves the second to
+// the next free port and records the original, so the deploy never fails on it.
+func TestExplicitHostPortsResolveInsteadOfColliding(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_hostports"
+	envID, serverID := dbTestFixture(t, st, orgID, true, "general")
+
+	mkApp := func(name string, host int) store.Resource {
+		t.Helper()
+		spec := json.RawMessage(`{"image":"nginx","ports":[{"container":80,"host":` +
+			fmt.Sprintf("%d", host) + `}]}`)
+		res, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+			EnvironmentID: envID, ServerID: serverID, Name: name, Kind: "app", Spec: spec,
+		}, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	// The first app gets exactly what it asked for.
+	a := mkApp("first", 5432)
+	if got := hostPortOf(t, st, a.ID); got.Host != 5432 || got.RequestedHost != 0 {
+		t.Fatalf("first app: host=%d requested=%d, want 5432 with no move", got.Host, got.RequestedHost)
+	}
+
+	// The second asks for the same port and is moved, with the request recorded.
+	b := mkApp("second", 5432)
+	if got := hostPortOf(t, st, b.ID); got.Host != 5433 || got.RequestedHost != 5432 {
+		t.Fatalf("second app: host=%d requested=%d, want 5433 requested 5432", got.Host, got.RequestedHost)
+	}
+
+	// A mesh port already held by a database is avoided too: create a database
+	// (it takes MeshPortBase), then an app asking for exactly that port.
+	if _, err := st.CreateResource(ctx, orgID, store.CreateResourceInput{
+		EnvironmentID: envID, ServerID: serverID, Name: "db", Kind: "postgres", Spec: json.RawMessage(`{}`),
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	c := mkApp("third", int(store.MeshPortBase))
+	if got := hostPortOf(t, st, c.ID); got.Host == int(store.MeshPortBase) {
+		t.Fatalf("third app took mesh port %d instead of moving off it", got.Host)
+	}
+}
+
+// hostPortOf reads back the first port mapping stored on an app resource.
+func hostPortOf(t *testing.T, st *store.Store, resourceID string) struct {
+	Host          int `json:"host"`
+	RequestedHost int `json:"requestedHost"`
+} {
+	t.Helper()
+	var raw []byte
+	if err := st.Pool.QueryRow(context.Background(),
+		`SELECT spec->'ports'->0 FROM resources WHERE id = $1`, resourceID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Host          int `json:"host"`
+		RequestedHost int `json:"requestedHost"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

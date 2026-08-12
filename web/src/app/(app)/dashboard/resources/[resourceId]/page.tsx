@@ -181,8 +181,13 @@ async function loadCpResourceFacts(
   orgId: string,
   resourceId: string,
   environmentId: string
-): Promise<{ statusError: string | null; healthCheck: CpHealthCheck | null; publicUrl: string | null }> {
-  const none = { statusError: null, healthCheck: null, publicUrl: null };
+): Promise<{
+  statusError: string | null;
+  healthCheck: CpHealthCheck | null;
+  publicUrl: string | null;
+  movedPorts: { requested: number; actual: number }[];
+}> {
+  const none = { statusError: null, healthCheck: null, publicUrl: null, movedPorts: [] };
   if (!cpEnabled()) return none;
   try {
     const resources = await cpListResources(orgId, environmentId);
@@ -193,6 +198,17 @@ async function loadCpResourceFacts(
     // (createResourceBody copies gitdetect's healthCheck through). The Settings
     // tab used to claim a constant "Enabled" here (SIGMA-240).
     const hc = res?.spec?.healthCheck;
+    // Host ports the control plane had to move off a collision (SIGMA-352): the
+    // spec records the original as requestedHost when it differs from host, so
+    // the page can say "you asked for 5432, it is running on 5433" instead of a
+    // deploy that silently bound elsewhere.
+    const rawPorts = res?.spec?.ports;
+    const movedPorts = Array.isArray(rawPorts)
+      ? rawPorts
+          .map((p) => (p && typeof p === "object" ? (p as Record<string, unknown>) : {}))
+          .filter((p) => typeof p.requestedHost === "number" && p.requestedHost !== p.host)
+          .map((p) => ({ requested: p.requestedHost as number, actual: p.host as number }))
+      : [];
     return {
       statusError: typeof err === "string" && err.trim() ? err : null,
       healthCheck: hc && typeof hc === "object" ? (hc as CpHealthCheck) : null,
@@ -200,6 +216,7 @@ async function loadCpResourceFacts(
       // the answer to "where is my app" that used to exist nowhere for a
       // resource without a custom domain.
       publicUrl: res?.publicUrl && res.publicUrl.trim() ? res.publicUrl : null,
+      movedPorts,
     };
   } catch {
     return none;
@@ -303,7 +320,7 @@ export default async function ResourceDetailPage({
   // loader here — an unreachable control plane must not render as "the pipeline
   // is configured and nothing arrived" (SIGMA-236).
   const telemetry = await loadResourceTelemetry(orgId, resourceId, loadFailures);
-  const { statusError, healthCheck, publicUrl } = await loadCpResourceFacts(
+  const { statusError, healthCheck, publicUrl, movedPorts } = await loadCpResourceFacts(
     orgId,
     resourceId,
     detail.resource.environmentId
@@ -396,6 +413,7 @@ export default async function ResourceDetailPage({
       autoDeploy={autoDeploy}
       healthCheck={healthCheck}
       publicUrl={publicUrl}
+      movedPorts={movedPorts}
     />
   );
 }
