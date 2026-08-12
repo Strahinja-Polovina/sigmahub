@@ -217,10 +217,25 @@ func ensurePreviewTx(ctx context.Context, tx pgx.Tx, conn GitConnection, prNumbe
 		return "", "", err
 	}
 	resourceID = newID("res")
+	// The template spec is copied verbatim, so its explicit host ports must be
+	// resolved against what is already bound on the preview server, exactly as
+	// CreateResource does — otherwise two PRs open at once both claim the same host
+	// port and the second container fails to bind (SIGMA-357). A no-op for the
+	// common container-only preview spec.
+	spec, err = resolveAppHostPortsTx(ctx, tx, conn.PreviewServerID, resourceID, spec)
+	if err != nil {
+		return "", "", err
+	}
+	// A routable label of its own (SIGMA-357). Without it the preview inherits the
+	// empty default: ListPreviewEnvironments yields no URL and the reconciler
+	// renders no Traefik router, so the preview deploys green and is reachable by
+	// nobody — the exact gap SIGMA-351 set out to close, left open on the one path
+	// that never went through CreateResource.
+	previewLabel := PublicLabel(envName, "app", resourceID)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, ephemeral)
-		VALUES ($1, $2, $3, $4, $5, $6, 'app', $7, TRUE)`,
-		resourceID, conn.OrgID, conn.ProjectID, envID, conn.PreviewServerID, envName, spec); err != nil {
+		INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec, ephemeral, public_label)
+		VALUES ($1, $2, $3, $4, $5, $6, 'app', $7, TRUE, $8)`,
+		resourceID, conn.OrgID, conn.ProjectID, envID, conn.PreviewServerID, envName, spec, previewLabel); err != nil {
 		return "", "", err
 	}
 	// The template spec is copied verbatim, placements included, so the derived

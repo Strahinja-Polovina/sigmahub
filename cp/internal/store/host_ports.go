@@ -140,7 +140,9 @@ func boundHostPortsTx(ctx context.Context, tx pgx.Tx, serverID, excludeResourceI
 	used := map[int]bool{}
 
 	// Mesh ports. One query over the union of the three tables that
-	// allocateMeshPort also reads, so the two allocators agree on what is taken.
+	// allocateMeshPort also reads. allocateMeshPort now also unions the app host
+	// ports below (SIGMA-355), so both allocators see the same used-set from both
+	// directions — a mesh port never lands on an app port and vice versa.
 	rows, err := tx.Query(ctx, `
 		SELECT port FROM db_credentials WHERE server_id = $1
 		UNION

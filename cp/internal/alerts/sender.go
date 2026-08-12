@@ -67,8 +67,61 @@ func NewSender() *Sender {
 			}
 			return s.checkDestination(req.URL.String())
 		},
+		Transport: &http.Transport{
+			// Pin the dial to the IP the rule just validated. The URL-level check
+			// (checkDestination / CheckRedirect) resolves the host and then throws
+			// the address away; the transport would resolve again independently, so
+			// a low-TTL record could pass the check as a public IP and answer a
+			// private one at dial (DNS rebinding, SIGMA-359). Resolving and
+			// validating inside the dial closes that window. No Proxy on purpose:
+			// the guard needs a direct connection to pin the address.
+			DialContext:         s.pinnedDialContext,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
 	}
 	return s
+}
+
+// pinnedDialContext resolves the host once, validates every candidate address
+// against the public-destination rule, and dials the validated address — so the
+// IP that passed the check is the exact IP connected (SIGMA-359). Bypassed only
+// by the in-package test flag, whose httptest servers live on 127.0.0.1.
+func (s *Sender) pinnedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	if s.allowInternalDestinations {
+		return d.DialContext(ctx, network, addr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if err := store.CheckPublicIP(host, ip); err != nil {
+			return nil, err
+		}
+		return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+	var firstErr error
+	for _, ip := range ips {
+		if err := store.CheckPublicIP(host, ip); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no public address for %s", host)
+	}
+	return nil, firstErr
 }
 
 // checkDestination re-applies the create-time destination rule at send time.
@@ -299,6 +352,14 @@ func (s *Sender) sendEmail(ch store.AlertChannelSend, title, body string) error 
 	_ = json.Unmarshal(ch.Config, &cfg)
 	if cfg.Host == "" || cfg.From == "" || len(cfg.To) == 0 {
 		return fmt.Errorf("email channel needs host, from and at least one recipient")
+	}
+	// Re-validate the SMTP destination at send, like slack/webhook: this row may
+	// predate the create-time check, and the host may resolve somewhere new.
+	// Bypassed only by the in-package test flag (an SMTP stub lives on 127.0.0.1).
+	if !s.allowInternalDestinations {
+		if err := store.ValidateEmailDestination(cfg.Host, cfg.Port); err != nil {
+			return fmt.Errorf("smtp: %s", err)
+		}
 	}
 	port := cfg.Port
 	if port == 0 {

@@ -150,7 +150,9 @@ func (u *Updater) client() *http.Client {
 func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 	var spec struct {
 		Version string `json:"version"`
-		Repo    string `json:"repo"`
+		// NOTE: a "repo" field on the wire is intentionally NOT decoded here. The
+		// cosign identity is pinned below (SIGMA-360); letting the spec choose it
+		// would let an attacker's repo vouch for an attacker's binary.
 		// DownloadBase is the control plane's own release proxy for this exact
 		// version — "<cp public url>/dl/<version>" — and when the CP sends one
 		// it is the only place the assets are fetched from. See the comment on
@@ -166,10 +168,14 @@ func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 	if spec.Version == u.CurrentVersion {
 		return nil // already there — idempotent no-op
 	}
-	repo := spec.Repo
-	if repo == "" {
-		repo = u.Repo
-	}
+	// The cosign trust anchor is PINNED, never taken from the op spec (SIGMA-360).
+	// Letting the document choose the repo its own binary is verified against is no
+	// check at all: an attacker publishes a malicious sigmad in a repo they own,
+	// cosign keyless-signs it under THAT repo's GitHub-Actions OIDC identity, and a
+	// spec-chosen identity regexp would accept it — a root binary swap that passes
+	// verification. DownloadBase may still move the bytes (authenticity comes from
+	// the pinned identity below), but spec.Repo must not choose the identity.
+	repo := u.Repo
 	if repo == "" {
 		repo = DefaultRepo
 	}

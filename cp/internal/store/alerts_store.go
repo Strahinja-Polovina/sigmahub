@@ -110,6 +110,7 @@ func validateChannelConfig(kind string, cfg json.RawMessage, secret string) erro
 	case "email":
 		var c struct {
 			Host string   `json:"host"`
+			Port int      `json:"port"`
 			From string   `json:"from"`
 			To   []string `json:"to"`
 		}
@@ -118,6 +119,12 @@ func validateChannelConfig(kind string, cfg json.RawMessage, secret string) erro
 		}
 		if c.Host == "" || c.From == "" || len(c.To) == 0 {
 			return ErrInvalid{Msg: "email channels require config.host, config.from and config.to"}
+		}
+		// The SMTP host is a tenant-chosen egress destination, exactly like the
+		// webhook/slack URL — so it gets the same public-address rule instead of
+		// being an unguarded connect into the operator's network (SIGMA-359).
+		if err := ValidateEmailDestination(c.Host, c.Port); err != nil {
+			return err
 		}
 	case "telegram":
 		var c struct {
@@ -241,6 +248,52 @@ func checkPublicIP(shown string, ip net.IP) error {
 	}
 	if internal {
 		return ErrInvalid{Msg: "destination " + shown + " is an internal address; alert channels must point at a public endpoint"}
+	}
+	return nil
+}
+
+// CheckPublicIP exposes the address rule to the alerts sender, so a pinned dial
+// can validate the exact IP it is about to connect and close the DNS-rebinding
+// window between validation and dial (SIGMA-359).
+func CheckPublicIP(shown string, ip net.IP) error { return checkPublicIP(shown, ip) }
+
+// allowedSMTPPorts are the only ports an email channel may use. A wide-open port
+// turns the SMTP send into a general TCP-connect primitive against the operator's
+// network (SIGMA-359); these are the ports that actually carry mail. 0 means
+// "use the default (587)".
+var allowedSMTPPorts = map[int]bool{0: true, 25: true, 465: true, 587: true}
+
+// ValidateEmailDestination applies the alert-egress rule to an email channel's
+// SMTP host and port. The destination is a bare host+port rather than a URL, so
+// it has its own entry point, but the same public-address rule as webhook/slack:
+// an email channel must not be a hole through which the CP dials 169.254.169.254
+// or the Postgres host. Callable from the sender for a send-time re-check.
+func ValidateEmailDestination(host string, port int) error {
+	if !allowedSMTPPorts[port] {
+		return ErrInvalid{Msg: "email channel port must be 25, 465 or 587"}
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ErrInvalid{Msg: "email channel needs a host"}
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return checkPublicIP(host, ip)
+	}
+	lower := strings.ToLower(strings.TrimSuffix(host, "."))
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return ErrInvalid{Msg: "email host " + host + " is an internal address; alert channels must point at a public endpoint"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), destinationLookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return ErrInvalid{Msg: "email host " + host + " does not resolve"}
+	}
+	for _, ip := range ips {
+		if err := checkPublicIP(host, ip); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -78,6 +78,20 @@ func (r *Runner) fail(ctx context.Context, opID string, err error) error {
 }
 
 // opConfigure dispatches one bucket/key/quota/measure action.
+// safeS3Ident permits the bucket / access-key charset the CP emits (letters,
+// digits, dot, hyphen, underscore) — free of every shell metacharacter, so a
+// value interpolated into an in-container command cannot break out (SIGMA-360).
+func safeS3Ident(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Runner) opConfigure(ctx context.Context, op dsd.Op) error {
 	var spec OpSpec
 	if err := json.Unmarshal(op.Spec, &spec); err != nil {
@@ -85,6 +99,16 @@ func (r *Runner) opConfigure(ctx context.Context, op dsd.Op) error {
 	}
 	if spec.OpID == "" || spec.Action == "" {
 		return fmt.Errorf("s3 op spec missing opId/action")
+	}
+	// Bucket and AccessKey are interpolated into an in-container `sh -c` command
+	// (weedShellSecret, double-quoted so $SK expands). The CP generates them, but
+	// the agent must not trust that: validate the identifier shape so a crafted
+	// value cannot break out of the command or command-substitute (SIGMA-360).
+	if spec.Bucket != "" && !safeS3Ident(spec.Bucket) {
+		return fmt.Errorf("s3 op has an unsafe bucket %q", spec.Bucket)
+	}
+	if spec.AccessKey != "" && !safeS3Ident(spec.AccessKey) {
+		return fmt.Errorf("s3 op has an unsafe access key %q", spec.AccessKey)
 	}
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
