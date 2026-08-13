@@ -125,6 +125,14 @@ func (s *Store) WALCredentialForResource(ctx context.Context, serverID, resource
 
 // SetWALStatus records a successful shipping cycle's high-water mark (BOLA:
 // the resource must live on the reporting server).
+//
+// The high-water mark only ever moves FORWARD (SIGMA-365): a regressing agent
+// report — a restarted shipper re-reporting a cached/earlier segment, an out-of-
+// order delivery — must not drag last_shipped_at backwards, or the restore-window
+// gate would refuse a valid PITR target for a time the WAL actually covers. The
+// update still fires when the row exists (so RowsAffected distinguishes "not on
+// this server" → ErrNotFound from a no-op regressing report), but advances the
+// segment and timestamp only when the report is newer.
 func (s *Store) SetWALStatus(ctx context.Context, serverID, resourceID, lastSegment string, at time.Time) error {
 	tag, err := s.Pool.Exec(ctx, `
 		INSERT INTO wal_archive_status (resource_id, org_id, last_segment, last_shipped_at, updated_at)
@@ -132,8 +140,10 @@ func (s *Store) SetWALStatus(ctx context.Context, serverID, resourceID, lastSegm
 		  FROM db_credentials dc
 		 WHERE dc.resource_id = $1 AND dc.server_id = $2
 		ON CONFLICT (resource_id) DO UPDATE
-		   SET last_segment = EXCLUDED.last_segment,
-		       last_shipped_at = EXCLUDED.last_shipped_at,
+		   SET last_segment = CASE
+		           WHEN EXCLUDED.last_shipped_at > wal_archive_status.last_shipped_at
+		           THEN EXCLUDED.last_segment ELSE wal_archive_status.last_segment END,
+		       last_shipped_at = GREATEST(wal_archive_status.last_shipped_at, EXCLUDED.last_shipped_at),
 		       updated_at = now()`,
 		resourceID, serverID, lastSegment, at)
 	if err != nil {

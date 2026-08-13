@@ -95,6 +95,30 @@ func TestSyncSkipsFailedOrgWithoutRecording(t *testing.T) {
 	}
 }
 
+// A pass with drift to push that pushes NONE of it — the shape of a rotated
+// Paddle key or a wrong price id — returns a non-nil error so the usage-sweep
+// heartbeat's last-success clock can go stale instead of reporting green over
+// silent revenue drift (SIGMA-365). A single failure amid successes stays
+// non-fatal (TestSyncSkipsFailedOrgWithoutRecording).
+func TestSyncSignalsSystemicFailure(t *testing.T) {
+	st := &fakeStore{drift: []store.SubscriptionDrift{
+		{OrgID: "org_a", SubscriptionID: "sub_a", Billed: 1, Want: 4},
+	}}
+	// failFor matches the only drifted subscription → every update fails.
+	s := &Syncer{Store: st, Paddle: &fakePaddle{failFor: "sub_a"}, PriceID: "pri_1"}
+
+	n, err := s.Sync(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("a pass that synced nothing while drift existed must return an error")
+	}
+	if n != 0 {
+		t.Fatalf("synced = %d, want 0", n)
+	}
+	if _, ok := st.recorded["org_a"]; ok {
+		t.Error("a failed push must not be recorded")
+	}
+}
+
 // A store write failure must likewise leave the org un-debounced so the next
 // sweep retries, and must not be counted as synced.
 func TestSyncDoesNotCountUnrecordedPush(t *testing.T) {
