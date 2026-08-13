@@ -201,6 +201,15 @@ func (d *Driver) opContainerApply(ctx context.Context, op dsd.Op) error {
 	if err := CheckPolicy(spec); err != nil {
 		return err
 	}
+	// Under d.mu, exactly as reconcileOne is: without it a 30s reconcile tick for
+	// this same container and this apply both run converge (inspect → remove →
+	// create) concurrently, and one loses the create to a Docker 409 "name already
+	// in use" — surfacing a spurious 'failed' on a container that is in fact
+	// running (SIGMA-365). Holding it across PutDesired also closes the window
+	// where GC could reap the just-created container before its desired record
+	// lands.
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if err := d.converge(ctx, spec); err != nil {
 		return err
 	}
