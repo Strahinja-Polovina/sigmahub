@@ -133,6 +133,16 @@ const (
 	// competes for the same connections, so widening the pass means using these
 	// slots properly rather than adding a second, unaccounted bound.
 	reconcileConcurrency = 4
+	// reconcileTimeout bounds a single server's reconcile on BOTH the async nudge
+	// path and the 60s fleet resync. Without it the resync ran on the raw
+	// process-root ctx, so one reconcile wedged on a dead connection or a lock
+	// could pin a resync slot forever and, with enough of them, stall fleet-wide
+	// drift repair — the exact SLO the resync exists to hold (SIGMA-365). pgx
+	// propagates this deadline into every query the reconcile issues, so it also
+	// unwedges a query blocked on a lock or a dead connection; a pool-wide
+	// statement_timeout is deliberately NOT used because it would also abort the
+	// legitimately long backfill migrations.
+	reconcileTimeout = 10 * time.Second
 	// reconcileQueueWait bounds how long a queued ReconcileAsync waits for a
 	// slot before giving up. Fire-and-forget goroutines must not pile up
 	// without limit, and dropping is safe: reconcile is level-triggered and the
@@ -603,7 +613,7 @@ func (r *Reconciler) ReconcileAsync(orgID, serverID string) {
 			return
 		}
 		defer release()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
 		defer cancel()
 		// Recovered for the same reason as the resync, and more urgently: this
 		// goroutine has no caller left to return an error to, so an unrecovered
@@ -709,8 +719,12 @@ func (r *Reconciler) resyncPass(ctx context.Context) error {
 					return
 				}
 				// safeReconcile, not Reconcile: one bad row must quarantine one
-				// server, not end the process for every tenant (SIGMA-250).
-				err := r.safeReconcile(ctx, sv.OrgID, sv.ServerID)
+				// server, not end the process for every tenant (SIGMA-250). Bounded
+				// per server (SIGMA-365) so a single wedged reconcile can't hold a
+				// resync slot forever and stall the whole pass.
+				rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+				err := r.safeReconcile(rctx, sv.OrgID, sv.ServerID)
+				cancel()
 				release()
 				if err != nil {
 					r.log.Error("resync: reconcile", "err", err, "server", sv.ServerID)

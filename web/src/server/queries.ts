@@ -430,17 +430,27 @@ async function buildEnvPanel(
     .select()
     .from(s.resources)
     .where(eq(s.resources.environmentId, env.id));
-  const withDeploy = await Promise.all(
-    resources.map(async (r) => {
-      const [latest] = await db
-        .select()
+  // One DISTINCT ON query for the latest deployment of EVERY resource in the env,
+  // not one query per resource inside a Promise.all — the same N+1 getOrgResources
+  // already fixed, which getEnvironmentPanels then multiplied over every
+  // environment on the project-detail page (SIGMA-365).
+  const latest = resources.length
+    ? await db
+        .selectDistinctOn([s.deployments.resourceId])
         .from(s.deployments)
-        .where(eq(s.deployments.resourceId, r.id))
-        .orderBy(desc(s.deployments.startedAt))
-        .limit(1);
-      return { ...r, latestDeploy: latest ?? null };
-    })
-  );
+        .where(
+          inArray(
+            s.deployments.resourceId,
+            resources.map((r) => r.id)
+          )
+        )
+        .orderBy(s.deployments.resourceId, desc(s.deployments.startedAt))
+    : [];
+  const latestByResource = new Map(latest.map((d) => [d.resourceId, d]));
+  const withDeploy = resources.map((r) => ({
+    ...r,
+    latestDeploy: latestByResource.get(r.id) ?? null,
+  }));
   return { env, servers, resources: withDeploy };
 }
 

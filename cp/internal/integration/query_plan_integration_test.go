@@ -66,6 +66,19 @@ func (n planNode) usesIndex(name string) bool {
 	return found
 }
 
+// hasFunctionScan reports whether the plan contains a Function Scan node — the
+// signature of a set-returning function like jsonb_array_elements being run
+// per row, which is exactly the cost SIGMA-365 removed from ResourceHostedHere.
+func (n planNode) hasFunctionScan() bool {
+	found := false
+	n.walk(func(p planNode) {
+		if p.NodeType == "Function Scan" {
+			found = true
+		}
+	})
+	return found
+}
+
 // rowsTouched totals the rows every scan of a relation actually produced,
 // across all loops of a nested loop. This is the number the cost tickets are
 // about: a plan that touches 40,000 deployment rows to answer a question about
@@ -414,6 +427,109 @@ func TestDeployTargetsForServerUsesPartialIndex(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Fatalf("unattached server has %d deploy targets, want 0", len(empty))
+	}
+}
+
+// TestResourceSpecsForServerAvoidsJsonbScan is SIGMA-365. ResourceHostedHere's
+// Compose-placement arm used to be EXISTS(jsonb_array_elements(spec->'compose'->
+// 'services') WHERE serverId = $) — an un-indexable set-returning function with
+// no restriction on `resources` alone, so ResourceSpecsForServer (the single
+// hottest read on the CP, run once per server on every 60s fleet resync) forced a
+// cross-tenant Seq Scan of the whole resources table AND detoasted+parsed every
+// non-owning tenant's spec jsonb per row. Rewritten to a semi-join on the indexed
+// resource_service_placements. The regression marker is the Function Scan node
+// reappearing, and nothing functional fails when it does — hence a plan test.
+func TestResourceSpecsForServerAvoidsJsonbScan(t *testing.T) {
+	st, _ := testStore(t)
+	ctx := context.Background()
+	orgID := "org_plan_hosted"
+
+	// A fleet, so one server's slice is small enough that the placement index is
+	// unambiguously the cheaper access path than a jsonb scan of every row.
+	const servers, resourcesPerServer = 40, 5
+
+	proj, err := st.CreateProject(ctx, orgID, "p", "", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := st.CreateEnvironment(ctx, orgID, proj.ID, "prod", true, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverIDs := make([]string, 0, servers)
+	for i := 0; i < servers; i++ {
+		bootTok, _, _, err := st.IssueBootstrapToken(ctx, orgID, "host", "general", "", "", "test", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, err := st.RegisterServer(ctx, bootTok, "host", "0.1.0", json.RawMessage(`{}`), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AttachServer(ctx, orgID, env.ID, reg.Server.ID, "test"); err != nil {
+			t.Fatal(err)
+		}
+		serverIDs = append(serverIDs, reg.Server.ID)
+	}
+	// Half the resources are Compose apps that place a service on the NEXT server
+	// in the ring, so the placement arm is exercised, not trivially empty.
+	for i, srv := range serverIDs {
+		spec := `{"image":"nginx"}`
+		if i%2 == 1 {
+			spec = `{"compose":{"services":[{"name":"web"},` +
+				`{"name":"worker","serverId":"` + serverIDs[(i+1)%len(serverIDs)] + `"}]}}`
+		}
+		if _, err := st.Pool.Exec(ctx, `
+			INSERT INTO resources (id, org_id, project_id, environment_id, server_id, name, kind, spec)
+			SELECT 'res_h_'||$5||'_'||j, $1, $2, $3, $4, 'app'||$5||'_'||j, 'app', $6::jsonb
+			  FROM generate_series(1, $7) j`,
+			orgID, proj.ID, env.ID, srv, strconv.Itoa(i), spec, resourcesPerServer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Raw inserts skip syncServicePlacementsTx; project placements as 0062 does.
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO resource_service_placements (resource_id, service, server_id)
+		SELECT r.id, COALESCE(svc->>'name', ''), svc->>'serverId'
+		  FROM resources r
+		  CROSS JOIN LATERAL jsonb_array_elements(
+		       CASE WHEN jsonb_typeof(r.spec->'compose'->'services') = 'array'
+		            THEN r.spec->'compose'->'services' ELSE '[]'::jsonb END) svc
+		 WHERE COALESCE(svc->>'serverId', '') <> ''
+		ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range []string{"resources", "resource_service_placements", "cluster_nodes"} {
+		if _, err := st.Pool.Exec(ctx, "ANALYZE "+tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The real ResourceSpecsForServer query, reconstructed from the shared rule.
+	query := `
+		SELECT r.id, r.project_id, r.kind, r.spec, r.ephemeral, COALESCE(r.cluster_id, ''),
+		       COALESCE(r.public_label, ''),
+		       COALESCE((SELECT sv.endpoint FROM servers sv WHERE sv.id = $1), '')
+		  FROM resources r
+		 WHERE` + store.ResourceHostedHere("$1") + `
+		 ORDER BY r.created_at`
+	target := serverIDs[0]
+	plan := explainPlan(t, st, true, query, target)
+
+	if plan.hasFunctionScan() {
+		t.Fatalf("ResourceSpecsForServer runs a per-row set-returning function (jsonb scan is back, "+
+			"SIGMA-365); plan = %s", planJSON(t, plan))
+	}
+
+	// The rewrite must not change WHO is hosted: server 0 owns its own resources
+	// and hosts the placed 'worker' of the last server's Compose apps in the ring.
+	specs, err := st.ResourceSpecsForServer(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 2*resourcesPerServer {
+		t.Fatalf("ResourceSpecsForServer(%s) = %d resources, want %d owned + %d placed",
+			target, len(specs), resourcesPerServer, resourcesPerServer)
 	}
 }
 

@@ -13,6 +13,7 @@ package billingsync
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -48,7 +49,14 @@ type Syncer struct {
 //
 // A failure on one org is logged and skipped, never fatal: the next sweep
 // retries it, and one org's Paddle error must not stop the rest of the fleet
-// from being billed correctly.
+// from being billed correctly. BUT a pass that had drift to push and pushed NONE
+// of it returns a non-nil error (SIGMA-365): that is the signature of a systemic
+// failure — a rotated Paddle key, a wrong CP_PADDLE_PRICE_ID, a subscription
+// state Paddle rejects — under which Paddle is being told the wrong quantity for
+// every affected org. Surfacing it lets the usage-sweep heartbeat's last-success
+// clock go stale (SIGMA-248) instead of reporting green over silent revenue
+// drift. A single transient org failure amid successes stays non-fatal, so the
+// heartbeat does not flap.
 func (s *Syncer) Sync(ctx context.Context, now time.Time) (int, error) {
 	if s == nil || s.Paddle == nil || s.PriceID == "" || s.Store == nil {
 		return 0, nil
@@ -61,16 +69,19 @@ func (s *Syncer) Sync(ctx context.Context, now time.Time) (int, error) {
 	if actor == "" {
 		actor = "system:billing-sync"
 	}
-	synced := 0
+	synced, failed := 0, 0
 	for _, d := range drifted {
 		if err := s.Paddle.UpdateSubscriptionQuantity(ctx, d.SubscriptionID, s.PriceID, d.Want); err != nil {
 			s.log().Error("billing sync: update quantity", "err", err, "org", d.OrgID,
 				"subscription", d.SubscriptionID, "billed", d.Billed, "want", d.Want)
+			failed++
 			continue
 		}
 		// Record only after Paddle accepted it. Recording first would debounce a
 		// push that never happened, leaving the org mis-billed for the whole
-		// debounce window.
+		// debounce window. A record failure here is NOT revenue drift — Paddle was
+		// already told the right quantity — it only means the next sweep re-pushes
+		// idempotently, so it does not count toward the systemic-failure signal.
 		if err := s.Store.RecordQuantitySynced(ctx, d.OrgID, d.Want, actor); err != nil {
 			s.log().Error("billing sync: record synced quantity", "err", err, "org", d.OrgID)
 			continue
@@ -78,6 +89,9 @@ func (s *Syncer) Sync(ctx context.Context, now time.Time) (int, error) {
 		s.log().Info("billing sync: subscription quantity updated",
 			"org", d.OrgID, "from", d.Billed, "to", d.Want)
 		synced++
+	}
+	if synced == 0 && failed > 0 {
+		return 0, fmt.Errorf("billing sync: all %d drifted subscription(s) failed to update", failed)
 	}
 	return synced, nil
 }

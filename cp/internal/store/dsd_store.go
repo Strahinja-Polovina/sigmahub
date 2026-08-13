@@ -378,15 +378,24 @@ type ResourceSpec struct {
 // do not agree on argument order. The query must expose the resource as `r`.
 func ResourceHostedHere(serverParam string) string {
 	p := serverParam
+	// The Compose-placement arm reads the indexed resource_service_placements
+	// table, NOT r.spec's jsonb (SIGMA-365). The jsonb form
+	// (jsonb_array_elements(spec->'compose'->'services') WHERE serverId = $)
+	// cannot be index-driven and is un-restrictable on `resources` alone, so it
+	// forced a cross-tenant seq scan of the whole resources table — detoasting and
+	// parsing every non-owning row's spec — on every reconcile of every server.
+	// resource_service_placements is the faithful projection of exactly those
+	// placements (maintained by syncServicePlacementsTx / SetComposePlacements,
+	// held true by TestComposePlacementsStayProjected), which is why
+	// DeployTargetsForServerQuery already reads it. Same rule, an index behind it.
 	return `
 		(r.server_id = ` + p + `
 		 OR (r.cluster_id IS NOT NULL AND EXISTS (
 		       SELECT 1 FROM cluster_nodes n
 		        WHERE n.cluster_id = r.cluster_id AND n.server_id = ` + p + `))
-		 OR (jsonb_typeof(r.spec->'compose'->'services') = 'array'
-		     AND EXISTS (
-		       SELECT 1 FROM jsonb_array_elements(r.spec->'compose'->'services') svc
-		        WHERE svc->>'serverId' = ` + p + `)))`
+		 OR EXISTS (
+		       SELECT 1 FROM resource_service_placements rsp
+		        WHERE rsp.resource_id = r.id AND rsp.server_id = ` + p + `))`
 }
 
 func (s *Store) ResourceSpecsForServer(ctx context.Context, serverID string) ([]ResourceSpec, error) {
