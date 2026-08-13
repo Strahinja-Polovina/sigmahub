@@ -121,6 +121,24 @@ export const auth = betterAuth({
     },
   },
   socialProviders,
+  // Rate limiting on the auth surface (SIGMA-365). better-auth enables a limiter
+  // only in production by default; turn it on explicitly (dev too) and hold the
+  // credential-guessing endpoints well below the global rate so password spraying
+  // and reset/2FA probing are throttled. Storage is in-memory, which bounds a
+  // SINGLE instance — a horizontally-scaled deployment should point this at shared
+  // (database/secondary) storage so the limit holds across replicas, and the edge
+  // should still carry its own rate limit / WAF (both tracked in SIGMA-365).
+  rateLimit: {
+    enabled: true,
+    window: 60,
+    max: 100,
+    customRules: {
+      "/sign-in/email": { window: 60, max: 5 },
+      "/sign-up/email": { window: 60, max: 5 },
+      "/forget-password": { window: 60, max: 3 },
+      "/two-factor/verify": { window: 60, max: 5 },
+    },
+  },
   plugins: [twoFactor()],
 });
 
