@@ -46,15 +46,23 @@ func TestStaleLoops(t *testing.T) {
 		t.Fatalf("a loop that last passed 2h ago is stale again; got %v", stale)
 	}
 
-	// Fail() must NOT clear staleness — a loop erroring every tick is exactly
-	// the case this exists to catch, and it advances no last-success clock.
+	// A loop that is TICKING AND FAILING is alive, and must not be reported
+	// wedged (SIGMA-365). Killing the control plane does not fix the bad row or
+	// the declined card that made the pass fail, and pass verdicts are the first
+	// failure across the whole fleet — so treating "errored" as "stopped" turned
+	// one tenant's condition into a permanent 503 and a fleet-wide restart loop
+	// that no restart could clear. The failing case is alerted on separately, off
+	// the error counter.
 	r.Loop(LoopSweeper).Fail()
 	for _, name := range r.StaleLoops(time.Now()) {
 		if name == LoopSweeper {
-			return // still reported stale, as intended
+			t.Fatal("a loop that ticks and fails is alive; only a STOPPED loop is wedged")
 		}
 	}
-	t.Fatal("a loop that only ever fails must still be reported stale")
+	// ...but once it stops reporting at all, it is wedged.
+	if stale := r.StaleLoops(time.Now().Add(2 * time.Hour)); len(stale) != len(Loops) {
+		t.Fatalf("a loop that stopped reporting must be wedged; got %v", stale)
+	}
 }
 
 // The budget table has to cover every loop the catalog names, or a loop silently

@@ -739,7 +739,7 @@ func assertBillingNotCappedTx(ctx context.Context, tx pgx.Tx, orgID string, now 
 //   - Only without a LIVE subscription. active/trialing/paused orgs bill for what
 //     they use and are not capped here; past_due/canceled orgs are already
 //     handled (with a grace period) by assertBillingNotCappedTx.
-func assertFreeTierNotExhaustedTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time, billingConfigured bool) error {
+func assertFreeTierNotExhaustedTx(ctx context.Context, tx pgx.Tx, orgID, newType string, now time.Time, billingConfigured bool) error {
 	// A paywall on a deployment with no way to pay is not a paywall, it is a
 	// broken product: a self-hosted SigmaHub has no Paddle credentials, no
 	// checkout and no portal, and capping it at three units would simply end the
@@ -755,18 +755,44 @@ func assertFreeTierNotExhaustedTx(ctx context.Context, tx pgx.Tx, orgID string, 
 		// Never subscribed → free tier applies.
 	case err != nil:
 		return err
-	case status == "active" || status == "trialing" || status == "paused":
-		// A live subscription pays for growth.
+	case billingDelinquent(status):
+		// past_due / canceled belong to assertBillingNotCappedTx, which gives them
+		// a 14-day grace period that SigmaHub emails the customer as a promise
+		// ("nothing is paused"). Capping them here too would nullify that grace
+		// AND explain it with "has no active subscription", which is false on both
+		// counts. One owner per condition.
+		return nil
+	case status != "":
+		// Any other recorded status — active, trialing, paused — is a live
+		// subscription, and a live subscription pays for growth.
 		return nil
 	}
 
+	// The LIVE fleet, not the billing high-water mark. billedUnitsSQL deliberately
+	// takes the 24h maximum so a heartbeat blip cannot scale a subscription down
+	// and re-up minutes later — correct for PRICING, wrong for admission control:
+	// an org that deleted its servers still reads its old peak, so it would be
+	// refused its own replacement for a day and told it "is using all 3 free
+	// units" while running none (SIGMA-365).
+	//
+	// 'provisioning' counts. Servers are created in that state and only flip to
+	// 'running' when an agent checks in, so counting only 'running' let N bootstrap
+	// tokens be minted before any agent connected — precisely the "40-unit fleet
+	// for free" this gate exists to stop. 'incompatible' does not count: that host
+	// can never run a workload (SIGMA-203), so it is not capacity.
 	var units int
-	if err := tx.QueryRow(ctx,
-		`SELECT `+billedUnitsSQL("$1::text", "$2::timestamptz"),
-		orgID, now.UTC().Add(-quantitySyncWindow)).Scan(&units); err != nil {
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(`+unitWeightSQL("sv.type")+`), 0)
+		  FROM servers sv
+		 WHERE sv.org_id = $1 AND sv.deleted_at IS NULL
+		   AND sv.status IN ('provisioning', 'running', 'unreachable')`,
+		orgID).Scan(&units); err != nil {
 		return err
 	}
-	if units < BillingFreeTier {
+	// The server being created counts toward its own admission, or an org at 2
+	// units adds a 4-unit GPU and sits at 6 forever. `>` not `>=`: landing exactly
+	// ON the free tier is what the free tier promises.
+	if units+ServerUnitWeight(newType) <= BillingFreeTier {
 		return nil
 	}
 	return ErrBillingCapped{OrgID: orgID, Status: statusOverFreeTier, Since: now, GraceUntil: now}

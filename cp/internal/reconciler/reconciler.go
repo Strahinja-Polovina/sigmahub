@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -576,22 +577,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, orgID, serverID string) erro
 // importantly the advisory-lock unlock — still run as the stack unwinds; a
 // leaked lock would wedge that server's reconciles for good.
 //
-// The panic becomes an ordinary error, which means the caller treats it like
-// any other per-server failure: Run logs it and moves to the next server, and
-// the pass is reported as failed so the resync's last-success clock (SIGMA-248)
-// goes stale rather than a quarantined server being silently skipped. The stack
-// is logged with the org and server, because "the CP is fine but srv_x never
-// converges" is otherwise a very hard thing to explain.
+// The panic becomes an ordinary error, so the caller moves to the next server —
+// but one wrapped in errReconcilePanic, because a panic is the control plane's
+// own bug and not a tenant's condition: it fails the whole resync pass on its
+// own, where an ordinary per-server error needs the fleet to agree (resyncPass).
+// The stack is logged with the org and server, because "the CP is fine but srv_x
+// never converges" is otherwise a very hard thing to explain.
 func (r *Reconciler) safeReconcile(ctx context.Context, orgID, serverID string) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			r.log.Error("reconcile panic — server quarantined, fleet continues",
 				"org", orgID, "server", serverID, "panic", p, "stack", string(debug.Stack()))
-			err = fmt.Errorf("panic reconciling server %s: %v", serverID, p)
+			err = fmt.Errorf("panic reconciling server %s: %v: %w", serverID, p, errReconcilePanic)
 		}
 	}()
 	return r.Reconcile(ctx, orgID, serverID)
 }
+
+// errReconcilePanic marks a per-server failure that is a defect in the control
+// plane rather than a condition on a customer's host. A quarantined server must
+// never be silently skipped (SIGMA-250), so it fails the resync pass regardless
+// of how much of the fleet converged around it.
+var errReconcilePanic = errors.New("reconcile panic")
 
 // ReconcileAsync runs Reconcile in the background (fire-and-forget from an API
 // handler that already returned) with its own short timeout.
@@ -676,22 +683,50 @@ func (r *Reconciler) resyncPass(ctx context.Context) error {
 		workers = len(servers)
 	}
 
-	// The pass's verdict for the heartbeat (SIGMA-248): a server that failed to
-	// reconcile. A resync that could not converge some of the fleet has not done
-	// its job, and dating it as a success would hide exactly the state worth
-	// alerting on. Which of several failures is kept is not meaningful — the
-	// verdict is read as a boolean — so it is simply the first one recorded.
+	// The pass's verdict for the heartbeat (SIGMA-248/365).
+	//
+	// It used to be "any server failed". On a fleet of one that is the same as
+	// the rule below; on a real fleet it is not, because the single commonest
+	// reason a reconcile fails is that a CUSTOMER'S HOST is down — which is
+	// ordinary, is already surfaced as that server's `unreachable` status, and is
+	// not something restarting or paging the control plane can fix. One such host
+	// pinned the resync loop's last-success clock in the past forever, so the
+	// alert that means "drift repair has stopped" came to mean "somebody's box is
+	// off", and the condition it was built for would have arrived into a channel
+	// that was already red.
+	//
+	// So a pass fails only when EVERY server it attempted failed. That is the
+	// shape of a control-plane-side fault — the database gone, the signing key
+	// unreadable, a panic in render — where nothing is converging for anyone, and
+	// it is the only shape a fleet-wide alert can act on. Partial failures are
+	// logged per server, as they already were.
 	var (
-		mu      sync.Mutex
-		passErr error
-		next    atomic.Int64
-		wg      sync.WaitGroup
+		mu        sync.Mutex
+		passErr   error
+		attempted int
+		failed    int
+		panicked  bool
+		next      atomic.Int64
+		wg        sync.WaitGroup
 	)
 	fail := func(e error) {
 		mu.Lock()
+		failed++
+		if errors.Is(e, errReconcilePanic) {
+			// A panic is the control plane's own defect, not a customer host being
+			// off, so it fails the pass on its own (SIGMA-250).
+			panicked = true
+		}
 		if passErr == nil {
+			// Which of several failures is kept is not meaningful — the verdict is
+			// read as a boolean — so it is simply the first one recorded.
 			passErr = e
 		}
+		mu.Unlock()
+	}
+	attempt := func() {
+		mu.Lock()
+		attempted++
 		mu.Unlock()
 	}
 
@@ -705,6 +740,7 @@ func (r *Reconciler) resyncPass(ctx context.Context) error {
 					return
 				}
 				sv := servers[idx]
+				attempt()
 				// Each reconcile takes a slot, exactly as the serial loop did:
 				// the resync shares the pool with whatever ReconcileAsync
 				// fan-out is in flight, so its connections have to be accounted
@@ -734,7 +770,24 @@ func (r *Reconciler) resyncPass(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
-	return passErr
+
+	mu.Lock()
+	defer mu.Unlock()
+	if failed == 0 {
+		return nil
+	}
+	if panicked {
+		return fmt.Errorf("resync: %d of %d server(s) failed to reconcile: %w", failed, attempted, passErr)
+	}
+	if failed < attempted {
+		// Visible, but not the loop's verdict: these are per-server conditions and
+		// each already has its own error line above. The count is what tells an
+		// operator reading the log whether "a host is down" or "the fleet is".
+		r.log.Warn("resync: some servers did not converge",
+			"failed", failed, "attempted", attempted)
+		return nil
+	}
+	return fmt.Errorf("resync: all %d server(s) failed to reconcile: %w", attempted, passErr)
 }
 
 // reportResyncPass publishes how long a fleet-resync pass took and complains

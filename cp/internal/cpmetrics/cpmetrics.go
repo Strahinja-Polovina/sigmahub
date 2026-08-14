@@ -61,8 +61,8 @@ var Loops = []string{
 	LoopUsageSweep,
 }
 
-// staleBudgets is how long each loop may go without a SUCCESSFUL pass before the
-// control plane should be considered wedged (SIGMA-365).
+// staleBudgets is how long each loop may go without COMPLETING A PASS AT ALL
+// before the control plane should be considered wedged (SIGMA-365).
 //
 // Per-loop rather than one number, because the tick intervals differ by two
 // orders of magnitude (the deploy drain runs every 3 seconds, the usage sweep
@@ -83,13 +83,19 @@ var staleBudgets = map[string]time.Duration{
 	LoopUsageSweep:       60 * time.Minute, // ticks every 10m
 }
 
-// StaleLoops names every loop whose last successful pass is older than its
-// budget, oldest budget first for a stable answer. Empty means "every background
-// loop has completed a pass recently".
+// StaleLoops names every loop that has not completed a pass inside its budget,
+// in catalog order for a stable answer. Empty means "every background loop is
+// still turning".
 //
-// A loop that has NEVER succeeded is judged from process start, not from the
-// zero time, so a control plane that is still booting — or one whose slowest
-// loop has not reached its first tick — is not reported as wedged.
+// "Completed a pass" and not "succeeded": a loop whose work is failing is alive,
+// and killing the process does not fix a bad row or an expired card. Failure is
+// reported by sigmahub_cp_loop_errors_total and alerted on separately; this is
+// the signal that says the goroutine itself has stopped, which IS worth a
+// restart.
+//
+// A loop that has never reported is judged from process start, not from the zero
+// time, so a control plane that is still booting — or one whose slowest loop has
+// not reached its first tick — is not reported as wedged.
 func (r *Registry) StaleLoops(now time.Time) []string {
 	if r == nil {
 		return nil
@@ -106,7 +112,9 @@ func (r *Registry) StaleLoops(now time.Time) []string {
 		if !ok {
 			continue
 		}
-		since := st.lastSuccess
+		// lastAttempt, not lastSuccess — see the field's comment. A loop that is
+		// ticking and failing is a loop that is alive.
+		since := st.lastAttempt
 		if since.IsZero() {
 			since = r.startedAt
 		}
@@ -130,6 +138,15 @@ type PoolStats struct {
 type loopState struct {
 	// lastSuccess is zero until the loop completes a pass without error.
 	lastSuccess time.Time
+	// lastAttempt moves on EVERY pass, successful or not. It is what liveness
+	// reads (SIGMA-365): "has this loop stopped running" is a different question
+	// from "is its work failing", and only the first one is answered by killing
+	// the process. A pass verdict is the first failure across the whole fleet, so
+	// one bad server row or one customer's expired card would otherwise freeze
+	// lastSuccess forever and make /livez a permanent 503 that no restart clears —
+	// turning one tenant's condition into a fleet-wide restart loop. The failing
+	// case is still visible, on sigmahub_cp_loop_errors_total and its alert.
+	lastAttempt time.Time
 	iterations  uint64
 	errors      uint64
 }
@@ -223,6 +240,7 @@ func (l *Loop) record(ok bool) {
 		l.reg.loops[l.name] = st
 	}
 	st.iterations++
+	st.lastAttempt = time.Now()
 	if ok {
 		st.lastSuccess = time.Now()
 	} else {

@@ -79,10 +79,27 @@ func (s *Server) handleBillingCheckout(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "billing checkout")
 		return
 	}
-	qty := summary.BillableUnits
+	// The quantity a NEW subscription opens at, floored at SubscriptionMinQuantity
+	// exactly as an existing one is (SIGMA-365).
+	//
+	// It used to be the bare billable count, which deadlocked the conversion
+	// funnel at the only point that matters: an org sitting on the whole free tier
+	// is refused its next server (SIGMA-363) and sent here to subscribe, but its
+	// billable count is still 0 — three units, three free — so checkout answered
+	// 422 "no billable units yet" and the dashboard rendered Subscribe disabled
+	// and labelled "Within free tier". Capped from growing and refused a way to
+	// pay, with no in-product escape.
+	//
+	// Opening at the minimum is what the customer is actually buying: the unit
+	// that takes them past the free tier. The quantity sweep re-prices it to the
+	// real figure within the debounce window as soon as the server they wanted
+	// connects, and SubscriptionMinQuantity is the same floor that keeps it alive
+	// afterwards, so this introduces no new number.
+	qty := store.BillableQuantity(summary.BilledUnits, true)
 	if qty < 1 {
-		// Nothing billable yet (within the free tier) — checkout would create a
-		// zero-quantity transaction. Tell the UI honestly.
+		// Unreachable while SubscriptionMinQuantity >= 1; kept as a guard so a
+		// future floor of 0 cannot silently send Paddle a zero-quantity
+		// transaction.
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
 			"error": "no billable units yet — the first 3 units are free (an ordinary server is 1 unit)",
 		})

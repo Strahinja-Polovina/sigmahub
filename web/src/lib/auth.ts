@@ -4,7 +4,7 @@ import { twoFactor } from "better-auth/plugins";
 import { db, authSchema } from "../server/db";
 import { sendMail } from "../server/email";
 import { configuredAuthProviders } from "./auth-providers";
-import { mailDelivers } from "./mail";
+import { emailVerificationRequired } from "./email-verification";
 
 // Session/token signing key. better-auth falls back to an insecure default
 // when unset — acceptable only in dev; a production SERVER must fail fast, or
@@ -22,53 +22,15 @@ if (
   );
 }
 
-// Boolean env parsing that mirrors cp/internal/config.parseBoolEnv, which in
-// turn mirrors Go's strconv.ParseBool: the set of accepted spellings is the
-// same on both sides of the product, so an operator who writes `=1` in the CP
-// section of their .env and `=1` in the web section gets the same answer twice.
-// Unset/empty is the documented default; anything else that is not a recognised
-// spelling throws, because a security flag that quietly reads `false` after a
-// typo is worse than one that refuses to start.
-const TRUTHY = new Set(["1", "t", "T", "TRUE", "true", "True"]);
-const FALSY = new Set(["0", "f", "F", "FALSE", "false", "False"]);
-
-export function parseBoolEnv(key: string, raw: string | undefined, def = false): boolean {
-  const v = (raw ?? "").trim();
-  if (v === "") return def;
-  if (TRUTHY.has(v)) return true;
-  if (FALSY.has(v)) return false;
-  throw new Error(`${key} must be a boolean (true/false), got ${JSON.stringify(raw)}`);
-}
-
 // Invite email-match (acceptInvite) rests on the account's email actually
-// belonging to the user. AUTH_REQUIRE_EMAIL_VERIFICATION=true makes better-auth
-// block sign-in until the address is verified, closing that gap (SIGMA-82). It
-// is opt-in: no SMTP is bundled (verification links go to the server log, like
-// the reset flow), so turning it on without a real transport would strand
-// sign-ups — a deliberate operator choice once a transport is wired, not a
-// silent default that breaks the beta.
-//
-// It is parsed with parseBoolEnv, not `=== "true"`. The identical fail-open
-// construct on the control-plane side was SIGMA-142: an operator who wrote
-// CP_REQUIRE_ACTOR=1 got a silent `false` and ran with the security control off
-// while believing it was on. This flag is the same shape of control on the same
-// SIGMA-82 gap, so it gets the same contract — every spelling Go's
-// strconv.ParseBool accepts turns it on, and an unrecognised value fails boot
-// loudly instead of leaving sign-in open to unverified addresses with no signal
-// anywhere in the logs or the UI (SIGMA-261).
-// Default: ON wherever mail can actually be delivered (SIGMA-361/365). The flag
-// was opt-in because no transport was bundled and turning it on would have
-// stranded every sign-up at an unsendable verification link. Now that SMTP_HOST +
-// SMTP_FROM wire a real transport, the deployment that can verify addresses
-// should verify them by default — invite acceptance, audit rows and the whole
-// "email is identity" assumption rest on it. A deployment with no transport keeps
-// the old default (the link goes to the log and the operator relays it), and an
-// explicit AUTH_REQUIRE_EMAIL_VERIFICATION still wins either way.
-const requireEmailVerification = parseBoolEnv(
-  "AUTH_REQUIRE_EMAIL_VERIFICATION",
-  process.env.AUTH_REQUIRE_EMAIL_VERIFICATION,
-  mailDelivers()
-);
+// belonging to the user; requiring a verified address is what closes that gap
+// (SIGMA-82). The policy — the flag, its spellings, and its
+// deliverability-derived default — lives in lib/email-verification.ts, because
+// the invite gate in server/actions/members.ts has to reach exactly the same
+// verdict and used to compute its own (SIGMA-365). Read once here: better-auth's
+// options are fixed at construction, and a control that could change under a
+// running process is not a control.
+const requireEmailVerification = emailVerificationRequired();
 
 // Third-party sign-in, from the same flags the auth screens read (SIGMA-246).
 // Empty on a deployment that has set no OAuth credentials — which is every
@@ -147,6 +109,21 @@ export const auth = betterAuth({
   emailVerification: {
     // Only sent on sign-up when verification is actually required.
     sendOnSignUp: requireEmailVerification,
+    // A refused sign-in must hand back the way in, not just the reason it was
+    // refused (SIGMA-365). better-auth's default is to answer EMAIL_NOT_VERIFIED
+    // and send nothing, which leaves a user whose sign-up mail was lost — or who
+    // signed up in the window before the operator wired SMTP — with no route to a
+    // fresh link anywhere in the product: the only sender is sign-up, and
+    // sign-up now answers a duplicate address with a deliberate no-op. With this
+    // on, every attempt to sign in re-issues the link to the address that is
+    // trying to use it, so the flow is self-healing. It reveals nothing: the
+    // caller already proved the password on the line above.
+    sendOnSignIn: true,
+    // The link is the proof; making the user then type the password they just
+    // typed is a second wall in front of the same door. It also matters for
+    // invites — the ?invite= token rides through as the callbackURL, and landing
+    // signed-in on the accept page is the whole flow in one hop.
+    autoSignInAfterVerification: true,
     sendVerificationEmail: async ({ user, url }) => {
       await sendMail({
         to: user.email,

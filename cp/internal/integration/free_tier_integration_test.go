@@ -84,6 +84,125 @@ func TestSubscribingLiftsTheFreeTierCap(t *testing.T) {
 	}
 }
 
+// The conversion funnel must not be a dead end (SIGMA-365). The first cut of the
+// ceiling engaged at units >= 3 while checkout required units >= 4, so an org
+// with exactly three general servers — the shape the free tier advertises, and
+// where every organically growing org lands — was refused growth AND shown a
+// disabled Subscribe button reading "Within free tier". It could neither grow nor
+// pay, with no in-product escape, at the single moment the paywall exists to
+// create a customer.
+func TestFreeTierCapIsNotADeadEnd(t *testing.T) {
+	st, _ := testStore(t)
+	st.SetBillingConfigured(true)
+	ctx := context.Background()
+	orgID := "org_funnel"
+
+	for i := 0; i < store.BillingFreeTier; i++ {
+		connectServer(t, st, orgID, fmt.Sprintf("free%d", i))
+	}
+	// Capped, as intended.
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "blocked", "general", "", "", "admin", time.Hour); err == nil {
+		t.Fatal("precondition: an org at the ceiling must be refused growth")
+	}
+	// And it can pay. The checkout opens a subscription at the minimum quantity —
+	// the unit that takes the org past the free tier — so the 402's "start a
+	// subscription from Settings → Billing" is a route that exists rather than a
+	// sentence pointing at a disabled button.
+	sum, err := st.BillingSummaryForOrg(ctx, orgID, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qty := store.BillableQuantity(sum.BilledUnits, true); qty < 1 {
+		t.Fatalf("an org refused growth at the ceiling has nothing to buy "+
+			"(checkout quantity=%d, billedUnits=%d): capped and unable to subscribe "+
+			"is a dead end", qty, sum.BilledUnits)
+	}
+
+	// And once it has paid, it grows.
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_fn", SubscriptionID: "sub_fn", Status: "active", Quantity: 1,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "fourth", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("after subscribing, the refused server must be creatable: %v", err)
+	}
+}
+
+// A deleted server frees its capacity immediately. The first cut read the 24h
+// billing high-water mark, which exists to stop a heartbeat blip re-pricing a
+// subscription — correct for the invoice, wrong for admission: an org that
+// deleted a server was told it "is using all 3 free units" while running two, and
+// could not replace it for a day. That is the rebuild path and the fumbled-
+// onboarding path, both common at launch.
+func TestFreeTierFreesCapacityWhenAServerGoes(t *testing.T) {
+	st, _ := testStore(t)
+	st.SetBillingConfigured(true)
+	ctx := context.Background()
+	orgID := "org_replace"
+
+	var ids []string
+	for i := 0; i < store.BillingFreeTier; i++ {
+		ids = append(ids, connectServer(t, st, orgID, fmt.Sprintf("s%d", i)))
+	}
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "blocked", "general", "", "", "admin", time.Hour); err == nil {
+		t.Fatal("precondition: full fleet is capped")
+	}
+	// Delete one (soft delete, as the product does) and replace it at once.
+	if _, err := st.Pool.Exec(ctx, `UPDATE servers SET deleted_at = now() WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "replacement", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("a freed unit must be reusable immediately, not in 24h: %v", err)
+	}
+}
+
+// The gate weighs the server being ADDED. Without that an org at 2 units adds a
+// 4-unit GPU and sits at 6 units free forever — the straddle that made the
+// ceiling advisory rather than binding.
+func TestFreeTierCountsTheWeightOfTheServerBeingAdded(t *testing.T) {
+	st, _ := testStore(t)
+	st.SetBillingConfigured(true)
+	ctx := context.Background()
+	orgID := "org_straddle"
+
+	connectServer(t, st, orgID, "one")
+	connectServer(t, st, orgID, "two") // 2 units of 3 used
+
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "gpu-straddle", "gpu", "", "", "admin", time.Hour); err == nil {
+		t.Fatal("a 4-unit GPU must not slip under a 3-unit ceiling from 2 units used")
+	}
+	// A 1-unit server still fits exactly, because landing ON the tier is what the
+	// free tier promises.
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "third", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("the third free unit must still be free: %v", err)
+	}
+}
+
+// A delinquent org has ONE owner: assertBillingNotCappedTx, which gives it a
+// 14-day grace period SigmaHub emails the customer as a promise. The free-tier
+// gate must not cap it too — that nullifies the grace and explains it with "has
+// no active subscription", which is false on both counts.
+func TestDelinquentOrgKeepsItsGracePeriod(t *testing.T) {
+	st, _ := testStore(t)
+	st.SetBillingConfigured(true)
+	ctx := context.Background()
+	orgID := "org_grace"
+
+	for i := 0; i < store.BillingFreeTier; i++ {
+		connectServer(t, st, orgID, fmt.Sprintf("g%d", i))
+	}
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_g", SubscriptionID: "sub_g", Status: "past_due", Quantity: 1,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	// Inside the grace window: nothing is paused, exactly as the dunning email says.
+	if _, _, _, err := st.IssueBootstrapToken(ctx, orgID, "during-grace", "general", "", "", "admin", time.Hour); err != nil {
+		t.Fatalf("a past_due org inside its grace period must still grow: %v", err)
+	}
+}
+
 func TestUnbilledOrgsSurfacesOverTierUsage(t *testing.T) {
 	st, _ := testStore(t)
 	ctx := context.Background()
