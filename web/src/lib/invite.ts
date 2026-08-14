@@ -9,6 +9,36 @@ import { createHash, randomBytes } from "node:crypto";
  *  enough that a teammate can accept over a weekend. */
 export const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Outbound-mail throttles for the invite flow (SIGMA-365).
+//
+// Every SigmaHub account is an Org Admin of its own personal org the moment it
+// signs up, so "an org admin" is "anyone who registered". Resend had no limit at
+// all: holding the button mailed an arbitrary address without bound, from the
+// sending domain every other tenant's password-reset mail depends on. A
+// blocklisted domain is not fixed by deploying a patch.
+//
+// The numbers are deliberately generous — the point is to make automated abuse
+// uneconomic, not to police a team onboarding twenty people in one sitting. And
+// neither limit is a dead end even when it bites: the invite dialog offers the
+// link to copy, so an admin who hits the cap can still onboard immediately by
+// sending the link themselves, and both refusals say when the limit lifts.
+export const INVITE_RESEND_COOLDOWN_MS = 60 * 1000;
+export const INVITE_SEND_WINDOW_MS = 60 * 60 * 1000;
+export const INVITE_SENDS_PER_WINDOW = 25;
+
+/** How long until this invitation may be mailed again, in ms. 0 = now. */
+export function resendWaitMs(lastSentAt: Date, now: Date): number {
+  return Math.max(0, INVITE_RESEND_COOLDOWN_MS - (now.getTime() - lastSentAt.getTime()));
+}
+
+/** Human wait, for a refusal that has to tell the admin when to come back. */
+export function humanWait(ms: number): string {
+  const secs = Math.ceil(ms / 1000);
+  if (secs < 60) return `${secs} second${secs === 1 ? "" : "s"}`;
+  const mins = Math.ceil(secs / 60);
+  return `${mins} minute${mins === 1 ? "" : "s"}`;
+}
+
 export const ORG_ROLES = ["Org Admin", "Project Admin", "Developer"] as const;
 export const PROJECT_GRANT_ROLES = ["Project Admin", "Developer"] as const;
 

@@ -139,12 +139,23 @@ export const auth = betterAuth({
   // Rate limiting on the auth surface (SIGMA-365). better-auth enables a limiter
   // only in production by default; turn it on explicitly (dev too) and hold the
   // credential-guessing endpoints well below the global rate so password spraying
-  // and reset/2FA probing are throttled. Storage is in-memory, which bounds a
-  // SINGLE instance — a horizontally-scaled deployment should point this at shared
-  // (database/secondary) storage so the limit holds across replicas, and the edge
-  // should still carry its own rate limit / WAF (both tracked in SIGMA-365).
+  // and reset/2FA probing are throttled.
+  //
+  // Storage is the DATABASE, not the default in-process map. The map bounds one
+  // process, so with N replicas behind a proxy the effective sign-in limit
+  // silently becomes N × 5/min — and it degrades with no signal anywhere, on a
+  // change (scaling out) that nobody would connect to authentication. Making the
+  // limit a property of the deployment rather than of a process means scaling is
+  // a scaling decision, not a security one. Counters live in `rate_limit`
+  // (server/db/auth-schema.ts) and better-auth prunes expired rows itself.
+  //
+  // This is the whole request path for the reference deployment. It does NOT
+  // replace an edge rate limit or WAF for unauthenticated flooding — no
+  // application-level limiter can, since the request has already reached the app
+  // to be counted. That remains infrastructure, and `Caddyfile` carries the block.
   rateLimit: {
     enabled: true,
+    storage: "database",
     window: 60,
     max: 100,
     customRules: {

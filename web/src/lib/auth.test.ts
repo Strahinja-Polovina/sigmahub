@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type AuthOptions = {
+  rateLimit?: { enabled?: boolean; storage?: string; customRules?: Record<string, unknown> };
   emailAndPassword?: { requireEmailVerification?: boolean };
   emailVerification?: {
     sendOnSignUp?: boolean;
@@ -76,6 +77,21 @@ describe("the way back in when an address is unverified", () => {
     // first link was lost has no route to a second one at all.
     const opts = await loadAuthOptions("true");
     expect(opts.emailVerification?.sendOnSignIn).toBe(true);
+  });
+
+  it("counts rate limits in the database, so the limit survives a second replica", async () => {
+    // The default in-process map bounds ONE process: with N replicas the
+    // effective sign-in limit becomes N × 5/min, and it degrades in silence on a
+    // change (scaling out) nobody would connect to authentication. The storage
+    // backing it is checked here because the failure has no other symptom —
+    // server/db/rate-limit-storage.test.ts proves the table can actually take it.
+    const opts = await loadAuthOptions(undefined);
+    expect(opts.rateLimit?.enabled).toBe(true);
+    expect(opts.rateLimit?.storage).toBe("database");
+    // The credential-guessing endpoints stay well below the global rate.
+    expect(Object.keys(opts.rateLimit?.customRules ?? {})).toEqual(
+      expect.arrayContaining(["/sign-in/email", "/sign-up/email", "/forget-password"])
+    );
   });
 
   it("signs the user in when the link is used, so the hop is invisible", async () => {

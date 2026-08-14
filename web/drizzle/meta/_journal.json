@@ -78,6 +78,27 @@
       "when": 1786703756842,
       "tag": "0010_grandfather_verified_emails",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786736790289,
+      "tag": "0011_rate_limit_counters",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786737044309,
+      "tag": "0012_invite_send_throttle",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786737424089,
+      "tag": "0013_org_mail_budget",
+      "breakpoints": true
     }
   ]
 }

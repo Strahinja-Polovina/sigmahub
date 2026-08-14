@@ -9,10 +9,13 @@ import { requireOrgAdmin, getSessionUser } from "../active-org";
 import { writeAudit } from "../audit";
 import { sendInviteEmail } from "../email";
 import { emailVerificationRequired } from "../../lib/email-verification";
+import { chargeOrgMail } from "../mail-budget";
 import {
   INVITE_TTL_MS,
   appBaseUrl,
   hashInviteToken,
+  humanWait,
+  resendWaitMs,
   inviteRejection,
   inviteRejectionMessage,
   inviteUrl,
@@ -85,6 +88,13 @@ export async function inviteMember(input: {
     throw new Error("An invite is already pending for that email — resend or revoke it first.");
   }
 
+  // Charge the org's outbound-mail budget BEFORE writing the row, so a refusal
+  // does not leave a pending invitation nobody was told about (SIGMA-365).
+  // Scoped per org, so one abuser cannot spend another tenant's allowance, and
+  // never a dead end: the message names the reset and the copy-link route, which
+  // works immediately.
+  await chargeOrgMail(input.orgId);
+
   const { raw, hash } = newInviteToken();
   try {
     await db.insert(s.invitations).values({
@@ -128,15 +138,40 @@ export async function resendInvite(input: {
 }): Promise<{ inviteUrl: string; delivered: boolean }> {
   const actor = await requireOrgAdmin(input.orgId);
   const [inv] = await db
-    .select({ email: s.invitations.email, role: s.invitations.role, status: s.invitations.status })
+    .select({
+      email: s.invitations.email,
+      role: s.invitations.role,
+      status: s.invitations.status,
+      lastSentAt: s.invitations.lastSentAt,
+    })
     .from(s.invitations)
     .where(and(eq(s.invitations.id, input.invitationId), eq(s.invitations.orgId, input.orgId)));
   if (!inv || inv.status !== "pending") throw new Error("No pending invite to resend.");
 
+  // Resend had NO limit (SIGMA-365): holding the button mailed an arbitrary
+  // address without bound, from our sending domain. The recipient does not have
+  // to be a customer, and a blocklisted domain is not fixed by deploying a patch.
+  const wait = resendWaitMs(inv.lastSentAt, new Date());
+  if (wait > 0) {
+    throw new Error(
+      `An invite was just sent to ${inv.email}. You can resend in ${humanWait(wait)} — ` +
+        `or copy the link from the invite list and send it yourself now.`
+    );
+  }
+  // The per-invitation cooldown above bounds how often ONE address is mailed; it
+  // does not bound the org, which can hold many pending invitations and rotate
+  // through them. The budget is what actually bounds volume, so a resend is
+  // charged exactly like a new invite.
+  await chargeOrgMail(input.orgId);
+
   const { raw, hash } = newInviteToken();
   await db
     .update(s.invitations)
-    .set({ tokenHash: hash, expiresAt: new Date(Date.now() + INVITE_TTL_MS) })
+    .set({
+      tokenHash: hash,
+      expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+      lastSentAt: new Date(),
+    })
     .where(eq(s.invitations.id, input.invitationId));
 
   const url = inviteUrl(appBaseUrl(), raw);
