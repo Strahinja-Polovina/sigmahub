@@ -227,12 +227,35 @@ services:
       SIGMAHUB_CP_PROVISION_TOKEN: ${CP_PROVISION_TOKEN}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
-      # Block sign-in until the address is verified (SIGMA-82/SIGMA-261). Off by
-      # default because no SMTP is bundled — verification links go to the web
-      # container's log — so turning it on before a transport is wired strands
-      # sign-ups. Parsed strictly on the web side: an unrecognised value fails
-      # the container's boot instead of silently leaving the control off.
-      AUTH_REQUIRE_EMAIL_VERIFICATION: ${AUTH_REQUIRE_EMAIL_VERIFICATION:-false}
+      # Block sign-in until the address is verified (SIGMA-82/SIGMA-261).
+      #
+      # Deliberately passed through EMPTY rather than defaulted here: empty means
+      # "let the web tier decide", and it decides by whether mail can actually be
+      # delivered (SIGMA-365). With SMTP wired below, verification is ON — invite
+      # acceptance, audit rows and the whole "email is identity" assumption rest
+      # on it. Without a transport it stays off, because a verification link that
+      # only reaches the container log would strand every sign-up. Hard-coding
+      # `false` here, as this line used to, silently overrode that judgement.
+      # Parsed strictly on the web side: an unrecognised value fails the
+      # container's boot instead of leaving the control quietly off.
+      AUTH_REQUIRE_EMAIL_VERIFICATION: ${AUTH_REQUIRE_EMAIL_VERIFICATION:-}
+      # Outbound mail (SIGMA-361/365). Set SMTP_HOST + SMTP_FROM and the product
+      # starts delivering invites, verification and password resets for real;
+      # leave them unset and every one of those links goes to this container's
+      # log instead, with the UI saying so rather than pointing users at a spam
+      # folder that will never fill. Public sign-up should not be opened until
+      # these are set — a locked-out user cannot ask anyone to relay a link.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # Escape hatch for a submission server on a trusted network that offers no
+      # STARTTLS. Off by default: these messages carry bearer links.
+      SMTP_ALLOW_INSECURE: ${SMTP_ALLOW_INSECURE:-}
+      # Optional shared secret for GET /api/health?require=cp, the deploy gate
+      # that round-trips to the control plane. Unset leaves it open, as it was.
+      HEALTH_PROBE_TOKEN: ${HEALTH_PROBE_TOKEN:-}
     # Loopback only, for the same reason as cp above: the dashboard is reached
     # through the proxy, and this binding is for on-box checks.
     ports:
@@ -340,6 +363,51 @@ services:
     depends_on:
       - vmstorage
 
+  # ── Operator monitoring (optional; enable with COMPOSE_PROFILES=monitoring) ──
+  # The control plane's own health, scraped and alerted on (SIGMA-365).
+  #
+  # This is NOT the telemetry profile above. That one is the tenant pipeline —
+  # customer logs and metrics. This one watches the control plane itself, and it
+  # is deliberately a separate profile so it can run on a deployment that offers
+  # no tenant telemetry at all, and keep working when the tenant pipeline is the
+  # thing that broke.
+  #
+  # Until this existed, SIGMA-248's loop last-success clocks were exported and
+  # scraped by nobody: every "the loop goes stale and we will know" guarantee
+  # rested on alerting the docs described and the deployment never shipped. If
+  # you run no monitoring at all, GET /livez on the CP is the zero-infrastructure
+  # version — it answers 503 in the same state these rules page on, so any uptime
+  # checker or orchestrator liveness probe catches it.
+  vmsingle:
+    image: victoriametrics/victoria-metrics:v1.102.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - -promscrape.config=/etc/monitoring/scrape.yml
+      - -retentionPeriod=${CP_MONITORING_RETENTION:-30d}
+      - -storageDataPath=/storage
+    volumes:
+      - ./monitoring:/etc/monitoring:ro
+      - monitoring-data:/storage
+
+  vmalert:
+    image: victoriametrics/vmalert:v1.102.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - -rule=/etc/monitoring/alerts.yml
+      - -datasource.url=http://vmsingle:8428
+      # Where evaluated alerts go. Unset means they are still visible in
+      # vmalert's own UI and as the ALERTS series, but nothing pages — point this
+      # at an Alertmanager to have these reach a human.
+      - -notifier.url=${CP_ALERTMANAGER_URL:-}
+      # Recording the rules' own results back lets you graph them.
+      - -remoteWrite.url=http://vmsingle:8428
+    depends_on:
+      - vmsingle
+
 volumes:
   db-data:
   cp-data:
@@ -347,3 +415,4 @@ volumes:
   caddy-config:
   loki-data:
   vm-data:
+  monitoring-data:

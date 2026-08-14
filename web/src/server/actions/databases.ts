@@ -1,6 +1,6 @@
 "use server";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as s from "../db/schema";
 import { requireProjectAdminForResource, requireResourceVisible } from "../active-org";
@@ -17,7 +17,12 @@ import {
 /** The local row a demo connection is derived from: the resource itself, plus
  *  the mesh address of the host it landed on — a managed engine binds to the
  *  private mesh and nothing else, which is the fact the panel exists to state. */
-async function demoResource(resourceId: string) {
+// Org-scoped on purpose (SIGMA-365). requireProjectAdminForResource falls back to
+// the org gate when the mirror has no row for the id, which an org admin passes —
+// so an unscoped lookup here would answer for ANOTHER org's resource. In CP mode
+// the control plane refuses that call anyway; the demo branch has no such
+// backstop, so the scope has to live in the query.
+async function demoResource(orgId: string, resourceId: string) {
   const [row] = await db
     .select({
       id: s.resources.id,
@@ -26,8 +31,9 @@ async function demoResource(resourceId: string) {
       meshIp: s.servers.meshIp,
     })
     .from(s.resources)
+    .innerJoin(s.projects, eq(s.resources.projectId, s.projects.id))
     .leftJoin(s.servers, eq(s.resources.serverId, s.servers.id))
-    .where(eq(s.resources.id, resourceId));
+    .where(and(eq(s.resources.id, resourceId), eq(s.projects.orgId, orgId)));
   return row;
 }
 
@@ -46,7 +52,7 @@ export async function getDatabaseInfo(input: {
 }): Promise<CpDatabaseInfo | null> {
   await requireResourceVisible(input.orgId, input.resourceId);
   if (cpEnabled()) return cpGetDatabase(input.orgId, input.resourceId);
-  const row = await demoResource(input.resourceId);
+  const row = await demoResource(input.orgId, input.resourceId);
   if (!row) return null;
   return demoDatabaseInfo({
     resourceId: row.id,
@@ -75,7 +81,7 @@ export async function revealDatabaseConnection(input: {
       role,
     });
   } else {
-    const row = await demoResource(input.resourceId);
+    const row = await demoResource(input.orgId, input.resourceId);
     const demo = row
       ? demoDatabaseConnection({
           resourceId: row.id,

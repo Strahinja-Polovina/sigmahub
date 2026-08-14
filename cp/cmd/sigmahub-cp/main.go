@@ -505,6 +505,11 @@ func run() error {
 		paddleClient, paddleQuantity = pc, pc
 		log.Info("paddle billing configured", "env", cfg.PaddleEnv)
 	}
+	// SIGMA-363: the free tier has a ceiling, but ONLY where there is a way to
+	// pay. Both halves are required — a client with no price id can take no
+	// checkout — and a deployment missing either keeps growing without limit,
+	// which is the ordinary self-hosted case.
+	st.SetBillingConfigured(paddleClient != nil && cfg.PaddlePriceID != "")
 	// SIGMA-171: the billed quantity used to be sent to Paddle once, at
 	// checkout, and never again — every org that grew or shrank after
 	// subscribing was invoiced for its subscribe-time server count while the
@@ -564,6 +569,26 @@ func run() error {
 						fail(err)
 					} else if n > 0 {
 						log.Warn("billing dunning: delinquent orgs reminded", "orgs", n)
+					}
+					// SIGMA-363: orgs over the free tier with no live subscription.
+					// They have no Paddle relationship to reconcile against, so
+					// before this they appeared in no operator view at all — the
+					// one shape of unpaid usage that was completely invisible.
+					// Growth is already refused at server creation; this is how a
+					// human finds out it is happening. Warn, for the same reason
+					// dunning warns: alert channels are per-org, so this line is
+					// the operator's only notice.
+					if unbilled, err := st.UnbilledOrgs(ctx, time.Now()); err != nil {
+						log.Error("unbilled usage report", "err", err)
+						fail(err)
+					} else if len(unbilled) > 0 {
+						value := 0
+						for _, o := range unbilled {
+							value += o.MonthlyValue
+						}
+						log.Warn("unbilled usage: orgs over the free tier with no subscription",
+							"orgs", len(unbilled), "monthly_value", value,
+							"currency", store.BillingCurrency, "largest", unbilled[0].OrgID)
 					}
 					return passErr
 				}))

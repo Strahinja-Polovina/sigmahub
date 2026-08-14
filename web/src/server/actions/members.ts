@@ -8,6 +8,7 @@ import { user } from "../db/auth-schema";
 import { requireOrgAdmin, getSessionUser } from "../active-org";
 import { writeAudit } from "../audit";
 import { sendInviteEmail } from "../email";
+import { mailDelivers } from "../../lib/mail";
 import {
   INVITE_TTL_MS,
   appBaseUrl,
@@ -185,6 +186,20 @@ export async function acceptInvite(input: { token: string }): Promise<{ orgId: s
     if (!sameEmail(sessionUser.email, inv.email)) {
       throw new Error(
         `This invitation was sent to ${inv.email}. Sign in with that email to accept it.`
+      );
+    }
+    // The email match above is the ONLY thing binding this invite to a person,
+    // so the address has to have been proven (SIGMA-361). Anyone can register an
+    // account claiming any address; without verification, someone holding a
+    // leaked invite link registers the invited address and joins the org as
+    // themselves. Enforced wherever verification is actually achievable — i.e.
+    // wherever mail is deliverable. A deployment with no transport keeps the
+    // email-match-only rule, because requiring a verification link that can only
+    // reach the container log would strand every self-hosted invite.
+    if (mailDelivers() && !sessionUser.emailVerified) {
+      throw new Error(
+        "Verify your email address before accepting this invitation. " +
+          "Check your inbox for the verification link, or request a new one from the sign-in page."
       );
     }
 

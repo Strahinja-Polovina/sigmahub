@@ -46,11 +46,19 @@ func TestBillingMeterAndSummary(t *testing.T) {
 	ctx := context.Background()
 	orgID := "org_bill"
 
-	// 4 connected servers: 3 free, 1 billable.
-	for i, n := range []string{"s1", "s2", "s3", "s4"} {
+	// 4 connected servers: 3 free, 1 billable — reached the way a customer
+	// reaches it. The free tier is finite (SIGMA-363), so the fourth server needs
+	// a subscription; that is the funnel, and it must not change the arithmetic
+	// this test is about (BillableQuantity's minimum is 1, which 4-3 already is).
+	for _, n := range []string{"s1", "s2", "s3"} {
 		connectServer(t, st, orgID, n)
-		_ = i
 	}
+	if err := st.UpsertSubscription(ctx, orgID, store.BillingStatus{
+		OrgID: orgID, CustomerID: "ctm_m", SubscriptionID: "sub_m", Status: "active", Quantity: 1,
+	}, "paddle-webhook"); err != nil {
+		t.Fatal(err)
+	}
+	connectServer(t, st, orgID, "s4")
 	// The meter records one row per connected server for this hour.
 	n, err := st.SweepServerHours(ctx, time.Now())
 	if err != nil {

@@ -2,7 +2,9 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { twoFactor } from "better-auth/plugins";
 import { db, authSchema } from "../server/db";
+import { sendMail } from "../server/email";
 import { configuredAuthProviders } from "./auth-providers";
+import { mailDelivers } from "./mail";
 
 // Session/token signing key. better-auth falls back to an insecure default
 // when unset — acceptable only in dev; a production SERVER must fail fast, or
@@ -54,9 +56,18 @@ export function parseBoolEnv(key: string, raw: string | undefined, def = false):
 // strconv.ParseBool accepts turns it on, and an unrecognised value fails boot
 // loudly instead of leaving sign-in open to unverified addresses with no signal
 // anywhere in the logs or the UI (SIGMA-261).
+// Default: ON wherever mail can actually be delivered (SIGMA-361/365). The flag
+// was opt-in because no transport was bundled and turning it on would have
+// stranded every sign-up at an unsendable verification link. Now that SMTP_HOST +
+// SMTP_FROM wire a real transport, the deployment that can verify addresses
+// should verify them by default — invite acceptance, audit rows and the whole
+// "email is identity" assumption rest on it. A deployment with no transport keeps
+// the old default (the link goes to the log and the operator relays it), and an
+// explicit AUTH_REQUIRE_EMAIL_VERIFICATION still wins either way.
 const requireEmailVerification = parseBoolEnv(
   "AUTH_REQUIRE_EMAIL_VERIFICATION",
-  process.env.AUTH_REQUIRE_EMAIL_VERIFICATION
+  process.env.AUTH_REQUIRE_EMAIL_VERIFICATION,
+  mailDelivers()
 );
 
 // Third-party sign-in, from the same flags the auth screens read (SIGMA-246).
@@ -87,9 +98,24 @@ const socialProviders = {
 // v1 dev: better-auth over the same PGlite DB (email+password + TOTP 2FA).
 // Orgs/memberships live in our own tables (V1-1); better-auth owns user auth.
 // Production points DATABASE_URL at a real Postgres behind the same adapter.
+// Public origin of the dashboard. better-auth otherwise infers it from the
+// incoming request headers, which behind the documented reverse proxy makes
+// secure-cookie inference and origin validation depend on what the proxy
+// forwards. Stating it makes both deterministic (SIGMA-365); unset keeps the
+// previous inferred behaviour, which is what dev wants.
+const baseURL = (process.env.BETTER_AUTH_URL ?? "").trim() || undefined;
+
 export const auth = betterAuth({
   appName: "SigmaHub",
   secret,
+  baseURL,
+  trustedOrigins: baseURL ? [baseURL] : undefined,
+  advanced: {
+    // The dashboard is served over TLS in every hosted deployment; pin the
+    // Secure attribute rather than letting it be inferred from a forwarded
+    // header. NODE_ENV is the same signal the rest of the app uses.
+    useSecureCookies: process.env.NODE_ENV === "production",
+  },
   database: drizzleAdapter(db, { provider: "pg", schema: authSchema }),
   emailAndPassword: {
     enabled: true,
@@ -100,24 +126,36 @@ export const auth = betterAuth({
     // through the victim's recovery — and /reset-password tells the user their
     // other sessions ended, so this is also what makes that sentence true.
     revokeSessionsOnPasswordReset: true,
-    // Reset emails: no SMTP is bundled, so the reset link goes to the server
-    // log — genuinely usable in dev/self-hosted setups (the operator can
-    // relay it), and honest about what happens instead of silently dropping.
-    // Wire a real transport here for hosted deployments — and in the SAME
-    // commit teach lib/mail.ts about it, because that is what /forgot reads to
-    // decide whether to say "check your inbox" or "ask your administrator for
-    // the link" (SIGMA-307). A transport wired here and not there puts the
-    // locked-out user back in their spam folder.
+    // Reset mail goes through the one door in server/email.ts, which submits
+    // over SMTP when a transport is configured and logs the link otherwise —
+    // the same answer lib/mail gives /forgot, so the copy ("check your inbox"
+    // vs "ask your administrator for the link") can never describe a delivery
+    // that did not happen (SIGMA-307/365).
     sendResetPassword: async ({ user, url }) => {
-      console.info(`[auth] password reset requested for ${user.email}: ${url}`);
+      await sendMail({
+        to: user.email,
+        subject: "Reset your SigmaHub password",
+        text:
+          `A password reset was requested for this address.\n\n` +
+          `Reset it here:\n${url}\n\n` +
+          `If this was not you, you can ignore this message — nothing changes ` +
+          `until the link is used. Signing in again with your existing password ` +
+          `also leaves it in place.\n`,
+      });
     },
   },
   emailVerification: {
-    // Same honest log transport as the reset flow (wire real SMTP for hosted).
     // Only sent on sign-up when verification is actually required.
     sendOnSignUp: requireEmailVerification,
     sendVerificationEmail: async ({ user, url }) => {
-      console.info(`[auth] email verification for ${user.email}: ${url}`);
+      await sendMail({
+        to: user.email,
+        subject: "Verify your SigmaHub email address",
+        text:
+          `Confirm this address to finish setting up your SigmaHub account.\n\n` +
+          `Verify:\n${url}\n\n` +
+          `If you did not create an account, you can ignore this message.\n`,
+      });
     },
   },
   socialProviders,

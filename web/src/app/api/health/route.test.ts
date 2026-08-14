@@ -103,16 +103,40 @@ describe("GET /api/health?require=cp", () => {
     expect(await res.json()).toMatchObject({ cp: "unreachable" });
   });
 
-  it("reports the control plane as disabled — without failing — when nobody asked for it", async () => {
+  it("answers a bare probe from liveness alone — no control-plane round trip", async () => {
     // Demo deployments run with no control plane on purpose. They are not
     // broken, so a bare /api/health must not say they are; the staging gate
     // states its expectation with ?require=cp instead.
-    delete process.env.SIGMAHUB_CP_URL;
-
+    //
+    // And the bare probe must not dial the control plane even when one IS
+    // configured (SIGMA-365): this route is reachable without a session, so a
+    // probe on every anonymous hit turned cheap public traffic into CP
+    // round-trips carrying the provision token, and told the caller whether a
+    // control plane existed, answered, and accepted our credential.
     const res = await get("http://web/api/health");
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ status: "ok", cp: "disabled" });
+    expect(await res.json()).toMatchObject({ status: "ok" });
     expect(calls).toHaveLength(0);
+  });
+
+  it("gates the control-plane probe behind HEALTH_PROBE_TOKEN when one is set", async () => {
+    process.env.HEALTH_PROBE_TOKEN = "probe_secret";
+    try {
+      const denied = await get("http://web/api/health?require=cp");
+      expect(denied.status).toBe(401);
+      expect(calls).toHaveLength(0);
+
+      const { GET } = await import("./route");
+      const allowed = await GET(
+        new Request("http://web/api/health?require=cp", {
+          headers: { authorization: "Bearer probe_secret" },
+        })
+      );
+      expect(allowed.status).toBe(200);
+      expect(calls).toHaveLength(1);
+    } finally {
+      delete process.env.HEALTH_PROBE_TOKEN;
+    }
   });
 });
