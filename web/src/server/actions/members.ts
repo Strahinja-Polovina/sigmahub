@@ -8,7 +8,7 @@ import { user } from "../db/auth-schema";
 import { requireOrgAdmin, getSessionUser } from "../active-org";
 import { writeAudit } from "../audit";
 import { sendInviteEmail } from "../email";
-import { mailDelivers } from "../../lib/mail";
+import { emailVerificationRequired } from "../../lib/email-verification";
 import {
   INVITE_TTL_MS,
   appBaseUrl,
@@ -192,11 +192,15 @@ export async function acceptInvite(input: { token: string }): Promise<{ orgId: s
     // so the address has to have been proven (SIGMA-361). Anyone can register an
     // account claiming any address; without verification, someone holding a
     // leaked invite link registers the invited address and joins the org as
-    // themselves. Enforced wherever verification is actually achievable — i.e.
-    // wherever mail is deliverable. A deployment with no transport keeps the
-    // email-match-only rule, because requiring a verification link that can only
-    // reach the container log would strand every self-hosted invite.
-    if (mailDelivers() && !sessionUser.emailVerified) {
+    // themselves.
+    //
+    // The gate is the deployment's verification policy, NOT "is mail
+    // deliverable" (SIGMA-365). Those are the same by default and differ the
+    // moment an operator states AUTH_REQUIRE_EMAIL_VERIFICATION — and reading
+    // deliverability there refused every invite on a deployment that had
+    // deliberately turned verification off, pointing each invitee at a link it
+    // was configured never to send. See lib/email-verification.ts.
+    if (emailVerificationRequired() && !sessionUser.emailVerified) {
       throw new Error(
         "Verify your email address before accepting this invitation. " +
           "Check your inbox for the verification link, or request a new one from the sign-in page."

@@ -22,7 +22,7 @@
  * went through the generator fails the web suite instead of quietly shipping a
  * stale dashboard.
  */
-export const CATALOG_SOURCE_SHA256 = "572762d4a70fbefc95d775f7e4dc2803b6887286f014691c74345a0baa550a1f";
+export const CATALOG_SOURCE_SHA256 = "124f48592926b20dbdeb8cb354be98f3404894966335f67efe90c44b1ed4a92e";
 
 export type ServerType =
   | "general"

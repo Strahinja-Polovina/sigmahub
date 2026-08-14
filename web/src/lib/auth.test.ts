@@ -10,7 +10,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type AuthOptions = {
   emailAndPassword?: { requireEmailVerification?: boolean };
-  emailVerification?: { sendOnSignUp?: boolean };
+  emailVerification?: {
+    sendOnSignUp?: boolean;
+    sendOnSignIn?: boolean;
+    autoSignInAfterVerification?: boolean;
+  };
 };
 
 /** Re-import lib/auth with the flag set to `value` (undefined = unset) and hand
@@ -57,4 +61,27 @@ describe("AUTH_REQUIRE_EMAIL_VERIFICATION accepts 1/True and rejects typos", () 
       await expect(import("./auth")).rejects.toThrow(/AUTH_REQUIRE_EMAIL_VERIFICATION/);
     });
   }
+});
+
+// A requirement with no way to satisfy it is a lockout, not a control
+// (SIGMA-365). Verification now defaults on wherever SMTP is configured, so an
+// existing install acquires it on the upgrade that wires the transport. These
+// two options are the escape hatches that keep that upgrade survivable; the
+// migration that grandfathers pre-existing accounts
+// (drizzle/0010_grandfather_verified_emails.sql) is the other half.
+describe("the way back in when an address is unverified", () => {
+  it("re-sends the link on a refused sign-in, because nothing else in the product can", async () => {
+    // Sign-up is the only other sender, and with verification on it answers a
+    // duplicate address with a deliberate no-op — so without this, a user whose
+    // first link was lost has no route to a second one at all.
+    const opts = await loadAuthOptions("true");
+    expect(opts.emailVerification?.sendOnSignIn).toBe(true);
+  });
+
+  it("signs the user in when the link is used, so the hop is invisible", async () => {
+    // Also what makes an invite work in one hop: the ?invite= token rides
+    // through as the callbackURL and the accept page needs a session.
+    const opts = await loadAuthOptions("true");
+    expect(opts.emailVerification?.autoSignInAfterVerification).toBe(true);
+  });
 });

@@ -343,13 +343,6 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
 		return "", "", err
 	}
-	// SIGMA-363: and the free tier has a ceiling. Same chokepoint, same "growth
-	// only, nothing running is touched" rule — an org using all its free units
-	// with no live subscription may not add another server. Without this, never
-	// subscribing was unlimited and strictly cheaper than subscribing.
-	if err := assertFreeTierNotExhaustedTx(ctx, tx, orgID, time.Now(), billingConfigured); err != nil {
-		return "", "", err
-	}
 	// A name the operator did not give is a name the MACHINE gets to supply:
 	// registration replaces the placeholder with the reported hostname
 	// (SIGMA-202). Until the agent checks in the row still has to be
@@ -374,6 +367,17 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	if !IsServerType(typ) {
 		return "", "", ErrInvalid{Msg: fmt.Sprintf("unknown server type %q; expected one of %s",
 			typ, strings.Join(ServerTypes(), ", "))}
+	}
+	// SIGMA-363: and the free tier has a ceiling. Same chokepoint, same "growth
+	// only, nothing running is touched" rule — an org using all its free units
+	// with no live subscription may not add another server. Without this, never
+	// subscribing was unlimited and strictly cheaper than subscribing.
+	//
+	// Deliberately AFTER the type is normalised and validated: the gate weighs the
+	// server being added (a gpu is 4 units, a general 1), so it needs the real
+	// type, and refusing an unknown type is a clearer answer than pricing it.
+	if err := assertFreeTierNotExhaustedTx(ctx, tx, orgID, typ, time.Now(), billingConfigured); err != nil {
+		return "", "", err
 	}
 	meshIP, err := allocateMeshIP(ctx, tx, orgID)
 	if err != nil {

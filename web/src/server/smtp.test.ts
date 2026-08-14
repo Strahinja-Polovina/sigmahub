@@ -175,6 +175,29 @@ describe("sendSmtpMail", () => {
     expect(f.body).toContain("https://sigmahub.test/reset?token=abc");
   });
 
+  it("puts a bare addr-spec in the envelope while the display name stays in From:", async () => {
+    // `SMTP_FROM="SigmaHub <no-reply@…>"` is the natural thing for an operator to
+    // write, and interpolating it verbatim produced
+    // `MAIL FROM:<SigmaHub <no-reply@…>>` — a 501 from every conforming server,
+    // on the password-reset path, seen by nobody (SIGMA-365).
+    const f = await fake();
+    await sendSmtpMail(
+      { host: "127.0.0.1", port: f.port, requireTls: false, timeoutMs: 5000 },
+      {
+        ...msg,
+        from: "SigmaHub <no-reply@sigmahub.test>",
+        to: ["Someone <someone@example.com>"],
+      }
+    );
+
+    expect(f.commands[1]).toBe("MAIL FROM:<no-reply@sigmahub.test>");
+    expect(f.commands[2]).toBe("RCPT TO:<someone@example.com>");
+    // ...and the display name is not lost — it belongs in the header, which is
+    // the half of the split that makes the mail look like it came from a product.
+    expect(f.body).toContain("From: SigmaHub <no-reply@sigmahub.test>");
+    expect(f.body).toContain("To: Someone <someone@example.com>");
+  });
+
   it("parses a multiline EHLO reply and one dribbled a byte at a time", async () => {
     // Both are ordinary on the wire and both break a naive reader: the multiline
     // reply must not be treated as complete at its first line, and a reply split

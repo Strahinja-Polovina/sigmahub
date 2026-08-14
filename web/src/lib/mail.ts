@@ -34,6 +34,38 @@ export type MailTransport =
 /** Submission port when SMTP_PORT is unset. 587 (STARTTLS), not 25. */
 export const defaultSmtpPort = 587;
 
+/**
+ * The addr-spec inside an address, for the SMTP envelope (SIGMA-365).
+ *
+ * MAIL FROM / RCPT TO take a bare `<user@host>` — a display name belongs in the
+ * `From:`/`To:` HEADER and nowhere else. Interpolating the configured value
+ * verbatim put `MAIL FROM:<SigmaHub <no-reply@example.com>>` on the wire, which
+ * every RFC-conforming server rejects with `501 5.5.4 Syntax`, and the same for
+ * an operator who wrote the address already wrapped in angle brackets. Both are
+ * the natural things to write, and the failure was silent all the way to the
+ * user, so the two forms are separated here rather than trusted to configuration.
+ *
+ * Lives in lib/ rather than next to the SMTP client because the boot check below
+ * has to apply the same rule the wire does — a value that passes validation and
+ * then gets parsed differently at send time is the bug this is meant to close.
+ */
+export function envelopeAddress(address: string): string {
+  // CR/LF first: a crafted value must not be able to smuggle in a header, and
+  // the angle-bracket match must not straddle a line break either.
+  const v = address.replace(/[\r\n]+/g, " ").trim();
+  const angled = /<([^<>]+)>\s*$/.exec(v);
+  return (angled ? angled[1] : v).trim();
+}
+
+/**
+ * Is this a submittable envelope sender? Deliberately not an RFC 5321 parser —
+ * it only has to reject the values that make a real server hang up, which in
+ * practice means "no @ in it at all" and "nothing on one side of the @".
+ */
+function isAddrSpec(v: string): boolean {
+  return /^[^\s@]+@[^\s@]+$/.test(v);
+}
+
 export function configuredMailTransport(): MailTransport {
   const host = (process.env.SMTP_HOST ?? "").trim();
   const from = (process.env.SMTP_FROM ?? "").trim();
@@ -41,6 +73,21 @@ export function configuredMailTransport(): MailTransport {
   // operator who set one of the two has a half-configured deployment that should
   // keep saying "not delivered" rather than start claiming an inbox.
   if (!host || !from) return { kind: "log" };
+  // A malformed sender fails HERE, at the first import of this module, and not at
+  // the first password reset (SIGMA-365). Every consumer of this transport is a
+  // flow nobody watches: the reset mail is sent for a user who is already locked
+  // out, the verification mail during a sign-up nobody is tailing logs for. A
+  // `501 5.5.4 Syntax` on those reaches the operator as "some users say they get
+  // no mail", weeks later. Refusing the value at boot is the same contract
+  // parseBoolEnv gives AUTH_REQUIRE_EMAIL_VERIFICATION in lib/auth.ts, and both
+  // are read at that module's top level, so the deployment does not start.
+  if (!isAddrSpec(envelopeAddress(from))) {
+    throw new Error(
+      `SMTP_FROM must be an email address (got ${JSON.stringify(from)}). ` +
+        `Write a bare address such as no-reply@example.com, or a display-name ` +
+        `form such as "SigmaHub <no-reply@example.com>".`
+    );
+  }
   const port = Number.parseInt((process.env.SMTP_PORT ?? "").trim(), 10);
   return {
     kind: "smtp",

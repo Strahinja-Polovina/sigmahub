@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Loader2, ShieldCheck } from "lucide-react";
+import { ArrowLeft, Loader2, MailCheck, ServerCog, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { authClient } from "@/lib/auth-client";
@@ -14,6 +14,7 @@ import { AuthDivider } from "@/components/auth/auth-divider";
 import { OtpInput } from "@/components/auth/otp-input";
 import { SocialButtons } from "@/components/auth/social-buttons";
 import { useAuthProviders } from "@/components/auth/auth-providers";
+import { useMailDelivery } from "@/components/auth/mail-delivery";
 import { anyAuthProvider } from "@/lib/auth-providers";
 import {
   validateEmail,
@@ -21,7 +22,7 @@ import {
   validatePassword,
 } from "@/components/auth/validators";
 
-type Step = "credentials" | "totp";
+type Step = "credentials" | "totp" | "verify";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -37,11 +38,16 @@ export default function LoginPage() {
   const [submitting, setSubmitting] = React.useState(false);
 
   const ssoAvailable = anyAuthProvider(useAuthProviders());
+  // Whether the link this screen may have just re-sent reaches a mailbox at all.
+  const mailDelivered = useMailDelivery();
 
   // TOTP state
   const [code, setCode] = React.useState("");
   const [codeError, setCodeError] = React.useState<string | null>(null);
   const [verifying, setVerifying] = React.useState(false);
+
+  // Verification state
+  const [resending, setResending] = React.useState(false);
 
   const submitCredentials = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -51,10 +57,29 @@ export default function LoginPage() {
     if (emailError || passwordError) return;
 
     setSubmitting(true);
-    const { data, error } = await authClient.signIn.email({ email, password });
+    const { data, error } = await authClient.signIn.email({
+      email,
+      password,
+      callbackURL: destAfterAuth(),
+    });
     setSubmitting(false);
 
     if (error) {
+      // The password was right; the address has not been confirmed. Rendering
+      // this as "Invalid email or password" — which is what the generic branch
+      // below did — sends the user to /forgot to reset a password that is not
+      // the problem, and the reset does not lift the block either, so recovery is
+      // impossible from inside the product (SIGMA-365). The server has just
+      // re-issued the link (emailVerification.sendOnSignIn), so this screen only
+      // has to say where it went.
+      if (
+        error.status === 403 ||
+        error.code === "EMAIL_NOT_VERIFIED" ||
+        /not verified/i.test(error.message ?? "")
+      ) {
+        setStep("verify");
+        return;
+      }
       toast.error("Couldn’t sign in", {
         description: error.message ?? "Invalid email or password.",
       });
@@ -89,6 +114,77 @@ export default function LoginPage() {
     toast.success("Welcome back");
     router.push(destAfterAuth());
   };
+
+  const resendVerification = async () => {
+    setResending(true);
+    try {
+      await authClient.sendVerificationEmail({ email, callbackURL: destAfterAuth() });
+    } catch {
+      // Swallowed: the outcome must not differ between an address that exists
+      // and one that does not.
+    }
+    setResending(false);
+    toast.success(
+      mailDelivered ? "Verification email sent" : "Verification link written to the log"
+    );
+  };
+
+  if (step === "verify") {
+    return (
+      <div>
+        <div className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary">
+          {mailDelivered ? <MailCheck className="size-5" /> : <ServerCog className="size-5" />}
+        </div>
+        <h1 className="mt-5 text-xl font-semibold tracking-tight text-foreground">
+          {mailDelivered ? "Confirm your email to continue" : "Email delivery isn’t configured"}
+        </h1>
+        {mailDelivered ? (
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            Your password is correct, but{" "}
+            <span className="font-medium text-foreground">{email}</span> hasn&apos;t been
+            confirmed yet. We&apos;ve just sent a fresh link — open it and you&apos;ll be
+            signed in.
+          </p>
+        ) : (
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            Your password is correct, but{" "}
+            <span className="font-medium text-foreground">{email}</span> hasn&apos;t been
+            confirmed and this deployment sends no mail. The link was written to the
+            dashboard server&apos;s log — ask your administrator for it.
+          </p>
+        )}
+
+        <div className="mt-7 grid gap-2">
+          <Button
+            type="button"
+            className="w-full"
+            onClick={resendVerification}
+            disabled={resending}
+          >
+            {resending && <Loader2 className="size-4 animate-spin" />}
+            {mailDelivered ? "Send it again" : "Write a new link to the log"}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            className="w-full"
+            onClick={() => {
+              setStep("credentials");
+              setPassword("");
+            }}
+          >
+            Use a different account
+          </Button>
+        </div>
+
+        <p className="mt-6 text-center text-xs text-muted-foreground">
+          {mailDelivered
+            ? "Didn’t get it? Check your spam folder, or send it again above."
+            : "An administrator can wire a mail transport so these links are sent automatically."}
+        </p>
+      </div>
+    );
+  }
 
   if (step === "totp") {
     return (

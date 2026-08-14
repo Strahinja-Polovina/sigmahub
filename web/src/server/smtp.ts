@@ -3,6 +3,8 @@ import "server-only";
 import net from "node:net";
 import tls from "node:tls";
 
+import { envelopeAddress } from "@/lib/mail";
+
 // A minimal SMTP submission client (SIGMA-365).
 //
 // No SMTP library is bundled deliberately: the product needs exactly one thing
@@ -203,10 +205,12 @@ export async function sendSmtpMail(
       }
     }
 
-    await send(`MAIL FROM:<${sanitizeHeader(msg.from)}>`);
+    // Envelope, not header: the display name goes in the From:/To: lines that
+    // buildMessage writes, never inside the angle brackets here.
+    await send(`MAIL FROM:<${envelopeAddress(msg.from)}>`);
     await expect(250, "MAIL FROM");
     for (const rcpt of msg.to) {
-      await send(`RCPT TO:<${sanitizeHeader(rcpt)}>`);
+      await send(`RCPT TO:<${envelopeAddress(rcpt)}>`);
       const reply = await reader.read();
       const code = replyCode(reply);
       // 251 is "not local, will forward" — also a success.

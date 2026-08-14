@@ -128,8 +128,12 @@ func (s *Server) handleIssueBootstrapToken(w http.ResponseWriter, r *http.Reques
 	token, serverID, expiresAt, err := s.store.IssueBootstrapToken(
 		r.Context(), orgID, req.Name, typ, req.Provider, req.Region, principalFrom(r).Name, defaultBootstrapTTL)
 	if err != nil {
-		s.log.Error("issue bootstrap token", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		// Through writeStoreErr, not a blanket 500: this is where the billing caps
+		// surface (SIGMA-365). ErrBillingCapped is a 402 naming the portal, and the
+		// free-tier ceiling is the ordinary conversion moment for every free
+		// customer — presenting it as "internal error" turns the paywall into a bug
+		// report and hides the one sentence that says what to do about it.
+		s.writeStoreErr(w, err, "issue bootstrap token")
 		return
 	}
 	writeJSON(w, http.StatusCreated, s.withInstallerRelease(map[string]any{
@@ -170,8 +174,7 @@ func (s *Server) handleProvisionServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("provision server", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		s.writeStoreErr(w, err, "provision server")
 		return
 	}
 	writeJSON(w, http.StatusCreated, s.withInstallerRelease(map[string]any{

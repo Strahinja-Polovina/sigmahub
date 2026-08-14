@@ -71,6 +71,13 @@
       "when": 1786260510215,
       "tag": "0009_resource_engine",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786703756842,
+      "tag": "0010_grandfather_verified_emails",
+      "breakpoints": true
     }
   ]
 }

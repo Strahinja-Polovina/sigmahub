@@ -1,0 +1,28 @@
+-- SIGMA-365: grandfather the accounts that predate email verification.
+--
+-- Verification used to be opt-in, because no SMTP transport was bundled and
+-- turning it on would have stranded every sign-up at an unsendable link. It now
+-- defaults ON wherever mail can actually be delivered (lib/auth.ts reads
+-- mailDelivers()), which means an existing install acquires the requirement the
+-- moment its operator sets SMTP_HOST + SMTP_FROM — a change they make to FIX
+-- their mail, with no reason to expect it touches sign-in.
+--
+-- Every row in `user` carries email_verified = false at that moment: the column
+-- defaults false and, with verification off, nothing ever set it. So on the next
+-- boot better-auth refuses every existing user at /sign-in/email with
+-- EMAIL_NOT_VERIFIED — including the administrator who just wired the SMTP, and
+-- including every account on a deployment whose users cannot be re-invited
+-- because invites require a signed-in admin. The install locks itself.
+--
+-- Grandfathering is the honest resolution, not a compromise. These addresses are
+-- unverified only in the sense that this deployment never asked; the accounts
+-- already have full access under the rules they signed up under, so marking them
+-- verified grants nothing that is not already granted. The alternative — asking
+-- users to re-prove an address to keep an account they already hold — is a
+-- password-reset storm on the day of an upgrade, and it fails closed on exactly
+-- the deployments whose mail is least likely to work first time.
+--
+-- The cut is the migration itself: it runs once, so accounts created after this
+-- point go through verification normally. On a fresh install the table is empty
+-- and this is a no-op.
+UPDATE "user" SET "email_verified" = true WHERE "email_verified" = false;
