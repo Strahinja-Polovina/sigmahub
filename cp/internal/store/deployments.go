@@ -566,15 +566,29 @@ func scanLatestDeployments(rows pgx.Rows) ([]Deployment, error) {
 	return out, rows.Err()
 }
 
+// RollbackWindow is how many past releases a rollback may pick from. The agent
+// keeps strictly more images than this per resource so every offered candidate
+// is still on the host (SIGMA-362).
+const RollbackWindow = 10
+
 // RollbackTargets returns a resource's last N SUCCESSFUL releases whose exact
 // images can be re-shipped, newest-first — the candidates a &lt;30s rebuild-free
 // rollback can pick from. Eligible: pinned releases (image_pin — per-deployment
 // immutable tags, SIGMA-173), or legacy single-container releases whose
 // recorded tag was really built. Legacy Compose releases are excluded — their
 // image_digest was a tag no Compose build ever produced (SIGMA-168).
+//
+// RollbackWindow is a promise about what the FLEET still holds, not just about
+// what this table remembers: on a same-host build there is no registry to
+// re-pull from, so an offered release whose image the agent has already pruned
+// rolls back into "no such image". The agent's defaultImageRetention is sized
+// against this number and explains the relationship from its side (SIGMA-362);
+// they are in different binaries, so neither can import the other's constant and
+// the invariant lives in these two comments. Raising this without raising that
+// re-opens the gap.
 func (s *Store) RollbackTargets(ctx context.Context, orgID, resourceID string, limit int) ([]Deployment, error) {
-	if limit <= 0 || limit > 10 {
-		limit = 10
+	if limit <= 0 || limit > RollbackWindow {
+		limit = RollbackWindow
 	}
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, org_id, resource_id, environment_id, server_id, connection_id, trigger, git_ref, git_sha,

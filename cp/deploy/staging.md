@@ -40,12 +40,34 @@ Fill in `.env` (all required unless noted):
 | `CP_APPS_DOMAIN` | Optional — the wildcard resource URLs are minted under, e.g. `apps.example.com` with `*.apps.example.com` pointed at the proxy servers. Empty falls back to sslip.io derived from each host's public address, so a resource is reachable on its first deploy with no DNS record at all (SIGMA-351). |
 | `CP_KMS_BACKEND` | `file` is fine for staging; `vault` for prod custody. |
 | `CP_DB_ENGINES` / `CP_S3_ENGINES` | Leave **empty** to exercise every engine the catalog defines — the list is derived, not written down (SIGMA-268). Set one only to cut it (`CP_DB_ENGINES=postgres`). |
-| `CP_PADDLE_*` | Optional — leave empty; billing degrades to the honest usage preview. |
+| `CP_PADDLE_*` | Optional — leave empty; billing degrades to the honest usage preview. Setting `CP_PADDLE_API_KEY` **and** `CP_PADDLE_PRICE_ID` also switches on the free-tier ceiling (SIGMA-363): an org using all 3 free units with no live subscription is refused *new servers* until it subscribes. Nothing running is touched, and resources on servers an org already has are unaffected. Left empty — the self-hosted case — nothing is ever capped, because a paywall on a deployment with no checkout is just a broken product. |
 | `CP_VM_WRITE_URL` / `CP_LOKI_URL` | Optional — telemetry shows not-configured until set. |
+| `SMTP_HOST` / `SMTP_FROM` | **Set these before opening public sign-up.** They turn on real mail delivery for invites, email verification and password resets. Optional `SMTP_PORT` (default 587; 465 uses implicit TLS), `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_ALLOW_INSECURE` for a submission server on a trusted network that offers no STARTTLS (off by default — these messages carry bearer links). |
+| `HEALTH_PROBE_TOKEN` | Optional shared secret for the dashboard's `GET /api/health?require=cp` deploy gate. Unset leaves the probe open. |
+| `CP_ALERTMANAGER_URL` | Optional — where `COMPOSE_PROFILES=monitoring` sends the control plane's own alerts (see §7). |
+
+> **Mail is a launch gate.** With no `SMTP_HOST`/`SMTP_FROM`, every invite,
+> verification and reset link is written to the web container's log and delivered
+> to nobody. That is genuinely workable self-hosted — the operator relays the
+> link, and every screen says so instead of pointing users at a spam folder — but
+> a locked-out user on a public sign-up cannot ask anyone for it. Setting these
+> also flips email verification on by default, which is what makes invite
+> acceptance safe: the address match is otherwise the only thing binding an invite
+> to a person, and anyone can register claiming any address (SIGMA-361).
 
 > **Key custody:** the file backend generates the KMS key on first boot inside
-> the `cp-data` volume. **Back that volume up** — every wrapped secret depends on
-> it. For a prod-shaped staging, set `CP_KMS_BACKEND=vault` + `CP_VAULT_*`.
+> the `cp-data` volume. **Back that volume up, independently of the database** —
+> it is the single root of all recoverability. Every tenant secret, database
+> credential, backup-target secret and restic repository password is sealed under
+> an org key wrapped by it, including the ones protecting snapshots already
+> sitting in the customer's own bucket. Losing it does not degrade the install; it
+> makes the entire encrypted corpus permanently unreadable, offsite backups
+> included, with no recovery path by design (that property is also what makes
+> org purge a real erasure). Restoring a database backup without the matching
+> custody root restores ciphertext and nothing else. For a prod-shaped staging,
+> set `CP_KMS_BACKEND=vault` + `CP_VAULT_*` and back the Vault transit key up the
+> way Vault documents; rotation is supported in place (`RotateKEK`) and re-wraps
+> every envelope, so a rotated root never strands a live secret.
 
 ## 2. Bring the stack up
 
@@ -191,8 +213,37 @@ construction: when `CreateDueBackupRuns` starts erroring, no backup run is
 created for any tenant, and `backup_failed` cannot fire because it needs a run
 to exist before it can fail.
 
-Alert on staleness, generously relative to each loop's interval (the resync
-runs every 60s, the usage sweep every 10 minutes):
+### `GET /livez` — the zero-infrastructure version
+
+If you run no monitoring stack at all, this is the one thing to wire up:
+
+```
+curl -sf http://localhost:8080/livez   # 200 "alive", 503 once a loop is wedged
+```
+
+It applies the staleness judgement below **inside** the control plane, per loop,
+with a budget sized to each loop's own interval, and names the wedged loops in
+the body. Point a Kubernetes `livenessProbe`, a Docker healthcheck, an uptime
+checker or a cron at it and the failure class this section is about stops being
+invisible without any of the rest of this.
+
+It is deliberately **not** `/readyz`. A wedged background loop does not stop the
+API serving reads and writes, so the correct response is to restart the process,
+not to pull it out of the load balancer and take the dashboard down as well.
+`/readyz` stays "can I serve" (a database ping); `/livez` is "should I be
+restarted".
+
+### The alerting stack, shipped
+
+```
+COMPOSE_PROFILES=monitoring docker compose up -d
+```
+
+brings up `vmsingle` (scrapes `cp:8080/metrics` every 30s, config in
+`deploy/monitoring/scrape.yml`) and `vmalert` (rules in
+`deploy/monitoring/alerts.yml`). Set `CP_ALERTMANAGER_URL` to have the alerts
+page someone; without it they are still visible in vmalert's UI and as the
+`ALERTS` series. The rules are the ones this section used to only describe:
 
 ```
 - alert: SigmahubCPLoopStalled
@@ -200,16 +251,42 @@ runs every 60s, the usage sweep every 10 minutes):
   for: 10m
 ```
 
-Include `== 0` in the same alert: a loop that never started must page, and a
-zero timestamp is how that looks. `sigmahub_cp_loop_errors_total` distinguishes
-"spinning and failing" from "not running at all", and
-`sigmahub_cp_db_pool_connections{state="acquired"}` at the ceiling is a control
-plane about to stall every loop at once.
+plus `SigmahubCPLoopNeverStarted` (`== 0` — a loop that never started must page,
+and a zero timestamp is how that looks), `SigmahubCPLoopErroring`
+(`sigmahub_cp_loop_errors_total`, which distinguishes "spinning and failing" from
+"not running at all"), `SigmahubCPPoolSaturated` (a pool at its ceiling is a
+control plane about to stall every loop at once) and
+`SigmahubCPResyncOutrunningTick`.
 
-This is the CP's own health, deliberately separate from the tenant-facing
-telemetry pipeline: the alert path for customer events is the per-org outbox,
-which is itself one of these loops, so a control plane in trouble cannot be
-relied on to report that it is in trouble. Scrape this from outside.
+This profile is separate from `telemetry` on purpose. That one is the **tenant**
+pipeline (customer logs and metrics); this one watches the control plane itself,
+has to work on a deployment that offers no tenant telemetry at all, and has to
+keep working when the tenant pipeline is the thing that broke. Same reasoning one
+level up: the alert path for customer events is the per-org outbox, which is
+itself one of these loops, so a control plane in trouble cannot be relied on to
+report that it is in trouble. Scrape it from outside where you can.
+
+## 7b. Before you open sign-up to the internet (SIGMA-365)
+
+Three things are configuration, not code, and all three are off in a bare
+bring-up. A closed beta with trusted tenants is fine without them; a public
+sign-up page is not.
+
+1. **Mail.** `SMTP_HOST` + `SMTP_FROM` (§1). Without them invites and password
+   resets reach nobody, and email verification — the thing that makes an invited
+   address mean a person — stays off.
+2. **Edge rate limiting.** better-auth throttles the credential endpoints inside
+   the dashboard, which is the whole request path for this single-instance
+   deployment. Add a CDN/WAF or a `caddy-ratelimit` build (the exact block is
+   commented in `Caddyfile`) before exposing sign-in publicly, and note that the
+   in-process counters stop being sufficient the moment a second `web` replica
+   exists.
+3. **Monitoring.** `COMPOSE_PROFILES=monitoring`, or at minimum a check against
+   `GET /livez` (§7). Otherwise a wedged control plane is silent.
+
+Billing enforcement (§1, `CP_PADDLE_*`) is the fourth switch: without it every
+org grows without limit, which is correct self-hosted and wrong for a hosted
+tenant.
 
 ## 8. Retention (SIGMA-249)
 
@@ -271,6 +348,25 @@ rolling an image back does not roll the schema back. So:
 - **Roll the schema forward only.** If a migration is wrong, fix it with another
   migration. There are no down-migrations, by design — a down-migration is a
   destructive operation run at the worst possible moment.
+
+### Sizing the migration window
+
+Each migration file runs in one transaction under the advisory lock above, so
+while a long one is applying, **every other replica's boot blocks on that lock**.
+Two shipped migrations do full-table work and are worth a maintenance window on a
+large install rather than a rolling restart:
+
+- `0063_server_hours_unit_weight.sql` backfills `server_hours`, the one meter
+  table that grows a row per running server per hour and is therefore unbounded
+  in install age.
+- `0065_resource_public_label.sql` backfills `resources` and then builds a unique
+  index **without** `CONCURRENTLY` (it cannot: the runner is inside a
+  transaction), which holds a `SHARE` lock blocking writes to `resources` for the
+  duration.
+
+Both are correct and both are one-time. On a fresh or small install they are
+imperceptible. Run `migrate` as the explicit deploy step above, watch it finish,
+then roll the binaries — do not discover the lock wait as a stalled rollout.
 
 ## 10. Running more than one control-plane replica (SIGMA-291)
 

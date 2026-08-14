@@ -241,6 +241,14 @@ func (d *Driver) applyNode(ctx context.Context, op dsd.Op) (err error) {
 	env := []string{
 		"INSTALL_K3S_SKIP_START=false",
 		"K3S_TOKEN=" + spec.JoinToken,
+		// Pin the Kubernetes version (SIGMA-365). Unpinned, get.k3s.io installs
+		// whatever "stable" means at the moment the script runs, so two nodes
+		// joined a week apart can land on different minor versions and the
+		// version a cluster runs is decided by when it happened to be built —
+		// neither reproducible nor something we test against. This is the same
+		// version CI exercises the real API server with (ci.yml K3S_VERSION);
+		// the two are expected to move together.
+		"INSTALL_K3S_VERSION=" + K3sVersion,
 	}
 	var args []string
 	if spec.Role == RoleControlPlane {
