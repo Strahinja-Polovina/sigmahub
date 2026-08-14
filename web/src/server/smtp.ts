@@ -218,7 +218,15 @@ export async function sendSmtpMail(
     await expect(354, "DATA");
     await send(buildMessage(msg));
     await expect(250, "message body");
+
+    // Orderly shutdown. The message is already queued (the 250 above), so this
+    // is politeness — but `destroy()` straight after writing QUIT can reset the
+    // connection before the server has read it, which a strict MTA logs as an
+    // aborted session. end() flushes the write and sends FIN; it does not wait
+    // for the 221, so an unresponsive server cannot delay a send that already
+    // succeeded. The destroy() below is then a no-op backstop.
     await send("QUIT");
+    await new Promise<void>((resolve) => socket.end(() => resolve()));
   } finally {
     clearTimeout(deadline);
     socket.destroy();
