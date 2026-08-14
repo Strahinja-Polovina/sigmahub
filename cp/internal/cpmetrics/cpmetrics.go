@@ -61,6 +61,62 @@ var Loops = []string{
 	LoopUsageSweep,
 }
 
+// staleBudgets is how long each loop may go without a SUCCESSFUL pass before the
+// control plane should be considered wedged (SIGMA-365).
+//
+// Per-loop rather than one number, because the tick intervals differ by two
+// orders of magnitude (the deploy drain runs every 3 seconds, the usage sweep
+// every 10 minutes) and a single threshold would either miss a dead fast loop or
+// cry wolf at a healthy slow one. Each budget is a generous multiple of its
+// loop's interval: the question is "has this stopped?", not "was this pass late".
+//
+// This is what /livez reads. It is deliberately NOT what /readyz reads: a wedged
+// background loop does not stop the API from serving reads and writes, so the
+// correct response is to restart the process, not to pull it out of the load
+// balancer and take the dashboard down with it.
+var staleBudgets = map[string]time.Duration{
+	LoopReconcilerResync: 10 * time.Minute, // ticks every 60s
+	LoopDeployDrain:      10 * time.Minute, // ticks every 3s
+	LoopBackupScheduler:  15 * time.Minute, // ticks every 60s
+	LoopAlertDispatcher:  15 * time.Minute, // ticks every 30s
+	LoopSweeper:          10 * time.Minute, // ticks every 30s
+	LoopUsageSweep:       60 * time.Minute, // ticks every 10m
+}
+
+// StaleLoops names every loop whose last successful pass is older than its
+// budget, oldest budget first for a stable answer. Empty means "every background
+// loop has completed a pass recently".
+//
+// A loop that has NEVER succeeded is judged from process start, not from the
+// zero time, so a control plane that is still booting — or one whose slowest
+// loop has not reached its first tick — is not reported as wedged.
+func (r *Registry) StaleLoops(now time.Time) []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var stale []string
+	for _, name := range Loops {
+		st := r.loops[name]
+		if st == nil {
+			continue
+		}
+		budget, ok := staleBudgets[name]
+		if !ok {
+			continue
+		}
+		since := st.lastSuccess
+		if since.IsZero() {
+			since = r.startedAt
+		}
+		if now.Sub(since) > budget {
+			stale = append(stale, name)
+		}
+	}
+	return stale
+}
+
 // PoolStats is the pgxpool snapshot worth exporting: a control plane whose
 // connections are all checked out is about to stall every loop at once, and
 // that is visible here minutes before it is visible anywhere else.

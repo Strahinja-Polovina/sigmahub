@@ -182,7 +182,13 @@ func boundHostPortsTx(ctx context.Context, tx pgx.Tx, serverID, excludeResourceI
 		}
 		var ports []hostPortMapping
 		if err := json.Unmarshal(raw, &ports); err != nil {
-			continue // a spec we cannot parse cannot reserve a port
+			// Fail CLOSED (SIGMA-365). This used to `continue`, on the reading
+			// that "a spec we cannot parse cannot reserve a port" — but the
+			// neighbour is running whatever it declared whether or not we can
+			// read it, so skipping it hands its port to someone else and both
+			// containers then fight over the bind. An opaque neighbour is
+			// blocking, not free: refuse to resolve rather than resolve wrongly.
+			return nil, fmt.Errorf("unreadable port spec on a resource of server %s: %w", serverID, err)
 		}
 		for _, p := range ports {
 			if p.Host > 0 {

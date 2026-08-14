@@ -55,19 +55,44 @@ async function probeControlPlane(base: string): Promise<CpHealth> {
   return res.status < 500 ? "ok" : "unreachable";
 }
 
+/** Optional shared secret for the CP probe. Unset (the default, and every
+ *  existing rollout) leaves the probe open, as it was.
+ *
+ *  Deliberately no response memoisation: this is a deploy gate, and a gate that
+ *  answers from a cache can report a control plane that has since gone away. The
+ *  amplification concern is addressed by not probing at all unless asked, and by
+ *  this token on hosted deployments. */
+function probeAuthorized(request: Request): boolean {
+  const want = (process.env.HEALTH_PROBE_TOKEN ?? "").trim();
+  if (!want) return true;
+  const got = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+  return got === want;
+}
+
 export async function GET(request: Request) {
   const required = new URL(request.url).searchParams.get("require")?.split(",") ?? [];
   const wantCp = required.includes("cp");
 
-  const base = cpBaseOrNull();
-  let cp: CpHealth;
-  if (!base) {
-    cp = wantCp ? "unconfigured" : "disabled";
-  } else {
-    cp = await probeControlPlane(base);
+  // Bare liveness: "this container is serving". No control-plane round-trip and
+  // no posture disclosure — an anonymous caller learns nothing about whether a
+  // control plane is configured, reachable, or accepting our credential.
+  if (!wantCp) {
+    return Response.json(
+      { status: "ok" },
+      { status: 200, headers: { "Cache-Control": "no-store" } }
+    );
   }
 
-  const healthy = cp === "ok" || cp === "disabled";
+  if (!probeAuthorized(request)) {
+    return Response.json(
+      { status: "unauthorized" },
+      { status: 401, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  const base = cpBaseOrNull();
+  const cp: CpHealth = base ? await probeControlPlane(base) : "unconfigured";
+  const healthy = cp === "ok";
   return Response.json(
     { status: healthy ? "ok" : "degraded", cp },
     {

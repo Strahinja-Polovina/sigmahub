@@ -60,12 +60,29 @@ type Store struct {
 	// their proxy servers. Empty is fully supported and falls back to sslip.io;
 	// see PublicHost.
 	appsDomain string
+	// billingConfigured is whether this deployment can actually take money —
+	// Paddle credentials AND a price id. It gates the free-tier ceiling
+	// (SIGMA-363) and nothing else.
+	billingConfigured bool
 }
 
 // SetAppsDomain installs the wildcard domain SigmaHub mints resource URLs under
 // (SIGMA-351). Empty means no wildcard is configured, which is not an error: the
 // sslip.io fallback keeps a fresh install reachable on its first deploy.
 func (s *Store) SetAppsDomain(domain string) { s.appsDomain = domain }
+
+// SetBillingConfigured tells the store whether this deployment can take money:
+// Paddle credentials and a price id, the same condition that decides whether the
+// dashboard can open a checkout.
+//
+// It gates ONE thing — the free-tier ceiling (SIGMA-363) — and it has to, because
+// a paywall on a deployment with no way to pay is not a paywall, it is a broken
+// product. A self-hosted SigmaHub with no Paddle configured is the ordinary case
+// and must keep growing without limit; the ceiling exists to stop a HOSTED tenant
+// from using the paid tiers for free, and a hosted deployment is exactly the one
+// that has these credentials. Default false, so every path that has not been told
+// otherwise (tests, self-hosted, demo) is uncapped.
+func (s *Store) SetBillingConfigured(v bool) { s.billingConfigured = v }
 
 // InstallationTokenSource mints short-lived GitHub App installation access
 // tokens for connections that carry an installation id.

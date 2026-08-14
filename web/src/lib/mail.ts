@@ -19,16 +19,35 @@
 // prebuilt image, so an operator wiring SMTP on Tuesday must not have to rebuild
 // the web bundle for the UI to stop apologising.
 
-/** The transports this build knows how to use. `log` — the only one today —
- *  means "printed where the operator can find it, delivered to nobody". */
-export type MailTransport = { kind: "log" };
+/** The transports this build knows how to use. `log` means "printed where the
+ *  operator can find it, delivered to nobody"; `smtp` is a real submission
+ *  server and is what makes mailDelivers() answer true (SIGMA-365).
+ *
+ *  The descriptor carries NO credentials on purpose. This module is plain lib/
+ *  code that a client component could import, and while Next never inlines a
+ *  non-NEXT_PUBLIC_ variable into a client bundle, the password simply has no
+ *  business in a value the UI reads — server/smtp.ts reads it directly instead. */
+export type MailTransport =
+  | { kind: "log" }
+  | { kind: "smtp"; host: string; port: number; from: string };
+
+/** Submission port when SMTP_PORT is unset. 587 (STARTTLS), not 25. */
+export const defaultSmtpPort = 587;
 
 export function configuredMailTransport(): MailTransport {
-  // Nothing to configure yet: adding an SMTP/API sender means reading its
-  // settings out of the environment here and returning its descriptor, at
-  // which point mailDelivers() below starts answering true on the deployments
-  // that set them.
-  return { kind: "log" };
+  const host = (process.env.SMTP_HOST ?? "").trim();
+  const from = (process.env.SMTP_FROM ?? "").trim();
+  // Both, or neither: a host with no envelope sender cannot submit, and an
+  // operator who set one of the two has a half-configured deployment that should
+  // keep saying "not delivered" rather than start claiming an inbox.
+  if (!host || !from) return { kind: "log" };
+  const port = Number.parseInt((process.env.SMTP_PORT ?? "").trim(), 10);
+  return {
+    kind: "smtp",
+    host,
+    from,
+    port: Number.isFinite(port) && port > 0 ? port : defaultSmtpPort,
+  };
 }
 
 /** Whether a message handed to a sender reaches the recipient's mailbox. False

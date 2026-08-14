@@ -429,6 +429,11 @@ type ErrBillingCapped struct {
 }
 
 func (e ErrBillingCapped) Error() string {
+	if e.Status == statusOverFreeTier {
+		return fmt.Sprintf("this organization is using all %d free units and has no active subscription — "+
+			"everything already running keeps running, but adding another server needs a subscription "+
+			"(start one from Settings → Billing)", BillingFreeTier)
+	}
 	what := "payment is past due"
 	if e.Status == "canceled" {
 		what = "the subscription was canceled"
@@ -437,6 +442,12 @@ func (e ErrBillingCapped) Error() string {
 		"existing servers, deploys and backups keep running, but new servers and resources are paused until billing is restored in the customer portal",
 		what, e.Since.UTC().Format("2006-01-02"), e.GraceUntil.UTC().Format("2006-01-02"))
 }
+
+// statusOverFreeTier is the cap reason for an org that has never subscribed and
+// has consumed the whole free tier. Not a Paddle subscription status — it never
+// appears in org_billing — which is why it is spelled differently from the ones
+// that do.
+const statusOverFreeTier = "over_free_tier"
 
 // billingDelinquent reports whether a subscription status means "not paying".
 // `paused` is deliberately NOT here: a pause is an agreed, reversible state the
@@ -547,6 +558,64 @@ func (s *Store) DelinquentOrgs(ctx context.Context, now time.Time) ([]Delinquent
 	return out, rows.Err()
 }
 
+// UnbilledOrgs lists orgs that are over the free tier with no live subscription —
+// consuming paid capacity while paying nothing (SIGMA-363).
+//
+// The complement of DelinquentOrgs, and the reason it exists: that report filters
+// to past_due/canceled, so an org that simply never subscribed appeared in NO
+// operator view at all. The one scenario where unpaid usage was completely
+// invisible was the one with no Paddle relationship to reconcile against.
+//
+// Sorted by revenue at stake, largest first: this is a list to work through, and
+// the 40-unit tenant matters more than the 4-unit one.
+func (s *Store) UnbilledOrgs(ctx context.Context, now time.Time) ([]DelinquentOrg, error) {
+	// The org list is derived from the control plane's own tables — there is no
+	// orgs table here, tenants live in the dashboard's database — and from BOTH
+	// halves of what billedUnitsSQL prices: servers connected now, and servers
+	// metered during the window but since removed. Missing the second would let
+	// an org run a fleet all month, delete it, and drop off the report.
+	query := fmt.Sprintf(`
+		WITH tenants AS (
+		    SELECT DISTINCT org_id FROM servers WHERE deleted_at IS NULL
+		    UNION
+		    SELECT DISTINCT org_id FROM server_hours WHERE hour >= $1
+		)
+		SELECT t.org_id,
+		       COALESCE(b.status, 'none'),
+		       COALESCE(b.paddle_subscription_id, ''),
+		       (SELECT COUNT(*) FROM servers sv
+		         WHERE sv.org_id = t.org_id AND sv.deleted_at IS NULL AND sv.status = 'running'),
+		       %s AS units
+		  FROM tenants t
+		  LEFT JOIN org_billing b ON b.org_id = t.org_id
+		 WHERE COALESCE(b.status, 'none') NOT IN ('active', 'trialing', 'paused')
+		 ORDER BY units DESC, t.org_id`, billedUnitsSQL("t.org_id", "$1"))
+	rows, err := s.Pool.Query(ctx, query, now.UTC().Add(-quantitySyncWindow))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DelinquentOrg
+	for rows.Next() {
+		var d DelinquentOrg
+		if err := rows.Scan(&d.OrgID, &d.Status, &d.SubscriptionID, &d.Servers, &d.Units); err != nil {
+			return nil, err
+		}
+		// Only orgs actually past the giveaway. Everything at or under the free
+		// tier is a customer using the product as offered.
+		if d.Units <= BillingFreeTier {
+			continue
+		}
+		d.Since = now
+		d.GraceExpiresAt = now
+		d.Capped = true // growth is refused at precreateServerTx
+		d.MonthlyValue = BillableQuantity(d.Units, false) * BillingUnitPrice
+		d.Currency = BillingCurrency
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // SweepBillingDunning re-alerts every delinquent org whose last reminder is
 // older than BillingDunningInterval, and returns how many were reminded.
 //
@@ -628,7 +697,9 @@ func assertBillingNotCappedTx(ctx context.Context, tx pgx.Tx, orgID string, now 
 	err := tx.QueryRow(ctx,
 		`SELECT status, status_since FROM org_billing WHERE org_id = $1`, orgID).Scan(&status, &since)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Never subscribed. The free tier is a product, not a delinquency.
+		// Never subscribed. The free tier is a product, not a delinquency. Its
+		// CEILING is enforced separately, on server creation only — see
+		// assertFreeTierNotExhaustedTx.
 		return nil
 	}
 	if err != nil {
@@ -644,6 +715,61 @@ func assertBillingNotCappedTx(ctx context.Context, tx pgx.Tx, orgID string, now 
 		return nil
 	}
 	return ErrBillingCapped{OrgID: orgID, Status: status, Since: since, GraceUntil: graceUntil}
+}
+
+// assertFreeTierNotExhaustedTx refuses a NEW SERVER for an org that is using the
+// whole free tier and has no live subscription (SIGMA-363).
+//
+// The asymmetry this closes: an org that subscribed and then let its card lapse
+// was capped after the grace period, while an org that never entered a card at
+// all was capped by nothing — so a 40-unit fleet ran indefinitely for free, and
+// the rational move for every customer was to never subscribe. The meter, the
+// dashboard's "Total due" and the quantity sweep all existed; the one thing
+// missing was anything that read them before handing out more capacity.
+//
+// Deliberately narrow, in three ways:
+//
+//   - Only SERVERS. Units are per server, so this is the only creation that grows
+//     the bill. An org on the free tier can still create as many apps, databases
+//     and buckets as it likes on the servers it already has — that is what the
+//     free tier is FOR, and gating resources on it would make the free tier
+//     useless rather than finite.
+//   - Only GROWTH. Nothing running is touched, exactly like the delinquency cap:
+//     we do not take a customer's fleet away, we decline to add to it.
+//   - Only without a LIVE subscription. active/trialing/paused orgs bill for what
+//     they use and are not capped here; past_due/canceled orgs are already
+//     handled (with a grace period) by assertBillingNotCappedTx.
+func assertFreeTierNotExhaustedTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time, billingConfigured bool) error {
+	// A paywall on a deployment with no way to pay is not a paywall, it is a
+	// broken product: a self-hosted SigmaHub has no Paddle credentials, no
+	// checkout and no portal, and capping it at three units would simply end the
+	// install. The ceiling exists to stop a HOSTED tenant using paid tiers for
+	// free, and a hosted deployment is exactly the one that has these credentials.
+	if !billingConfigured {
+		return nil
+	}
+	var status string
+	err := tx.QueryRow(ctx, `SELECT status FROM org_billing WHERE org_id = $1`, orgID).Scan(&status)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Never subscribed → free tier applies.
+	case err != nil:
+		return err
+	case status == "active" || status == "trialing" || status == "paused":
+		// A live subscription pays for growth.
+		return nil
+	}
+
+	var units int
+	if err := tx.QueryRow(ctx,
+		`SELECT `+billedUnitsSQL("$1::text", "$2::timestamptz"),
+		orgID, now.UTC().Add(-quantitySyncWindow)).Scan(&units); err != nil {
+		return err
+	}
+	if units < BillingFreeTier {
+		return nil
+	}
+	return ErrBillingCapped{OrgID: orgID, Status: statusOverFreeTier, Since: now, GraceUntil: now}
 }
 
 // quantitySyncDebounce is how long a pushed quantity is trusted before the sweep

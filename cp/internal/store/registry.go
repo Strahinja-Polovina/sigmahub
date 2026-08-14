@@ -331,7 +331,7 @@ type ProvisionInput struct {
 // necessarily the caller's: an empty one becomes a placeholder here, and the
 // bootstrap-token row and the audit entry have to record what the server is
 // actually called rather than the empty string the caller passed.
-func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in ProvisionInput) (string, string, error) {
+func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in ProvisionInput, billingConfigured bool) (string, string, error) {
 	if in.Distro != "" && !DistroSupported(in.Distro) {
 		return "", "", ErrUnsupportedDistro
 	}
@@ -341,6 +341,13 @@ func precreateServerTx(ctx context.Context, tx pgx.Tx, orgID string, in Provisio
 	// so the cap cannot be routed around by picking the other one. Nothing that
 	// is already running is touched — see the dunning policy in billing.go.
 	if err := assertBillingNotCappedTx(ctx, tx, orgID, time.Now()); err != nil {
+		return "", "", err
+	}
+	// SIGMA-363: and the free tier has a ceiling. Same chokepoint, same "growth
+	// only, nothing running is touched" rule — an org using all its free units
+	// with no live subscription may not add another server. Without this, never
+	// subscribing was unlimited and strictly cheaper than subscribing.
+	if err := assertFreeTierNotExhaustedTx(ctx, tx, orgID, time.Now(), billingConfigured); err != nil {
 		return "", "", err
 	}
 	// A name the operator did not give is a name the MACHINE gets to supply:
@@ -414,7 +421,7 @@ func (s *Store) IssueBootstrapToken(ctx context.Context, orgID, serverName, serv
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	serverID, name, err := precreateServerTx(ctx, tx, orgID, ProvisionInput{
-		Name: serverName, Type: serverType, Provider: provider, Region: region})
+		Name: serverName, Type: serverType, Provider: provider, Region: region}, s.billingConfigured)
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -463,7 +470,7 @@ func (s *Store) ProvisionServer(ctx context.Context, orgID string, in ProvisionI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	serverID, name, err := precreateServerTx(ctx, tx, orgID, in)
+	serverID, name, err := precreateServerTx(ctx, tx, orgID, in, s.billingConfigured)
 	if err != nil {
 		return ProvisionResult{}, err
 	}

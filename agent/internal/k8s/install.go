@@ -15,6 +15,15 @@ import (
 // installerURL is the official k3s install script.
 const installerURL = "https://get.k3s.io"
 
+// K3sVersion is the Kubernetes version every SigmaHub cluster node installs.
+//
+// Pinned rather than left to the install script's "stable" channel so a cluster's
+// version is a property of the SigmaHub release that built it, not of the day its
+// nodes happened to be provisioned — and so the version customers run is the one
+// CI exercises against a real API server (.github/workflows/ci.yml K3S_VERSION).
+// Moving this means moving that in the same change.
+const K3sVersion = "v1.31.4+k3s1"
+
 // maxInstallerBytes bounds the download (the script is ~50 KB).
 const maxInstallerBytes = 2 << 20
 

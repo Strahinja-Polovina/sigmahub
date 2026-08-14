@@ -3,7 +3,7 @@
 // S3 storage (P2-1): the info/reveal split mirrors databases — metadata for
 // every member, the audited credential reveal for Project Admin+.
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import * as schema from "../db/schema";
 import { requireProjectAdminForResource, requireResourceVisible } from "../active-org";
@@ -37,7 +37,11 @@ function ensureCp() {
 }
 
 /** The local row a demo endpoint is derived from. */
-async function demoResource(resourceId: string) {
+// Org-scoped on purpose (SIGMA-365), for the reason spelled out on the twin in
+// actions/databases.ts: requireProjectAdminForResource can fall back to the org
+// gate for an id the mirror does not hold, and the demo branch has no control
+// plane behind it to refuse a foreign resource.
+async function demoResource(orgId: string, resourceId: string) {
   const [row] = await db
     .select({
       id: schema.resources.id,
@@ -47,8 +51,9 @@ async function demoResource(resourceId: string) {
       meshIp: schema.servers.meshIp,
     })
     .from(schema.resources)
+    .innerJoin(schema.projects, eq(schema.resources.projectId, schema.projects.id))
     .leftJoin(schema.servers, eq(schema.resources.serverId, schema.servers.id))
-    .where(eq(schema.resources.id, resourceId));
+    .where(and(eq(schema.resources.id, resourceId), eq(schema.projects.orgId, orgId)));
   return row;
 }
 
@@ -63,7 +68,7 @@ export async function getS3Info(input: {
 }): Promise<CpS3Info | null> {
   await requireResourceVisible(input.orgId, input.resourceId);
   if (cpEnabled()) return cpGetS3(input.orgId, input.resourceId);
-  const row = await demoResource(input.resourceId);
+  const row = await demoResource(input.orgId, input.resourceId);
   if (!row || row.kind !== "s3") return null;
   // The engine the resource was CREATED with, not the catalog default: this
   // panel is where a demo user finds out what their SeaweedFS pick got them,
@@ -88,7 +93,7 @@ export async function revealS3Connection(input: {
       role,
     });
   } else {
-    const row = await demoResource(input.resourceId);
+    const row = await demoResource(input.orgId, input.resourceId);
     if (!row || row.kind !== "s3") throw new Error("This resource is not object storage.");
     conn = demoS3Connection({
       resourceId: row.id,

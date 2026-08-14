@@ -322,6 +322,10 @@ func New(log *slog.Logger, db Pinger, st StoreAPI, dom DomainAPI, opts Options) 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+	// "Restart me": 503 once a background loop has stopped completing passes
+	// (SIGMA-365). Unauthenticated like its two neighbours — it answers a
+	// yes/no and names loop constants, carrying no tenant data.
+	s.mux.HandleFunc("GET /livez", s.handleLivez)
 	// The control plane's own health (SIGMA-248). Unauthenticated, like the two
 	// probes above, and for the same reason: whatever scrapes it runs outside
 	// this process and often before any credential exists. It is safe to leave
@@ -620,6 +624,30 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// handleLivez answers "should this process be restarted?" (SIGMA-365).
+//
+// /healthz and /readyz both stay 200 on a control plane whose reconciler, deploy
+// drain, backup scheduler, alert dispatcher or usage sweep has been wedged for a
+// day: the first is static and the second only pings Postgres. The loop
+// last-success clocks that WOULD have shown it (SIGMA-248) are on /metrics, which
+// on a default install nothing scrapes — so the failure class those clocks exist
+// for had no consumer. This gives it one that every orchestrator already speaks.
+//
+// Deliberately separate from /readyz: a wedged background loop does not stop the
+// API from serving, so the right action is to restart the process, not to pull it
+// out of the load balancer and take the dashboard down as well.
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	if stale := s.metrics.StaleLoops(time.Now()); len(stale) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "wedged",
+			"reason": "background loops have not completed a pass",
+			"loops":  stale,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
 }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {

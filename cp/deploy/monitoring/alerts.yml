@@ -1,0 +1,89 @@
+# Operator-facing alerts on the control plane's own health (SIGMA-365).
+#
+# These are deliberately about the CP itself, not about tenants: the customer
+# alert path is the per-org outbox, which is one of the loops below, so a control
+# plane in trouble cannot be relied on to report that it is in trouble.
+#
+# Loaded by vmalert (`COMPOSE_PROFILES=monitoring`). Point vmalert at an
+# Alertmanager with CP_ALERTMANAGER_URL to have these page someone; without one
+# they are still visible in vmalert's UI and via the ALERTS series.
+
+groups:
+  - name: sigmahub-cp
+    rules:
+      # The headline: a loop that has stopped completing passes. Generous
+      # relative to every loop's interval (the resync runs every 60s, the usage
+      # sweep every 10 minutes) because the question is "has this stopped?", not
+      # "was that pass late". This is the metric-side twin of GET /livez, which
+      # makes the same judgement per loop with the same intent.
+      - alert: SigmahubCPLoopStalled
+        expr: time() - sigmahub_cp_loop_last_success_seconds > 1800
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Control-plane loop {{ $labels.loop }} has not completed a pass in 30m"
+          description: >-
+            The loop is not doing its work and nothing else will do it. Backups
+            are not being scheduled, deploys are not draining, alerts are not
+            being delivered or usage is not being metered, depending on which
+            loop this is. Check the CP logs and restart it if it is wedged
+            (GET /livez answers 503 in exactly this state).
+
+      # A loop that never started at all reports a zero timestamp, which the rule
+      # above would read as "stalled since 1970" only after time() exceeds the
+      # budget — true, but this states it plainly and pages faster.
+      - alert: SigmahubCPLoopNeverStarted
+        expr: sigmahub_cp_loop_last_success_seconds == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Control-plane loop {{ $labels.loop }} has never completed a pass"
+          description: >-
+            The loop has been up for 15 minutes without a single successful
+            iteration. Usually a misconfiguration that fails every pass rather
+            than a transient error.
+
+      # Spinning and failing, as distinct from not running: the loop ticks, every
+      # pass errors, so the last-success clock is stale AND the error counter
+      # climbs. Worth its own line because the remedy differs.
+      - alert: SigmahubCPLoopErroring
+        expr: rate(sigmahub_cp_loop_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Control-plane loop {{ $labels.loop }} is failing every pass"
+          description: >-
+            The loop is running but its work is not completing. The CP log names
+            the failing step.
+
+      # A pool with every connection checked out is a control plane about to
+      # stall every loop at once, and it shows here minutes before it shows
+      # anywhere else.
+      - alert: SigmahubCPPoolSaturated
+        expr: >-
+          sigmahub_cp_db_pool_connections{state="acquired"}
+            >= ignoring(state) sigmahub_cp_db_pool_max_connections
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Control-plane database pool is saturated"
+          description: >-
+            Every pooled connection is checked out. Reconciles, API requests and
+            background loops are all queueing behind it.
+
+      # The fleet's drift-repair SLO. A pass that outruns its own tick means the
+      # advertised 60s convergence has silently become the pass duration.
+      - alert: SigmahubCPResyncOutrunningTick
+        expr: sigmahub_cp_resync_pass_last_seconds > 60
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Fleet resync pass is taking longer than its 60s interval"
+          description: >-
+            Drift repair is now happening at the pass duration, not at the
+            configured interval. Usually fleet growth or a slow database.

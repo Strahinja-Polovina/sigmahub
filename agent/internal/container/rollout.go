@@ -198,7 +198,17 @@ type imageRetainer interface {
 // defaultImageRetention is how many built images per resource are kept so a
 // rebuild-free rollback always has a target; older images are pruned to bound
 // disk use.
-const defaultImageRetention = 10
+//
+// It must comfortably EXCEED the control plane's rollback-candidate count
+// (RollbackTargets caps its list at 10), and the reason is the counting rule
+// (SIGMA-362): the CP offers the 10 newest SUCCESSFUL releases, while this prunes
+// by tag — every image this host built or pulled, failed and superseded builds
+// included. With the two numbers equal, a run of failed builds between two
+// releases pushed a still-offered release out of the local cache, and rolling
+// back to it died with "no such image" on a same-host build, where there is no
+// registry to re-pull from. Keeping twice the window means the offered set stays
+// present unless more than half the recent tags were failures.
+const defaultImageRetention = 20
 
 // retainImages keeps the newest `keep` images under a repo prefix (e.g.
 // "sigmahub/<res>:" or a Compose service's "sigmahub/<res>-<svc>:") and removes
