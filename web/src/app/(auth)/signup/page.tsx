@@ -139,8 +139,8 @@ export default function SignupPage() {
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
             If{" "}
             <span className="font-medium text-foreground">{awaitingVerification}</span>{" "}
-            is new to SigmaHub, a verification link is on its way. Open it to finish
-            setting up your account — you&apos;ll be signed in from there.
+            is new to SigmaHub, a verification link is on its way. Open it to confirm
+            the address, then log in with the password you just chose.
           </p>
         ) : (
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">

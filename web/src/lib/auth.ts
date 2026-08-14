@@ -119,11 +119,22 @@ export const auth = betterAuth({
     // trying to use it, so the flow is self-healing. It reveals nothing: the
     // caller already proved the password on the line above.
     sendOnSignIn: true,
-    // The link is the proof; making the user then type the password they just
-    // typed is a second wall in front of the same door. It also matters for
-    // invites — the ?invite= token rides through as the callbackURL, and landing
-    // signed-in on the accept page is the whole flow in one hop.
-    autoSignInAfterVerification: true,
+    // NOT auto-signed-in, though it is tempting and was briefly on (SIGMA-365).
+    //
+    // better-auth's /verify-email calls internalAdapter.createSession directly
+    // when this is set — no second factor, ever. The twoFactor plugin works by
+    // intercepting /sign-in/email and withholding the session until a TOTP code
+    // arrives, so it is not on this path and cannot be. That makes a verification
+    // link a complete sign-in for any account that is 2FA-enrolled but unverified,
+    // which is a reachable combination: verification is off wherever no transport
+    // is configured, so a user can sign up, enable 2FA, and only then have the
+    // operator wire SMTP.
+    //
+    // Whoever holds the mailbox then holds the account — which is precisely the
+    // compromise the second factor exists to survive. The cost of leaving it off
+    // is one extra sign-in after verifying, and /signup says so rather than
+    // promising a hop it no longer performs.
+    autoSignInAfterVerification: false,
     sendVerificationEmail: async ({ user, url }) => {
       await sendMail({
         to: user.email,

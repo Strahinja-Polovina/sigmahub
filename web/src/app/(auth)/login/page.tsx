@@ -142,8 +142,8 @@ export default function LoginPage() {
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
             Your password is correct, but{" "}
             <span className="font-medium text-foreground">{email}</span> hasn&apos;t been
-            confirmed yet. We&apos;ve just sent a fresh link — open it and you&apos;ll be
-            signed in.
+            confirmed yet. We&apos;ve just sent a fresh link — open it, then come back
+            and log in.
           </p>
         ) : (
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">

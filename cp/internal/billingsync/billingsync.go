@@ -34,12 +34,21 @@ import (
 // "org_x still exists", and the real event it was built for would have arrived
 // into an already-red channel with nothing to distinguish it.
 //
-// So the signal now needs a population, a unanimous verdict, and persistence.
+// The first fix for that required a POPULATION — three drifted subscriptions
+// before a pass could be called systemic. That is wrong in the direction that
+// matters at launch: a control plane with two paying customers never has three
+// drifted subscriptions, so a rotated key would have stopped all billing in
+// total silence on exactly the deployments where every customer counts. And the
+// population never was the discriminator; with one subscription, "one bad
+// tenant" and "everything is broken" are the same observation.
+//
+// What actually distinguishes the noise from the signal is not how many orgs
+// fail but how the alert BEHAVES once it fires. A permanently-failing
+// subscription must not hold the heartbeat red forever — it must alert, then let
+// the per-org backoff quiet it down, and alert again on a widening interval for
+// as long as it stays broken. So the signal needs a unanimous verdict and
+// persistence, and the backoff below supplies the cadence.
 const (
-	// Fewer drifted subscriptions than this cannot distinguish a fleet-wide
-	// outage from one bad tenant, so no pass over a smaller population is ever
-	// called systemic.
-	minSystemicPopulation = 3
 	// Consecutive qualifying passes before the error is returned. At the sweep's
 	// 10-minute tick this is ~30 minutes of every push failing — long enough that
 	// a Paddle blip does not flap the heartbeat, short enough to be well inside
@@ -181,42 +190,50 @@ func (s *Syncer) Sync(ctx context.Context, now time.Time) (int, error) {
 		s.log().Warn("billing sync: subscriptions skipped while backing off", "count", deferred)
 	}
 	attempted := synced + failed
-	// "Every push failed, over a population big enough to mean something."
-	// deferred orgs are excluded from the numerator and included in the
-	// population: a fleet-wide outage is not less systemic because one of its
-	// victims happened to be in backoff.
-	unanimous := attempted > 0 && synced == 0 && len(drifted) >= minSystemicPopulation
 
-	// Back off the orgs that failed IN THIS PASS — but NOT while the pass looks
-	// systemic. Skipping them there would starve the streak below of the attempts
-	// that prove the outage, and the alert built for exactly this case would
-	// never fire. When some orgs succeeded, or the population is too small to be
-	// systemic, a repeated failure is that org's own problem and is slowed down.
+	// Back off the orgs that failed IN THIS PASS. Unconditionally: this is what
+	// keeps a permanently-broken subscription from being retried every ten
+	// minutes forever, AND — because the streak below only moves on passes that
+	// attempted something — it is what turns a stuck alert into a widening one.
 	//
 	// Only this pass's failures, never every org in the map: an org that was
 	// DEFERRED this pass has just decremented its way to a retry, and re-arming
 	// it here would hold it at one pass short of an attempt forever.
-	if !unanimous {
-		for _, orgID := range failedNow {
-			st := s.orgs[orgID]
-			if st.failures > 1 {
-				st.cooldown = min(1<<(st.failures-2), maxCooldownPasses)
-				s.log().Warn("billing sync: backing off a subscription that keeps failing",
-					"org", orgID, "consecutive_failures", st.failures,
-					"skipping_passes", st.cooldown)
-			}
+	for _, orgID := range failedNow {
+		st := s.orgs[orgID]
+		if st.failures > 1 {
+			st.cooldown = min(1<<(st.failures-2), maxCooldownPasses)
+			s.log().Warn("billing sync: backing off a subscription that keeps failing",
+				"org", orgID, "consecutive_failures", st.failures,
+				"skipping_passes", st.cooldown)
 		}
 	}
 
-	if unanimous {
+	// The streak counts EVIDENCE, not passes. A pass that attempted nothing —
+	// every drifted org in backoff, or no drift at all — proves nothing either
+	// way, so it must neither advance the streak nor clear it. Clearing it there
+	// was the trap in the first design: backoff would have starved the streak of
+	// the very attempts that demonstrate an outage, and the alert could never
+	// have fired at all.
+	switch {
+	case attempted == 0:
+		// no evidence this pass; hold whatever we had
+	case synced == 0:
 		s.systemicStreak++
-	} else {
+	default:
+		// Something got through. Whatever is wrong is not "nothing is billing".
 		s.systemicStreak = 0
 	}
 	if s.systemicStreak >= systemicPasses {
+		// Re-arm rather than latch. The condition is still true next pass, and an
+		// alert that fires every ten minutes until someone fixes Paddle is how a
+		// channel gets muted. With the backoff above, the next report is several
+		// passes away, and further away again after that — which is the cadence a
+		// human actually wants from "still broken".
+		s.systemicStreak = 0
 		return synced, fmt.Errorf(
 			"billing sync: all %d attempted subscription update(s) failed on %d consecutive passes — "+
-				"check CP_PADDLE_API_KEY and CP_PADDLE_PRICE_ID", failed, s.systemicStreak)
+				"check CP_PADDLE_API_KEY and CP_PADDLE_PRICE_ID", failed, systemicPasses)
 	}
 	return synced, nil
 }

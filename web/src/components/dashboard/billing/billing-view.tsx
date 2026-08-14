@@ -113,9 +113,46 @@ type Subscription = {
    *  it is reversible and must not offer a second checkout (SIGMA-294). */
   status: string;
   billableUnits: number;
+  /** The org's whole fleet in units, and the tier that is free. Both are needed
+   *  to decide whether checkout is OFFERED, because at exactly the free tier
+   *  billableUnits is 0 and that is precisely when growth is refused. */
+  billedUnits?: number;
+  freeTier?: number;
   serverHoursThisMonth: number;
   orgId: string;
 };
+
+/**
+ * May this org start a checkout? (SIGMA-365)
+ *
+ * Not `billableUnits >= 1`, which is what this used to ask and which produced a
+ * closed loop for the customer who most needs to pay: at EXACTLY the free tier
+ * billableUnits is 0 — nothing is chargeable yet — and that is the same moment
+ * the free-tier gate begins refusing new servers, with a message telling them to
+ * subscribe from this page. They arrived here and found the button greyed out and
+ * labelled "Within free tier". Refused growth, refused payment, no way forward.
+ *
+ * The control plane's checkout handler was fixed to accept this case (it floors
+ * the quantity through BillableQuantity), so the only thing left holding the
+ * customer out was this predicate. The question it should ask is "is this fleet
+ * at or past the point where the free tier stops carrying it", which is about the
+ * whole fleet and the tier, not about what happens to be chargeable today.
+ *
+ * Below the tier the button stays disabled on purpose: subscribing there bills
+ * the minimum quantity for capacity that is free, and nothing is refusing them
+ * anything yet.
+ */
+function canSubscribe(sub: {
+  billableUnits: number;
+  billedUnits?: number;
+  freeTier?: number;
+}): boolean {
+  if (sub.billableUnits >= 1) return true;
+  // Older payloads (and demo mode) carry neither field; fall back to the old
+  // predicate rather than offering a checkout we cannot justify.
+  if (sub.billedUnits === undefined || sub.freeTier === undefined) return false;
+  return sub.billedUnits >= sub.freeTier && sub.freeTier > 0;
+}
 
 /** Send the browser to Paddle — checkout to subscribe, the customer portal for
  *  payment method, subscription state and, crucially, invoices.
@@ -218,9 +255,9 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
             <Button
               size="sm"
               onClick={() => go(sub.orgId, "checkout")}
-              disabled={pending || sub.billableUnits < 1}
+              disabled={pending || !canSubscribe(sub)}
             >
-              {sub.billableUnits < 1 ? "Within free tier" : "Subscribe"}
+              {canSubscribe(sub) ? "Subscribe" : "Within free tier"}
             </Button>
           )}
         </div>

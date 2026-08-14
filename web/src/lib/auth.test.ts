@@ -94,10 +94,17 @@ describe("the way back in when an address is unverified", () => {
     );
   });
 
-  it("signs the user in when the link is used, so the hop is invisible", async () => {
-    // Also what makes an invite work in one hop: the ?invite= token rides
-    // through as the callbackURL and the accept page needs a session.
+  it("does NOT hand out a session for a clicked link — that would skip 2FA", async () => {
+    // better-auth's /verify-email calls internalAdapter.createSession directly
+    // when autoSignInAfterVerification is set, with no second factor on that
+    // path — the twoFactor plugin intercepts /sign-in/email, which the link
+    // never touches. So a verification link would be a complete sign-in for any
+    // account that is 2FA-enrolled but unverified, and that combination is
+    // reachable: verification is off wherever no transport is configured, so a
+    // user can sign up, enable 2FA, and only then have the operator wire SMTP.
+    // Whoever holds the mailbox would hold the account — the exact compromise
+    // the second factor exists to survive.
     const opts = await loadAuthOptions("true");
-    expect(opts.emailVerification?.autoSignInAfterVerification).toBe(true);
+    expect(opts.emailVerification?.autoSignInAfterVerification).toBe(false);
   });
 });
