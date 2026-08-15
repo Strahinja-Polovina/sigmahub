@@ -146,9 +146,15 @@ describe("BillingView subscription card", () => {
     expect(btn.disabled).toBe(false);
   });
 
-  it("keeps checkout closed while the org is genuinely below the tier", () => {
-    // Subscribing here bills the minimum quantity for capacity that is free, and
-    // nothing is refusing them anything yet — so the button stays off.
+  // The same predicate produced a launch blocker twice. The second time is what
+  // settled it: the gate refuses a server whose OWN weight does not fit the
+  // remaining headroom, so an org with zero servers is refused a `gpu` host
+  // (weight 4 > tier 3) while billedUnits is 0 — and a button keyed on
+  // billedUnits was still disabled. No free-tier org could ever connect a GPU,
+  // the product's headline primitive, or pay to fix it. The dashboard was
+  // re-deriving a decision the CP makes with information the dashboard does not
+  // have, so it stopped deriving it.
+  it("offers Subscribe to a brand-new org, which is the GPU customer's only way in", () => {
     render(
       <BillingView
         orgName="Acme"
@@ -158,13 +164,15 @@ describe("BillingView subscription card", () => {
           ...subscription,
           status: "none",
           billableUnits: 0,
-          billedUnits: 1,
+          billedUnits: 0,
           freeTier: 3,
         }}
       />
     );
-    expect(screen.queryByRole("button", { name: /^Subscribe$/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /Within free tier/ })).toBeTruthy();
+    const btn = screen.getByRole("button", { name: /^Subscribe$/ }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    // ...and the price is STATED rather than enforced by a dead control.
+    expect(screen.getByText(/within the free tier/i)).toBeTruthy();
   });
 
   it("still offers Subscribe to an org already over the tier", () => {

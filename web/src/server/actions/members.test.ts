@@ -21,6 +21,7 @@ import * as s from "@/server/db/schema";
 import { user } from "@/server/db/auth-schema";
 import { hashInviteToken, INVITE_TTL_MS } from "@/lib/invite";
 import { FIXTURE, seedDemoFixture, type DemoDb } from "@/server/testing/demo-db";
+import { unwrap } from "@/lib/action-result";
 
 /** Who is signed in when the invite link is opened. */
 const session = vi.hoisted(() => ({
@@ -47,6 +48,16 @@ const { db } = await import("@/server/db");
 const { acceptInvite } = await import("@/server/actions/members");
 
 const d = () => db as unknown as DemoDb;
+
+
+/** An action's refusal message. Actions return `{ ok: false, error }` rather
+ *  than throwing, because Next redacts a thrown server-action error in
+ *  production and these sentences exist to be read (SIGMA-365). */
+async function refusal(p: Promise<{ ok: boolean } | { ok: false; error: string }>): Promise<string> {
+  const res = (await p) as { ok: boolean; error?: string };
+  expect(res.ok, "expected the action to refuse, but it succeeded").toBe(false);
+  return res.error ?? "";
+}
 
 const TOKEN = "raw-invite-token-for-the-test";
 
@@ -109,7 +120,7 @@ describe("acceptInvite", () => {
   it("refuses an invite addressed to a different email", async () => {
     await seedInvite({ email: "someone.else@example.com" });
 
-    await expect(acceptInvite({ token: TOKEN })).rejects.toThrow(
+    expect(await refusal(acceptInvite({ token: TOKEN }))).toMatch(
       /sent to someone\.else@example\.com/
     );
     // Nothing partially applied: no membership, and the invite is still live
@@ -121,33 +132,33 @@ describe("acceptInvite", () => {
   it("matches the invited email case-insensitively", async () => {
     await seedInvite({ email: "Invitee@Example.COM" });
 
-    await expect(acceptInvite({ token: TOKEN })).resolves.toEqual({ orgId: FIXTURE.orgId });
+    await expect(acceptInvite({ token: TOKEN })).resolves.toEqual({ ok: true, orgId: FIXTURE.orgId });
     expect((await membership()).role).toBe("Project Admin");
   });
 
   it("is one-time: the same link cannot be accepted twice", async () => {
     await seedInvite();
-    await acceptInvite({ token: TOKEN });
+    unwrap(await acceptInvite({ token: TOKEN }));
     expect((await inviteRow()).status).toBe("accepted");
     expect((await inviteRow()).acceptedAt).not.toBeNull();
 
-    await expect(acceptInvite({ token: TOKEN })).rejects.toThrow(/already been accepted/);
+    expect(await refusal(acceptInvite({ token: TOKEN }))).toMatch(/already been accepted/);
   });
 
   it("refuses a revoked or expired invite", async () => {
     await seedInvite({ status: "revoked" });
-    await expect(acceptInvite({ token: TOKEN })).rejects.toThrow(/revoked/);
+    expect(await refusal(acceptInvite({ token: TOKEN }))).toMatch(/revoked/);
     expect(await membership()).toBeUndefined();
 
     await d().delete(s.invitations);
     await seedInvite({ expiresAt: new Date(Date.now() - 1000) });
-    await expect(acceptInvite({ token: TOKEN })).rejects.toThrow(/expired/);
+    expect(await refusal(acceptInvite({ token: TOKEN }))).toMatch(/expired/);
     expect(await membership()).toBeUndefined();
   });
 
   it("refuses a token that matches no invitation", async () => {
     await seedInvite();
-    await expect(acceptInvite({ token: "not-the-token" })).rejects.toThrow(/invalid/);
+    expect(await refusal(acceptInvite({ token: "not-the-token" }))).toMatch(/invalid/);
     expect(await membership()).toBeUndefined();
   });
 
@@ -162,7 +173,7 @@ describe("acceptInvite", () => {
       ]),
     });
 
-    await acceptInvite({ token: TOKEN });
+    unwrap(await acceptInvite({ token: TOKEN }));
 
     const mem = await membership();
     expect(mem.role).toBe("Developer");
@@ -182,7 +193,7 @@ describe("acceptInvite", () => {
 
   it("leaves an org-wide invite unscoped", async () => {
     await seedInvite({ role: "Org Admin" });
-    await acceptInvite({ token: TOKEN });
+    unwrap(await acceptInvite({ token: TOKEN }));
     const mem = await membership();
     expect(mem.role).toBe("Org Admin");
     expect(mem.scoped).toBe(false);
@@ -200,7 +211,7 @@ describe("acceptInvite", () => {
     });
     await seedInvite({ role: "Developer" });
 
-    await acceptInvite({ token: TOKEN });
+    unwrap(await acceptInvite({ token: TOKEN }));
 
     expect((await membership()).role).toBe("Org Admin");
     expect(

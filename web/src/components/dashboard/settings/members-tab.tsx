@@ -44,6 +44,7 @@ import { restoreOrgWideAccess } from "@/server/actions/project-members";
 import type { PendingInvite, SettingsMember } from "./settings-view";
 import { InviteMemberDialog } from "./invite-member-dialog";
 import { Mail, RefreshCw, X } from "lucide-react";
+import { unwrap } from "@/lib/action-result";
 
 const ROLES = ["Org Admin", "Project Admin", "Developer"] as const;
 const ROLE_VARIANT: Record<string, React.ComponentProps<typeof Badge>["variant"]> = {
@@ -211,7 +212,9 @@ function PendingInviteRow({ orgId, invite }: { orgId: string; invite: PendingInv
   function resend() {
     startTransition(async () => {
       try {
-        const { delivered, inviteUrl } = await resendInvite({ orgId, invitationId: invite.id });
+        const { delivered, inviteUrl } = unwrap(
+          await resendInvite({ orgId, invitationId: invite.id })
+        );
         if (delivered) {
           toast.success(`Invite re-sent to ${invite.email}`);
         } else {

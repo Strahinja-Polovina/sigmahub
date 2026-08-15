@@ -31,6 +31,7 @@ import {
   hashInviteToken,
 } from "@/lib/invite";
 import { FIXTURE, seedDemoFixture, type DemoDb } from "@/server/testing/demo-db";
+import { unwrap } from "@/lib/action-result";
 
 const sent: string[] = [];
 
@@ -84,9 +85,9 @@ describe("resendInvite", () => {
   it("refuses a second send inside the cooldown, and sends no mail", async () => {
     await seedPending(new Date());
 
-    await expect(
-      resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" })
-    ).rejects.toThrow(/resend in/i);
+    const res = await resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" });
+    expect(res.ok).toBe(false);
+    expect(res.ok ? "" : res.error).toMatch(/resend in/i);
     // The mail is the thing being limited; a refusal that still sent it would be
     // a limit in name only.
     expect(sent).toEqual([]);
@@ -96,15 +97,14 @@ describe("resendInvite", () => {
     // A refusal with no exit is the exact defect class this review series keeps
     // finding. This one has two exits and must name both.
     await seedPending(new Date());
-    await expect(
-      resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" })
-    ).rejects.toThrow(/copy the link/i);
+    const res = await resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" });
+    expect(res.ok ? "" : res.error).toMatch(/copy the link/i);
   });
 
   it("allows the resend once the cooldown has elapsed, and re-arms", async () => {
     await seedPending(new Date(Date.now() - 5 * 60 * 1000));
 
-    const out = await resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" });
+    const out = unwrap(await resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" }));
     expect(out.delivered).toBe(true);
     expect(sent).toEqual(["target@example.com"]);
 
@@ -112,9 +112,8 @@ describe("resendInvite", () => {
     // would be a one-shot that an attacker clears by waiting once.
     const [row] = await d().select().from(s.invitations).where(eq(s.invitations.id, "inv_1"));
     expect(Date.now() - row.lastSentAt.getTime()).toBeLessThan(5000);
-    await expect(
-      resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" })
-    ).rejects.toThrow(/resend in/i);
+    const again = await resendInvite({ orgId: FIXTURE.orgId, invitationId: "inv_1" });
+    expect(again.ok ? "" : again.error).toMatch(/resend in/i);
   });
 });
 
@@ -130,29 +129,35 @@ describe("the per-org outbound-mail budget", () => {
 
   it("lets a real team onboard — the budget is above ordinary use", async () => {
     await spend(INVITE_SENDS_PER_WINDOW - 1);
-    const out = await inviteMember({
+    const out = unwrap(await inviteMember({
       orgId: FIXTURE.orgId,
       email: "newhire@example.com",
       role: "Developer",
-    });
+    }));
     expect(out.delivered).toBe(true);
     expect(sent).toHaveLength(INVITE_SENDS_PER_WINDOW);
   });
 
-  it("refuses past the budget, without sending", async () => {
+  it("stops SENDING past the budget, without refusing the invite", async () => {
+    // The budget bounds mail, not membership. Refusing the invite here was the
+    // first version and it was a dead end: the refusal told the admin to copy
+    // the invite link, and because it came before the insert there was no
+    // invitation and no link to copy (SIGMA-365).
     await spend(INVITE_SENDS_PER_WINDOW);
     sent.length = 0;
-    await expect(
-      inviteMember({ orgId: FIXTURE.orgId, email: "spam@example.com", role: "Developer" })
-    ).rejects.toThrow(new RegExp(`${INVITE_SENDS_PER_WINDOW} invite emails`));
+    const out = unwrap(
+      await inviteMember({ orgId: FIXTURE.orgId, email: "spam@example.com", role: "Developer" })
+    );
     expect(sent).toEqual([]);
-  });
-
-  it("names the way out, so the budget is a delay and not a wall", async () => {
-    await spend(INVITE_SENDS_PER_WINDOW);
-    await expect(
-      inviteMember({ orgId: FIXTURE.orgId, email: "spam@example.com", role: "Developer" })
-    ).rejects.toThrow(/copy the invite link/i);
+    expect(out.delivered).toBe(false);
+    expect(out.throttled).toBe(true);
+    // The exit the dialog offers has to actually exist.
+    expect(out.inviteUrl).toMatch(/\/invite\//);
+    const [row] = await d()
+      .select()
+      .from(s.invitations)
+      .where(eq(s.invitations.email, "spam@example.com"));
+    expect(row).toBeTruthy();
   });
 
   // THE ONE THAT MATTERS. The first version of this throttle was a resend
@@ -178,16 +183,15 @@ describe("the per-org outbound-mail budget", () => {
     // loop ran forever; under the budget it stops.
     for (let round = 0; round < 20 && refusedAfter === 0; round++) {
       for (const id of ids) {
-        try {
-          await resendInvite({ orgId: FIXTURE.orgId, invitationId: id });
-          await d()
-            .update(s.invitations)
-            .set({ lastSentAt: new Date(Date.now() - 10 * 60 * 1000) })
-            .where(eq(s.invitations.id, id));
-        } catch {
+        const res = await resendInvite({ orgId: FIXTURE.orgId, invitationId: id });
+        if (!res.ok) {
           refusedAfter = sent.length;
           break;
         }
+        await d()
+          .update(s.invitations)
+          .set({ lastSentAt: new Date(Date.now() - 10 * 60 * 1000) })
+          .where(eq(s.invitations.id, id));
       }
     }
     expect(refusedAfter).toBeGreaterThan(0);
@@ -203,11 +207,11 @@ describe("the per-org outbound-mail budget", () => {
       .update(s.orgMailBudget)
       .set({ windowStart: new Date(Date.now() - INVITE_SEND_WINDOW_MS - 60_000) });
 
-    const out = await inviteMember({
+    const out = unwrap(await inviteMember({
       orgId: FIXTURE.orgId,
       email: "tomorrow@example.com",
       role: "Developer",
-    });
+    }));
     expect(out.delivered).toBe(true);
   });
 
@@ -225,11 +229,11 @@ describe("the per-org outbound-mail budget", () => {
 
   it("is scoped per org — one abuser cannot spend another tenant's allowance", async () => {
     await spend(INVITE_SENDS_PER_WINDOW);
-    const out = await inviteMember({
+    const out = unwrap(await inviteMember({
       orgId: FIXTURE.rivalOrgId,
       email: "unaffected@example.com",
       role: "Developer",
-    });
+    }));
     expect(out.delivered).toBe(true);
   });
 });

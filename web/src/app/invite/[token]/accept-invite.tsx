@@ -8,6 +8,7 @@ import { Check, Loader2, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { acceptInvite } from "@/server/actions/members";
 import { authClient } from "@/lib/auth-client";
+import { unwrap } from "@/lib/action-result";
 
 /** The interactive tail of the accept page. `matches` is whether the signed-in
  *  account's email equals the invite's — only then can it be accepted; a
@@ -49,7 +50,7 @@ export function AcceptInvite({
   function accept() {
     startTransition(async () => {
       try {
-        const { orgId } = await acceptInvite({ token });
+        const { orgId } = unwrap(await acceptInvite({ token }));
         // Make the just-joined org the active one so the dashboard opens on it.
         document.cookie = `sh_org=${orgId}; path=/; max-age=31536000; samesite=lax`;
         toast.success("Invitation accepted");

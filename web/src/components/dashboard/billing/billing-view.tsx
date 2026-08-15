@@ -123,35 +123,45 @@ type Subscription = {
 };
 
 /**
- * May this org start a checkout? (SIGMA-365)
+ * May this org start a checkout? Always (SIGMA-365).
  *
- * Not `billableUnits >= 1`, which is what this used to ask and which produced a
- * closed loop for the customer who most needs to pay: at EXACTLY the free tier
- * billableUnits is 0 — nothing is chargeable yet — and that is the same moment
- * the free-tier gate begins refusing new servers, with a message telling them to
- * subscribe from this page. They arrived here and found the button greyed out and
- * labelled "Within free tier". Refused growth, refused payment, no way forward.
+ * This predicate has now produced a launch blocker twice, in the same shape, and
+ * the second time is what settled the question. It began as
+ * `billableUnits >= 1`: at EXACTLY the free tier billableUnits is 0 — nothing is
+ * chargeable yet — and that is the same moment the gate starts refusing new
+ * servers with a message telling the customer to subscribe from this page. They
+ * arrived and found the button greyed out. It then became
+ * `billedUnits >= freeTier`, which fixed that case and missed the WEIGHT: the
+ * gate refuses a server whose own units do not fit the remaining headroom, so an
+ * org with ZERO servers is refused a `gpu` host (weight 4 > tier 3) while
+ * `billedUnits` is 0 and the button is still disabled. On the day sign-up opens,
+ * no free-tier org can ever connect a GPU — the product's headline primitive —
+ * and cannot pay to fix it either.
  *
- * The control plane's checkout handler was fixed to accept this case (it floors
- * the quantity through BillableQuantity), so the only thing left holding the
- * customer out was this predicate. The question it should ask is "is this fleet
- * at or past the point where the free tier stops carrying it", which is about the
- * whole fleet and the tier, not about what happens to be chargeable today.
+ * The pattern is that the dashboard was trying to re-derive a decision the
+ * control plane makes with information the dashboard does not have (the type and
+ * weight of the server the customer is about to add). It will keep being wrong.
  *
- * Below the tier the button stays disabled on purpose: subscribing there bills
- * the minimum quantity for capacity that is free, and nothing is refusing them
- * anything yet.
+ * So the button is simply always live, and the price is stated instead of being
+ * enforced by a disabled control. Subscribing while genuinely below the tier
+ * costs the 1-unit minimum, which is the customer's choice to make — and the row
+ * says so before they click. Refusing to let someone pay us is a strange thing to
+ * spend a launch blocker on.
  */
-function canSubscribe(sub: {
+function canSubscribe(): boolean {
+  return true;
+}
+
+/** Is this org still inside the free tier? Only used to explain the price, never
+ *  to decide whether checkout is offered. */
+function withinFreeTier(sub: {
   billableUnits: number;
   billedUnits?: number;
   freeTier?: number;
 }): boolean {
-  if (sub.billableUnits >= 1) return true;
-  // Older payloads (and demo mode) carry neither field; fall back to the old
-  // predicate rather than offering a checkout we cannot justify.
-  if (sub.billedUnits === undefined || sub.freeTier === undefined) return false;
-  return sub.billedUnits >= sub.freeTier && sub.freeTier > 0;
+  if (sub.billableUnits >= 1) return false;
+  if (sub.billedUnits === undefined || sub.freeTier === undefined) return true;
+  return sub.billedUnits < sub.freeTier;
 }
 
 /** Send the browser to Paddle — checkout to subscribe, the customer portal for
@@ -252,13 +262,20 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
               {sub.status === "paused" ? "Resume subscription" : "Manage subscription"}
             </Button>
           ) : (
-            <Button
-              size="sm"
-              onClick={() => go(sub.orgId, "checkout")}
-              disabled={pending || !canSubscribe(sub)}
-            >
-              {canSubscribe(sub) ? "Subscribe" : "Within free tier"}
-            </Button>
+            <div className="flex flex-col items-end gap-1">
+              <Button
+                size="sm"
+                onClick={() => go(sub.orgId, "checkout")}
+                disabled={pending || !canSubscribe()}
+              >
+                Subscribe
+              </Button>
+              {withinFreeTier(sub) && (
+                <span className="text-[0.7rem] text-muted-foreground">
+                  You&apos;re within the free tier — subscribing now bills the 1-unit minimum.
+                </span>
+              )}
+            </div>
           )}
         </div>
       </CardContent>

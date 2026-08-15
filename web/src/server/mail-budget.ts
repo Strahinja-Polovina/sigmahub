@@ -2,6 +2,7 @@ import "server-only";
 
 import { sql } from "drizzle-orm";
 import { db } from "./db";
+import { Refusal } from "../lib/action-result";
 import { INVITE_SENDS_PER_WINDOW, INVITE_SEND_WINDOW_MS, humanWait } from "../lib/invite";
 
 // A bound on how much mail one organization can make us send (SIGMA-365).
@@ -21,9 +22,10 @@ import { INVITE_SENDS_PER_WINDOW, INVITE_SEND_WINDOW_MS, humanWait } from "../li
 // 1500 messages an hour from one org. That is the version of this that was
 // written first, and it did not hold.
 
-/** Thrown when the org has spent its window. Carries the wait so the caller can
- *  say when, rather than just no. */
-export class MailBudgetExceeded extends Error {
+/** Thrown when the org has spent its window AND the caller has an existing
+ *  invitation whose link the admin can copy instead. Carries the wait so the
+ *  message can say when, rather than just no. */
+export class MailBudgetExceeded extends Refusal {
   constructor(readonly retryAfterMs: number) {
     super(
       `This organization has sent ${INVITE_SENDS_PER_WINDOW} invite emails in the last hour, ` +
@@ -54,6 +56,30 @@ export async function chargeOrgMail(
   limit = INVITE_SENDS_PER_WINDOW,
   windowMs = INVITE_SEND_WINDOW_MS
 ): Promise<void> {
+  const spent = await spendOrgMail(orgId, limit, windowMs);
+  if (spent !== null) throw new MailBudgetExceeded(spent);
+}
+
+/**
+ * The same charge, reporting instead of throwing: null when the message may be
+ * sent, or the ms until the window resets when it may not.
+ *
+ * Both shapes exist because the right answer differs by caller, and getting that
+ * wrong is how the first version of this limit produced a dead end. On a RESEND
+ * the invitation already exists, so refusing is honest — its link is sitting in
+ * the members list and the message can point at it. On a fresh INVITE there is
+ * no row yet, so a refusal names a link that was never created: the admin is
+ * told to copy something that does not exist. There, the budget must refuse the
+ * MAIL and not the invite — create the invitation, skip the send, hand back the
+ * link — which is the same degraded path the product already takes on a
+ * deployment with no transport, and it is bounded for exactly the same reason:
+ * nothing was sent.
+ */
+export async function spendOrgMail(
+  orgId: string,
+  limit = INVITE_SENDS_PER_WINDOW,
+  windowMs = INVITE_SEND_WINDOW_MS
+): Promise<number | null> {
   const cutoff = new Date(Date.now() - windowMs);
   const rows = await db.execute<{ sent: number; window_start: Date }>(sql`
     INSERT INTO org_mail_budget (org_id, window_start, sent)
@@ -67,10 +93,10 @@ export async function chargeOrgMail(
   `);
   const row = (rows as unknown as { rows?: { sent: number; window_start: Date }[] }).rows?.[0]
     ?? (rows as unknown as { sent: number; window_start: Date }[])[0];
-  if (!row) return; // no row back is not a reason to refuse a legitimate invite
+  if (!row) return null; // no row back is not a reason to refuse a legitimate invite
   const sent = Number(row.sent);
-  if (sent <= limit) return;
+  if (sent <= limit) return null;
 
   const opened = new Date(row.window_start).getTime();
-  throw new MailBudgetExceeded(Math.max(1000, opened + windowMs - Date.now()));
+  return Math.max(1000, opened + windowMs - Date.now());
 }
