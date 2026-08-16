@@ -773,6 +773,19 @@ func (r *Reconciler) resyncPass(ctx context.Context) error {
 
 	mu.Lock()
 	defer mu.Unlock()
+	// A pass that never REACHED most of the fleet has not done its job, however
+	// the servers it did reach turned out (SIGMA-365). When acquireSlot fails the
+	// worker returns rather than continuing, so a saturated semaphore drops every
+	// server still unclaimed — and with only a handful of workers charged one
+	// failure each, `failed < attempted` held and the pass reported success.
+	// `record(ok=true)` then advanced the last-success clock, /livez stayed 200,
+	// and hundreds of servers went unreconciled with nothing anywhere saying so.
+	// Unlike a host being down, this is a control-plane condition and the only
+	// signal it has.
+	if attempted < len(servers) {
+		return fmt.Errorf("resync: abandoned after %d of %d server(s) — reconcile slots exhausted",
+			attempted, len(servers))
+	}
 	if failed == 0 {
 		return nil
 	}

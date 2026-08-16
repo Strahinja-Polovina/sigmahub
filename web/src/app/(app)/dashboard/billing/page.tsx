@@ -50,6 +50,13 @@ export default async function BillingPage() {
         configured: b.configured,
         status: b.subscription.status,
         billableUnits: b.billableUnits,
+        // The Subscribe button needs the FLEET size and the tier, not just what
+        // is billable today: at exactly the free tier billableUnits is 0, which
+        // is also the point the free-tier gate starts refusing new servers
+        // (SIGMA-365). Deciding from billableUnits alone disabled the one button
+        // the refusal tells the customer to press.
+        billedUnits: b.billedUnits,
+        freeTier: b.freeTier,
         serverHoursThisMonth: b.serverHoursThisMonth,
         orgId,
       };

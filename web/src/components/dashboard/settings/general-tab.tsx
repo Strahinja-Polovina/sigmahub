@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { updateOrg } from "@/server/actions/org";
 import type { SettingsOrg } from "./settings-view";
+import { unwrap } from "@/lib/action-result";
 
 const PLAN_LABELS: Record<string, string> = { free: "Free", cloud: "Cloud" };
 
@@ -41,7 +42,7 @@ export function GeneralTab({ org, isAdmin }: { org: SettingsOrg; isAdmin: boolea
     if (!dirty || !isAdmin) return;
     startTransition(async () => {
       try {
-        await updateOrg({ orgId: org.id, name: name.trim() });
+        unwrap(await updateOrg({ orgId: org.id, name: name.trim() }));
         toast.success("Organization settings saved", {
           description: `Name updated to “${name.trim()}”.`,
         });

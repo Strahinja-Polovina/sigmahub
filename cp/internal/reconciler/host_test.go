@@ -183,3 +183,65 @@ func TestRenderHostOpsAgentUpdateOmitsDownloadBaseWithoutPublicURL(t *testing.T)
 		t.Fatal("missing agent.update op")
 	}
 }
+
+// The agent reports its version WITHOUT the leading `v`, and the control plane
+// stores the desired one WITH it (SIGMA-365).
+//
+// `.goreleaser.yaml` stamps `-X main.version={{ .Version }}`, and goreleaser's
+// `.Version` is the tag minus the `v` — which is why install.sh computes
+// `ver_noV="${SIGMAHUB_VERSION#v}"` and why installer.go and the agent's
+// selfupdate both TrimPrefix before building a URL. Meanwhile the API validates
+// the desired version against `^v[0-9]+\.[0-9]+\.[0-9]+`, so `v0.4.0` is the
+// only spelling that can be stored.
+//
+// Compared raw, those two are never equal, and the consequences compound: the
+// upgrade op is re-rendered into EVERY later document, and the agent's own
+// idempotency guard was the same raw compare, so each one re-ran a ~30 MB
+// download, a cosign verification, a binary rewrite and an os.Exit(0) restart of
+// the root daemon on a customer's host — on every deploy, secret rotation or
+// domain attach, with no way to clear it (an empty desired version means "use
+// the CP's own release" and a non-`v` value is refused at the API).
+//
+// The existing vocabulary test compares the two REGEXPS out of source and cannot
+// see this; only a comparison of the actual values can.
+func TestAgentUpdateDropsOutWhenTheAgentIsAlreadyOnTheTargetVersion(t *testing.T) {
+	for _, tc := range []struct{ desired, reported string }{
+		{"v0.4.0", "0.4.0"}, // the real pairing: CP stores v-prefixed, agent stamps bare
+		{"v0.4.0", "v0.4.0"},
+		{"0.4.0", "0.4.0"},
+	} {
+		ops := renderHostOps("srv_x", store.HostHardening{
+			MeshInterface: "sigma0", AgentVersion: tc.reported, DesiredAgentVersion: tc.desired,
+		}, "https://cp.example.test")
+		for _, op := range ops {
+			if op.Kind == dsd.KindAgentUpdate {
+				t.Errorf("desired %q vs reported %q rendered an upgrade op — the agent is already there, "+
+					"so this op re-downloads and restarts sigmad on every future document",
+					tc.desired, tc.reported)
+			}
+		}
+	}
+}
+
+// ...and it must still render when the versions genuinely differ, whichever way
+// each side happens to spell them.
+func TestAgentUpdateStillRendersOnARealVersionChange(t *testing.T) {
+	for _, tc := range []struct{ desired, reported string }{
+		{"v0.5.0", "0.4.0"},
+		{"v0.5.0", "v0.4.0"},
+		{"v0.5.0", ""}, // never checked in
+	} {
+		ops := renderHostOps("srv_y", store.HostHardening{
+			MeshInterface: "sigma0", AgentVersion: tc.reported, DesiredAgentVersion: tc.desired,
+		}, "https://cp.example.test")
+		found := false
+		for _, op := range ops {
+			if op.Kind == dsd.KindAgentUpdate {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("desired %q vs reported %q rendered no upgrade op", tc.desired, tc.reported)
+		}
+	}
+}

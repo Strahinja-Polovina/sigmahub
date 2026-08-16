@@ -17,6 +17,8 @@ import { useAuthProviders } from "@/components/auth/auth-providers";
 import { useMailDelivery } from "@/components/auth/mail-delivery";
 import { anyAuthProvider } from "@/lib/auth-providers";
 import {
+  normalizeBackupCode,
+  validateBackupCode,
   validateEmail,
   validateOtp,
   validatePassword,
@@ -45,6 +47,11 @@ export default function LoginPage() {
   const [code, setCode] = React.useState("");
   const [codeError, setCodeError] = React.useState<string | null>(null);
   const [verifying, setVerifying] = React.useState(false);
+  // The other second factor. Backup codes were generated, shown once, and
+  // described as the way back in — and had no field anywhere in the product to
+  // be typed into, so a lost authenticator was a permanent lockout (SIGMA-365).
+  const [useBackup, setUseBackup] = React.useState(false);
+  const [backupCode, setBackupCode] = React.useState("");
 
   // Verification state
   const [resending, setResending] = React.useState(false);
@@ -115,6 +122,29 @@ export default function LoginPage() {
     router.push(destAfterAuth());
   };
 
+  const redeemBackupCode = async () => {
+    const err = validateBackupCode(backupCode);
+    setCodeError(err);
+    if (err) return;
+
+    setVerifying(true);
+    const { error } = await authClient.twoFactor.verifyBackupCode({
+      code: normalizeBackupCode(backupCode),
+    });
+    setVerifying(false);
+
+    if (error) {
+      // Each code works once, so "wrong" and "already spent" are the same
+      // situation to the user and need the same next step.
+      setCodeError("That code is not valid, or has already been used. Try another one.");
+      return;
+    }
+    toast.success("Welcome back", {
+      description: "That backup code is now used up — generate a new set in Settings → Security.",
+    });
+    router.push(destAfterAuth());
+  };
+
   const resendVerification = async () => {
     setResending(true);
     try {
@@ -142,8 +172,8 @@ export default function LoginPage() {
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
             Your password is correct, but{" "}
             <span className="font-medium text-foreground">{email}</span> hasn&apos;t been
-            confirmed yet. We&apos;ve just sent a fresh link — open it and you&apos;ll be
-            signed in.
+            confirmed yet. We&apos;ve just sent a fresh link — open it, then come back
+            and log in.
           </p>
         ) : (
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
@@ -196,29 +226,59 @@ export default function LoginPage() {
           Two-factor authentication
         </h1>
         <p className="mt-1.5 text-sm text-muted-foreground">
-          Enter the 6-digit code from your authenticator app for{" "}
-          <span className="font-medium text-foreground">{email}</span>.
+          {useBackup ? (
+            <>
+              Enter one of the backup codes you saved when you turned on two-factor
+              authentication for{" "}
+              <span className="font-medium text-foreground">{email}</span>.
+            </>
+          ) : (
+            <>
+              Enter the 6-digit code from your authenticator app for{" "}
+              <span className="font-medium text-foreground">{email}</span>.
+            </>
+          )}
         </p>
 
         <form
           className="mt-7 grid gap-4"
           onSubmit={(e) => {
             e.preventDefault();
-            verifyCode();
+            if (useBackup) redeemBackupCode();
+            else verifyCode();
           }}
         >
-          <OtpInput
-            value={code}
-            onChange={(v) => {
-              setCode(v);
-              if (codeError) setCodeError(null);
-            }}
-            onComplete={(v) => verifyCode(v)}
-            invalid={!!codeError}
-            disabled={verifying}
-            autoFocus
-          />
-          {codeError && <p className="text-xs text-destructive">{codeError}</p>}
+          {useBackup ? (
+            <AuthField
+              id="backup-code"
+              label="Backup code"
+              type="text"
+              autoComplete="one-time-code"
+              placeholder="abcde-12345"
+              value={backupCode}
+              onValueChange={(v) => {
+                setBackupCode(v);
+                if (codeError) setCodeError(null);
+              }}
+              error={codeError}
+              autoFocus
+            />
+          ) : (
+            <>
+              <OtpInput
+                value={code}
+                onChange={(v) => {
+                  setCode(v);
+                  if (codeError) setCodeError(null);
+                }}
+                onComplete={(v) => verifyCode(v)}
+                invalid={!!codeError}
+                disabled={verifying}
+                autoFocus
+              />
+              {codeError && <p className="text-xs text-destructive">{codeError}</p>}
+            </>
+          )}
 
           <Button type="submit" className="w-full" disabled={verifying}>
             {verifying && <Loader2 className="size-4 animate-spin" />}
@@ -232,6 +292,8 @@ export default function LoginPage() {
             onClick={() => {
               setStep("credentials");
               setCode("");
+              setBackupCode("");
+              setUseBackup(false);
               setCodeError(null);
             }}
             className="inline-flex items-center gap-1.5 text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:text-foreground"
@@ -239,16 +301,21 @@ export default function LoginPage() {
             <ArrowLeft className="size-3.5" />
             Back
           </button>
+          {/* The way in when the authenticator is gone — which is the entire
+              reason backup codes exist, and was the one thing the product never
+              offered. What used to sit here was a "Resend code" button that made
+              no network call at all and toasted "a new code is on its way to your
+              device": for TOTP there is nothing to resend, and it was aimed
+              precisely at the user who is locked out (SIGMA-365). */}
           <button
             type="button"
-            onClick={() =>
-              toast.info("Code resent", {
-                description: "A new code is on its way to your device.",
-              })
-            }
+            onClick={() => {
+              setUseBackup((v) => !v);
+              setCodeError(null);
+            }}
             className="font-medium text-primary outline-none transition-colors hover:text-primary/80 focus-visible:underline"
           >
-            Resend code
+            {useBackup ? "Use your authenticator app" : "Use a backup code"}
           </button>
         </div>
       </div>

@@ -30,10 +30,12 @@ vi.mock("sonner", () => {
   });
   return { toast };
 });
-const setActiveOrg = vi.fn<(orgId: string) => Promise<void>>(async () => {});
+// Actions answer with a result rather than throwing — a thrown server-action
+// error is redacted in production, so refusals are returned (SIGMA-365).
+const setActiveOrg = vi.fn<(orgId: string) => Promise<{ ok: true }>>(async () => ({ ok: true }));
 const createOrg = vi.fn<
-  (input: { name: string }) => Promise<{ orgId: string; name: string }>
->(async ({ name }) => ({ orgId: "org_new", name }));
+  (input: { name: string }) => Promise<{ ok: true; orgId: string; name: string }>
+>(async ({ name }) => ({ ok: true, orgId: "org_new", name }));
 vi.mock("@/server/actions/org", () => ({
   setActiveOrg: (orgId: string) => setActiveOrg(orgId),
   createOrg: (input: { name: string }) => createOrg(input),

@@ -25,4 +25,25 @@
 -- The cut is the migration itself: it runs once, so accounts created after this
 -- point go through verification normally. On a fresh install the table is empty
 -- and this is a no-op.
-UPDATE "user" SET "email_verified" = true WHERE "email_verified" = false;
+--
+-- The NOT EXISTS is what keeps this from being a back door rather than a
+-- migration. Unconditionally, it also verifies accounts on a deployment that had
+-- ALREADY turned verification on — where an unverified row is not "we never
+-- asked", it is "this person did not prove the address". `email_verified` is
+-- load-bearing for exactly one control, the invite email-match in
+-- server/actions/members.ts, and the whole point of that control is that someone
+-- holding a leaked invite link cannot register the invited address and walk in.
+-- Marking those rows verified would hand them the thing the control exists to
+-- withhold.
+--
+-- A deployment that has been verifying has at least one verified account; a
+-- deployment that never asked has none. That is the difference, it is visible in
+-- the data, and it is the condition below.
+--
+-- The one case it decides "wrongly" is a deployment where verification was on
+-- and NOBODY ever completed it. There, no account can sign in at all, so every
+-- row is already locked out and grandfathering is the recovery rather than a
+-- weakening.
+UPDATE "user" SET "email_verified" = true
+ WHERE "email_verified" = false
+   AND NOT EXISTS (SELECT 1 FROM "user" WHERE "email_verified" = true);

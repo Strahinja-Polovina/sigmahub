@@ -18,6 +18,8 @@ import { and, eq } from "drizzle-orm";
 import * as s from "@/server/db/schema";
 import { user as authUser } from "@/server/db/auth-schema";
 import type { DemoDb } from "@/server/testing/demo-db";
+import { unwrap } from "@/lib/action-result";
+import { MAX_ORGS_PER_USER } from "@/lib/org-limits";
 
 const ADA = { id: "usr_ada", name: "Ada Admin", email: "ada@acme.example" };
 
@@ -66,7 +68,7 @@ beforeEach(async () => {
 
 describe("createOrg", () => {
   it("inserts an org and an Org Admin membership for the caller", async () => {
-    const { orgId } = await createOrg({ name: "Beta Client" });
+    const { orgId } = unwrap(await createOrg({ name: "Beta Client" }));
 
     const [org] = await db.select().from(s.orgs).where(eq(s.orgs.id, orgId));
     expect(org?.name).toBe("Beta Client");
@@ -86,17 +88,39 @@ describe("createOrg", () => {
   });
 
   it("rejects a blank name instead of creating a nameless org", async () => {
-    await expect(createOrg({ name: "   " })).rejects.toThrow(/name is required/i);
+    const res = await createOrg({ name: "   " });
+    expect(res.ok).toBe(false);
+    expect(res.ok ? "" : res.error).toMatch(/name is required/i);
     expect(await db.select().from(s.orgs)).toHaveLength(0);
   });
 
   it("gives a second org with the same name its own slug", async () => {
-    const a = await createOrg({ name: "Beta Client" });
-    const b = await createOrg({ name: "Beta Client" });
+    const a = unwrap(await createOrg({ name: "Beta Client" }));
+    const b = unwrap(await createOrg({ name: "Beta Client" }));
     expect(b.orgId).not.toBe(a.orgId);
 
     const rows = await db.select().from(s.orgs);
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map((r) => r.slug)).size).toBe(2);
+  });
+
+  // SIGMA-365. The ceiling that makes the OTHER ceilings mean something.
+  //
+  // Every abuse limit added for the public launch is scoped per organization:
+  // the free tier bounds units per org, and the outbound-mail budget bounds
+  // invite email per org. Both were designed and tested against a fixed org, and
+  // neither noticed that this action mints orgs for the price of a session. A
+  // loop here is unlimited free capacity and an unlimited mail cannon at the
+  // same time — the exact two things those limits were written to prevent.
+  it("stops one account minting organizations without bound", async () => {
+    for (let i = 0; i < MAX_ORGS_PER_USER; i++) {
+      const res = await createOrg({ name: `Client ${i}` });
+      expect(res.ok, `org ${i} should be allowed — the limit is ${MAX_ORGS_PER_USER}`).toBe(true);
+    }
+    const res = await createOrg({ name: "One too many" });
+    expect(res.ok).toBe(false);
+    // The refusal has to name a route forward, like every other limit here.
+    expect(res.ok ? "" : res.error).toMatch(/invite you|contact support/i);
+    expect(await db.select().from(s.orgs)).toHaveLength(MAX_ORGS_PER_USER);
   });
 });

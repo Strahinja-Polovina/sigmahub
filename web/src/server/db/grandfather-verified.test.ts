@@ -44,20 +44,39 @@ describe("the grandfathering migration", () => {
       { email: "grace@example.com", email_verified: true },
     ]);
 
-    // The cut is the migration running once: an account created after it — a
-    // genuine new sign-up — is not swept up by a second application.
+    await pglite.close();
+  }, 60_000);
+
+  // The back door this would have been without its guard.
+  //
+  // On a deployment that had ALREADY turned verification on, an unverified row
+  // does not mean "we never asked" — it means "this person never proved the
+  // address". `email_verified` is load-bearing for exactly one control, the
+  // invite email-match, and that control exists so someone holding a leaked
+  // invite link cannot register the invited address and walk into the org.
+  // Verifying those rows hands them precisely what it withholds.
+  it("leaves genuinely unverified accounts alone where verification was already on", async () => {
+    const pglite = new PGlite();
+    await migrate(drizzle(pglite), { migrationsFolder: "drizzle" });
+
+    // The signature of a deployment that has been verifying: someone completed
+    // it. The one who did not is unverified on purpose.
     await pglite.query(`
       INSERT INTO "user" (id, name, email, email_verified)
-      VALUES ('u_new', 'Alan', 'alan@example.com', false)
+      VALUES ('u_ok', 'Ada', 'ada@example.com', true),
+             ('u_pending', 'Mallory', 'invited@example.com', false)
     `);
+
+    const sql = fs.readFileSync(path.join(process.cwd(), MIGRATION), "utf8");
     await pglite.exec(sql);
-    const rerun = await pglite.query<{ email_verified: boolean }>(
-      `SELECT email_verified FROM "user" WHERE id = 'u_new'`
+
+    const after = await pglite.query<{ id: string; email_verified: boolean }>(
+      `SELECT id, email_verified FROM "user" ORDER BY id`
     );
-    // It WOULD flip on a re-run, which is exactly why the guard is drizzle's
-    // ledger and not the statement: this asserts the fact, so that anyone
-    // tempted to make the file idempotent-by-rerunning sees what that costs.
-    expect(rerun.rows[0].email_verified).toBe(true);
+    expect(after.rows).toEqual([
+      { id: "u_ok", email_verified: true },
+      { id: "u_pending", email_verified: false },
+    ]);
 
     await pglite.close();
   }, 60_000);

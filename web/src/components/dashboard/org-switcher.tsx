@@ -41,6 +41,7 @@ import {
 } from "@/components/ui/sidebar";
 import { useActiveOrg } from "@/components/dashboard/org-context";
 import { createOrg, setActiveOrg } from "@/server/actions/org";
+import { unwrap } from "@/lib/action-result";
 
 function orgInitial(name: string) {
   return name.charAt(0).toUpperCase();
@@ -63,7 +64,7 @@ export function OrgSwitcher() {
     if (id === org.id) return;
     setOrgId(id); // immediate client feedback
     startTransition(async () => {
-      await setActiveOrg(id); // persist cookie so server components follow
+      unwrap(await setActiveOrg(id)); // persist cookie so server components follow
       router.refresh();
     });
   }
@@ -74,7 +75,7 @@ export function OrgSwitcher() {
     if (!name) return;
     startCreate(async () => {
       try {
-        await createOrg({ name });
+        unwrap(await createOrg({ name }));
         setCreateOpen(false);
         setNewName("");
         toast.success(`Created ${name}`, {

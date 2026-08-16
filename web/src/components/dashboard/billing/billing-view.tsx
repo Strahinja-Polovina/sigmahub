@@ -113,9 +113,56 @@ type Subscription = {
    *  it is reversible and must not offer a second checkout (SIGMA-294). */
   status: string;
   billableUnits: number;
+  /** The org's whole fleet in units, and the tier that is free. Both are needed
+   *  to decide whether checkout is OFFERED, because at exactly the free tier
+   *  billableUnits is 0 and that is precisely when growth is refused. */
+  billedUnits?: number;
+  freeTier?: number;
   serverHoursThisMonth: number;
   orgId: string;
 };
+
+/**
+ * May this org start a checkout? Always (SIGMA-365).
+ *
+ * This predicate has now produced a launch blocker twice, in the same shape, and
+ * the second time is what settled the question. It began as
+ * `billableUnits >= 1`: at EXACTLY the free tier billableUnits is 0 — nothing is
+ * chargeable yet — and that is the same moment the gate starts refusing new
+ * servers with a message telling the customer to subscribe from this page. They
+ * arrived and found the button greyed out. It then became
+ * `billedUnits >= freeTier`, which fixed that case and missed the WEIGHT: the
+ * gate refuses a server whose own units do not fit the remaining headroom, so an
+ * org with ZERO servers is refused a `gpu` host (weight 4 > tier 3) while
+ * `billedUnits` is 0 and the button is still disabled. On the day sign-up opens,
+ * no free-tier org can ever connect a GPU — the product's headline primitive —
+ * and cannot pay to fix it either.
+ *
+ * The pattern is that the dashboard was trying to re-derive a decision the
+ * control plane makes with information the dashboard does not have (the type and
+ * weight of the server the customer is about to add). It will keep being wrong.
+ *
+ * So the button is simply always live, and the price is stated instead of being
+ * enforced by a disabled control. Subscribing while genuinely below the tier
+ * costs the 1-unit minimum, which is the customer's choice to make — and the row
+ * says so before they click. Refusing to let someone pay us is a strange thing to
+ * spend a launch blocker on.
+ */
+function canSubscribe(): boolean {
+  return true;
+}
+
+/** Is this org still inside the free tier? Only used to explain the price, never
+ *  to decide whether checkout is offered. */
+function withinFreeTier(sub: {
+  billableUnits: number;
+  billedUnits?: number;
+  freeTier?: number;
+}): boolean {
+  if (sub.billableUnits >= 1) return false;
+  if (sub.billedUnits === undefined || sub.freeTier === undefined) return true;
+  return sub.billedUnits < sub.freeTier;
+}
 
 /** Send the browser to Paddle — checkout to subscribe, the customer portal for
  *  payment method, subscription state and, crucially, invoices.
@@ -215,13 +262,20 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
               {sub.status === "paused" ? "Resume subscription" : "Manage subscription"}
             </Button>
           ) : (
-            <Button
-              size="sm"
-              onClick={() => go(sub.orgId, "checkout")}
-              disabled={pending || sub.billableUnits < 1}
-            >
-              {sub.billableUnits < 1 ? "Within free tier" : "Subscribe"}
-            </Button>
+            <div className="flex flex-col items-end gap-1">
+              <Button
+                size="sm"
+                onClick={() => go(sub.orgId, "checkout")}
+                disabled={pending || !canSubscribe()}
+              >
+                Subscribe
+              </Button>
+              {withinFreeTier(sub) && (
+                <span className="text-[0.7rem] text-muted-foreground">
+                  You&apos;re within the free tier — subscribing now bills the 1-unit minimum.
+                </span>
+              )}
+            </div>
           )}
         </div>
       </CardContent>

@@ -275,12 +275,19 @@ sign-up page is not.
 1. **Mail.** `SMTP_HOST` + `SMTP_FROM` (§1). Without them invites and password
    resets reach nobody, and email verification — the thing that makes an invited
    address mean a person — stays off.
-2. **Edge rate limiting.** better-auth throttles the credential endpoints inside
-   the dashboard, which is the whole request path for this single-instance
-   deployment. Add a CDN/WAF or a `caddy-ratelimit` build (the exact block is
-   commented in `Caddyfile`) before exposing sign-in publicly, and note that the
-   in-process counters stop being sufficient the moment a second `web` replica
-   exists.
+2. **Edge rate limiting.** The dashboard throttles its own credential endpoints
+   and counts in the **database** (`rate_limit`), so the limit is a property of
+   the deployment rather than of a process — running a second `web` replica is a
+   scaling decision and not a security one, with nothing to configure. Outbound
+   invite mail is throttled too, per organization, because sign-up makes every
+   new account an Org Admin and `resendInvite` would otherwise mail an arbitrary
+   address without bound from your sending domain.
+
+   None of that covers **unauthenticated flooding**: an application limiter can
+   only count a request that already reached the application. Put a CDN/WAF or a
+   `caddy-ratelimit` build (the exact block is commented in `Caddyfile`) in front
+   before exposing sign-in publicly. This is the one item on this list that
+   cannot be closed in the product.
 3. **Monitoring.** `COMPOSE_PROFILES=monitoring`, or at minimum a check against
    `GET /livez` (§7). Otherwise a wedged control plane is silent.
 

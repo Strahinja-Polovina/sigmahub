@@ -98,6 +98,11 @@ export const invitations = pgTable(
     status: text("status").notNull().default("pending"), // pending | accepted | revoked
     expiresAt: timestamp("expires_at").notNull(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
+    // When this invitation was last MAILED — which created_at is not, because a
+    // resend does not create a row. It is what makes the resend cooldown
+    // possible (SIGMA-365); without it, holding the resend button mailed an
+    // arbitrary address without limit from our sending domain.
+    lastSentAt: timestamp("last_sent_at").notNull().defaultNow(),
     acceptedAt: timestamp("accepted_at"),
   },
   // At most one PENDING invite per (org, lower(email)) — the DB is the authority
@@ -110,6 +115,31 @@ export const invitations = pgTable(
       .where(sql`${t.status} = 'pending'`),
   })
 );
+
+// Outbound-mail budget, one row per organization (SIGMA-365).
+//
+// Sign-up makes every new account an Org Admin of its own org, so on a public
+// launch the invite flow is reachable by anyone who registered — and it mails
+// arbitrary addresses from the sending domain that every other tenant's
+// password-reset mail depends on. A blocklisted domain is not fixed by
+// deploying a patch.
+//
+// This exists because the obvious bounds do not bound anything. A per-invitation
+// resend cooldown limits how often ONE row is mailed; a cap on invitations
+// created per hour limits how many new rows appear. Their product is the real
+// limit — 25 pending invites resent once a minute each is 1500 messages an hour.
+// Counting sends is the only thing that bounds sends.
+//
+// window_start is when the window OPENED, not when the last message went out: a
+// sliding last-send timestamp would let a steady drip push the window forward
+// forever and never reset the count.
+export const orgMailBudget = pgTable("org_mail_budget", {
+  orgId: text("org_id")
+    .primaryKey()
+    .references(() => orgs.id, { onDelete: "cascade" }),
+  windowStart: timestamp("window_start").notNull().defaultNow(),
+  sent: integer("sent").notNull().default(0),
+});
 
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),

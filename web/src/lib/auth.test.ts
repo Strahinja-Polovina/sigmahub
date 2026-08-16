@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type AuthOptions = {
+  rateLimit?: { enabled?: boolean; storage?: string; customRules?: Record<string, unknown> };
   emailAndPassword?: { requireEmailVerification?: boolean };
   emailVerification?: {
     sendOnSignUp?: boolean;
@@ -78,10 +79,32 @@ describe("the way back in when an address is unverified", () => {
     expect(opts.emailVerification?.sendOnSignIn).toBe(true);
   });
 
-  it("signs the user in when the link is used, so the hop is invisible", async () => {
-    // Also what makes an invite work in one hop: the ?invite= token rides
-    // through as the callbackURL and the accept page needs a session.
+  it("counts rate limits in the database, so the limit survives a second replica", async () => {
+    // The default in-process map bounds ONE process: with N replicas the
+    // effective sign-in limit becomes N × 5/min, and it degrades in silence on a
+    // change (scaling out) nobody would connect to authentication. The storage
+    // backing it is checked here because the failure has no other symptom —
+    // server/db/rate-limit-storage.test.ts proves the table can actually take it.
+    const opts = await loadAuthOptions(undefined);
+    expect(opts.rateLimit?.enabled).toBe(true);
+    expect(opts.rateLimit?.storage).toBe("database");
+    // The credential-guessing endpoints stay well below the global rate.
+    expect(Object.keys(opts.rateLimit?.customRules ?? {})).toEqual(
+      expect.arrayContaining(["/sign-in/email", "/sign-up/email", "/forget-password"])
+    );
+  });
+
+  it("does NOT hand out a session for a clicked link — that would skip 2FA", async () => {
+    // better-auth's /verify-email calls internalAdapter.createSession directly
+    // when autoSignInAfterVerification is set, with no second factor on that
+    // path — the twoFactor plugin intercepts /sign-in/email, which the link
+    // never touches. So a verification link would be a complete sign-in for any
+    // account that is 2FA-enrolled but unverified, and that combination is
+    // reachable: verification is off wherever no transport is configured, so a
+    // user can sign up, enable 2FA, and only then have the operator wire SMTP.
+    // Whoever holds the mailbox would hold the account — the exact compromise
+    // the second factor exists to survive.
     const opts = await loadAuthOptions("true");
-    expect(opts.emailVerification?.autoSignInAfterVerification).toBe(true);
+    expect(opts.emailVerification?.autoSignInAfterVerification).toBe(false);
   });
 });

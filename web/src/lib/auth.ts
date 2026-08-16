@@ -119,11 +119,22 @@ export const auth = betterAuth({
     // trying to use it, so the flow is self-healing. It reveals nothing: the
     // caller already proved the password on the line above.
     sendOnSignIn: true,
-    // The link is the proof; making the user then type the password they just
-    // typed is a second wall in front of the same door. It also matters for
-    // invites — the ?invite= token rides through as the callbackURL, and landing
-    // signed-in on the accept page is the whole flow in one hop.
-    autoSignInAfterVerification: true,
+    // NOT auto-signed-in, though it is tempting and was briefly on (SIGMA-365).
+    //
+    // better-auth's /verify-email calls internalAdapter.createSession directly
+    // when this is set — no second factor, ever. The twoFactor plugin works by
+    // intercepting /sign-in/email and withholding the session until a TOTP code
+    // arrives, so it is not on this path and cannot be. That makes a verification
+    // link a complete sign-in for any account that is 2FA-enrolled but unverified,
+    // which is a reachable combination: verification is off wherever no transport
+    // is configured, so a user can sign up, enable 2FA, and only then have the
+    // operator wire SMTP.
+    //
+    // Whoever holds the mailbox then holds the account — which is precisely the
+    // compromise the second factor exists to survive. The cost of leaving it off
+    // is one extra sign-in after verifying, and /signup says so rather than
+    // promising a hop it no longer performs.
+    autoSignInAfterVerification: false,
     sendVerificationEmail: async ({ user, url }) => {
       await sendMail({
         to: user.email,
@@ -139,12 +150,23 @@ export const auth = betterAuth({
   // Rate limiting on the auth surface (SIGMA-365). better-auth enables a limiter
   // only in production by default; turn it on explicitly (dev too) and hold the
   // credential-guessing endpoints well below the global rate so password spraying
-  // and reset/2FA probing are throttled. Storage is in-memory, which bounds a
-  // SINGLE instance — a horizontally-scaled deployment should point this at shared
-  // (database/secondary) storage so the limit holds across replicas, and the edge
-  // should still carry its own rate limit / WAF (both tracked in SIGMA-365).
+  // and reset/2FA probing are throttled.
+  //
+  // Storage is the DATABASE, not the default in-process map. The map bounds one
+  // process, so with N replicas behind a proxy the effective sign-in limit
+  // silently becomes N × 5/min — and it degrades with no signal anywhere, on a
+  // change (scaling out) that nobody would connect to authentication. Making the
+  // limit a property of the deployment rather than of a process means scaling is
+  // a scaling decision, not a security one. Counters live in `rate_limit`
+  // (server/db/auth-schema.ts) and better-auth prunes expired rows itself.
+  //
+  // This is the whole request path for the reference deployment. It does NOT
+  // replace an edge rate limit or WAF for unauthenticated flooding — no
+  // application-level limiter can, since the request has already reached the app
+  // to be counted. That remains infrastructure, and `Caddyfile` carries the block.
   rateLimit: {
     enabled: true,
+    storage: "database",
     window: 60,
     max: 100,
     customRules: {

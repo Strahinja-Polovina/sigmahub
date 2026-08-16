@@ -25,6 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { inviteMember } from "@/server/actions/members";
+import { unwrap } from "@/lib/action-result";
 
 const ROLES: { value: string; hint: string }[] = [
   { value: "Org Admin", hint: "Full access across the organization" },
@@ -50,15 +51,22 @@ export function InviteMemberDialog({ orgId }: { orgId: string }) {
     if (!emailValid) return;
     startTransition(async () => {
       try {
-        const { delivered, inviteUrl } = await inviteMember({ orgId, email, role });
+        const { delivered, inviteUrl, throttled } = unwrap(
+          await inviteMember({ orgId, email, role })
+        );
         if (delivered) {
           toast.success(`Invitation sent to ${email}`, { description: `Role: ${role}` });
         } else {
-          // Honest degradation: no mail transport is wired, so copy the link
-          // for the admin to relay rather than pretend an email went out.
+          // Honest degradation: the invite exists either way, so hand over the
+          // link rather than pretend an email went out. The two reasons it did
+          // not go out are different problems and must not share one sentence —
+          // telling an operator with working SMTP that their mail is
+          // unconfigured sends them to debug the wrong thing (SIGMA-365).
           await navigator.clipboard?.writeText(inviteUrl).catch(() => {});
           toast.success(`Invite created for ${email}`, {
-            description: "Email delivery isn’t configured — the invite link was copied to your clipboard.",
+            description: throttled
+              ? "Your organization has hit its hourly limit for invite emails, so nothing was sent — the invite link was copied to your clipboard."
+              : "Email delivery isn’t configured — the invite link was copied to your clipboard.",
           });
         }
         setOpen(false);

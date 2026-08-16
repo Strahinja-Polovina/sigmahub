@@ -31,7 +31,19 @@ type BillingStore interface {
 
 const paddleWebhookMaxBytes = 5 << 20
 
-func (s *Server) billingConfigured() bool { return s.paddle != nil }
+// Billing is configured only when BOTH halves are present (SIGMA-365).
+//
+// This used to ask about the API key alone, while main.go gates the free-tier
+// ceiling on `paddleClient != nil && cfg.PaddlePriceID != ""`. With a key and no
+// price id the two disagreed and every consequence was silent: this endpoint
+// answered `configured: true`, the dashboard offered Subscribe, each click
+// posted an empty price_id and Paddle 400'd into a 502 — while
+// assertFreeTierNotExhaustedTx returned nil, so the free tier was uncapped for
+// every tenant at the same time. A launch-day env-var slip, and nothing names it.
+//
+// Config validation checks only that PaddleEnv is sandbox|production, so this is
+// the one place the pairing can be enforced.
+func (s *Server) billingConfigured() bool { return s.paddle != nil && s.paddlePriceID != "" }
 
 func (s *Server) handleGetBilling(w http.ResponseWriter, r *http.Request) {
 	if s.billing == nil {

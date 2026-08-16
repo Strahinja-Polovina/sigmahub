@@ -112,3 +112,46 @@ func TestPrereleaseIsAValidUpdateTarget(t *testing.T) {
 		t.Fatalf("agent.update %s: %v — the control plane accepts this tag and serves it from /dl", target, err)
 	}
 }
+
+// The other half of the same vocabulary gap (SIGMA-365).
+//
+// goreleaser stamps `main.version` from `{{ .Version }}`, which is the tag MINUS
+// the leading `v` — the reason install.sh computes `ver_noV="${SIGMAHUB_VERSION#v}"`
+// and the reason downloadURL below TrimPrefixes before naming the archive. The
+// control plane validates the desired version against `^v[0-9]+...`, so the op
+// always carries the `v` form.
+//
+// Compared raw, this guard could never fire. Since the control plane's own
+// re-render check had the same shape, the upgrade op rode in every subsequent
+// document and this handler ran it every time: a ~30 MB download, a cosign
+// verification, a binary rewrite and an os.Exit(0) restart of the root daemon on
+// a customer's machine — on every deploy, secret rotation or domain attach.
+//
+// The guard is the last thing standing between that op and the customer's host,
+// so it is asserted against the spellings that actually occur rather than the
+// ones that would be tidy.
+func TestUpdateIsANoOpWhenAlreadyOnTheTargetVersion(t *testing.T) {
+	// `asked` is always v-prefixed: it comes from the control plane, whose API
+	// refuses anything else, and versionRe here enforces the same on the wire.
+	// What varies is how THIS binary spells its own version.
+	for _, tc := range []struct{ current, asked string }{
+		{"0.4.0", "v0.4.0"}, // the real pairing: stamped bare, asked v-prefixed
+		{"v0.4.0", "v0.4.0"},
+	} {
+		u := &Updater{CurrentVersion: tc.current}
+		spec, err := json.Marshal(map[string]string{"version": tc.asked})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// No DownloadBase and no network available here: if the guard fails to
+		// short-circuit, the handler reaches out and this errors — which is the
+		// signal, since in production it would instead succeed and replace the
+		// running binary.
+		if err := u.handle(context.Background(), dsd.Op{
+			ID: "agent:update:srv_1:" + tc.asked, Kind: Kind, Spec: spec,
+		}); err != nil {
+			t.Errorf("current %q asked %q: %v — the agent is already on this version and must do nothing",
+				tc.current, tc.asked, err)
+		}
+	}
+}

@@ -26,8 +26,21 @@ export default async function ServerDetailPage({
   const visible = await visibleProjects(user.id, orgId, role);
 
   if (cpEnabled()) {
-    const cpServer = await cpGetServer(orgId, serverId);
-    if (!cpServer) notFound();
+    // A reachability failure is NOT a 404 and must not become an unhandled
+    // throw either (SIGMA-365): the layout is already telling the operator the
+    // control plane is unreachable, and this page crashing underneath that
+    // banner takes away the per-server Disconnect controls at exactly the moment
+    // they are wanted. `null` here means "no such server"; a thrown error means
+    // "we could not ask", and only the first is a 404.
+    let cpServer: Awaited<ReturnType<typeof cpGetServer>> | undefined;
+    let reachable = true;
+    try {
+      cpServer = await cpGetServer(orgId, serverId);
+    } catch {
+      reachable = false;
+    }
+    if (reachable && !cpServer) notFound();
+    if (cpServer) {
     const [points, cpResources] = await Promise.all([
       cpServerMetrics(orgId, serverId).then(cpMetricsToPoints),
       // SIGMA-328: ask the control plane for this server's resources only.
@@ -87,6 +100,7 @@ export default async function ServerDetailPage({
         }}
       />
     );
+  }
   }
 
   const server = await getServer(serverId);

@@ -115,4 +115,76 @@ describe("BillingView subscription card", () => {
     );
     expect(screen.getByRole("button", { name: /^Subscribe$/ })).toBeTruthy();
   });
+
+  // SIGMA-365. The closed loop for the customer who most needs to pay.
+  //
+  // At EXACTLY the free tier, billableUnits is 0 — nothing is chargeable yet —
+  // and that is the same moment the free-tier gate starts refusing new servers,
+  // with a message telling the customer to subscribe from this page. They
+  // arrived and found the button greyed out, labelled "Within free tier".
+  // Refused growth, refused payment, no way forward from inside the product.
+  //
+  // The control plane's checkout handler was fixed to accept this case in the
+  // previous round; this predicate was the only thing still holding them out,
+  // which is why the fix looked complete and was not.
+  it("offers Subscribe to an org sitting at exactly the free tier", () => {
+    render(
+      <BillingView
+        orgName="Acme"
+        billing={billing}
+        servers={servers}
+        subscription={{
+          ...subscription,
+          status: "none",
+          billableUnits: 0, // nothing chargeable yet...
+          billedUnits: 3, // ...but the fleet is at the ceiling
+          freeTier: 3,
+        }}
+      />
+    );
+    const btn = screen.getByRole("button", { name: /^Subscribe$/ }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  // The same predicate produced a launch blocker twice. The second time is what
+  // settled it: the gate refuses a server whose OWN weight does not fit the
+  // remaining headroom, so an org with zero servers is refused a `gpu` host
+  // (weight 4 > tier 3) while billedUnits is 0 — and a button keyed on
+  // billedUnits was still disabled. No free-tier org could ever connect a GPU,
+  // the product's headline primitive, or pay to fix it. The dashboard was
+  // re-deriving a decision the CP makes with information the dashboard does not
+  // have, so it stopped deriving it.
+  it("offers Subscribe to a brand-new org, which is the GPU customer's only way in", () => {
+    render(
+      <BillingView
+        orgName="Acme"
+        billing={billing}
+        servers={servers}
+        subscription={{
+          ...subscription,
+          status: "none",
+          billableUnits: 0,
+          billedUnits: 0,
+          freeTier: 3,
+        }}
+      />
+    );
+    const btn = screen.getByRole("button", { name: /^Subscribe$/ }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    // ...and the price is STATED rather than enforced by a dead control.
+    expect(screen.getByText(/within the free tier/i)).toBeTruthy();
+  });
+
+  it("still offers Subscribe to an org already over the tier", () => {
+    render(
+      <BillingView
+        orgName="Acme"
+        billing={billing}
+        servers={servers}
+        subscription={{ ...subscription, status: "none", billableUnits: 5, billedUnits: 8, freeTier: 3 }}
+      />
+    );
+    const btn = screen.getByRole("button", { name: /^Subscribe$/ }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
 });
