@@ -46,11 +46,16 @@
 	#
 	# What IS in place without it: better-auth limits the credential endpoints
 	# (sign-in, sign-up, forget-password, 2FA verify) well below its global rate,
-	# in memory. For this single-instance reference deployment that is the whole
-	# request path, so it is effective. It stops being sufficient the moment you
-	# run more than one `web` replica — the counters are per-process — or expose
-	# sign-in to the open internet, where you want the flood dropped before it
-	# reaches the application at all.
+	# counting in the DATABASE (the `rate_limit` table). The limit is therefore a
+	# property of the deployment rather than of a process, so running more than
+	# one `web` replica is a scaling decision and not a security one — there is
+	# nothing to configure. Outbound invite mail is bounded per organization for
+	# the same reason.
+	#
+	# What that cannot cover is unauthenticated flooding: an application limiter
+	# can only count a request that has already reached the application. That is
+	# what the block below is for, and it is the reason to want it before sign-in
+	# is exposed to the open internet.
 	#
 	# With a caddy-ratelimit build, this is the shape:
 	#

@@ -169,6 +169,7 @@ export function Overview({
   runningResources,
   activeDeploys,
   billing,
+  billingUnavailable,
   resources,
   activity,
 }: {
@@ -178,6 +179,9 @@ export function Overview({
   runningResources: number;
   activeDeploys: number;
   billing: Billing;
+  /** The control plane could not be asked, so the charge is unknown rather than
+   *  zero — see the comment at the Monthly cost tile. */
+  billingUnavailable?: boolean;
   resources: OverviewResource[];
   activity: Activity[];
 }) {
@@ -201,11 +205,18 @@ export function Overview({
           hint={`${resources.length} resources deployed`}
           icon={Boxes}
         />
+        {/* The charge comes from the control plane, which is what Paddle is
+            billed with; when it cannot be reached this says so instead of
+            falling back to a mirror figure that applies neither the
+            subscription minimum nor the high-water mark (SIGMA-365). A
+            confident wrong number about money is worse than a dash. */}
         <StatCard
           label="Monthly cost"
-          value={formatCurrency(billing.amount, billing.currency)}
+          value={billingUnavailable ? "—" : formatCurrency(billing.amount, billing.currency)}
           hint={
-            billing.isFree ? (
+            billingUnavailable ? (
+              "Control plane unreachable — open Billing to retry"
+            ) : billing.isFree ? (
               <span className="inline-flex items-center gap-1.5">
                 <StatusDot status="running" />
                 Free tier · up to {billing.freeTier} units

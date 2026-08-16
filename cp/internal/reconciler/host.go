@@ -54,7 +54,28 @@ func renderHostOps(serverID string, hh store.HostHardening, publicURL string) []
 	// differs from what the agent last reported; the agent's post-update
 	// heartbeat carries the new version and the op drops out of the document.
 	// The op id embeds the target version so a later retarget is a new op.
-	if hh.DesiredAgentVersion != "" && hh.DesiredAgentVersion != hh.AgentVersion {
+	//
+	// Compared WITHOUT the leading `v`, because the two sides of this comparison
+	// spell the same version differently and always have (SIGMA-365).
+	// `.goreleaser.yaml` stamps `-X main.version={{ .Version }}`, and goreleaser's
+	// `.Version` is the tag minus the `v` — which is why install.sh computes
+	// `ver_noV="${SIGMAHUB_VERSION#v}"` to name the archive, and why both
+	// api/installer.go and the agent's selfupdate TrimPrefix before building a
+	// URL. So the agent reports `0.4.0` while DesiredAgentVersion is validated
+	// against `^v[0-9]+...` and stored as `v0.4.0`.
+	//
+	// Raw, `"v0.4.0" != "0.4.0"` is permanently true: the upgrade op is re-rendered
+	// into every later document, and since the agent's own idempotency guard was
+	// the same raw compare it re-ran every time — a ~30 MB download, a cosign
+	// verification, a binary rewrite and an os.Exit(0) restart of the root daemon
+	// on the customer's host, on every deploy, secret rotation or domain attach,
+	// forever. And nothing could clear it: an empty desired version means "use the
+	// CP's own release" and any non-`v` value is refused at the API.
+	//
+	// Normalised on comparison rather than at the ldflags, because agents already
+	// in the field report the bare form and changing the stamp would strand them.
+	if hh.DesiredAgentVersion != "" &&
+		strings.TrimPrefix(hh.DesiredAgentVersion, "v") != strings.TrimPrefix(hh.AgentVersion, "v") {
 		spec := map[string]string{"version": hh.DesiredAgentVersion}
 		// SIGMA-262: tell the agent to download the release through THIS control
 		// plane's /dl proxy rather than github.com.

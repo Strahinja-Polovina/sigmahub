@@ -165,7 +165,14 @@ func (u *Updater) handle(ctx context.Context, op dsd.Op) error {
 	if !versionRe.MatchString(spec.Version) {
 		return fmt.Errorf("agent.update: invalid version %q", spec.Version)
 	}
-	if spec.Version == u.CurrentVersion {
+	// Compared without the leading `v`: the control plane stores and sends
+	// `v0.4.0` (its API validates against `^v[0-9]+...`) while this binary's
+	// version is stamped by goreleaser as `0.4.0` — the same mismatch TrimPrefix
+	// exists for a few lines below when building the download URL. Raw, this guard
+	// never fired, so an upgrade op re-rendered into every later document re-ran
+	// the whole thing: download, cosign, binary rewrite, os.Exit(0) restart of the
+	// root daemon, on every deploy or secret rotation, forever (SIGMA-365).
+	if strings.TrimPrefix(spec.Version, "v") == strings.TrimPrefix(u.CurrentVersion, "v") {
 		return nil // already there — idempotent no-op
 	}
 	// The cosign trust anchor is PINNED, never taken from the op spec (SIGMA-360).

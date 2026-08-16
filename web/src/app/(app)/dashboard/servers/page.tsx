@@ -26,7 +26,16 @@ export default async function ServersPage() {
 
   const cp = cpEnabled();
   const [servers, myOrgs, clusterData, sessionUser] = await Promise.all([
-    cp ? cpServersWithCounts(orgId) : getServersWithCounts(orgId),
+    // Fall back to the mirror when the control plane cannot be reached
+    // (SIGMA-365). These were the only routes that CRASHED during an outage:
+    // the layout renders "Control plane unreachable · Showing the last synced
+    // state" and directly beneath it this page threw its error boundary, while
+    // Overview, Projects, Resources and Billing all degraded politely. Servers
+    // is also where Disconnect and Force disconnect live, so the outage took
+    // away the controls an operator reaches for during an outage.
+    cp
+      ? cpServersWithCounts(orgId).catch(() => getServersWithCounts(orgId))
+      : getServersWithCounts(orgId),
     getMyOrgs(),
     // Both modes: the clusters panel is where a cluster is built, and hiding it
     // with no control plane made "promote your own servers into a cluster" a
